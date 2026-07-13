@@ -46,9 +46,6 @@ HUD_SCRIPT = textwrap.dedent("""\
 
             self.set_size_request(WIDTH, HEIGHT)
 
-            self.connect("draw", self._on_draw)
-            self.connect("map", self._center)
-
             self.levels = [0.0] * WAVE_BARS
             self.blink = True
             self.level_file_pos = 0
@@ -59,6 +56,27 @@ HUD_SCRIPT = textwrap.dedent("""\
             GLib.timeout_add(20, self._fade_in)
 
             self.set_opacity(0.0)
+
+            close_btn = Gtk.Button(label="✕")
+            close_btn.set_relief(Gtk.ReliefStyle.NONE)
+            close_btn.set_focus_on_click(False)
+            close_btn.set_size_request(24, 24)
+            close_btn.connect("clicked", lambda *_: Gtk.main_quit())
+
+            overlay = Gtk.Overlay()
+            self.add(overlay)
+
+            draw_area = Gtk.DrawingArea()
+            draw_area.connect("draw", self._on_draw)
+            overlay.add(draw_area)
+
+            close_btn.set_halign(Gtk.Align.END)
+            close_btn.set_valign(Gtk.Align.START)
+            close_btn.set_margin_top(4)
+            close_btn.set_margin_end(8)
+            overlay.add_overlay(close_btn)
+
+            self.connect("map", self._center)
 
         def _tick_blink(self):
             self.blink = not self.blink

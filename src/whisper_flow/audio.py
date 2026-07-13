@@ -93,11 +93,12 @@ class AudioRecorder:
             except Exception:
                 pass
 
-    def record_with_vad(self, stop_event=None) -> str | None:
+    def record_with_vad(self, stop_event=None, level_file: str | None = None) -> str | None:
         """Record audio with Voice Activity Detection.
 
         Args:
             stop_event: Threading event to stop recording
+            level_file: Path to write audio levels for HUD visualization
 
         Returns:
             Path to the recorded audio file, or None if cancelled
@@ -157,6 +158,8 @@ class AudioRecorder:
                         log("Warning: Audio read error, continuing...")
                         continue
 
+                    self._write_level(level_file, buf)
+
                     voiced = self.vad.is_speech(buf, self.config.sample_rate)
                     ring_buffer.append(buf)
 
@@ -193,12 +196,40 @@ class AudioRecorder:
                 pass
             return None
 
-    def record_push_to_talk(self, stop_key: str, stop_event=None) -> str | None:
+    def _write_level(self, level_file: str | None, buf: bytes):
+        """Write audio level to the level file for HUD visualization.
+
+        Args:
+            level_file: Path to level file, or None
+            buf: Audio frame bytes
+
+        """
+        if not level_file:
+            return
+        try:
+            samples = len(buf) // 2
+            if samples < 1:
+                return
+            import struct
+            vals = struct.unpack(f"<{samples}h", buf)
+            rms = int((sum(v * v for v in vals) / max(samples, 1)) ** 0.5)
+            with open(level_file, "ab") as f:
+                f.write(struct.pack("<i", rms))
+            import sys
+            sys.stdout.write(f"[WAVE] wrote rms={rms} samples={samples} size={len(buf)} to {level_file}\n")
+            sys.stdout.flush()
+        except Exception as e:
+            import sys
+            sys.stdout.write(f"[WAVE] _write_level error: {e}\n")
+            sys.stdout.flush()
+
+    def record_push_to_talk(self, stop_key: str, stop_event=None, level_file: str | None = None) -> str | None:
         """Record audio with push-to-talk functionality.
 
         Args:
             stop_key: Key combination to stop recording (for display only)
             stop_event: Threading event to stop recording
+            level_file: Path to write audio levels for HUD visualization
 
         Returns:
             Path to the recorded audio file, or None if cancelled
@@ -239,10 +270,12 @@ class AudioRecorder:
             listener = keyboard.Listener(on_press=on_press)
             listener.start()
 
+            frame_count = 0
             try:
                 while not stop_flag["stop"]:
                     # Check if stop event is set (for daemon control)
                     if stop_event and stop_event.is_set():
+                        log(f"[AUDIO] stop_event set after {frame_count} frames")
                         stop_flag["stop"] = True
                         break
 
@@ -254,6 +287,10 @@ class AudioRecorder:
                         continue
 
                     frames.append(buf)
+                    self._write_level(level_file, buf)
+                    frame_count += 1
+                    if frame_count % 25 == 0:
+                        log(f"[AUDIO] recorded {frame_count} frames so far")
 
             finally:
                 self._stop_stream_safely(stream)
@@ -279,12 +316,14 @@ class AudioRecorder:
         self,
         silence_duration: float,
         stop_event=None,
+        level_file: str | None = None,
     ) -> str | None:
         """Record audio until silence is detected for the specified duration.
 
         Args:
             silence_duration: Duration of silence in seconds before stopping
             stop_event: Threading event to stop recording
+            level_file: Path to write audio levels for HUD visualization
 
         Returns:
             Path to the recorded audio file, or None if cancelled
@@ -342,6 +381,7 @@ class AudioRecorder:
                         continue
 
                     frames.append(buf)
+                    self._write_level(level_file, buf)
 
                     # Check for voice activity
                     voiced = self.vad.is_speech(buf, self.config.sample_rate)

@@ -50,6 +50,7 @@ class HotkeyManager:
 
         # Simple state
         self.last_key_times: dict[str, float] = {}  # Track per-key debouncing
+        self.key_press_times: dict[str, float] = {}  # Track when each key was pressed (for stuck detection)
         self.active_combination: str | None = None
         self.current_push_to_talk: str | None = None
         self.processing_callback: Callable[[], bool] | None = None
@@ -58,6 +59,7 @@ class HotkeyManager:
         self.last_heartbeat = time.time()
         self.heartbeat_interval = 10.0  # 10 seconds between heartbeats
         self.heartbeat_thread = None
+        self.stuck_key_timeout = 15.0  # Max time a key can be held before considered stuck
 
         # Key mapping for consistent naming
         self.key_mapping = {
@@ -163,6 +165,7 @@ class HotkeyManager:
             # Reset state
             self.pressed_keys.clear()
             self.last_key_times.clear()
+            self.key_press_times.clear()
             self.active_combination = None
             self.current_push_to_talk = None
 
@@ -320,6 +323,7 @@ class HotkeyManager:
                 f"[HOTKEY] Adding {key_name} to pressed_keys. Before: {self.pressed_keys}",
             )
             self.pressed_keys.add(key_name)
+            self.key_press_times[key_name] = current_time
             log(f"[HOTKEY] After adding {key_name}: {self.pressed_keys}")
 
             # Check for hotkey matches
@@ -332,6 +336,7 @@ class HotkeyManager:
             log(f"[HOTKEY] Error in key press handler: {e}")
             # Reset to known good state
             self.pressed_keys.clear()
+            self.key_press_times.clear()
             self.active_combination = None
 
     def _on_key_release(self, key) -> None:
@@ -360,6 +365,7 @@ class HotkeyManager:
                 f"[HOTKEY] Removing {key_name} from pressed_keys. Before: {self.pressed_keys}",
             )
             self.pressed_keys.discard(key_name)
+            self.key_press_times.pop(key_name, None)
             log(f"[HOTKEY] After removing {key_name}: {self.pressed_keys}")
 
             # Handle push-to-talk release - only when ALL keys in the combination are released
@@ -390,6 +396,7 @@ class HotkeyManager:
             log(f"[HOTKEY] Error in key release handler: {e}")
             # Reset to known good state
             self.pressed_keys.clear()
+            self.key_press_times.clear()
             self.active_combination = None
             self.current_push_to_talk = None
 
@@ -483,6 +490,17 @@ class HotkeyManager:
         except Exception as e:
             log(f"[HOTKEY] Error triggering hotkey release '{name}': {e}")
 
+    def force_reset(self) -> None:
+        """Force reset all hotkey state. Call this when recording stops to prevent stuck keys."""
+        log(
+            f"[HOTKEY] Force reset - clearing state. pressed_keys was: {self.pressed_keys}, active: {self.active_combination}, ptt: {self.current_push_to_talk}",
+        )
+        self.pressed_keys.clear()
+        self.key_press_times.clear()
+        self.last_key_times.clear()
+        self.active_combination = None
+        self.current_push_to_talk = None
+
     def _handle_escape_key(self) -> None:
         """Handle escape key press for canceling operations."""
         # This can be overridden or configured with a callback
@@ -523,6 +541,47 @@ class HotkeyManager:
                     self.active_combination = None
                     self.current_push_to_talk = None
 
+                # Stuck key detection: remove keys held longer than the timeout
+                stuck_keys = []
+                for key_name, press_time in list(self.key_press_times.items()):
+                    held_duration = current_time - press_time
+                    if held_duration > self.stuck_key_timeout:
+                        stuck_keys.append((key_name, held_duration))
+
+                if stuck_keys:
+                    log(
+                        f"[HOTKEY] Stuck key detection: keys held too long: {[(k, f'{d:.1f}s') for k, d in stuck_keys]}",
+                    )
+                    for key_name, _ in stuck_keys:
+                        self.pressed_keys.discard(key_name)
+                        self.key_press_times.pop(key_name, None)
+                        self.last_key_times.pop(key_name, None)
+                    log(
+                        f"[HOTKEY] Stuck keys removed. pressed_keys now: {self.pressed_keys}",
+                    )
+                    # If pressed_keys is now empty, clear the active state
+                    if not self.pressed_keys:
+                        log(
+                            "[HOTKEY] Stuck key recovery: all keys cleared, resetting active state",
+                        )
+                        self.active_combination = None
+                        self.current_push_to_talk = None
+
+                # Check for inconsistent state: active_combination set but not all combo keys are pressed
+                if self.active_combination and self.pressed_keys:
+                    binding = self.active_bindings.get(self.active_combination)
+                    if binding and not binding.keys.issubset(self.pressed_keys):
+                        log(
+                            f"[HOTKEY] Inconsistent state: active combination {self.active_combination} keys {binding.keys} not all in pressed_keys {self.pressed_keys}",
+                        )
+                        # Only reset if the missing keys aren't coming back (they were released)
+                        # If released keys are missing, this means we missed release events
+                        log(
+                            "[HOTKEY] Resetting active state due to inconsistent key state",
+                        )
+                        self.active_combination = None
+                        self.current_push_to_talk = None
+
                 # Check if keyboard listener is still alive
                 if self.keyboard_listener and not self.keyboard_listener.is_alive():
                     log("[HOTKEY] Warning: Keyboard listener died, attempting restart")
@@ -546,6 +605,7 @@ class HotkeyManager:
             # Reset state
             self.pressed_keys.clear()
             self.last_key_times.clear()
+            self.key_press_times.clear()
             self.active_combination = None
             self.current_push_to_talk = None
 

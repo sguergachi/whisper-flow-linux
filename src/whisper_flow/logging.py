@@ -13,4 +13,4 @@ def set_logging_enabled(enabled: bool):
 def log(*args, **kwargs):
     """Conditional print function that only prints when logging is enabled."""
     if _logging_enabled:
-        print(*args, **kwargs)
+        print(*args, **kwargs, flush=True)

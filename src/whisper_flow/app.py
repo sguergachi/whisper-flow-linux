@@ -35,12 +35,13 @@ class WhisperFlow:
         self.completion_service = CompletionService(self.config)
         self.prompt_manager = PromptManager(self.config, self.system_manager)
 
-    def run_voice_flow_push_to_talk_daemon(self, stop_key: str, stop_event) -> bool:
+    def run_voice_flow_push_to_talk_daemon(self, stop_key: str, stop_event, level_file: str | None = None) -> bool:
         """Run voice flow with daemon-controlled push-to-talk recording.
 
         Args:
             stop_key: Hotkey combination that stops recording (for display)
             stop_event: Threading event to control recording stop
+            level_file: Path to write audio levels for HUD visualization
 
         Returns:
             True if successful, False otherwise
@@ -48,7 +49,7 @@ class WhisperFlow:
         """
         try:
             # Record audio with daemon-controlled stop event
-            audio_file = self.audio_recorder.record_push_to_talk(stop_key, stop_event)
+            audio_file = self.audio_recorder.record_push_to_talk(stop_key, stop_event, level_file=level_file)
 
             if not audio_file:
                 log("No audio recorded")
@@ -61,11 +62,12 @@ class WhisperFlow:
             self.system_manager.notify(f"Push-to-talk failed: {e}")
             return False
 
-    def run_voice_flow_auto_stop(self, silence_duration: float = 2.0) -> bool:
+    def run_voice_flow_auto_stop(self, silence_duration: float = 2.0, level_file: str | None = None) -> bool:
         """Run voice flow with auto-stop on silence.
 
         Args:
             silence_duration: Seconds of silence before stopping
+            level_file: Path to write audio levels for HUD visualization
 
         Returns:
             True if successful, False otherwise
@@ -74,7 +76,7 @@ class WhisperFlow:
         try:
             # Record audio until silence detected
             log(f"Recording... Will auto-stop after {silence_duration}s of silence")
-            audio_file = self.audio_recorder.record_until_silence(silence_duration)
+            audio_file = self.audio_recorder.record_until_silence(silence_duration, level_file=level_file)
 
             if not audio_file:
                 log("No audio recorded")

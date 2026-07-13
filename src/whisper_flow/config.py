@@ -10,24 +10,24 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 def _resolve_env_file() -> str | os.PathLike[str]:
     """Resolve a stable .env location.
 
-    Prefer the project root (…/src/..../) .env when running from the repo,
-    otherwise fall back to CWD-relative ".env" (pydantic default behavior).
+    Prefer ~/.config/whisper-flow/.env, fall back to project root,
+    then CWD-relative ".env".
     """
+    config_env = Path.home() / ".config" / "whisper-flow" / ".env"
+    if config_env.exists():
+        return config_env
     try:
         current_path = Path(__file__).resolve().parent
-        max_levels = 8  # Limit how far up we search
+        max_levels = 8
         level = 0
-
         while level < max_levels:
             candidate = current_path / ".env"
             if candidate.exists():
-                print(f"Using env file: {candidate}")
                 return candidate
             current_path = current_path.parent
             level += 1
     except Exception:
-        print("Error resolving env file")
-    print("Using default env file")
+        pass
     return ".env"
 
 
@@ -167,19 +167,26 @@ class Config(BaseSettings):
         env="WHISPER_FLOW_QUEUE_REQUEST_TIMEOUT",
     )
 
+    # Local whisper.cpp configuration
+    local_whisper_url: str | None = Field(
+        default=None,
+        description="URL for local whisper.cpp server (e.g. http://localhost:8082)",
+        env="WHISPER_FLOW_LOCAL_WHISPER_URL",
+    )
+
     # Hotkey Configuration
     hotkey_transcribe: str = Field(
-        default="ctrl+cmd",
+        default="cmd+alt",
         description="Hotkey for push-to-talk transcription",
         env="WHISPER_FLOW_HOTKEY_TRANSCRIBE",
     )
     hotkey_auto_transcribe: str = Field(
-        default="ctrl+cmd+space",
+        default="cmd+alt+space",
         description="Hotkey for auto-stop transcription",
         env="WHISPER_FLOW_HOTKEY_AUTO_TRANSCRIBE",
     )
     hotkey_command: str = Field(
-        default="ctrl+cmd+alt",
+        default="ctrl+alt",
         description="Hotkey for push-to-talk command mode",
         env="WHISPER_FLOW_HOTKEY_COMMAND",
     )

@@ -2,7 +2,10 @@
 
 import os
 import queue
+import shutil
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -13,7 +16,8 @@ from PIL import Image, ImageDraw
 from .app import WhisperFlow
 from .config import Config
 from .hotkey_manager import HotkeyManager, HotkeyMode
-from .logging import log
+from .hud import HUD
+from .logging import log, set_logging_enabled
 
 
 class WhisperFlowDaemon:
@@ -21,8 +25,9 @@ class WhisperFlowDaemon:
 
     def __init__(self, config_dir: Path | None = None):
         """Initialize the daemon."""
-        log("[DAEMON] Initializing WhisperFlowDaemon...")
         self.config = Config(config_dir=config_dir) if config_dir else Config()
+        set_logging_enabled(self.config.logging_enabled)
+        log("[DAEMON] Initializing WhisperFlowDaemon...")
         self.tray_icon = None
         self.is_running = False
         self.is_recording = False
@@ -44,6 +49,10 @@ class WhisperFlowDaemon:
         # Initialize the new HotkeyManager
         log("[DAEMON] Creating HotkeyManager...")
         self.hotkey_manager = HotkeyManager()
+
+        # Initialize HUD overlay for recording indicator
+        log("[DAEMON] Creating HUD overlay...")
+        self.hud = HUD()
 
         # Initialize WhisperFlow instances for different modes
         log("[DAEMON] Creating WhisperFlow instances...")
@@ -394,6 +403,23 @@ class WhisperFlowDaemon:
         self.stop_recording_event = threading.Event()
         self.recording_start_time = time.time()
 
+        # Save the currently active window UUID for focus restoration at paste time
+        app = self._get_app_for_mode(mode)
+        saved_window = None
+        try:
+            app.system_manager.save_active_window()
+            saved_window = app.system_manager._saved_window
+            log(f"[DAEMON] Saved active window for mode: {mode} -> {saved_window}")
+        except Exception as e:
+            log(f"[DAEMON] Failed to save active window: {e}")
+
+        # Create level file for HUD waveform
+        fd, self._level_file = tempfile.mkstemp(suffix=".levels", prefix="whisper-flow-")
+        os.close(fd)
+
+        # Show HUD overlay
+        self.hud.show(level_file=self._level_file)
+
         # Update tray icon to recording state
         if self.tray_icon:
             self.tray_icon.icon = self.create_recording_icon()
@@ -433,6 +459,7 @@ class WhisperFlowDaemon:
                 )
                 success = app.run_voice_flow_auto_stop(
                     silence_duration=self.config.auto_stop_silence_duration,
+                    level_file=getattr(self, "_level_file", None),
                 )
             elif mode in ["transcribe", "command"]:
                 # Push-to-talk mode: record until stop event is set
@@ -445,6 +472,7 @@ class WhisperFlowDaemon:
                 success = app.run_voice_flow_push_to_talk_daemon(
                     stop_key=hotkey,
                     stop_event=self.stop_recording_event,
+                    level_file=getattr(self, "_level_file", None),
                 )
             else:
                 # Fallback to auto-stop
@@ -484,6 +512,8 @@ class WhisperFlowDaemon:
             return
 
         log("[DAEMON] Canceling current recording")
+        # Force-reset hotkey state to prevent stuck modifiers
+        self.hotkey_manager.force_reset()
         self._stop_recording()
 
     def _stop_recording(self):
@@ -494,9 +524,24 @@ class WhisperFlowDaemon:
 
         log(f"[DAEMON] Stopping recording for mode: {self.current_mode}")
 
+        # Force-reset hotkey state to prevent stuck modifiers
+        self.hotkey_manager.force_reset()
+
         # Signal the recording thread to stop
         if self.stop_recording_event:
             self.stop_recording_event.set()
+
+        # Hide HUD overlay
+        self.hud.hide()
+
+        # Clean up level file
+        level_file = getattr(self, "_level_file", None)
+        if level_file:
+            try:
+                os.unlink(level_file)
+            except OSError:
+                pass
+            self._level_file = None
 
         # Reset recording state
         self.is_recording = False
@@ -516,11 +561,13 @@ class WhisperFlowDaemon:
         self.transcribe_app.system_manager.notify(message)
 
     def open_settings(self, icon, item):
-        """Open settings (placeholder for future implementation)."""
+        """Open settings directory in file manager."""
         log("[DAEMON] Settings menu item clicked")
-        self.notify(
-            "Settings not yet implemented - edit ~/.config/whisper-flow/config.yaml",
-        )
+        config_dir = self.config.config_dir
+        if shutil.which("xdg-open"):
+            subprocess.Popen(["xdg-open", str(config_dir)])
+        else:
+            self.notify(f"Config directory: {config_dir}")
 
     def test_configuration(self, icon, item):
         """Test system configuration."""

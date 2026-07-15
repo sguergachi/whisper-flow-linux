@@ -1,5 +1,6 @@
 """Advanced hotkey management for whisper-flow with optimized key handling."""
 
+import os
 import threading
 import time
 from collections.abc import Callable
@@ -9,6 +10,22 @@ from enum import Enum
 from pynput import keyboard
 
 from .logging import log
+
+
+def _is_wayland():
+    """Check if running under Wayland."""
+    return os.environ.get("WAYLAND_DISPLAY") or os.environ.get("XDG_SESSION_TYPE") == "wayland"
+
+
+def _parse_hotkey(keys_str, key_mapping):
+    """Parse a hotkey string like 'cmd+alt' into a set of normalized key names."""
+    parts = keys_str.lower().split("+")
+    key_set = set()
+    for part in parts:
+        part = part.strip()
+        mapped = key_mapping.get(part, part)
+        key_set.add(mapped)
+    return key_set
 
 
 class HotkeyMode(Enum):
@@ -61,19 +78,23 @@ class HotkeyManager:
         self.heartbeat_thread = None
         self.stuck_key_timeout = 15.0  # Max time a key can be held before considered stuck
 
-        # Key mapping for consistent naming
+        # Key mapping for consistent naming (runtime keys have _l/_r suffixes)
         self.key_mapping = {
             "ctrl_l": "ctrl",
             "ctrl_r": "ctrl",
             "cmd_l": "cmd",
             "cmd_r": "cmd",
-            "super_l": "cmd",  # Map super to cmd for consistency
-            "super_r": "cmd",  # Map super to cmd for consistency
+            "super_l": "cmd",
+            "super_r": "cmd",
             "alt_l": "alt",
             "alt_r": "alt",
             "shift_l": "shift",
             "shift_r": "shift",
             "space": "space",
+            # Shorthand names used in config
+            "super": "cmd",
+            "win": "cmd",
+            "command": "cmd",
         }
 
         log("[HOTKEY] HotkeyManager initialized")
@@ -138,17 +159,42 @@ class HotkeyManager:
             for name, binding in self.active_bindings.items():
                 log(f"[HOTKEY]   {name}: {binding.keys} ({binding.mode.value})")
 
-            self.keyboard_listener = keyboard.Listener(
-                on_press=self._on_key_press,
-                on_release=self._on_key_release,
-            )
-            self.keyboard_listener.start()
+            # Auto-detect Wayland and use evdev backend if so
+            if _is_wayland():
+                log("[HOTKEY] Wayland detected, using evdev backend")
+                self._start_evdev()
+            else:
+                self.keyboard_listener = keyboard.Listener(
+                    on_press=self._on_key_press,
+                    on_release=self._on_key_release,
+                )
+                self.keyboard_listener.start()
+
             self.is_running = True
             self._start_heartbeat()
             log("[HOTKEY] HotkeyManager started successfully")
         except Exception as e:
             log(f"[HOTKEY] Failed to start HotkeyManager: {e}")
             raise
+
+    def _start_evdev(self):
+        """Start the evdev-based keyboard listener for Wayland."""
+        from .hotkey_evdev import EvdevHotkeyListener
+
+        self._evdev_listener = EvdevHotkeyListener()
+
+        for name, binding in self.active_bindings.items():
+            # Build key string from the parsed set (which is normalized)
+            key_str = "+".join(sorted(binding.keys))
+            press_cb = binding.callback_press
+            release_cb = binding.callback_release if binding.mode == HotkeyMode.PUSH_TO_TALK else None
+
+            self._evdev_listener.register_hotkey(
+                name, key_str, press_cb, release_cb
+            )
+
+        self._evdev_listener.start()
+        log("[HOTKEY] Evdev hotkey listener started")
 
     def stop(self) -> None:
         """Stop the hotkey listener."""
@@ -157,6 +203,10 @@ class HotkeyManager:
 
         try:
             log("[HOTKEY] Stopping HotkeyManager...")
+            # Stop evdev listener if active
+            if hasattr(self, "_evdev_listener") and self._evdev_listener:
+                self._evdev_listener.stop()
+                self._evdev_listener = None
             if self.keyboard_listener:
                 self.keyboard_listener.stop()
                 self.keyboard_listener = None
@@ -188,8 +238,9 @@ class HotkeyManager:
 
         for part in parts:
             part = part.strip()
-            # Add the standardized key name
-            key_set.add(part)
+            # Apply key mapping so config names match runtime pressed keys
+            mapped = self.key_mapping.get(part, part)
+            key_set.add(mapped)
 
         return key_set
 

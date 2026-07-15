@@ -176,17 +176,17 @@ class Config(BaseSettings):
 
     # Hotkey Configuration
     hotkey_transcribe: str = Field(
-        default="cmd+alt",
+        default="super+alt",
         description="Hotkey for push-to-talk transcription",
         env="WHISPER_FLOW_HOTKEY_TRANSCRIBE",
     )
     hotkey_auto_transcribe: str = Field(
-        default="cmd+alt+space",
+        default="ctrl+alt+space",
         description="Hotkey for auto-stop transcription",
         env="WHISPER_FLOW_HOTKEY_AUTO_TRANSCRIBE",
     )
     hotkey_command: str = Field(
-        default="ctrl+alt",
+        default="cmd+shift+alt",
         description="Hotkey for push-to-talk command mode",
         env="WHISPER_FLOW_HOTKEY_COMMAND",
     )

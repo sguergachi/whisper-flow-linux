@@ -725,7 +725,7 @@ Use 'whisper-flow stop' to exit daemon
         import sys
 
         log("[DAEMON] Launching worker process...")
-        args = [sys.argv[0], "daemon", "--_worker"]
+        args = ["whisper-flow", "daemon", "--_worker"]
         print("Starting WhisperFlow daemon...")
 
         log_file_path = Path.home() / ".config" / "whisper-flow" / "daemon.log"
@@ -765,6 +765,11 @@ Use 'whisper-flow stop' to exit daemon
         try:
             self.is_running = True
             log("[DAEMON] Worker process started")
+
+            # Write PID file so parent process can verify startup
+            pid_file = Path.home() / ".config" / "whisper-flow" / "daemon.pid"
+            pid_file.parent.mkdir(parents=True, exist_ok=True)
+            pid_file.write_text(str(os.getpid()))
 
             # Start watchdog for health monitoring
             self._start_watchdog()

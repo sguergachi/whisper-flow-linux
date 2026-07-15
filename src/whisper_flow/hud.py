@@ -231,6 +231,25 @@ class HUD:
             with open(self._log_path) as f:
                 stderr_out = f.read()
             print(f"[HUD] Failed to start HUD: {stderr_out}", flush=True)
+            return
+
+        # Give the HUD process more time to start (it's blocking on Gtk.main())
+        # Check if the log file has the expected output
+        for i in range(5):
+            time.sleep(0.5)
+            if self._log_path and os.path.exists(self._log_path):
+                with open(self._log_path) as f:
+                    content = f.read()
+                    if "[HUD] Starting with LEVEL_FILE=" in content:
+                        print(f"[HUD] HUD started successfully", flush=True)
+                        return
+        
+        # If we get here, the HUD may have started but wasn't detected
+        # Try to verify by checking if process is still alive
+        if self._process and self._process.poll() is None:
+            print(f"[HUD] HUD process is running (PID: {self._process.pid})", flush=True)
+        else:
+            print(f"[HUD] WARNING: Could not verify HUD startup", flush=True)
 
     def hide(self):
         """Hide the recording HUD overlay."""

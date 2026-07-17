@@ -34,11 +34,11 @@ class TranscriptionService:
         """Transcribe audio file.
 
         Args:
-            audio_path: Path to the audio file
+            audio_path: Path to the recorded audio file
             max_retries: Maximum number of retry attempts
 
         Returns:
-            Transcribed text or None if failed
+            Transcribed text or None if failed/blank
 
         """
         audio_file = Path(audio_path)
@@ -48,8 +48,15 @@ class TranscriptionService:
         for attempt in range(max_retries):
             try:
                 if self.local_url:
-                    return self._transcribe_local(audio_path)
-                return self._transcribe_with_openai(audio_path)
+                    text = self._transcribe_local(audio_path)
+                else:
+                    text = self._transcribe_with_openai(audio_path)
+
+                if text and text.strip() and text.strip() != "[BLANK_AUDIO]":
+                    return text.strip()
+
+                log("Blank audio detected, skipping paste")
+                return None
             except Exception as e:
                 if attempt == max_retries - 1:
                     raise RuntimeError(

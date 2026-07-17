@@ -632,14 +632,10 @@ class WhisperFlowDaemon:
         except Exception:
             pass
         subprocess.Popen(
-            [
-                "bash", "-c",
-                "sleep 2 && systemctl --user restart whisper-flow.service",
-            ],
+            ["systemctl", "--user", "restart", "whisper-flow.service"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             stdin=subprocess.DEVNULL,
-            start_new_session=True,
         )
         self.is_running = False
         if self.tray_icon:

@@ -263,6 +263,7 @@ class WhisperFlowDaemon:
             ),
             pystray.MenuItem("Settings", self.open_settings),
             pystray.MenuItem("Test Configuration", self.test_configuration),
+            pystray.MenuItem("Reload Daemon", self.reload_daemon),
             pystray.MenuItem("Exit", self.stop_daemon),
         )
 
@@ -616,14 +617,31 @@ class WhisperFlowDaemon:
         """Stop the daemon."""
         log("[DAEMON] Stop daemon requested")
         try:
-            # Show exit notification
             self.notify("👋 WhisperFlow daemon stopping...")
         except Exception:
-            pass  # Don't fail if notification doesn't work
-
+            pass
         self.is_running = False
+        if self.tray_icon:
+            self.tray_icon.stop()
 
-        # Stop the tray icon (this will exit the main loop)
+    def reload_daemon(self, icon=None, item=None):
+        """Reload/restart the daemon via systemd."""
+        log("[DAEMON] Reload daemon requested")
+        try:
+            self.notify("🔄 Reloading WhisperFlow daemon...")
+        except Exception:
+            pass
+        subprocess.Popen(
+            [
+                "bash", "-c",
+                "sleep 2 && systemctl --user restart whisper-flow.service",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        self.is_running = False
         if self.tray_icon:
             self.tray_icon.stop()
 

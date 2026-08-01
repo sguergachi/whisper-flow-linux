@@ -75,9 +75,10 @@ STROKE_RGB = (0.42, 0.43, 0.47)
 # rounded ends are a staircase. Keeping it inside the outline hides that edge
 # under the stroke instead of leaving a ragged rim of blur outside the pill.
 # The margin also has to absorb fractional scaling: at 1.25x this surface is
-# 67.5 physical pixels tall, and the compositor rounds the region outward, so
-# too small an inset leaves blur poking past the corners.
-BLUR_INSET = 4
+# 67.5 physical pixels tall and the compositor rounds the region outward.
+# Two pixels covers that; it was briefly wider while chasing the corner
+# artifact, which turned out to be GTK's window shadow instead.
+BLUR_INSET = 2
 # Cap shape. n = 2 is a circle; just above 2 keeps the capsule silhouette while
 # giving zero curvature where the cap meets the straight edge. Going much
 # higher squares the ends off into a rounded rectangle.
@@ -88,16 +89,19 @@ CAP_EXT = 1.12   # cap reaches this many half-heights along the edge
 # more of the frost, so this is the one knob that trades the two off.
 MATERIAL_RGB = (0.03, 0.03, 0.04)
 MATERIAL_ALPHA = 0.80
-EDGE_COVER = BLUR_INSET + 1.5   # opaque rim that hides the blur region's edge
+# Rim masking the blur region's edge. Only just wider than the inset: it is
+# darker than the glass, so every extra pixel reads as a heavy border.
+EDGE_COVER = BLUR_INSET + 0.5
+EDGE_COVER_ALPHA = 0.90
 # Inner shadow, in the CSS sense: it holds full strength for SPREAD, then
 # fades out over BLUR. Concentric strokes clipped to the pill stand in for a
 # gradient - each covers half its line width inward, so keeping every radius
 # at or beyond SPREAD leaves that band evenly covered and only the outer ones
 # thin out, which is the falloff.
 INNER_SHADOW_ALPHA = 0.20
-INNER_SHADOW_SPREAD = 14
-INNER_SHADOW_BLUR = 14
-INNER_SHADOW_STEPS = 18
+INNER_SHADOW_SPREAD = 1
+INNER_SHADOW_BLUR = 1
+INNER_SHADOW_STEPS = 6   # a 2px band needs few bands to look smooth
 INNER_SHADOW_RGB = (0.13, 0.13, 0.15)
 
 FADE_MS = 200.0      # fade in and out duration
@@ -569,7 +573,7 @@ class HudWindow(Gtk.Window):
         # ragged; this hides that boundary rather than leaving it on show.
         _squircle(cr, 0, 0, w, h)
         cr.set_line_width(2 * EDGE_COVER)
-        cr.set_source_rgba(*MATERIAL_RGB, 0.95 * a)
+        cr.set_source_rgba(*MATERIAL_RGB, EDGE_COVER_ALPHA * a)
         cr.stroke()
 
         # Inner shadow. Layers composite as 1-(1-x)^n rather than adding, so

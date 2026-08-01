@@ -14,6 +14,7 @@ import pystray
 from PIL import Image, ImageDraw, ImageFilter
 
 from .app import WhisperFlow
+from .backend import LocalBackend, detect_accelerator, recommended_model
 from .config import Config
 from .hotkey_manager import HotkeyManager, HotkeyMode
 from .hud import HUD
@@ -109,6 +110,12 @@ class WhisperFlowDaemon:
         # Initialize HUD overlay for recording indicator
         log("[DAEMON] Creating HUD overlay...")
         self.hud = HUD()
+
+        # Managed speech engine, so a fresh install has something to talk to
+        self.backend = LocalBackend(self.config, notify=self.notify)
+        self._backend_model = None
+        self._setup_process = None
+        self._setup_lock = threading.Lock()
 
         # Initialize WhisperFlow instances for different modes
         log("[DAEMON] Creating WhisperFlow instances...")
@@ -287,6 +294,7 @@ class WhisperFlowDaemon:
                 enabled=False,
             ),
             pystray.MenuItem("Settings", self.open_settings),
+            pystray.MenuItem("Speech model...", self.setup_speech_model),
             pystray.MenuItem("Test Configuration", self.test_configuration),
             pystray.MenuItem("Reload Daemon", self.reload_daemon),
             pystray.MenuItem("Exit", self.stop_daemon),
@@ -666,6 +674,126 @@ class WhisperFlowDaemon:
                 pass  # not every tray backend implements it
         manager.notify(message)
 
+    def setup_speech_model(self, icon=None, item=None):
+        """Open the setup window, or download headlessly if there is none.
+
+        The tray callback has to return immediately or the icon stops
+        responding, so both paths hand off to another process or thread.
+        """
+        if self._open_setup_window():
+            return
+        self._download_model_headless()
+
+    def _open_setup_window(self) -> bool:
+        """Launch the one-button setup window as its own process.
+
+        It cannot share this process: pystray owns an event loop here and Tk
+        demands the main thread of wherever it runs. Returns False where
+        there is no window to show, so the caller can fall back.
+        """
+        if sys.platform != "win32":
+            return False
+        with self._setup_lock:
+            if self._setup_process and self._setup_process.poll() is None:
+                return True             # already open; don't stack windows
+
+            if getattr(sys, "frozen", False):
+                cmd = [sys.executable, "--setup"]
+            else:
+                cmd = [sys.executable, "-m", "whisper_flow.setup_win"]
+            try:
+                process = self._setup_process = subprocess.Popen(cmd)
+            except Exception as e:
+                log(f"[DAEMON] could not open the setup window: {e}")
+                return False
+
+        threading.Thread(target=self._after_setup_window, args=(process,),
+                         daemon=True, name="whisper-flow-setup-watch").start()
+        return True
+
+    def _after_setup_window(self, process=None) -> None:
+        """Adopt whatever the setup window installed, once it closes."""
+        process = process or self._setup_process
+        try:
+            process.wait()
+        except Exception:
+            return
+
+        # working_model() reads the disk rather than the config file, so
+        # whatever the window downloaded is picked up here and now. The .env
+        # it wrote only matters for the next launch.
+        model = self.backend.working_model()
+        if not model or model == self._backend_model:
+            return                      # dismissed, or nothing new
+
+        self.backend.stop()
+        url = self.backend.start(model)
+        if not url:
+            self.notify("The new speech model would not start")
+            return
+        self.config.model_name = model
+        self._backend_model = model
+        self._use_backend_url(url)
+        self.notify(f"Speech model ready ({model.replace('ggml-', '')})")
+
+    def _download_model_headless(self) -> None:
+        """Fall back for platforms with no setup window: just fetch it."""
+        def work():
+            accelerator = detect_accelerator()
+            model = recommended_model(accelerator)
+            if self.backend.install(model, force_download=True):
+                self.backend.stop()
+                url = self.backend.start(model)
+                if url:
+                    self.config.model_name = model
+                    self._backend_model = model
+                    self._use_backend_url(url)
+                    self.notify(f"Speech model ready ({accelerator})")
+            # install() and start() report their own failures.
+
+        threading.Thread(target=work, daemon=True,
+                         name="whisper-flow-model-setup").start()
+
+    def _start_managed_backend(self) -> None:
+        """Bring up the bundled server if one is configured and present.
+
+        Only starts what is already downloaded. Pulling gigabytes without
+        being asked, on a connection that might be metered, is not something
+        to do at startup.
+        """
+        if not getattr(self.config, "manage_local_server", False):
+            return
+        if (self.config.local_whisper_url or "").strip():
+            return          # pointed at something else already
+        model = self.backend.working_model()
+        if not model:
+            # Nothing can transcribe yet, so setup is the whole difference
+            # between a working app and a dead one. Open it straight away.
+            if not self._open_setup_window():
+                self.notify(
+                    "No speech model yet - use 'Set up speech model' in the tray")
+            return
+
+        url = self.backend.start(model)
+        if not url:
+            return
+        self._backend_model = model
+        self._use_backend_url(url)
+
+        # It already works, so the GPU model is an offer rather than a
+        # requirement. Ask once: downloading 1.6GB unprompted on a connection
+        # that might be metered is not a decision to make on someone's behalf.
+        if self.backend.setup_reason() == "gpu":
+            self._open_setup_window()
+
+    def _use_backend_url(self, url: str) -> None:
+        """Point every mode's transcription service at the running server."""
+        self.config.local_whisper_url = url
+        for app in (self.transcribe_app, self.auto_transcribe_app,
+                    self.command_app):
+            app.config.local_whisper_url = url
+            app.transcription_service.local_url = url.rstrip("/")
+
     def open_settings(self, icon, item):
         """Open settings directory in file manager."""
         log("[DAEMON] Settings menu item clicked")
@@ -962,6 +1090,9 @@ Use 'whisper-flow stop' to exit daemon
             # Set up hotkeys
             self.setup_hotkeys()
 
+            # And a transcription backend, if one is installed
+            self._start_managed_backend()
+
             if foreground:
                 # Foreground mode: try tray, fallback to notification mode
                 log("[DAEMON] Running in foreground mode")
@@ -1013,6 +1144,12 @@ Use 'whisper-flow stop' to exit daemon
         if self.is_recording:
             log("[DAEMON] Stopping active recording during cleanup")
             self._stop_recording()
+
+        # Stop the managed speech server
+        try:
+            self.backend.stop()
+        except Exception as e:
+            log(f"[DAEMON] Error stopping backend: {e}")
 
         # Stop hotkey manager
         try:

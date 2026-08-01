@@ -1,8 +1,9 @@
 # PyInstaller spec for the Windows build.
 #
-# One executable. It runs the tray daemon normally, and the overlay when
-# launched with --hud, which hud.py does per recording. Shipping the overlay
-# as a second .exe only raised the question of which one to run.
+# One executable. It runs the tray daemon normally, the overlay when launched
+# with --hud (which hud.py does per recording), and the model setup window
+# with --setup. Shipping those as separate .exes only raised the question of
+# which one to run.
 #
 # The Linux modules must not be pulled in: evdev, gi and pynput have no
 # Windows wheels, and a hidden import would force exactly that.
@@ -21,6 +22,7 @@ hidden = collect_submodules("pydantic") + [
     "whisper_flow.system_win",
     "whisper_flow.blur_win",
     "whisper_flow.hud_win",
+    "whisper_flow.setup_win",
     "pystray._win32",
     "PIL._tkinter_finder",
     # blur_win reaches for these, and ctypes.wintypes is a submodule that
@@ -28,6 +30,7 @@ hidden = collect_submodules("pydantic") + [
     "ctypes.wintypes",
     "tkinter",
     "tkinter.constants",
+    "tkinter.ttk",          # the setup window's progress bar
 ]
 
 app = Analysis(

@@ -1,15 +1,25 @@
 """Advanced hotkey management for whisper-flow with optimized key handling."""
 
 import os
+import sys
 import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 
-from pynput import keyboard
-
 from .logging import log
+
+try:
+    # X11-only fallback listener. Absent on Windows, where the native hook is
+    # used, and unused on Wayland, where evdev is.
+    from pynput import keyboard
+except Exception:  # pragma: no cover - platform dependent
+    keyboard = None
+
+
+def _is_windows():
+    return sys.platform == "win32"
 
 
 def _is_wayland():
@@ -63,7 +73,8 @@ class HotkeyManager:
         self.pressed_keys: set[str] = set()
         self.active_bindings: dict[str, HotkeyBinding] = {}
         self.is_running = False
-        self.keyboard_listener: keyboard.Listener | None = None
+        self.keyboard_listener = None
+        self._evdev_listener = None
 
         # Simple state
         self.last_key_times: dict[str, float] = {}  # Track per-key debouncing
@@ -159,8 +170,12 @@ class HotkeyManager:
             for name, binding in self.active_bindings.items():
                 log(f"[HOTKEY]   {name}: {binding.keys} ({binding.mode.value})")
 
-            # Auto-detect Wayland and use evdev backend if so
-            if _is_wayland():
+            # One backend per platform: a low-level hook on Windows, evdev on
+            # Wayland, pynput's X11 listener otherwise.
+            if _is_windows():
+                log("[HOTKEY] Windows detected, using keyboard hook backend")
+                self._start_windows()
+            elif _is_wayland():
                 log("[HOTKEY] Wayland detected, using evdev backend")
                 self._start_evdev()
             else:
@@ -177,6 +192,29 @@ class HotkeyManager:
             log(f"[HOTKEY] Failed to start HotkeyManager: {e}")
             raise
 
+    def _listener_alive(self) -> bool:
+        """Whether the active backend's listener thread is still pumping events."""
+        if self._evdev_listener:
+            return self._evdev_listener.is_alive()
+        if self.keyboard_listener:
+            return self.keyboard_listener.is_alive()
+        return False
+
+    def _start_windows(self):
+        """Start the Windows low-level keyboard hook."""
+        from .hotkey_win import WinHotkeyListener
+
+        self._evdev_listener = WinHotkeyListener()
+        for name, binding in self.active_bindings.items():
+            key_str = "+".join(sorted(binding.keys))
+            release_cb = (binding.callback_release
+                          if binding.mode == HotkeyMode.PUSH_TO_TALK else None)
+            self._evdev_listener.register_hotkey(
+                name, key_str, binding.callback_press, release_cb,
+            )
+        self._evdev_listener.start()
+        log("[HOTKEY] Windows hotkey listener started")
+
     def _start_evdev(self):
         """Start the evdev-based keyboard listener for Wayland."""
         from .hotkey_evdev import EvdevHotkeyListener
@@ -190,7 +228,8 @@ class HotkeyManager:
             release_cb = binding.callback_release if binding.mode == HotkeyMode.PUSH_TO_TALK else None
 
             self._evdev_listener.register_hotkey(
-                name, key_str, press_cb, release_cb
+                name, key_str, press_cb, release_cb,
+                release_modifiers=binding.mode == HotkeyMode.PUSH_TO_TALK,
             )
 
         self._evdev_listener.start()
@@ -581,7 +620,7 @@ class HotkeyManager:
 
                 # Log heartbeat status
                 log(
-                    f"[HOTKEY] Heartbeat - running: {self.is_running}, listener_alive: {self.keyboard_listener.is_alive() if self.keyboard_listener else False}, pressed_keys: {len(self.pressed_keys)}, active_combination: {self.active_combination}, push_to_talk: {self.current_push_to_talk}",
+                    f"[HOTKEY] Heartbeat - running: {self.is_running}, listener_alive: {self._listener_alive()}, pressed_keys: {len(self.pressed_keys)}, active_combination: {self.active_combination}, push_to_talk: {self.current_push_to_talk}",
                 )
 
                 # Safety check: if we have an active combination but no pressed keys, clear it
@@ -633,8 +672,8 @@ class HotkeyManager:
                         self.active_combination = None
                         self.current_push_to_talk = None
 
-                # Check if keyboard listener is still alive
-                if self.keyboard_listener and not self.keyboard_listener.is_alive():
+                # Check if the keyboard listener is still alive
+                if not self._listener_alive():
                     log("[HOTKEY] Warning: Keyboard listener died, attempting restart")
                     self._restart_listener()
 
@@ -645,10 +684,16 @@ class HotkeyManager:
                 time.sleep(self.heartbeat_interval)
 
     def _restart_listener(self):
-        """Restart the keyboard listener if it died."""
+        """Restart the keyboard listener if it died, using the same backend."""
         try:
             log("[HOTKEY] Restarting keyboard listener...")
             # Stop existing listener
+            if self._evdev_listener:
+                try:
+                    self._evdev_listener.stop()
+                except Exception as e:
+                    log(f"[HOTKEY] Error stopping dead evdev listener: {e}")
+                self._evdev_listener = None
             if self.keyboard_listener:
                 self.keyboard_listener.stop()
                 self.keyboard_listener = None
@@ -660,12 +705,17 @@ class HotkeyManager:
             self.active_combination = None
             self.current_push_to_talk = None
 
-            # Start new listener
-            self.keyboard_listener = keyboard.Listener(
-                on_press=self._on_key_press,
-                on_release=self._on_key_release,
-            )
-            self.keyboard_listener.start()
+            # Start a new listener on whichever backend this session uses
+            if _is_windows():
+                self._start_windows()
+            elif _is_wayland():
+                self._start_evdev()
+            else:
+                self.keyboard_listener = keyboard.Listener(
+                    on_press=self._on_key_press,
+                    on_release=self._on_key_release,
+                )
+                self.keyboard_listener.start()
             log("[HOTKEY] Keyboard listener restarted successfully")
 
         except Exception as e:

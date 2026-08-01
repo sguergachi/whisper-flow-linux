@@ -1,0 +1,16 @@
+[Unit]
+Description=WhisperFlow voice-to-text daemon
+# Needs the graphical session: it talks to the compositor and the clipboard.
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=@VENV@/bin/whisper-flow daemon --foreground
+Environment=ALSA_SUPPRESS_WARNINGS=1
+Environment=PATH=@HOME@/.local/bin:/usr/local/bin:/usr/bin:/bin
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=graphical-session.target

@@ -1,0 +1,207 @@
+name: build
+
+on:
+  push:
+    # Every branch: a build that only runs after merging cannot tell you
+    # whether the branch was mergeable.
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+# A tag build publishes a release; everything else just uploads artifacts.
+permissions:
+  contents: write
+
+jobs:
+  test:
+    name: test (linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          # portaudio and libevdev are needed to build pyaudio and evdev;
+          # gobject/gtk4 so the HUD module imports during collection.
+          sudo apt-get install -y \
+            portaudio19-dev libevdev-dev \
+            python3-gi gir1.2-gtk-4.0 libgtk-4-dev libcairo2-dev \
+            xvfb
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Lint
+        # Only the checks that catch real breakage; style is not gated.
+        run: ruff check src/ tests/ --select F,E9
+
+      - name: Test
+        # Under xvfb because pystray resolves its backend at import time and
+        # its X11 one refuses to load without a display.
+        run: xvfb-run -a pytest -q -p no:cacheprovider
+
+  linux:
+    name: package (linux)
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build wheel and sdist
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+
+      - name: Assemble the installer bundle
+        run: |
+          VERSION=$(python -c "import tomllib;print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          STAGE="whisper-flow-${VERSION}-linux"
+          mkdir -p "$STAGE"
+          cp -r packaging/linux/* "$STAGE"/
+          cp dist/*.whl "$STAGE"/
+          cp README.md "$STAGE"/
+          # install.sh detects the bundled wheel itself, so nothing here has
+          # to rewrite it - a sed against a script it cannot test is exactly
+          # how the bundle shipped broken the first time.
+          tar czf "${STAGE}.tar.gz" "$STAGE"
+          echo "ARTIFACT=${STAGE}.tar.gz" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-installer
+          path: |
+            ${{ env.ARTIFACT }}
+            dist/*.whl
+            dist/*.tar.gz
+
+  windows:
+    name: package (windows)
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          # pipwin-free: PyAudio publishes Windows wheels from 0.2.14.
+          pip install "pyaudio>=0.2.14"
+          pip install -e .
+          pip install pyinstaller
+
+      - name: Confirm the package imports without the Linux modules
+        # The whole point of the platform split. If this fails, the frozen
+        # build would fail the same way on a user's machine.
+        run: |
+          python -c "import whisper_flow.system_win, whisper_flow.hotkey_win; print('windows modules OK')"
+          python -c "import whisper_flow.hud_win, whisper_flow.blur_win; print('hud + blur OK')"
+          python -c "import whisper_flow.blur_win as b; print('runner build', b.windows_build(), 'supported', b.is_supported())"
+          python -c "from whisper_flow.daemon import WhisperFlowDaemon; print('daemon imports OK')"
+
+      - name: Build
+        working-directory: packaging/windows
+        run: pyinstaller --noconfirm --clean whisper-flow.spec
+
+      - name: Stage the release folder
+        shell: bash
+        run: |
+          VERSION=$(python -c "import tomllib;print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          mv packaging/windows/dist/whisper-flow "whisper-flow-${VERSION}-windows"
+          cp packaging/windows/README-windows.md "whisper-flow-${VERSION}-windows/README.md"
+          echo "ARTIFACT=whisper-flow-${VERSION}-windows" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-build
+          path: ${{ env.ARTIFACT }}
+
+  release:
+    name: release
+    # Every merge to master publishes, and so does a version tag. Pull
+    # requests build but never publish.
+    if: >-
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/master' ||
+       github.ref == 'refs/heads/main' ||
+       startsWith(github.ref, 'refs/tags/v'))
+    needs: [linux, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          # Needed for tomllib to read the version; this job checks out but
+          # does not otherwise set up Python.
+          python-version: "3.12"
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Zip the Windows folder
+        run: |
+          cd artifacts/windows-build
+          zip -qr ../whisper-flow-windows.zip .
+
+      - name: Work out what kind of release this is
+        id: plan
+        run: |
+          VERSION=$(python -c "import tomllib;print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            # A tagged release is the stable one and keeps its history.
+            echo "tag=${GITHUB_REF#refs/tags/}"        >> "$GITHUB_OUTPUT"
+            echo "title=whisper-flow ${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+            echo "prerelease=false"                     >> "$GITHUB_OUTPUT"
+            echo "rolling=false"                        >> "$GITHUB_OUTPUT"
+          else
+            # Master builds share one rolling tag, so the newest build is
+            # always at the same URL and tags do not accumulate per merge.
+            echo "tag=latest"                           >> "$GITHUB_OUTPUT"
+            echo "title=Latest build (v${VERSION}, build ${GITHUB_RUN_NUMBER})" >> "$GITHUB_OUTPUT"
+            echo "prerelease=true"                      >> "$GITHUB_OUTPUT"
+            echo "rolling=true"                         >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.plan.outputs.tag }}"
+
+          # The rolling release has to be removed first, tag included, or the
+          # tag keeps pointing at whichever commit created it.
+          if [[ "${{ steps.plan.outputs.rolling }}" == "true" ]]; then
+            gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
+          fi
+
+          NOTES="Built from \`${GITHUB_SHA::7}\` on $(date -u +'%Y-%m-%d %H:%M UTC').
+
+          **Linux** - unpack \`whisper-flow-*-linux.tar.gz\` and run \`install.sh\`.
+          Needs GTK4, gtk4-layer-shell and ydotool; the installer checks and
+          tells you what is missing.
+
+          **Windows** - unpack \`whisper-flow-windows.zip\` and run
+          \`whisper-flow.exe\`. Requires Windows 11 22H2 or later."
+
+          gh release create "$TAG" \
+            --title "${{ steps.plan.outputs.title }}" \
+            --notes "$NOTES" \
+            --target "$GITHUB_SHA" \
+            ${{ steps.plan.outputs.prerelease == 'true' && '--prerelease' || '' }} \
+            artifacts/linux-installer/*.tar.gz \
+            artifacts/linux-installer/dist/*.whl \
+            artifacts/whisper-flow-windows.zip

@@ -3,9 +3,14 @@
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 
 from .config import Config
+
+IS_WINDOWS = sys.platform == "win32"
+if IS_WINDOWS:  # pragma: no cover - platform dependent
+    from . import system_win
 
 
 class SystemManager:
@@ -30,6 +35,9 @@ class SystemManager:
             message: Notification message
 
         """
+        if IS_WINDOWS:
+            system_win.notify("Whisper-Flow", message)
+            return
         if shutil.which("notify-send"):
             subprocess.Popen(
                 [
@@ -149,6 +157,37 @@ class SystemManager:
         except Exception:
             return None
 
+    def active_window_center(self) -> tuple[int, int] | None:
+        """Centre point of the saved (or current) window, in compositor coords.
+
+        Used to put the HUD on the screen the user is actually dictating into;
+        a Wayland client cannot work that out for itself.
+        """
+        window_id = self._saved_window or self._get_active_window()
+        if not window_id or not self._kdotool_available():
+            return None
+        try:
+            result = subprocess.run(
+                ["kdotool", "getwindowgeometry", window_id],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode != 0:
+                return None
+            pos = size = None
+            for line in result.stdout.splitlines():
+                line = line.strip()
+                if line.startswith("Position:"):
+                    pos = line.split(":", 1)[1].strip().split(",")
+                elif line.startswith("Geometry:"):
+                    size = line.split(":", 1)[1].strip().split("x")
+            if not pos or not size:
+                return None
+            x, y = int(float(pos[0])), int(float(pos[1]))
+            w, h = int(float(size[0])), int(float(size[1]))
+            return x + w // 2, y + h // 2
+        except Exception:
+            return None
+
     def _activate_window(self, window_id: str) -> bool:
         """Activate a window by its UUID via kdotool."""
         if not self._kdotool_available() or not window_id:
@@ -181,6 +220,13 @@ class SystemManager:
             import sys as _sys
             _sys.stdout.write(f"[PASTE] Text to paste ({len(text)} chars): {text[:80]}...\n")
             _sys.stdout.flush()
+
+            if IS_WINDOWS:
+                sanitized = text.replace("\n", " ")
+                if system_win.type_text(sanitized):
+                    return True
+                return (system_win.copy_to_clipboard(sanitized)
+                        and system_win.send_paste())
 
             if self._is_wayland():
                 import sys as _sys
@@ -242,6 +288,30 @@ class SystemManager:
             _sys.stdout.flush()
             return False
 
+    def type_text(self, text: str) -> bool:
+        """Type text into whatever is focused, right now.
+
+        Used by live transcription, which appends to what the user is already
+        looking at. Deliberately does not touch the clipboard and does not
+        re-activate a saved window: focus is already correct, and stealing it
+        mid-sentence would fight the user.
+        """
+        if not text:
+            return True
+        sanitized = text.replace("\n", " ")
+        if IS_WINDOWS:
+            return system_win.type_text(sanitized)
+        if self._is_wayland():
+            return self._ydotool_type(sanitized) or self._wtype_type(sanitized)
+        if shutil.which("xdotool"):
+            result = subprocess.run(
+                ["xdotool", "type", "--clearmodifiers", "--", sanitized],
+                check=False,
+                capture_output=True,
+            )
+            return result.returncode == 0
+        return False
+
     def _send_paste_keystroke(self) -> bool:
         import sys as _sys
         _sys.stdout.write("[PASTE] _send_paste_keystroke called\n")
@@ -269,6 +339,8 @@ class SystemManager:
 
         """
         try:
+            if IS_WINDOWS:
+                return system_win.copy_to_clipboard(text)
             if self._is_wayland() and shutil.which("wl-copy"):
                 p = subprocess.Popen(
                     ["wl-copy"],
@@ -339,10 +411,33 @@ class SystemManager:
     def _is_wayland(self) -> bool:
         return self._wayland or self._xdg_session == "wayland"
 
+    def _release_modifiers_windows(self) -> None:
+        system_win.release_modifiers()
+
+    def _release_modifiers(self) -> None:
+        """Tell the compositor no modifiers are held, before injecting text.
+
+        A backstop. The hotkey listener already tells the compositor the
+        push-to-talk keys were released when the combination fires, so this
+        normally has nothing to do; it covers paths that inject text without
+        a hotkey being held.
+
+        Only releases are sent, never presses, so the worst case is a
+        redundant key-up.
+        """
+        try:
+            subprocess.run(
+                ["ydotool", "key", *[f"{c}:0" for c in self.MODIFIER_CODES]],
+                check=False, capture_output=True, timeout=5,
+            )
+        except Exception:
+            pass
+
     def _ydotool_type(self, text: str) -> bool:
         import sys as _sys
         _sys.stdout.write(f"[PASTE] _ydotool_type called with text={text!r}\n")
         _sys.stdout.flush()
+        self._release_modifiers()
         with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
             f.write(text)
             tmp = f.name

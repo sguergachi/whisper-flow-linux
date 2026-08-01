@@ -167,6 +167,20 @@ class Config(BaseSettings):
         env="WHISPER_FLOW_QUEUE_REQUEST_TIMEOUT",
     )
 
+    # Live (streaming) transcription
+    live_transcription: bool = Field(
+        default=True,
+        description="Type text as you speak instead of all at once on release",
+        env="WHISPER_FLOW_LIVE_TRANSCRIPTION",
+    )
+    live_interval: float = Field(
+        default=0.9,
+        description="Seconds between live transcription passes",
+        ge=0.3,
+        le=5.0,
+        env="WHISPER_FLOW_LIVE_INTERVAL",
+    )
+
     # Local whisper.cpp configuration
     local_whisper_url: str | None = Field(
         default=None,

@@ -66,7 +66,7 @@ def set_device(
         info = pa.get_host_api_info_by_index(0)
         num_devices = info.get("deviceCount")
         if device_index < 0 or device_index >= num_devices:
-            typer.echo(f"Invalid device index. Use 'whisper-flow list-devices' to see available devices.")
+            typer.echo("Invalid device index. Use 'whisper-flow list-devices' to see available devices.")
             raise typer.Exit(1)
         dev = pa.get_device_info_by_host_api_device_index(0, device_index)
         if dev.get("maxInputChannels", 0) == 0:
@@ -237,7 +237,7 @@ def status(config_dir: ConfigDirOption = None):
 
     for name, cmd in deps.items():
         try:
-            result = subprocess.run(cmd, capture_output=True, check=True)
+            subprocess.run(cmd, capture_output=True, check=True)
             typer.echo(f"  {name}: ✓")
         except (subprocess.CalledProcessError, FileNotFoundError):
             typer.echo(f"  {name}: ✗")

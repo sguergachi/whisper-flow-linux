@@ -43,7 +43,7 @@ def test_tray_menu():
     os.environ["PYSTRAY_BACKEND"] = "gtk"
 
     try:
-        import gi
+        import gi  # noqa: F401
 
         print("✓ gi module available")
     except ImportError:

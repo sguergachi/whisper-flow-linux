@@ -11,13 +11,68 @@ import time
 from pathlib import Path
 
 import pystray
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFilter
 
 from .app import WhisperFlow
 from .config import Config
 from .hotkey_manager import HotkeyManager, HotkeyMode
 from .hud import HUD
 from .logging import log, set_logging_enabled
+
+# Modes driven by holding a hotkey down; they cannot be deferred and replayed.
+PUSH_TO_TALK_MODES = ("transcribe", "command")
+
+ICON_SIZE = 64
+ICON_SUPERSAMPLE = 8  # draw large, downscale: PIL has no antialiased primitives
+ICON_IDLE = (245, 245, 247, 255)
+ICON_RECORDING = (255, 69, 74, 255)
+
+
+def _render_mic_icon(color: tuple[int, int, int, int]) -> Image.Image:
+    """Draw a microphone glyph antialiased by supersampling.
+
+    Rendered in a 512px space, then reduced to the tray size, because PIL's
+    primitives have hard edges at 64px and the icon looks ragged.
+    """
+    s = ICON_SIZE * ICON_SUPERSAMPLE
+    image = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+
+    u = s / 64.0  # one unit of the 64px design grid
+    cx = s / 2
+    stroke = round(4.5 * u)
+
+    # Capsule body
+    draw.rounded_rectangle(
+        [cx - 8 * u, 9 * u, cx + 8 * u, 35 * u],
+        radius=8 * u,
+        fill=color,
+    )
+
+    # Cradle: the lower half of a circle, wrapping under the capsule.
+    # PIL angles run clockwise from 3 o'clock, so 0->180 sweeps the bottom.
+    cradle_r = 13 * u
+    cradle_cy = 34 * u
+    draw.arc(
+        [cx - cradle_r, cradle_cy - cradle_r, cx + cradle_r, cradle_cy + cradle_r],
+        start=0,
+        end=180,
+        fill=color,
+        width=stroke,
+    )
+
+    # Stem down from the cradle, then the base
+    draw.line([cx, cradle_cy + cradle_r, cx, 54 * u], fill=color, width=stroke)
+    draw.line([cx - 9 * u, 54 * u, cx + 9 * u, 54 * u], fill=color, width=stroke)
+
+    # A dark halo grown from the glyph's own alpha, so a light icon still reads
+    # against a light panel without needing to know the tray's theme.
+    halo_alpha = image.getchannel("A").filter(ImageFilter.MaxFilter(int(5 * u) | 1))
+    halo = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+    halo.putalpha(halo_alpha.point(lambda v: v * 100 // 255))
+    image = Image.alpha_composite(halo, image)
+
+    return image.resize((ICON_SIZE, ICON_SIZE), Image.LANCZOS)
 
 
 class WhisperFlowDaemon:
@@ -37,6 +92,7 @@ class WhisperFlowDaemon:
 
         # Processing state management
         self.processing_lock = threading.Lock()
+        self._stop_lock = threading.RLock()
         self.request_queue = queue.Queue()
         self.is_processing = False
 
@@ -80,6 +136,7 @@ class WhisperFlowDaemon:
     def _watchdog_loop(self):
         """Watchdog loop to monitor thread health and detect hangs."""
         log("[DAEMON] Watchdog loop started")
+        last_status = None
         while self.is_running:
             try:
                 # Check recording thread health
@@ -111,10 +168,19 @@ class WhisperFlowDaemon:
                         )
                         # Don't force stop here, just log warning
 
-                # Log periodic status
-                log(
-                    f"[DAEMON] Watchdog status - running: {self.is_running}, recording: {self.is_recording}, processing: {self.is_processing}, queue_size: {self.request_queue.qsize()}, current_mode: {self.current_mode}",
+                # Log status only when it changes; at a 2s interval a constant
+                # heartbeat buries every real message in the journal.
+                status = (
+                    self.is_recording,
+                    self.is_processing,
+                    self.request_queue.qsize(),
+                    self.current_mode,
                 )
+                if status != last_status:
+                    last_status = status
+                    log(
+                        f"[DAEMON] Watchdog status - running: {self.is_running}, recording: {self.is_recording}, processing: {self.is_processing}, queue_size: {self.request_queue.qsize()}, current_mode: {self.current_mode}",
+                    )
 
                 time.sleep(self.watchdog_interval)
 
@@ -131,19 +197,23 @@ class WhisperFlowDaemon:
         """
         log(f"[DAEMON] Forcing recording stop: {reason}")
         self.notify(f"⚠️ Recording stopped: {reason}")
+        mode = self.current_mode
 
         # Signal stop
         if self.stop_recording_event:
             self.stop_recording_event.set()
 
-        # Reset state
-        self.is_recording = False
-        self.current_mode = None
-        self.recording_start_time = None
+        # Go through the normal teardown rather than clearing the flags here.
+        # Clearing them directly left the HUD on screen and the level file on
+        # disk, because the recording thread's own cleanup then saw
+        # is_recording already False and returned without doing anything.
+        self._stop_recording()
 
-        # Restore tray icon
-        if self.tray_icon:
-            self.tray_icon.icon = self.create_tray_icon()
+        # This path exists because the recording thread is wedged or gone, so
+        # it may never release the processing lock itself. Releasing it here
+        # keeps one stuck recording from rejecting every later request with
+        # "system busy"; a late release from the thread is a no-op.
+        self._finish_processing(mode or "unknown")
 
     def daemonize(self):
         """Run as background process while preserving desktop session access."""
@@ -184,63 +254,12 @@ class WhisperFlowDaemon:
         log(f"[DAEMON] Daemonized with PID {os.getpid()}")
 
     def create_tray_icon(self) -> Image.Image:
-        """Create the system tray icon."""
-        # Create a simple microphone icon
-        size = 64
-        image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(image)
-
-        # Draw microphone shape
-        # Mic body
-        center_x, center_y = size // 2, size // 2
-        mic_width, mic_height = 20, 30
-        left = center_x - mic_width // 2
-        right = center_x + mic_width // 2
-        top = center_y - mic_height // 2
-        bottom = center_y + mic_height // 2
-
-        # Main mic body (rounded rectangle)
-        draw.rounded_rectangle(
-            [left, top, right, bottom],
-            radius=8,
-            fill="white",
-            outline="black",
-            width=2,
-        )
-
-        # Mic stand
-        stand_top = bottom + 2
-        stand_bottom = stand_top + 10
-        draw.line([center_x, stand_top, center_x, stand_bottom], fill="black", width=3)
-
-        # Base
-        base_left = center_x - 8
-        base_right = center_x + 8
-        draw.line(
-            [base_left, stand_bottom, base_right, stand_bottom],
-            fill="black",
-            width=3,
-        )
-
-        return image
+        """Create the system tray icon: a microphone glyph."""
+        return _render_mic_icon(ICON_IDLE)
 
     def create_recording_icon(self) -> Image.Image:
-        """Create the recording state icon (red dot)."""
-        size = 64
-        image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(image)
-
-        # Draw red circle
-        center = size // 2
-        radius = 20
-        draw.ellipse(
-            [center - radius, center - radius, center + radius, center + radius],
-            fill="red",
-            outline="darkred",
-            width=2,
-        )
-
-        return image
+        """Create the recording state icon: the same mic, lit red."""
+        return _render_mic_icon(ICON_RECORDING)
 
     def setup_tray_menu(self):
         """Setup the system tray menu."""
@@ -320,17 +339,20 @@ class WhisperFlowDaemon:
 
     def _is_processing(self) -> bool:
         """Check if system is currently processing a request."""
-        processing = self.is_processing or self.is_recording
-        log(
-            f"[DAEMON] Processing check: {processing} (is_processing: {self.is_processing}, is_recording: {self.is_recording})",
-        )
-        return processing
+        return self.is_processing or self.is_recording
 
     def _handle_hotkey_press(self, mode: str):
         """Handle hotkey press with queuing support."""
         log(f"[DAEMON] Hotkey press received for mode: {mode}")
 
         if self.is_processing or self.is_recording:
+            if mode in PUSH_TO_TALK_MODES:
+                # A held hotkey cannot be replayed later: by the time the queue
+                # drains the key is long released, so the recording would run
+                # until the max-duration watchdog kills it.
+                log(f"[DAEMON] System busy, dropping {mode} request")
+                self.notify("⏳ Still working on the last one")
+                return
             # Queue the request
             log(f"[DAEMON] System busy, queuing {mode} request")
             self.request_queue.put((mode, time.time()))
@@ -341,7 +363,13 @@ class WhisperFlowDaemon:
             self._process_mode(mode)
 
     def _process_mode(self, mode: str):
-        """Process a mode with proper locking and timeout protection."""
+        """Process a mode with proper locking and timeout protection.
+
+        The lock is held for the whole record-transcribe-paste cycle and is
+        released by the recording thread via ``_finish_processing``. Releasing
+        it here would let the next hotkey press start a second recording on top
+        of the one still running.
+        """
         log(f"[DAEMON] Attempting to process mode: {mode}")
 
         # Use a timeout for the processing lock to prevent indefinite blocking
@@ -354,18 +382,38 @@ class WhisperFlowDaemon:
             self.notify("⚠️ System busy, request ignored")
             return
 
+        log(f"[DAEMON] Processing lock acquired for mode: {mode}")
+        self.is_processing = True
+        self.recording_start_time = time.time()
         try:
-            log(f"[DAEMON] Processing lock acquired for mode: {mode}")
-            self.is_processing = True
-            self.recording_start_time = time.time()
-            self.start_recording(mode)
-        finally:
+            started = self.start_recording(mode)
+        except Exception as e:
+            log(f"[DAEMON] Error starting recording for mode {mode}: {e}")
+            started = False
+
+        if not started:
+            # No recording thread will run, so release the lock here.
+            self._finish_processing(mode)
+
+    def _finish_processing(self, mode: str):
+        """Release the processing lock once a request has fully completed.
+
+        Reached from the recording thread and, when that thread is wedged,
+        from the watchdog. The check and the release have to be atomic or both
+        can get through and release the lock twice.
+        """
+        with self._stop_lock:
+            if not self.is_processing:
+                return
             log(f"[DAEMON] Processing lock released for mode: {mode}")
             self.is_processing = False
             self.recording_start_time = None
-            self.processing_lock.release()
-            # Process next item in queue
-            self._process_next_in_queue()
+            try:
+                self.processing_lock.release()
+            except RuntimeError:
+                pass
+        # Process next item in queue
+        self._process_next_in_queue()
 
     def _process_next_in_queue(self):
         """Process next item in queue if any."""
@@ -392,13 +440,24 @@ class WhisperFlowDaemon:
         except Exception as e:
             log(f"[DAEMON] Error processing next in queue: {e}")
 
-    def start_recording(self, mode: str):
-        """Start recording in the specified mode."""
+    def start_recording(self, mode: str) -> bool:
+        """Start recording in the specified mode.
+
+        Returns:
+            True if a recording thread was started, False otherwise.
+
+        """
         if self.is_recording:
             log(f"[DAEMON] Already recording, ignoring start request for mode: {mode}")
-            return
+            return False
 
         log(f"[DAEMON] Starting recording for mode: {mode}")
+        # Clear the previous cycle's thread handle first. The watchdog treats
+        # "recording, but the thread is not alive" as a crash, and between
+        # setting the flag and starting the new thread the handle still points
+        # at the last one, which has finished - enough to force-stop a
+        # recording a moment after it began.
+        self.recording_thread = None
         self.is_recording = True
         self.current_mode = mode
         self.stop_recording_event = threading.Event()
@@ -418,8 +477,12 @@ class WhisperFlowDaemon:
         fd, self._level_file = tempfile.mkstemp(suffix=".levels", prefix="whisper-flow-")
         os.close(fd)
 
-        # Show HUD overlay
-        self.hud.show(level_file=self._level_file)
+        # Show the HUD on whichever screen holds the window being dictated into
+        try:
+            point = app.system_manager.active_window_center()
+        except Exception:
+            point = None
+        self.hud.show(level_file=self._level_file, point=point)
 
         # Update tray icon to recording state
         if self.tray_icon:
@@ -434,6 +497,7 @@ class WhisperFlowDaemon:
         )
         self.recording_thread.start()
         log(f"[DAEMON] Recording thread started for mode: {mode}")
+        return True
 
     def _stop_recording_if_active(self, mode: str):
         """Stop recording if the specified mode is currently active."""
@@ -469,12 +533,22 @@ class WhisperFlowDaemon:
                     if mode == "transcribe"
                     else self.config.hotkey_command
                 )
-                log(f"[DAEMON] Running push-to-talk mode with stop key: {hotkey}")
-                success = app.run_voice_flow_push_to_talk_daemon(
-                    stop_key=hotkey,
-                    stop_event=self.stop_recording_event,
-                    level_file=getattr(self, "_level_file", None),
-                )
+                # Command mode needs the whole utterance before the AI step, so
+                # only plain transcription can stream.
+                if mode == "transcribe" and self.config.live_transcription:
+                    log(f"[DAEMON] Running LIVE push-to-talk with stop key: {hotkey}")
+                    success = app.run_voice_flow_push_to_talk_live(
+                        stop_key=hotkey,
+                        stop_event=self.stop_recording_event,
+                        level_file=getattr(self, "_level_file", None),
+                    )
+                else:
+                    log(f"[DAEMON] Running push-to-talk mode with stop key: {hotkey}")
+                    success = app.run_voice_flow_push_to_talk_daemon(
+                        stop_key=hotkey,
+                        stop_event=self.stop_recording_event,
+                        level_file=getattr(self, "_level_file", None),
+                    )
             else:
                 # Fallback to auto-stop
                 log(f"[DAEMON] Unknown mode {mode}, falling back to auto-stop")
@@ -494,6 +568,7 @@ class WhisperFlowDaemon:
         finally:
             log(f"[DAEMON] Recording thread finishing for mode: {mode}")
             self._stop_recording()
+            self._finish_processing(mode)
 
     def _get_app_for_mode(self, mode: str) -> WhisperFlow:
         """Get the appropriate WhisperFlow instance for the mode."""
@@ -518,7 +593,17 @@ class WhisperFlowDaemon:
         self._stop_recording()
 
     def _stop_recording(self):
-        """Stop the current recording."""
+        """Stop the current recording.
+
+        Reached from the hotkey-release thread and from the recording thread's
+        cleanup, so the is_recording check and the teardown that follows have
+        to be one atomic step - otherwise both can pass the check and the HUD
+        gets hidden twice while the second caller works on cleared state.
+        """
+        with self._stop_lock:
+            self._stop_recording_locked()
+
+    def _stop_recording_locked(self):
         if not self.is_recording:
             log("[DAEMON] Not recording, nothing to stop")
             return
@@ -773,9 +858,27 @@ Use 'whisper-flow stop' to exit daemon
 
         sys.exit(0)
 
+    @staticmethod
+    def _check_platform_support() -> str | None:
+        """Why this machine cannot run the app, or None if it can.
+
+        Windows support targets 11 22H2 and later: the overlay's backdrop,
+        corners and border all come from composition attributes introduced
+        there. Saying so up front beats a HUD that silently never appears.
+        """
+        if sys.platform != "win32":
+            return None
+        from . import blur_win
+        return None if blur_win.is_supported() else blur_win.unsupported_reason()
+
     def _run_worker(self, foreground: bool = False):
         """Run the worker process with health monitoring."""
         log(f"[DAEMON] Starting worker process (foreground={foreground})")
+        unsupported = self._check_platform_support()
+        if unsupported:
+            log(f"[DAEMON] Unsupported platform: {unsupported}")
+            self.notify(f"whisper-flow needs Windows 11 22H2 or later: {unsupported}")
+            return
         try:
             self.is_running = True
             log("[DAEMON] Worker process started")

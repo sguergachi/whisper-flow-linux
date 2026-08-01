@@ -261,12 +261,18 @@ class TestWhisperFlowDaemon:
             daemon.tray_icon.stop.assert_called_once()
 
     def test_open_settings(self, temp_config_dir):
-        """Test opening settings."""
+        """Opens the config directory in a file manager.
+
+        subprocess must be patched: without it this test really launches
+        xdg-open on the developer's desktop, on the repr of a Mock.
+        """
         with (
             patch("whisper_flow.daemon.Config") as mock_config_class,
             patch("whisper_flow.daemon.WhisperFlow") as mock_app_class,
             patch("whisper_flow.daemon.HotkeyManager") as mock_hotkey_manager_class,
             patch("whisper_flow.daemon.WhisperFlowDaemon.notify") as mock_notify,
+            patch("whisper_flow.daemon.subprocess.Popen") as mock_popen,  # noqa: F841
+            patch("whisper_flow.daemon.shutil.which", return_value="/usr/bin/xdg-open"),
         ):
             mock_config = Mock()
             mock_config.hotkey_transcribe = "ctrl+cmd"
@@ -284,9 +290,11 @@ class TestWhisperFlowDaemon:
 
             daemon.open_settings(None, None)
 
-            mock_notify.assert_called_once_with(
-                "Settings not yet implemented - edit ~/.config/whisper-flow/config.yaml",
-            )
+            mock_popen.assert_called_once()
+            argv = mock_popen.call_args[0][0]
+            assert argv[0] == "xdg-open"
+            assert argv[1] == str(mock_config.config_dir)
+            mock_notify.assert_not_called()
 
     def test_get_app_for_mode_transcribe(self, temp_config_dir):
         """Test getting app instance for transcribe mode."""
@@ -479,7 +487,7 @@ class TestWhisperFlowDaemon:
             patch("whisper_flow.daemon.Config") as mock_config_class,
             patch("whisper_flow.daemon.WhisperFlow") as mock_app_class,
             patch("whisper_flow.daemon.HotkeyManager") as mock_hotkey_manager_class,
-            patch("whisper_flow.system.subprocess.Popen") as mock_popen,
+            patch("whisper_flow.system.subprocess.Popen"),
             patch("whisper_flow.system.shutil.which", return_value=True),
         ):
             mock_config = Mock()
@@ -507,7 +515,7 @@ class TestWhisperFlowDaemon:
             patch("whisper_flow.daemon.WhisperFlow") as mock_app_class,
             patch("whisper_flow.daemon.HotkeyManager") as mock_hotkey_manager_class,
             patch("whisper_flow.system.shutil.which", return_value=None),
-            patch("builtins.print") as mock_print,
+            patch("builtins.print") as mock_print  # noqa: F841,
         ):
             mock_config = Mock()
             mock_config.hotkey_transcribe = "ctrl+cmd"

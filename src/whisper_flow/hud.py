@@ -1,188 +1,33 @@
-"""HUD overlay for whisper-flow showing recording status with audio waveform."""
+"""Supervises the HUD overlay subprocess.
+
+The overlay itself lives in whisper_flow.hud_app and runs as its own process,
+so that GTK - which is not thread-safe and can block on the compositor - can
+never stall the audio capture loop.
+"""
 
 import os
 import signal
 import subprocess
 import sys
 import tempfile
-import textwrap
-import time
+import threading
+
+IS_WINDOWS = sys.platform == "win32"
 
 
-HUD_SCRIPT = textwrap.dedent("""\
-    import os
-    import struct
-    import gi
-    gi.require_version("Gtk", "3.0")
-    from gi.repository import Gtk, Gdk, GLib
-    import math
+LAYER_SHELL_CANDIDATES = (
+    "/usr/lib/libgtk4-layer-shell.so",
+    "/usr/lib64/libgtk4-layer-shell.so",
+    "/usr/lib/x86_64-linux-gnu/libgtk4-layer-shell.so",
+)
 
-    LEVEL_FILE = os.environ.get("WHISPER_FLOW_HUD_LEVEL_FILE", "")
 
-    WIDTH = 320
-    HEIGHT = 100
-    WAVE_HEIGHT = 40
-    WAVE_BARS = 60
-    TOP_HEIGHT = 32
-
-    class RecordingHUD(Gtk.Window):
-        def __init__(self):
-            Gtk.Window.__init__(self)
-            self.set_title("")
-            self.set_decorated(False)
-            self.set_resizable(False)
-            self.set_keep_above(True)
-            self.set_accept_focus(False)
-            self.set_focus_on_map(False)
-            self.set_skip_taskbar_hint(True)
-            self.set_skip_pager_hint(True)
-            self.set_type_hint(Gdk.WindowTypeHint.TOOLTIP)
-
-            screen = Gdk.Screen.get_default()
-            visual = screen.get_rgba_visual()
-            if visual:
-                self.set_visual(visual)
-            self.set_app_paintable(True)
-
-            self.set_size_request(WIDTH, HEIGHT)
-
-            self.levels = [0.0] * WAVE_BARS
-            self.blink = True
-            self.level_file_pos = 0
-            self.opacity = 0.0
-
-            GLib.timeout_add(600, self._tick_blink)
-            GLib.timeout_add(40, self._tick_levels)
-            GLib.timeout_add(20, self._fade_in)
-
-            self.set_opacity(0.0)
-
-            close_btn = Gtk.Button(label="✕")
-            close_btn.set_relief(Gtk.ReliefStyle.NONE)
-            close_btn.set_focus_on_click(False)
-            close_btn.set_size_request(24, 24)
-            close_btn.connect("clicked", lambda *_: Gtk.main_quit())
-
-            overlay = Gtk.Overlay()
-            self.add(overlay)
-
-            draw_area = Gtk.DrawingArea()
-            draw_area.connect("draw", self._on_draw)
-            overlay.add(draw_area)
-
-            close_btn.set_halign(Gtk.Align.END)
-            close_btn.set_valign(Gtk.Align.START)
-            close_btn.set_margin_top(4)
-            close_btn.set_margin_end(8)
-            overlay.add_overlay(close_btn)
-
-            self.connect("map", self._center)
-
-        def _tick_blink(self):
-            self.blink = not self.blink
-            self.queue_draw()
-            return True
-
-        def _tick_levels(self):
-            if not LEVEL_FILE:
-                return True
-            try:
-                with open(LEVEL_FILE, "rb") as f:
-                    f.seek(0, 2)
-                    size = f.tell()
-                    if size < 4:
-                        return True
-                    count = size // 4
-                    read_start = max(0, (count - WAVE_BARS) * 4)
-                    f.seek(read_start)
-                    data = f.read(WAVE_BARS * 4)
-                    raw = struct.unpack(f"<{len(data)//4}i", data) if len(data) >= 4 else []
-                    if raw:
-                        max_val = max(abs(v) for v in raw) or 1
-                        self.levels = [min(1.0, abs(v) / 1000.0) for v in raw]
-                        if len(self.levels) < WAVE_BARS:
-                            self.levels = [0.0] * (WAVE_BARS - len(self.levels)) + self.levels
-                        self.levels = self.levels[-WAVE_BARS:]
-                        self.queue_draw()
-            except OSError as e:
-                import sys
-                sys.stdout.write(f"[HUD] level file OSError: {e}\\n")
-                sys.stdout.flush()
-            except Exception as e:
-                import sys
-                sys.stdout.write(f"[HUD] level file error: {e}\\n")
-                sys.stdout.flush()
-            return True
-
-        def _fade_in(self):
-            self.opacity = min(1.0, self.opacity + 0.08)
-            self.set_opacity(self.opacity)
-            return self.opacity < 1.0
-
-        def _center(self, *args):
-            display = Gdk.Display.get_default()
-            monitor = display.get_primary_monitor()
-            if monitor is None:
-                monitor = display.get_monitor(0)
-            if monitor is None:
-                return
-            geometry = monitor.get_geometry()
-            x = geometry.x + (geometry.width - WIDTH) // 2
-            y = geometry.y + 36
-            self.move(x, y)
-
-        def _on_draw(self, widget, cr):
-            w = widget.get_allocated_width()
-            h = widget.get_allocated_height()
-
-            cr.set_source_rgba(0.08, 0.08, 0.08, 0.88)
-            _rounded_rect(cr, 0, 0, w, h, 12)
-            cr.fill()
-
-            dot_color = "#ff3333" if self.blink else "#cc0000"
-            cr.set_source_rgba(1.0, 0.2, 0.2, 1.0 if self.blink else 0.7)
-            cr.arc(24, 16, 5, 0, 2 * 3.14159)
-            cr.fill()
-
-            cr.set_source_rgba(1, 1, 1, 0.9)
-            cr.select_font_face("Sans", 0, 1)
-            cr.set_font_size(13)
-            cr.move_to(38, 21)
-            cr.show_text("Listening…")
-
-            bar_w = (w - 24) / WAVE_BARS
-            mid_y = TOP_HEIGHT + WAVE_HEIGHT // 2
-            max_h = WAVE_HEIGHT // 2 - 2
-
-            for i, level in enumerate(self.levels):
-                bar_h = max(1, int(level * max_h))
-                x = 12 + i * bar_w
-                r, g, b = _level_color(level)
-                cr.set_source_rgba(r, g, b, 0.9)
-                cr.rectangle(x, mid_y - bar_h, bar_w - 1, bar_h * 2)
-                cr.fill()
-
-    def _level_color(level):
-        if level < 0.3:
-            return 0.2, 1.0, 0.3
-        if level < 0.6:
-            return 1.0, 0.9, 0.2
-        return 1.0, 0.3, 0.2
-
-    def _rounded_rect(cr, x, y, w, h, r):
-        cr.arc(x+r, y+r, r, 180*3.14159/180, 270*3.14159/180)
-        cr.arc(x+w-r, y+r, r, 270*3.14159/180, 360*3.14159/180)
-        cr.arc(x+w-r, y+h-r, r, 0, 90*3.14159/180)
-        cr.arc(x+r, y+h-r, r, 90*3.14159/180, 180*3.14159/180)
-        cr.close_path()
-
-    import sys
-    sys.stdout.write(f"[HUD] Starting with LEVEL_FILE={LEVEL_FILE}\\n")
-    sys.stdout.flush()
-    win = RecordingHUD()
-    win.show_all()
-    Gtk.main()
-""")
+def _layer_shell_library() -> str | None:
+    """Path to libgtk4-layer-shell, or None if it is not installed."""
+    for path in LAYER_SHELL_CANDIDATES:
+        if os.path.exists(path):
+            return path
+    return None
 
 
 class HUD:
@@ -191,78 +36,154 @@ class HUD:
     def __init__(self):
         self._process = None
         self._log_path = None
+        self._log_file = None
+        # show() runs on the thread starting a recording, hide() on the one
+        # handling the hotkey release. Without this, a hide landing inside
+        # show()'s Popen finds no process to kill and leaks an overlay that
+        # nothing will ever take down. Reentrant because show() calls hide().
+        self._lock = threading.RLock()
 
-    def show(self, level_file: str = ""):
+    def show(self, level_file: str = "", monitor: str | None = None,
+             point: tuple[int, int] | None = None):
         """Show the recording HUD overlay.
+
+        Returns as soon as the subprocess is spawned. This runs on the path
+        that starts a recording, so it must not block: any wait here delays
+        the microphone opening and stalls the caller.
 
         Args:
             level_file: Path to a file containing audio level data (int16 values)
+            monitor: Connector name of the output to show on, e.g. "DP-1"
 
         """
+        with self._lock:
+            self._show_locked(level_file, monitor, point)
+
+    def _show_locked(self, level_file, monitor, point):
         self.hide()
 
         env = os.environ.copy()
-        # Ensure display environment is available for HUD subprocess
-        env.setdefault("WAYLAND_DISPLAY", "wayland-0")
-        env.setdefault("GDK_BACKEND", "wayland")
+        if not IS_WINDOWS:
+            # The overlay is a Wayland layer-shell surface; it has no X11 path.
+            env.setdefault("WAYLAND_DISPLAY", "wayland-0")
+            env["GDK_BACKEND"] = "wayland"
         env.setdefault("NO_AT_BRIDGE", "1")
+        # The pill is a few hundred pixels of 2D cairo drawing. GTK4's GPU
+        # renderers spend ~450ms building a GL/Vulkan context for it before the
+        # first frame; the software renderer draws it in a fraction of that.
+        env.setdefault("GSK_RENDERER", "cairo")
+        # Keep the script's own directory off sys.path: this package ships a
+        # logging.py that would otherwise shadow the standard library's.
+        env["PYTHONSAFEPATH"] = "1"
+        # gtk4-layer-shell must be loaded ahead of libwayland-client or it
+        # cannot intercept surface creation, and the window silently falls
+        # back to an ordinary toplevel.
+        preload = None if IS_WINDOWS else _layer_shell_library()
+        if preload:
+            existing = env.get("LD_PRELOAD", "")
+            env["LD_PRELOAD"] = f"{preload}:{existing}" if existing else preload
         if level_file:
             env["WHISPER_FLOW_HUD_LEVEL_FILE"] = level_file
+        if monitor:
+            env["WHISPER_FLOW_HUD_MONITOR"] = monitor
+        if point:
+            # Only a placement hint: a malformed one must never stop the HUD
+            # from appearing, it just falls back to the first monitor.
+            try:
+                env["WHISPER_FLOW_HUD_POINT"] = f"{int(point[0])},{int(point[1])}"
+            except (TypeError, ValueError, IndexError, KeyError):
+                pass
 
-        fd, path = tempfile.mkstemp(suffix=".py", prefix="whisper-flow-hud-")
-        with os.fdopen(fd, "w") as f:
-            f.write(HUD_SCRIPT)
+        # Launched by path rather than with -m: importing the package would
+        # pull in the daemon and with it pystray's GTK 3, and one process
+        # cannot hold both GTK 3 and the overlay's GTK 4.
+        # hud_app is GTK4 plus Wayland layer-shell; hud_win is tkinter. Same
+        # contract either way: level file in, overlay out.
+        argv = self._overlay_command()
 
-        # Write HUD stderr to a log file (avoids pipe buffer deadlock)
-        fd2, self._log_path = tempfile.mkstemp(suffix=".log", prefix="whisper-flow-hud-")
-        os.close(fd2)
+        fd, self._log_path = tempfile.mkstemp(suffix=".log", prefix="whisper-flow-hud-")
+        os.close(fd)
 
-        self._process = subprocess.Popen(
-            [sys.executable, path],
-            stdout=open(self._log_path, "a"),
-            stderr=subprocess.STDOUT,
-            env=env,
-            preexec_fn=os.setsid,
-        )
+        try:
+            self._log_file = open(self._log_path, "a")
+            # setsid groups the child on POSIX so the whole overlay can be
+            # signalled; Windows has no equivalent and no such argument.
+            extra = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+                     if IS_WINDOWS else {"preexec_fn": os.setsid})
+            self._process = subprocess.Popen(
+                argv,
+                stdout=self._log_file,
+                stderr=subprocess.STDOUT,
+                env=env,
+                **extra,
+            )
+        except Exception as e:
+            print(f"[HUD] Failed to spawn HUD: {e}", flush=True)
+            self._cleanup_files()
 
-        # Wait briefly and check if the process is still alive
-        time.sleep(0.3)
-        if self._process and self._process.poll() is not None:
-            with open(self._log_path) as f:
-                stderr_out = f.read()
-            print(f"[HUD] Failed to start HUD: {stderr_out}", flush=True)
-            return
+    @staticmethod
+    def _overlay_command() -> list[str]:
+        """How to launch the overlay, source tree or frozen build.
 
-        # Give the HUD process more time to start (it's blocking on Gtk.main())
-        # Check if the log file has the expected output
-        for i in range(5):
-            time.sleep(0.5)
-            if self._log_path and os.path.exists(self._log_path):
-                with open(self._log_path) as f:
-                    content = f.read()
-                    if "[HUD] Starting with LEVEL_FILE=" in content:
-                        print(f"[HUD] HUD started successfully", flush=True)
-                        return
-        
-        # If we get here, the HUD may have started but wasn't detected
-        # Try to verify by checking if process is still alive
-        if self._process and self._process.poll() is None:
-            print(f"[HUD] HUD process is running (PID: {self._process.pid})", flush=True)
-        else:
-            print(f"[HUD] WARNING: Could not verify HUD startup", flush=True)
+        A frozen build has no source files and sys.executable is the app
+        itself, so the overlay ships as its own executable beside it.
+        """
+        if getattr(sys, "frozen", False):
+            exe = "whisper-flow-hud.exe" if IS_WINDOWS else "whisper-flow-hud"
+            return [os.path.join(os.path.dirname(sys.executable), exe)]
+        module = "hud_win.py" if IS_WINDOWS else "hud_app.py"
+        return [sys.executable,
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), module)]
 
     def hide(self):
         """Hide the recording HUD overlay."""
+        with self._lock:
+            self._hide_locked()
+
+    def _hide_locked(self):
         if self._process:
+            proc = self._process
+            self._process = None
             try:
-                os.killpg(os.getpgid(self._process.pid), signal.SIGTERM)
+                if IS_WINDOWS:
+                    proc.terminate()
+                else:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
             except (OSError, ProcessLookupError):
                 pass
+            # Do not wait here. This runs on the thread dispatching hotkey
+            # callbacks, and the overlay takes a fade to exit; blocking would
+            # hold up every press that lands during it. Reap in the background
+            # so the child does not linger as a zombie.
+            threading.Thread(
+                target=self._reap, args=(proc,), daemon=True,
+                name="whisper-flow-hud-reap",
+            ).start()
+        self._cleanup_files()
+
+    @staticmethod
+    def _reap(proc):
+        """Collect the exited overlay, forcing it if the fade never finishes."""
+        try:
+            proc.wait(timeout=3)
+        except Exception:
             try:
-                self._process.wait(timeout=2)
+                if IS_WINDOWS:
+                    proc.kill()
+                else:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                proc.wait(timeout=2)
             except Exception:
                 pass
-            self._process = None
+
+    def _cleanup_files(self):
+        """Close and remove the temp files backing the HUD subprocess."""
+        if self._log_file:
+            try:
+                self._log_file.close()
+            except Exception:
+                pass
+            self._log_file = None
         if self._log_path:
             try:
                 os.unlink(self._log_path)

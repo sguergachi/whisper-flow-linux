@@ -89,8 +89,15 @@ CAP_EXT = 1.12   # cap reaches this many half-heights along the edge
 MATERIAL_RGB = (0.03, 0.03, 0.04)
 MATERIAL_ALPHA = 0.80
 EDGE_COVER = BLUR_INSET + 1.5   # opaque rim that hides the blur region's edge
-INNER_SHADOW_W = 7              # how far the inner shadow reaches inwards
-INNER_SHADOW_STEPS = 9          # more bands, so the wider spread stays smooth
+# Inner shadow, in the CSS sense: it holds full strength for SPREAD, then
+# fades out over BLUR. Concentric strokes clipped to the pill stand in for a
+# gradient - each covers half its line width inward, so keeping every radius
+# at or beyond SPREAD leaves that band evenly covered and only the outer ones
+# thin out, which is the falloff.
+INNER_SHADOW_ALPHA = 0.20
+INNER_SHADOW_SPREAD = 14
+INNER_SHADOW_BLUR = 14
+INNER_SHADOW_STEPS = 18
 INNER_SHADOW_RGB = (0.13, 0.13, 0.15)
 
 FADE_MS = 200.0      # fade in and out duration
@@ -565,13 +572,15 @@ class HudWindow(Gtk.Window):
         cr.set_source_rgba(*MATERIAL_RGB, 0.95 * a)
         cr.stroke()
 
-        # Inner shadow: concentric strokes fading inwards approximate a
-        # gradient and give the glass some depth at the edge.
+        # Inner shadow. Layers composite as 1-(1-x)^n rather than adding, so
+        # solve for the per-band alpha that lands on the target.
+        band = 1.0 - (1.0 - INNER_SHADOW_ALPHA) ** (1.0 / INNER_SHADOW_STEPS)
         for i in range(INNER_SHADOW_STEPS):
-            t = i / INNER_SHADOW_STEPS
+            frac = i / max(1, INNER_SHADOW_STEPS - 1)
+            reach = INNER_SHADOW_SPREAD + INNER_SHADOW_BLUR * frac
             _squircle(cr, 0, 0, w, h)
-            cr.set_line_width(2 * INNER_SHADOW_W * (1.0 - t))
-            cr.set_source_rgba(*INNER_SHADOW_RGB, 0.05 * (1.0 - t) * a)
+            cr.set_line_width(2 * reach)
+            cr.set_source_rgba(*INNER_SHADOW_RGB, band * a)
             cr.stroke()
         cr.restore()
 

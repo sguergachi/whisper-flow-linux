@@ -1,6 +1,6 @@
 """Audio transcription functionality for whisper-flow."""
 
-import json
+import re
 import time
 from pathlib import Path
 
@@ -9,6 +9,17 @@ from openai import OpenAI
 
 from .config import Config
 from .logging import log
+
+
+def _normalize(text: str | None) -> str:
+    """Collapse whisper's per-segment line breaks into a single dictated line.
+
+    Whisper splits its output on segment boundaries, which land mid-sentence.
+    Pasting those raw drops line breaks into the middle of what the user said.
+    """
+    if not text:
+        return ""
+    return re.sub(r"\s+", " ", text).strip()
 
 
 class TranscriptionService:
@@ -52,8 +63,9 @@ class TranscriptionService:
                 else:
                     text = self._transcribe_with_openai(audio_path)
 
-                if text and text.strip() and text.strip() != "[BLANK_AUDIO]":
-                    return text.strip()
+                text = _normalize(text)
+                if text and text != "[BLANK_AUDIO]":
+                    return text
 
                 log("Blank audio detected, skipping paste")
                 return None

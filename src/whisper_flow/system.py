@@ -149,6 +149,37 @@ class SystemManager:
         except Exception:
             return None
 
+    def active_window_center(self) -> tuple[int, int] | None:
+        """Centre point of the saved (or current) window, in compositor coords.
+
+        Used to put the HUD on the screen the user is actually dictating into;
+        a Wayland client cannot work that out for itself.
+        """
+        window_id = self._saved_window or self._get_active_window()
+        if not window_id or not self._kdotool_available():
+            return None
+        try:
+            result = subprocess.run(
+                ["kdotool", "getwindowgeometry", window_id],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode != 0:
+                return None
+            pos = size = None
+            for line in result.stdout.splitlines():
+                line = line.strip()
+                if line.startswith("Position:"):
+                    pos = line.split(":", 1)[1].strip().split(",")
+                elif line.startswith("Geometry:"):
+                    size = line.split(":", 1)[1].strip().split("x")
+            if not pos or not size:
+                return None
+            x, y = int(float(pos[0])), int(float(pos[1]))
+            w, h = int(float(size[0])), int(float(size[1]))
+            return x + w // 2, y + h // 2
+        except Exception:
+            return None
+
     def _activate_window(self, window_id: str) -> bool:
         """Activate a window by its UUID via kdotool."""
         if not self._kdotool_available() or not window_id:
@@ -241,6 +272,28 @@ class SystemManager:
             _sys.stdout.write(f"Error pasting text: {e}\n")
             _sys.stdout.flush()
             return False
+
+    def type_text(self, text: str) -> bool:
+        """Type text into whatever is focused, right now.
+
+        Used by live transcription, which appends to what the user is already
+        looking at. Deliberately does not touch the clipboard and does not
+        re-activate a saved window: focus is already correct, and stealing it
+        mid-sentence would fight the user.
+        """
+        if not text:
+            return True
+        sanitized = text.replace("\n", " ")
+        if self._is_wayland():
+            return self._ydotool_type(sanitized) or self._wtype_type(sanitized)
+        if shutil.which("xdotool"):
+            result = subprocess.run(
+                ["xdotool", "type", "--clearmodifiers", "--", sanitized],
+                check=False,
+                capture_output=True,
+            )
+            return result.returncode == 0
+        return False
 
     def _send_paste_keystroke(self) -> bool:
         import sys as _sys

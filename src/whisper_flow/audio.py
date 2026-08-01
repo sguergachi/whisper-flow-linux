@@ -40,11 +40,13 @@ try:
 except ImportError:
     pyaudio = None
 
-from pynput import keyboard
-
 from .config import Config
 from .logging import log
 from .system import SystemManager
+
+# Recordings shorter than this are dropped rather than transcribed - whisper
+# invents text when handed a fraction of a second of audio.
+MIN_RECORDING_SECONDS = 0.35
 
 
 class AudioRecorder:
@@ -130,19 +132,8 @@ class AudioRecorder:
             frames = []
             last_voice_time = time.time()
 
-            # Stop flag for keyboard interrupt
+            # Stop flag; the daemon signals termination through stop_event.
             stop_flag = {"stop": False}
-
-            def on_press(key):
-                try:
-                    if key == keyboard.Key.esc:
-                        stop_flag["stop"] = True
-                        return False  # Stop listener
-                except Exception:
-                    pass
-
-            listener = keyboard.Listener(on_press=on_press)
-            listener.start()
 
             try:
                 while not stop_flag["stop"]:
@@ -179,7 +170,6 @@ class AudioRecorder:
 
             finally:
                 self._stop_stream_safely(stream)
-                listener.stop()
 
             # Save the recorded audio
             if frames:
@@ -207,29 +197,35 @@ class AudioRecorder:
         if not level_file:
             return
         try:
-            samples = len(buf) // 2
-            if samples < 1:
+            samples = np.frombuffer(buf, dtype=np.int16)
+            if samples.size < 1:
                 return
             import struct
-            vals = struct.unpack(f"<{samples}h", buf)
-            rms = int((sum(v * v for v in vals) / max(samples, 1)) ** 0.5)
+            rms = int(np.sqrt(np.mean(samples.astype(np.float32) ** 2)))
             with open(level_file, "ab") as f:
                 f.write(struct.pack("<i", rms))
-            import sys
-            sys.stdout.write(f"[WAVE] wrote rms={rms} samples={samples} size={len(buf)} to {level_file}\n")
-            sys.stdout.flush()
-        except Exception as e:
-            import sys
-            sys.stdout.write(f"[WAVE] _write_level error: {e}\n")
-            sys.stdout.flush()
+        except Exception:
+            # Level reporting is cosmetic; never let it break a recording.
+            pass
 
-    def record_push_to_talk(self, stop_key: str, stop_event=None, level_file: str | None = None) -> str | None:
+    def record_push_to_talk(
+        self,
+        stop_key: str,
+        stop_event=None,
+        level_file: str | None = None,
+        on_tick=None,
+        tick_seconds: float = 1.0,
+    ) -> str | None:
         """Record audio with push-to-talk functionality.
 
         Args:
             stop_key: Key combination to stop recording (for display only)
             stop_event: Threading event to stop recording
             level_file: Path to write audio levels for HUD visualization
+            on_tick: Called with a snapshot of the frames so far, roughly every
+                tick_seconds, so live transcription can run alongside. It must
+                return immediately - it is on the capture loop.
+            tick_seconds: How often to hand out a snapshot
 
         Returns:
             Path to the recorded audio file, or None if cancelled
@@ -259,17 +255,7 @@ class AudioRecorder:
             frames = []
             stop_flag = {"stop": False}
 
-            def on_press(key):
-                try:
-                    if key == keyboard.Key.esc:
-                        stop_flag["stop"] = True
-                        return False  # Stop listener
-                except Exception:
-                    pass
-
-            listener = keyboard.Listener(on_press=on_press)
-            listener.start()
-
+            tick_frames = max(1, int(tick_seconds * 1000 / self.config.frame_ms))
             frame_count = 0
             try:
                 while not stop_flag["stop"]:
@@ -289,17 +275,28 @@ class AudioRecorder:
                     frames.append(buf)
                     self._write_level(level_file, buf)
                     frame_count += 1
-                    if frame_count % 25 == 0:
-                        log(f"[AUDIO] recorded {frame_count} frames so far")
+
+                    if on_tick and frame_count % tick_frames == 0:
+                        try:
+                            on_tick(list(frames))
+                        except Exception as e:
+                            log(f"[AUDIO] on_tick error: {e}")
 
             finally:
                 self._stop_stream_safely(stream)
-                listener.stop()
+
+            # Discard taps too short to contain speech - whisper hallucinates
+            # text from a fraction of a second of audio.
+            duration = frame_count * self.config.frame_ms / 1000
+            if duration < MIN_RECORDING_SECONDS:
+                log(f"[AUDIO] discarding {duration:.2f}s recording (too short)")
+                os.unlink(output_path)
+                return None
 
             # Save the recorded audio
             if frames:
                 self._save_wav_file(output_path, frames)
-                log("Recording stopped")
+                log(f"[AUDIO] recording stopped after {duration:.2f}s")
                 return output_path
             os.unlink(output_path)
             return None
@@ -355,17 +352,6 @@ class AudioRecorder:
             stop_flag = {"stop": False}
             recording_started = False
 
-            def on_press(key):
-                try:
-                    if key == keyboard.Key.esc:
-                        stop_flag["stop"] = True
-                        return False  # Stop listener
-                except Exception:
-                    pass
-
-            listener = keyboard.Listener(on_press=on_press)
-            listener.start()
-
             try:
                 while not stop_flag["stop"]:
                     # Check if stop event is set (for daemon control)
@@ -403,7 +389,6 @@ class AudioRecorder:
 
             finally:
                 self._stop_stream_safely(stream)
-                listener.stop()
 
             # Save the recorded audio
             if frames and recording_started:

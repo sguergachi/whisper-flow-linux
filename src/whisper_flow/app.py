@@ -7,6 +7,7 @@ from .completion import CompletionService
 from .config import Config
 from .logging import log, set_logging_enabled
 from .prompts import PromptManager
+from .streaming import LiveTranscriber
 from .system import SystemManager
 from .transcription import TranscriptionService
 
@@ -61,6 +62,68 @@ class WhisperFlow:
             log(f"Error in daemon push-to-talk flow: {e}")
             self.system_manager.notify(f"Push-to-talk failed: {e}")
             return False
+
+    def run_voice_flow_push_to_talk_live(self, stop_key: str, stop_event, level_file: str | None = None) -> bool:
+        """Push-to-talk that types text while the user is still speaking.
+
+        Words are typed as soon as two consecutive transcription passes agree
+        on them, so what lands on screen matches the final transcript instead
+        of being a guess that needs correcting. See streaming.LiveTranscriber.
+
+        Args:
+            stop_key: Hotkey combination that stops recording (for display)
+            stop_event: Threading event to control recording stop
+            level_file: Path to write audio levels for HUD visualization
+
+        Returns:
+            True if successful, False otherwise
+
+        """
+        live = LiveTranscriber(
+            transcribe=self.transcription_service.transcribe_audio,
+            emit=self.system_manager.type_text,
+            sample_rate=self.config.sample_rate,
+            interval=self.config.live_interval,
+        )
+        live.start()
+
+        audio_file = None
+        try:
+            audio_file = self.audio_recorder.record_push_to_talk(
+                stop_key,
+                stop_event,
+                level_file=level_file,
+                on_tick=live.offer,
+                tick_seconds=self.config.live_interval,
+            )
+
+            if not audio_file:
+                live.stop()
+                log("No audio recorded")
+                return False
+
+            # One last pass over the complete utterance, then type the tail.
+            final_text = self.transcription_service.transcribe_audio(audio_file)
+            live.finalize(final_text)
+
+            if not final_text and not live.committed_text:
+                log("Transcription produced nothing")
+                return False
+
+            log("Live transcription complete")
+            return True
+
+        except Exception as e:
+            live.stop()
+            log(f"Error in live push-to-talk flow: {e}")
+            self.system_manager.notify(f"Live dictation failed: {e}")
+            return False
+        finally:
+            if audio_file:
+                try:
+                    Path(audio_file).unlink()
+                except Exception:
+                    pass
 
     def run_voice_flow_auto_stop(self, silence_duration: float = 2.0, level_file: str | None = None) -> bool:
         """Run voice flow with auto-stop on silence.

@@ -137,3 +137,28 @@ def test_a_raising_emit_counts_as_a_delivery_failure():
                            sample_rate=16000)
     live._send(["hello"])
     assert live.delivery_failed
+
+
+# ------------------------------------------------------------------ timeouts
+def test_a_live_pass_uses_one_attempt_and_a_short_timeout():
+    """Retrying a live pass only delays the words queued behind it."""
+    from unittest.mock import Mock
+
+    from whisper_flow.app import WhisperFlow
+    from whisper_flow.transcription import FINAL_TIMEOUT, LIVE_TIMEOUT
+
+    assert LIVE_TIMEOUT < FINAL_TIMEOUT
+
+    app = WhisperFlow.__new__(WhisperFlow)          # no config or devices
+    app.transcription_service = Mock()
+    app.transcription_service.transcribe_audio.return_value = "hi"
+
+    # Rebuild the closure the live flow passes to LiveTranscriber.
+    def live_pass(path):
+        return app.transcription_service.transcribe_audio(
+            path, max_retries=1, timeout=LIVE_TIMEOUT)
+
+    live_pass("/tmp/x.wav")
+    kwargs = app.transcription_service.transcribe_audio.call_args.kwargs
+    assert kwargs["max_retries"] == 1
+    assert kwargs["timeout"] == LIVE_TIMEOUT

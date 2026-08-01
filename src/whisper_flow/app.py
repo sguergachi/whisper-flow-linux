@@ -10,7 +10,7 @@ from .logging import log, set_logging_enabled
 from .prompts import PromptManager
 from .streaming import LiveTranscriber
 from .system import SystemManager
-from .transcription import TranscriptionService
+from .transcription import LIVE_TIMEOUT, TranscriptionService
 
 
 class WhisperFlow:
@@ -80,8 +80,15 @@ class WhisperFlow:
             True if successful, False otherwise
 
         """
+        def live_pass(path):
+            # One attempt, short timeout. A live pass is superseded by the
+            # next one, so retrying it with backoff only delays the words
+            # that are already waiting behind it.
+            return self.transcription_service.transcribe_audio(
+                path, max_retries=1, timeout=LIVE_TIMEOUT)
+
         live = LiveTranscriber(
-            transcribe=self.transcription_service.transcribe_audio,
+            transcribe=live_pass,
             emit=self.system_manager.type_text,
             sample_rate=self.config.sample_rate,
             interval=self.config.live_interval,

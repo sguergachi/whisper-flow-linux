@@ -64,9 +64,23 @@ class AudioRecorder:
         self.system_manager = system_manager
         self.vad = webrtcvad.Vad(config.vad_mode)
 
-        # Initialize PyAudio with ALSA warning suppression
-        with suppress_alsa_warnings():
-            self.pa = pyaudio.PyAudio()
+        # Initialize PyAudio with ALSA warning suppression.
+        #
+        # Never fatal. The import above is already guarded, so pyaudio can be
+        # None here, and PyAudio() itself raises on a machine whose audio
+        # stack will not initialise. Either way this used to abort the
+        # recorder's construction and with it the whole daemon, so a sound
+        # problem cost the user their tray icon and hotkeys as well as their
+        # microphone. _check_pyaudio reports it per recording instead.
+        self.pa = None
+        if pyaudio is None:
+            log("[AUDIO] pyaudio is not installed; recording is unavailable")
+            return
+        try:
+            with suppress_alsa_warnings():
+                self.pa = pyaudio.PyAudio()
+        except Exception as e:
+            log(f"[AUDIO] could not initialise the audio system: {e}")
 
     def _read_audio_with_timeout(self, stream, chunk, timeout=0.1):
         """Read audio data (no timeout, PyAudio does not support timeout argument)."""
@@ -481,4 +495,15 @@ class AudioRecorder:
         if pyaudio is None:
             self.system_manager.notify("PyAudio not available")
             return False
+        if self.pa is None:
+            # Construction is not allowed to fail, so the failure surfaces
+            # here, on the recording that needs it.
+            log("[AUDIO] the audio system never initialised; retrying")
+            try:
+                with suppress_alsa_warnings():
+                    self.pa = pyaudio.PyAudio()
+            except Exception as e:
+                log(f"[AUDIO] audio system still unavailable: {e}")
+                self.system_manager.notify(f"No audio system: {e}")
+                return False
         return True

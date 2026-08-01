@@ -715,6 +715,18 @@ class WhisperFlowDaemon:
                 log(f"[DAEMON] could not open the setup window: {e}")
                 return False
 
+            # Popen succeeding only means the process started, not that a
+            # window appeared. Without tkinter - which is a separate package
+            # on most Linux distributions - the child exits immediately, and
+            # claiming a window is open would leave the user with no window
+            # and no message either.
+            time.sleep(0.4)
+            if process.poll() not in (None, 0):
+                log(f"[DAEMON] the setup window exited at once "
+                    f"({process.returncode}); falling back")
+                self._setup_process = None
+                return False
+
         threading.Thread(target=self._after_setup_window, args=(process,),
                          daemon=True, name="whisper-flow-setup-watch").start()
         return True

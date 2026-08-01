@@ -362,3 +362,44 @@ class TestWhisperFlow:
         set_logging_enabled(True)
         # This should print
         log("This should appear")
+
+
+def test_the_live_flow_really_does_shorten_its_passes(monkeypatch):
+    """Pins the wiring, not a copy of it: catches the closure being changed."""
+    from unittest.mock import Mock
+
+    from whisper_flow import app as app_module
+
+    seen = {}
+
+    class Recorder:
+        def record_push_to_talk(self, *a, **kw):
+            return None                              # stop after the wiring
+
+    class Service:
+        def transcribe_audio(self, path, max_retries=3, timeout=None):
+            seen["max_retries"] = max_retries
+            seen["timeout"] = timeout
+            return "text"
+
+    captured = {}
+
+    class FakeLive:
+        def __init__(self, transcribe, emit, sample_rate, interval):
+            captured["transcribe"] = transcribe
+
+        def start(self): pass
+        def stop(self): pass
+
+    monkeypatch.setattr(app_module, "LiveTranscriber", FakeLive)
+
+    flow = app_module.WhisperFlow.__new__(app_module.WhisperFlow)
+    flow.transcription_service = Service()
+    flow.system_manager = Mock()
+    flow.audio_recorder = Recorder()
+    flow.config = Mock(sample_rate=16000, live_interval=0.9)
+
+    flow.run_voice_flow_push_to_talk_live("super+alt", Mock())
+    captured["transcribe"]("/tmp/a.wav")
+    assert seen["max_retries"] == 1
+    assert seen["timeout"] == app_module.LIVE_TIMEOUT

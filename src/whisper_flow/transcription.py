@@ -22,6 +22,17 @@ def _normalize(text: str | None) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+# A recording can run to the configured maximum, and a CPU-only machine
+# transcribes it slower than real time, so the closing pass gets room.
+FINAL_TIMEOUT = 300.0
+
+# A live pass is best-effort and superseded by the next one a second later,
+# so it must never be the reason dictation appears to hang. At five minutes
+# with three retries, one unresponsive server could stall a pass for a
+# quarter of an hour while the overlay sat there animating.
+LIVE_TIMEOUT = 30.0
+
+
 class TranscriptionService:
     """Audio transcription service supporting OpenAI API and local whisper.cpp."""
 
@@ -41,7 +52,8 @@ class TranscriptionService:
         elif config.openai_api_key:
             self.client = OpenAI(api_key=config.openai_api_key)
 
-    def transcribe_audio(self, audio_path: str, max_retries: int = 3) -> str | None:
+    def transcribe_audio(self, audio_path: str, max_retries: int = 3,
+                         timeout: float = FINAL_TIMEOUT) -> str | None:
         """Transcribe audio file.
 
         Args:
@@ -59,7 +71,7 @@ class TranscriptionService:
         for attempt in range(max_retries):
             try:
                 if self.local_url:
-                    text = self._transcribe_local(audio_path)
+                    text = self._transcribe_local(audio_path, timeout)
                 else:
                     text = self._transcribe_with_openai(audio_path)
 
@@ -106,7 +118,8 @@ class TranscriptionService:
             )
             return transcription.strip()
 
-    def _transcribe_local(self, audio_path: str) -> str:
+    def _transcribe_local(self, audio_path: str,
+                          timeout: float = FINAL_TIMEOUT) -> str:
         """Transcribe audio using local whisper.cpp server.
 
         Args:
@@ -122,7 +135,7 @@ class TranscriptionService:
             resp = requests.post(
                 inference_url,
                 files={"file": audio_file},
-                timeout=300,
+                timeout=timeout,
             )
             resp.raise_for_status()
             result = resp.json()

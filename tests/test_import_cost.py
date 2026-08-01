@@ -58,3 +58,10 @@ def test_the_version_is_available_without_importing_anything():
     loaded = _import_in_fresh_process(
         "import whisper_flow; assert whisper_flow.__version__")
     assert not [m for m in EXPENSIVE if m in loaded]
+
+
+def test_all_matches_what_is_actually_exported():
+    """A hand-written __all__ must not drift from the lazy import table."""
+    import whisper_flow
+
+    assert sorted(whisper_flow.__all__) == sorted(whisper_flow._EXPORTS)

@@ -34,7 +34,20 @@ _EXPORTS = {
     "set_logging_enabled": ".logging",
 }
 
-__all__ = sorted(_EXPORTS)
+# Spelled out rather than derived from _EXPORTS: a computed __all__ is opaque
+# to every static analyser, including the one that checks this file.
+__all__ = [
+    "AudioRecorder",
+    "CompletionService",
+    "Config",
+    "PromptManager",
+    "SystemManager",
+    "TranscriptionService",
+    "WhisperFlow",
+    "WhisperFlowDaemon",
+    "log",
+    "set_logging_enabled",
+]
 
 
 def __getattr__(name: str):

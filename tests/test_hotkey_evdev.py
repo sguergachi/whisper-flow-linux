@@ -52,7 +52,7 @@ def _press_release(lis, *codes):
 
 
 def test_every_key_event_is_forwarded_exactly_once(listener):
-    """The listener must never withhold or invent input."""
+    """The listener must never withhold a real key event or invent a press."""
     fired = []
     listener.register_hotkey(
         "transcribe", "cmd+alt",
@@ -70,7 +70,7 @@ def test_every_key_event_is_forwarded_exactly_once(listener):
         listener._handle_key(FakeEvent(code, value))
 
     assert listener.forwarded == sent
-    assert not any(f[0] == "synthetic" for f in listener.forwarded)
+    assert not any(len(f) == 3 for f in listener.forwarded), "invented an event"
 
 
 def test_space_still_types_while_a_hotkey_binding_exists(listener):
@@ -120,3 +120,64 @@ def test_autorepeat_does_not_end_a_push_to_talk(listener):
     listener._handle_key(FakeEvent(ecodes.KEY_LEFTALT, 0))
     drain()
     assert fired == ["press", "release"]
+
+
+def test_no_key_down_is_ever_synthesised(listener):
+    """A synthetic press without a matching release strands a modifier."""
+    listener.register_hotkey(
+        "transcribe", "cmd+alt", lambda: None, lambda: None,
+        release_modifiers=True,
+    )
+    for code in (ecodes.KEY_LEFTMETA, ecodes.KEY_LEFTALT):
+        listener._handle_key(FakeEvent(code, 1))
+    for _ in range(20):
+        listener._handle_key(FakeEvent(ecodes.KEY_LEFTALT, 2))
+    for code in (ecodes.KEY_LEFTALT, ecodes.KEY_LEFTMETA):
+        listener._handle_key(FakeEvent(code, 0))
+
+    synthetic = [f for f in listener.forwarded if len(f) == 3 and f[0] == "synthetic"]
+    assert synthetic, "expected synthetic releases"
+    assert all(f[2] == 0 for f in synthetic), "synthesised a key press"
+
+
+def test_modifiers_are_released_to_the_compositor_while_held(listener):
+    """Otherwise dictated text arrives as global shortcuts, not text."""
+    listener.register_hotkey(
+        "transcribe", "cmd+alt", lambda: None, lambda: None,
+        release_modifiers=True,
+    )
+    listener._handle_key(FakeEvent(ecodes.KEY_LEFTMETA, 1))
+    listener._handle_key(FakeEvent(ecodes.KEY_LEFTALT, 1))
+
+    released = {
+        f[1] for f in listener.forwarded
+        if len(f) == 3 and f[0] == "synthetic" and f[2] == 0
+    }
+    assert released == {ecodes.KEY_LEFTMETA, ecodes.KEY_LEFTALT}
+
+    # A second key goes down before the synthetic releases, so the compositor
+    # sees Super+Alt rather than a bare Super tap opening the launcher.
+    real = [f for f in listener.forwarded if len(f) == 2]
+    assert real[:2] == [(ecodes.KEY_LEFTMETA, 1), (ecodes.KEY_LEFTALT, 1)]
+
+    # Auto-repeat must not re-assert them as held.
+    listener.forwarded.clear()
+    listener._handle_key(FakeEvent(ecodes.KEY_LEFTMETA, 2))
+    assert listener.forwarded == []
+
+
+def test_real_releases_still_reach_the_compositor(listener):
+    """A duplicate key-up is harmless; a missing one is not."""
+    listener.register_hotkey(
+        "transcribe", "cmd+alt", lambda: None, lambda: None,
+        release_modifiers=True,
+    )
+    listener._handle_key(FakeEvent(ecodes.KEY_LEFTMETA, 1))
+    listener._handle_key(FakeEvent(ecodes.KEY_LEFTALT, 1))
+    listener.forwarded.clear()
+    listener._handle_key(FakeEvent(ecodes.KEY_LEFTALT, 0))
+    listener._handle_key(FakeEvent(ecodes.KEY_LEFTMETA, 0))
+
+    assert (ecodes.KEY_LEFTALT, 0) in listener.forwarded
+    assert (ecodes.KEY_LEFTMETA, 0) in listener.forwarded
+    assert listener._muted == set()

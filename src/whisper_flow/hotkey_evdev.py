@@ -51,10 +51,21 @@ class EvdevHotkeyListener:
         self._callbacks = queue.Queue()
         self._active_hotkey = None
         self._press_triggered = set()  # hotkeys whose press callback was already fired
+        self._muted = set()  # codes whose auto-repeat is suppressed while held
 
-    def register_hotkey(self, name, key_string, callback_press, callback_release=None):
+    def register_hotkey(self, name, key_string, callback_press, callback_release=None,
+                        release_modifiers=False):
+        """Register a binding.
+
+        `release_modifiers` tells the compositor the combination's keys are no
+        longer held once it fires. Push-to-talk needs it: the app types the
+        transcription while the user is still holding the hotkey, and if the
+        compositor thinks Super and Alt are down, every injected character
+        arrives as a global shortcut - opening the launcher, starting a screen
+        recording - instead of as text.
+        """
         keys = self._parse_key_string(key_string)
-        self._bindings[name] = (keys, callback_press, callback_release)
+        self._bindings[name] = (keys, callback_press, callback_release, release_modifiers)
 
     def _parse_key_string(self, key_string):
         codes = set()
@@ -185,47 +196,74 @@ class EvdevHotkeyListener:
             pass
 
     def _handle_key(self, event):
-        """Track state and forward. Every event is forwarded, unconditionally.
+        """Track state and forward.
 
-        An earlier version held a combination's keys back from the compositor
-        so that text typed during dictation did not arrive as Super+<key>.
-        It is not worth it: a single missed release left a key held in the
-        pending list, and the next keystroke flushed a synthetic press that
-        never got its release - a modifier stuck down system-wide, which made
-        the keyboard unusable. Withholding real input is not something this
-        can get wrong safely, so it does not do it at all. The typing side
-        clears modifiers itself instead; see SystemManager.type_text.
+        Two rules keep this safe. Every key-down and key-up is forwarded
+        untouched, and no key-down is ever synthesised. An earlier version
+        held combination keys back and replayed them later; one missed release
+        left a synthetic press with no matching release, stranding a modifier
+        down system-wide and making the keyboard unusable. A dropped
+        auto-repeat cannot do that - the key is already down as far as the
+        compositor is concerned, and its real release is still coming.
         """
         code = CODE_ALIASES.get(event.code, event.code)
         value = event.value
 
-        # Auto-repeat (2) is never a state change: holding a push-to-talk
-        # combination generates these continuously, and treating one as a
-        # release ends the recording about half a second after it starts.
+        if value == 2:
+            # Auto-repeat. Never a state change: holding a push-to-talk
+            # combination generates these continuously, and treating one as a
+            # release ends the recording about half a second after it starts.
+            # Suppressed for muted keys so they are not re-asserted as held
+            # after we told the compositor they were released.
+            if code not in self._muted:
+                self._forward(event)
+            return
+
         if value == 1:
             self._key_state.add(code)
+            self._forward(event)
             self._check_bindings(rising=True)
-        elif value == 0:
-            # Drop the key before re-evaluating, otherwise the combination
-            # still looks held and the release callback never fires.
-            self._key_state.discard(code)
-            self._check_bindings(rising=False)
+            return
 
+        # Drop the key before re-evaluating, otherwise the combination still
+        # looks held and the release callback never fires.
+        self._key_state.discard(code)
+        self._muted.discard(code)
+        self._check_bindings(rising=False)
+        # Forwarded even if we already sent a synthetic release: a duplicate
+        # key-up is harmless, a missing one is not.
         self._forward(event)
+
+    def _release_to_compositor(self, keys):
+        """Tell the compositor a held combination has been released.
+
+        Only releases are synthesised, never presses. By the time this runs
+        the combination is complete, so the compositor has seen at least two
+        keys go down - it reads as Super+Alt being released, not as a bare
+        Super tap, which is what opens the launcher.
+        """
+        for code in keys:
+            if code in self._key_state and code not in self._muted:
+                self._muted.add(code)
+                try:
+                    self._uinput.write(ecodes.EV_KEY, code, 0)
+                    self._uinput.syn()
+                except Exception:
+                    pass
 
     def _check_bindings(self, rising: bool):
         # Only the most specific satisfied binding wins, so cmd+shift+alt does
         # not also fire the cmd+alt binding nested inside it.
         satisfied = [
             (name, keys)
-            for name, (keys, _, _) in self._bindings.items()
+            for name, (keys, _, _, _) in self._bindings.items()
             if keys and keys.issubset(self._key_state)
         ]
         winner = None
         if satisfied:
             winner = max(satisfied, key=lambda item: len(item[1]))[0]
 
-        for name, (keys, cb_press, cb_release) in self._bindings.items():
+        for name, (keys, cb_press, cb_release, release_mods) in self._bindings.items():
             if name == winner:
                 # Only arm on a key-down. Otherwise releasing shift out of
                 # cmd+shift+alt would "fall through" and fire cmd+alt, starting
@@ -233,6 +271,8 @@ class EvdevHotkeyListener:
                 if name not in self._press_triggered and rising:
                     self._press_triggered.add(name)
                     self._active_hotkey = name
+                    if release_mods:
+                        self._release_to_compositor(keys)
                     if cb_press:
                         self._callbacks.put((name, "press", cb_press))
             elif name in self._press_triggered:
@@ -274,4 +314,5 @@ class EvdevHotkeyListener:
             self._dispatch_thread = None
         self._key_state.clear()
         self._press_triggered.clear()
+        self._muted.clear()
         self._active_hotkey = None

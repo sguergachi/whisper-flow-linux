@@ -395,14 +395,13 @@ class SystemManager:
     def _release_modifiers(self) -> None:
         """Tell the compositor no modifiers are held, before injecting text.
 
-        Live transcription types while the user is still holding the
-        push-to-talk combination, so without this every character arrives as
-        Super+Alt+<key> - a shortcut, not text. Doing it here is deliberate:
-        the alternative is withholding the user's real key events upstream,
-        and getting that wrong strands a modifier down system-wide.
+        A backstop. The hotkey listener already tells the compositor the
+        push-to-talk keys were released when the combination fires, so this
+        normally has nothing to do; it covers paths that inject text without
+        a hotkey being held.
 
-        Injecting extra key-up events is safe in a way that withholding
-        key-down events is not: the worst case is a redundant release.
+        Only releases are sent, never presses, so the worst case is a
+        redundant key-up.
         """
         try:
             subprocess.run(

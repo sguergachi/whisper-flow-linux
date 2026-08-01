@@ -31,7 +31,7 @@ def test_daemon_components():
         print("✓ Tray menu created")
 
         # Test pystray icon creation
-        icon = pystray.Icon("test-daemon", icon_image, "Test Daemon", menu)
+        pystray.Icon("test-daemon", icon_image, "Test Daemon", menu)
         print("✓ Pystray icon created")
 
         print("✓ All daemon tray components working")

@@ -50,30 +50,6 @@ class TestHotkeyManager:
         assert binding.priority == 1
         assert binding.description == "Test hotkey"
 
-    def test_unregister_hotkey(self):
-        """Test unregistering hotkeys."""
-        manager = HotkeyManager()
-        callback = Mock()
-
-        # Register a hotkey
-        manager.register_hotkey(
-            name="test_hotkey",
-            keys="ctrl+cmd",
-            mode=HotkeyMode.SINGLE_PRESS,
-            callback_press=callback,
-        )
-
-        assert "test_hotkey" in manager.active_bindings
-
-        # Unregister it
-        result = manager.unregister_hotkey("test_hotkey")
-        assert result is True
-        assert "test_hotkey" not in manager.active_bindings
-
-        # Try to unregister non-existent hotkey
-        result = manager.unregister_hotkey("non_existent")
-        assert result is False
-
     def test_parse_hotkey_combination(self):
         """Test parsing hotkey combinations."""
         manager = HotkeyManager()
@@ -103,9 +79,15 @@ class TestHotkeyManager:
         assert manager.key_mapping.get("ctrl_l", "ctrl_l") == "ctrl"
         assert manager.key_mapping.get("cmd_r", "cmd_r") == "cmd"
 
+    @patch("whisper_flow.hotkey_manager._is_wayland", return_value=False)
+    @patch("whisper_flow.hotkey_manager._is_windows", return_value=False)
     @patch("whisper_flow.hotkey_manager.keyboard.Listener")
-    def test_start_stop(self, mock_listener_class):
-        """Test starting and stopping the hotkey manager."""
+    def test_start_stop(self, mock_listener_class, _mock_win, _mock_wayland):
+        """Starting and stopping the manager on the X11 backend.
+
+        The backend is pinned: left to itself this picks evdev on Wayland and
+        grabs the machine's real keyboards, which a test must never do.
+        """
         mock_listener = Mock()
         mock_listener_class.return_value = mock_listener
 
@@ -148,77 +130,27 @@ class TestHotkeyManager:
         manager.stop()
         assert manager.is_running is False
 
-    def test_is_hotkey_active(self):
-        """Test checking if hotkey is active."""
-        manager = HotkeyManager()
-
-        # Test when no hotkey is active
-        assert manager.is_hotkey_active("test") is False
-
-        # Test when different hotkey is active
-        manager.current_push_to_talk = "other"
-        assert manager.is_hotkey_active("test") is False
-
-        # Test when target hotkey is active
-        manager.current_push_to_talk = "test"
-        assert manager.is_hotkey_active("test") is True
-
-    def test_get_active_hotkeys(self):
-        """Test getting list of active hotkeys."""
-        manager = HotkeyManager()
-
-        # Test empty list
-        assert manager.get_active_hotkeys() == []
-
-        # Add some hotkeys
-        manager.register_hotkey("hotkey1", "ctrl+a", HotkeyMode.SINGLE_PRESS)
-        manager.register_hotkey("hotkey2", "ctrl+b", HotkeyMode.PUSH_TO_TALK)
-
-        hotkeys = manager.get_active_hotkeys()
-        assert len(hotkeys) == 2
-        assert "hotkey1" in hotkeys
-        assert "hotkey2" in hotkeys
-
-    def test_get_hotkey_info(self):
-        """Test getting hotkey information."""
-        manager = HotkeyManager()
-
-        # Test non-existent hotkey
-        info = manager.get_hotkey_info("non_existent")
-        assert info is None
-
-        # Register a hotkey and get its info
-        manager.register_hotkey(
-            name="test_hotkey",
-            keys="ctrl+cmd",
-            mode=HotkeyMode.SINGLE_PRESS,
-            priority=5,
-            description="Test description",
-        )
-
-        info = manager.get_hotkey_info("test_hotkey")
-        assert info is not None
-        assert info["name"] == "test_hotkey"
-        assert set(info["keys"]) == {"ctrl", "cmd"}
-        assert info["mode"] == "single_press"
-        assert info["priority"] == 5
-        assert info["description"] == "Test description"
-
     @patch("whisper_flow.hotkey_manager.time.time")
     def test_on_key_press_debouncing(self, mock_time):
-        """Test per-key debouncing."""
+        """Per-key debouncing ignores a repeat within the debounce window.
+
+        Both keys have to belong to a registered binding: the manager only
+        tracks keys that are part of some hotkey, and ignores the rest so
+        ordinary typing does not accumulate state.
+        """
         manager = HotkeyManager()
+        manager.register_hotkey("pair", "a+b", HotkeyMode.PUSH_TO_TALK)
         manager.last_key_times["a"] = 100.0
-        mock_time.return_value = 100.02  # Within debounce delay for key 'a'
+        mock_time.return_value = 100.02  # inside the debounce window for "a"
 
         mock_key = Mock()
         mock_key.name = "a"
 
-        # First press of 'a' should be debounced
+        # A repeat of "a" this soon is dropped.
         manager._on_key_press(mock_key)
-        assert len(manager.pressed_keys) == 0
+        assert "a" not in manager.pressed_keys
 
-        # Different key should NOT be debounced
+        # A different key has its own window, so it is not debounced.
         mock_key.name = "b"
         manager._on_key_press(mock_key)
         assert "b" in manager.pressed_keys

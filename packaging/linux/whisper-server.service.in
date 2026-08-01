@@ -1,0 +1,14 @@
+[Unit]
+Description=whisper.cpp local speech recognition server
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=@HOME@/Dev/whisper.cpp/build/bin/whisper-server \
+    -m @HOME@/Dev/whisper.cpp/models/ggml-large-v3-turbo.bin \
+    -l en --host 127.0.0.1 --port 8082 --convert
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

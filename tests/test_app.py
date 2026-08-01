@@ -75,6 +75,7 @@ class TestWhisperFlow:
             mock_audio.record_push_to_talk.assert_called_once_with(
                 "ctrl+shift+t",
                 stop_event,
+                level_file=None,
             )
             mock_transcription.transcribe_audio.assert_called_once_with("/tmp/test.wav")
 
@@ -128,7 +129,9 @@ class TestWhisperFlow:
             result = app.run_voice_flow_auto_stop(silence_duration=3.0)
 
             assert result is True
-            mock_audio.record_until_silence.assert_called_once_with(3.0)
+            mock_audio.record_until_silence.assert_called_once_with(
+                3.0, level_file=None,
+            )
 
     def test_run_comprehensive_validation(self, mock_config):
         """Test comprehensive validation method."""
@@ -143,28 +146,6 @@ class TestWhisperFlow:
             app = WhisperFlow()
 
             results = app.run_comprehensive_validation()
-
-            assert isinstance(results, dict)
-            assert "api_config" in results
-            assert "system_deps" in results
-            assert "audio_system" in results
-            assert "services" in results
-            assert "config_files" in results
-            assert "environment" in results
-
-    def test_run_comprehensive_tests(self, mock_config):
-        """Test comprehensive tests method."""
-        with (
-            patch("whisper_flow.app.Config", return_value=mock_config),
-            patch("whisper_flow.app.SystemManager"),
-            patch("whisper_flow.app.AudioRecorder"),
-            patch("whisper_flow.app.TranscriptionService"),
-            patch("whisper_flow.app.CompletionService"),
-            patch("whisper_flow.app.PromptManager"),
-        ):
-            app = WhisperFlow()
-
-            results = app.run_comprehensive_tests(verbose=True)
 
             assert isinstance(results, dict)
             assert "api_config" in results

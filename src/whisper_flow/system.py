@@ -3,9 +3,14 @@
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 
 from .config import Config
+
+IS_WINDOWS = sys.platform == "win32"
+if IS_WINDOWS:  # pragma: no cover - platform dependent
+    from . import system_win
 
 
 class SystemManager:
@@ -30,6 +35,9 @@ class SystemManager:
             message: Notification message
 
         """
+        if IS_WINDOWS:
+            system_win.notify("Whisper-Flow", message)
+            return
         if shutil.which("notify-send"):
             subprocess.Popen(
                 [
@@ -213,6 +221,13 @@ class SystemManager:
             _sys.stdout.write(f"[PASTE] Text to paste ({len(text)} chars): {text[:80]}...\n")
             _sys.stdout.flush()
 
+            if IS_WINDOWS:
+                sanitized = text.replace("\n", " ")
+                if system_win.type_text(sanitized):
+                    return True
+                return (system_win.copy_to_clipboard(sanitized)
+                        and system_win.send_paste())
+
             if self._is_wayland():
                 import sys as _sys
                 _sys.stdout.write("[PASTE] Wayland path entered\n")
@@ -284,6 +299,8 @@ class SystemManager:
         if not text:
             return True
         sanitized = text.replace("\n", " ")
+        if IS_WINDOWS:
+            return system_win.type_text(sanitized)
         if self._is_wayland():
             return self._ydotool_type(sanitized) or self._wtype_type(sanitized)
         if shutil.which("xdotool"):
@@ -322,6 +339,8 @@ class SystemManager:
 
         """
         try:
+            if IS_WINDOWS:
+                return system_win.copy_to_clipboard(text)
             if self._is_wayland() and shutil.which("wl-copy"):
                 p = subprocess.Popen(
                     ["wl-copy"],
@@ -391,6 +410,9 @@ class SystemManager:
 
     def _is_wayland(self) -> bool:
         return self._wayland or self._xdg_session == "wayland"
+
+    def _release_modifiers_windows(self) -> None:
+        system_win.release_modifiers()
 
     def _release_modifiers(self) -> None:
         """Tell the compositor no modifiers are held, before injecting text.

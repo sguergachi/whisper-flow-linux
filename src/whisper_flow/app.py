@@ -289,7 +289,7 @@ class WhisperFlow:
             try:
                 import subprocess
 
-                result = subprocess.run(
+                subprocess.run(
                     [dep, "--version"],
                     capture_output=True,
                     check=True,

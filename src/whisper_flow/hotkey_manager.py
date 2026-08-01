@@ -1,15 +1,25 @@
 """Advanced hotkey management for whisper-flow with optimized key handling."""
 
 import os
+import sys
 import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 
-from pynput import keyboard
-
 from .logging import log
+
+try:
+    # X11-only fallback listener. Absent on Windows, where the native hook is
+    # used, and unused on Wayland, where evdev is.
+    from pynput import keyboard
+except Exception:  # pragma: no cover - platform dependent
+    keyboard = None
+
+
+def _is_windows():
+    return sys.platform == "win32"
 
 
 def _is_wayland():
@@ -63,7 +73,7 @@ class HotkeyManager:
         self.pressed_keys: set[str] = set()
         self.active_bindings: dict[str, HotkeyBinding] = {}
         self.is_running = False
-        self.keyboard_listener: keyboard.Listener | None = None
+        self.keyboard_listener = None
         self._evdev_listener = None
 
         # Simple state
@@ -160,8 +170,12 @@ class HotkeyManager:
             for name, binding in self.active_bindings.items():
                 log(f"[HOTKEY]   {name}: {binding.keys} ({binding.mode.value})")
 
-            # Auto-detect Wayland and use evdev backend if so
-            if _is_wayland():
+            # One backend per platform: a low-level hook on Windows, evdev on
+            # Wayland, pynput's X11 listener otherwise.
+            if _is_windows():
+                log("[HOTKEY] Windows detected, using keyboard hook backend")
+                self._start_windows()
+            elif _is_wayland():
                 log("[HOTKEY] Wayland detected, using evdev backend")
                 self._start_evdev()
             else:
@@ -185,6 +199,21 @@ class HotkeyManager:
         if self.keyboard_listener:
             return self.keyboard_listener.is_alive()
         return False
+
+    def _start_windows(self):
+        """Start the Windows low-level keyboard hook."""
+        from .hotkey_win import WinHotkeyListener
+
+        self._evdev_listener = WinHotkeyListener()
+        for name, binding in self.active_bindings.items():
+            key_str = "+".join(sorted(binding.keys))
+            release_cb = (binding.callback_release
+                          if binding.mode == HotkeyMode.PUSH_TO_TALK else None)
+            self._evdev_listener.register_hotkey(
+                name, key_str, binding.callback_press, release_cb,
+            )
+        self._evdev_listener.start()
+        log("[HOTKEY] Windows hotkey listener started")
 
     def _start_evdev(self):
         """Start the evdev-based keyboard listener for Wayland."""
@@ -677,7 +706,9 @@ class HotkeyManager:
             self.current_push_to_talk = None
 
             # Start a new listener on whichever backend this session uses
-            if _is_wayland():
+            if _is_windows():
+                self._start_windows()
+            elif _is_wayland():
                 self._start_evdev()
             else:
                 self.keyboard_listener = keyboard.Listener(

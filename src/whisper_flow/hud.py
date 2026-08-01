@@ -12,6 +12,8 @@ import sys
 import tempfile
 import threading
 
+IS_WINDOWS = sys.platform == "win32"
+
 
 LAYER_SHELL_CANDIDATES = (
     "/usr/lib/libgtk4-layer-shell.so",
@@ -61,9 +63,10 @@ class HUD:
         self.hide()
 
         env = os.environ.copy()
-        # The overlay is a Wayland layer-shell surface; it has no X11 path.
-        env.setdefault("WAYLAND_DISPLAY", "wayland-0")
-        env["GDK_BACKEND"] = "wayland"
+        if not IS_WINDOWS:
+            # The overlay is a Wayland layer-shell surface; it has no X11 path.
+            env.setdefault("WAYLAND_DISPLAY", "wayland-0")
+            env["GDK_BACKEND"] = "wayland"
         env.setdefault("NO_AT_BRIDGE", "1")
         # The pill is a few hundred pixels of 2D cairo drawing. GTK4's GPU
         # renderers spend ~450ms building a GL/Vulkan context for it before the
@@ -75,7 +78,7 @@ class HUD:
         # gtk4-layer-shell must be loaded ahead of libwayland-client or it
         # cannot intercept surface creation, and the window silently falls
         # back to an ordinary toplevel.
-        preload = _layer_shell_library()
+        preload = None if IS_WINDOWS else _layer_shell_library()
         if preload:
             existing = env.get("LD_PRELOAD", "")
             env["LD_PRELOAD"] = f"{preload}:{existing}" if existing else preload
@@ -94,23 +97,43 @@ class HUD:
         # Launched by path rather than with -m: importing the package would
         # pull in the daemon and with it pystray's GTK 3, and one process
         # cannot hold both GTK 3 and the overlay's GTK 4.
-        hud_app = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hud_app.py")
+        # hud_app is GTK4 plus Wayland layer-shell; hud_win is tkinter. Same
+        # contract either way: level file in, overlay out.
+        argv = self._overlay_command()
 
         fd, self._log_path = tempfile.mkstemp(suffix=".log", prefix="whisper-flow-hud-")
         os.close(fd)
 
         try:
             self._log_file = open(self._log_path, "a")
+            # setsid groups the child on POSIX so the whole overlay can be
+            # signalled; Windows has no equivalent and no such argument.
+            extra = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+                     if IS_WINDOWS else {"preexec_fn": os.setsid})
             self._process = subprocess.Popen(
-                [sys.executable, hud_app],
+                argv,
                 stdout=self._log_file,
                 stderr=subprocess.STDOUT,
                 env=env,
-                preexec_fn=os.setsid,
+                **extra,
             )
         except Exception as e:
             print(f"[HUD] Failed to spawn HUD: {e}", flush=True)
             self._cleanup_files()
+
+    @staticmethod
+    def _overlay_command() -> list[str]:
+        """How to launch the overlay, source tree or frozen build.
+
+        A frozen build has no source files and sys.executable is the app
+        itself, so the overlay ships as its own executable beside it.
+        """
+        if getattr(sys, "frozen", False):
+            exe = "whisper-flow-hud.exe" if IS_WINDOWS else "whisper-flow-hud"
+            return [os.path.join(os.path.dirname(sys.executable), exe)]
+        module = "hud_win.py" if IS_WINDOWS else "hud_app.py"
+        return [sys.executable,
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), module)]
 
     def hide(self):
         """Hide the recording HUD overlay."""
@@ -122,7 +145,10 @@ class HUD:
             proc = self._process
             self._process = None
             try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                if IS_WINDOWS:
+                    proc.terminate()
+                else:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
             except (OSError, ProcessLookupError):
                 pass
             # Do not wait here. This runs on the thread dispatching hotkey
@@ -142,7 +168,10 @@ class HUD:
             proc.wait(timeout=3)
         except Exception:
             try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                if IS_WINDOWS:
+                    proc.kill()
+                else:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
                 proc.wait(timeout=2)
             except Exception:
                 pass

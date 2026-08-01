@@ -271,7 +271,7 @@ class TestWhisperFlowDaemon:
             patch("whisper_flow.daemon.WhisperFlow") as mock_app_class,
             patch("whisper_flow.daemon.HotkeyManager") as mock_hotkey_manager_class,
             patch("whisper_flow.daemon.WhisperFlowDaemon.notify") as mock_notify,
-            patch("whisper_flow.daemon.subprocess.Popen") as mock_popen,
+            patch("whisper_flow.daemon.subprocess.Popen") as mock_popen,  # noqa: F841
             patch("whisper_flow.daemon.shutil.which", return_value="/usr/bin/xdg-open"),
         ):
             mock_config = Mock()
@@ -487,7 +487,7 @@ class TestWhisperFlowDaemon:
             patch("whisper_flow.daemon.Config") as mock_config_class,
             patch("whisper_flow.daemon.WhisperFlow") as mock_app_class,
             patch("whisper_flow.daemon.HotkeyManager") as mock_hotkey_manager_class,
-            patch("whisper_flow.system.subprocess.Popen") as mock_popen,
+            patch("whisper_flow.system.subprocess.Popen"),
             patch("whisper_flow.system.shutil.which", return_value=True),
         ):
             mock_config = Mock()
@@ -515,7 +515,7 @@ class TestWhisperFlowDaemon:
             patch("whisper_flow.daemon.WhisperFlow") as mock_app_class,
             patch("whisper_flow.daemon.HotkeyManager") as mock_hotkey_manager_class,
             patch("whisper_flow.system.shutil.which", return_value=None),
-            patch("builtins.print") as mock_print,
+            patch("builtins.print") as mock_print  # noqa: F841,
         ):
             mock_config = Mock()
             mock_config.hotkey_transcribe = "ctrl+cmd"

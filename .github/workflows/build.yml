@@ -2,7 +2,9 @@ name: build
 
 on:
   push:
-    branches: [master, main]
+    # Every branch: a build that only runs after merging cannot tell you
+    # whether the branch was mergeable.
+    branches: ["**"]
     tags: ["v*"]
   pull_request:
   workflow_dispatch:

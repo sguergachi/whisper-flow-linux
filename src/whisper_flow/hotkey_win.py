@@ -48,6 +48,14 @@ for _n in range(1, 25):
 POLL_INTERVAL = 0.016   # ~60Hz; a tap shorter than this can be missed
 HELD_MASK = 0x8000      # high bit of GetAsyncKeyState means currently down
 
+# Both physical sides of a modifier mean the same thing, exactly as the Linux
+# listener treats them. Ctrl, Alt and Shift need no entry: 0x11, 0x12 and 0x10
+# are the combined codes and already report either side. Windows has no
+# combined code for the Windows key, so without this the right-hand one
+# silently did nothing.
+VK_RWIN = 0x5C
+VK_ALIASES = {VK_RWIN: NAME_TO_VK["super"]}
+
 
 class WinHotkeyListener:
     """Watches for hotkey combinations by sampling keyboard state."""
@@ -110,7 +118,7 @@ class WinHotkeyListener:
         down = set()
         for vk in self._watched:
             if self._user32.GetAsyncKeyState(vk) & HELD_MASK:
-                down.add(vk)
+                down.add(VK_ALIASES.get(vk, vk))
         return down
 
     @property
@@ -118,6 +126,10 @@ class WinHotkeyListener:
         watched = set()
         for keys, _, _ in self._bindings.values():
             watched |= set(keys)
+        # Poll the alternate physical key for anything aliased onto it.
+        for physical, logical in VK_ALIASES.items():
+            if logical in watched:
+                watched.add(physical)
         return watched
 
     def _poll_loop(self):
@@ -126,7 +138,8 @@ class WinHotkeyListener:
         previous = set()
         while self._running:
             try:
-                down = {vk for vk in watched if get(vk) & HELD_MASK}
+                down = {VK_ALIASES.get(vk, vk)
+                        for vk in watched if get(vk) & HELD_MASK}
                 if down != previous:
                     self._check_bindings(down, rising=len(down) > len(previous))
                     previous = down

@@ -1125,9 +1125,14 @@ Use 'whisper-flow stop' to exit daemon
         try:
             import ctypes
             kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-            # Global\ so it is one instance per machine, not per session.
+            # Local\ - one instance per session, not per machine. This is a
+            # per-user application installed without administrator rights, so
+            # two people signed in at once are each entitled to their own
+            # copy; a Global\ name would have let the first one block the
+            # second, and creating Global objects needs a privilege a
+            # standard user may not hold anyway.
             self._instance_mutex = kernel32.CreateMutexW(
-                None, False, "Global\\whisper-flow-daemon",
+                None, False, "Local\\whisper-flow-daemon",
             )
             ERROR_ALREADY_EXISTS = 183
             if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:

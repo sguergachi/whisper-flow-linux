@@ -125,16 +125,76 @@ def send_paste() -> bool:
     ])
 
 
+CF_UNICODETEXT = 13
+GMEM_MOVEABLE = 0x0002
+
+
 def copy_to_clipboard(text: str) -> bool:
-    """Put text on the clipboard using the built-in clip.exe."""
+    """Put text on the clipboard through the Win32 API.
+
+    Not clip.exe. That meant spawning a process for every copy, and it was
+    being fed UTF-16 with no byte-order mark, which clip.exe reads as the
+    console code page - so anything outside ASCII arrived as mojibake. The
+    failure reports this carries are exactly the text that must survive
+    intact.
+    """
+    try:
+        kernel32, user32 = ctypes.windll.kernel32, ctypes.windll.user32
+        buffer = ctypes.create_unicode_buffer(text)
+        size = ctypes.sizeof(buffer)
+
+        handle = kernel32.GlobalAlloc(GMEM_MOVEABLE, size)
+        if not handle:
+            return False
+        locked = kernel32.GlobalLock(handle)
+        if not locked:
+            kernel32.GlobalFree(handle)
+            return False
+        try:
+            ctypes.memmove(locked, buffer, size)
+        finally:
+            kernel32.GlobalUnlock(handle)
+
+        if not user32.OpenClipboard(None):
+            kernel32.GlobalFree(handle)
+            return False
+        try:
+            user32.EmptyClipboard()
+            # Ownership passes to the clipboard on success; freeing it after
+            # that would be a double free.
+            if not user32.SetClipboardData(CF_UNICODETEXT, handle):
+                kernel32.GlobalFree(handle)
+                return False
+        finally:
+            user32.CloseClipboard()
+        return True
+    except Exception as e:
+        log(f"[WIN] clipboard failed: {e}")
+        return _copy_via_clip_exe(text)
+
+
+def _copy_via_clip_exe(text: str) -> bool:
+    """Fallback for a locked clipboard. utf-16 here carries its own BOM."""
     try:
         proc = subprocess.run(
-            ["clip.exe"], input=text.encode("utf-16-le"),
-            capture_output=True, timeout=5,
+            ["clip.exe"], input=text.encode("utf-16"),
+            capture_output=True, timeout=5, check=False,
         )
         return proc.returncode == 0
     except Exception:
         return False
+
+
+def _ps_literal(text: str) -> str:
+    """Quote text for a PowerShell single-quoted string.
+
+    Doubling the quote is the only escape such a string has. Without this an
+    apostrophe ended the literal and the remainder of the message was parsed
+    as code - so an error like "can't open device" silently produced no
+    notification at all, and any text reaching here decided what ran.
+    """
+    flattened = " ".join(str(text).split())     # newlines would break the line
+    return flattened.replace("'", "''")
 
 
 def notify(title: str, message: str) -> None:
@@ -143,7 +203,8 @@ def notify(title: str, message: str) -> None:
         "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications,"
         " ContentType=WindowsRuntime] > $null;"
         "$t=[Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent(0);"
-        f"$t.GetElementsByTagName('text').Item(0).AppendChild($t.CreateTextNode('{title}')) > $null;"
+        f"$t.GetElementsByTagName('text').Item(0).AppendChild("
+        f"$t.CreateTextNode('{_ps_literal(title)}')) > $null;"
         "[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("
         "'whisper-flow').Show([Windows.UI.Notifications.ToastNotification]::new($t))"
     )

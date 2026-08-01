@@ -81,9 +81,26 @@ LEVEL_GAMMA = 0.65
 MAX_LIFETIME_S = 600
 DRAG_SLOP = 4
 
-# Same location the GTK overlay and Config use, so a checkout shared over a
-# home directory keeps one set of settings.
-POSITION_FILE = os.path.join(
+def _config_dir() -> str:
+    """Where settings live, matching config.default_config_dir().
+
+    This said it used the same location as Config and then hard-coded the
+    Unix one, so on Windows the overlay saved its position to ~/.config
+    while every other setting lived under LOCALAPPDATA. Config cannot be
+    imported here - it would pull pydantic into the overlay process - so the
+    rule is repeated rather than shared.
+    """
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+        return os.path.join(base, "whisper-flow")
+    return os.path.join(os.path.expanduser("~"), ".config", "whisper-flow")
+
+
+POSITION_FILE = os.path.join(_config_dir(), "hud-position.json")
+
+# Where the position used to be written on Windows. Read only, so an existing
+# placement survives the move.
+LEGACY_POSITION_FILE = os.path.join(
     os.path.expanduser("~"), ".config", "whisper-flow", "hud-position.json",
 )
 
@@ -94,12 +111,15 @@ def _ease(t: float) -> float:
 
 
 def _load_positions() -> dict:
-    try:
-        with open(POSITION_FILE) as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
+    for path in (POSITION_FILE, LEGACY_POSITION_FILE):
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            if isinstance(data, dict) and data:
+                return data
+        except Exception:
+            continue
+    return {}
 
 
 def _save_position(key: str, x: int, y: int) -> None:
@@ -141,10 +161,12 @@ class HudWindow:
         self.targets = deque([0.0] * BARS, maxlen=BARS)
         self.shown = [0.0] * BARS
         self.level_pos = 0
+        self._level_handle = None
         self._drag_from = None
         self._quitting = False
         self.style = None
 
+        self._build_items()
         self.canvas.bind("<Button-1>", self._on_press)
         self.canvas.bind("<B1-Motion>", self._on_drag)
         self.canvas.bind("<ButtonRelease-1>", self._on_release)
@@ -196,6 +218,14 @@ class HudWindow:
             return
         _save_position("default", self.x, self.y)
 
+    def _close_level_handle(self):
+        if self._level_handle is not None:
+            try:
+                self._level_handle.close()
+            except Exception:
+                pass
+            self._level_handle = None
+
     def quit(self):
         if self._quitting:
             return
@@ -211,6 +241,7 @@ class HudWindow:
             t = (now - self.fade_out_t0) * 1000.0 / FADE_MS
             self.alpha = 1.0 - _ease(t)
             if t >= 1.0:
+                self._close_level_handle()
                 self.root.destroy()
                 return
         try:
@@ -229,24 +260,33 @@ class HudWindow:
             # absence as the signal to go, so the overlay cannot be orphaned.
             if not os.path.exists(self.level_file):
                 print("[HUD] level file gone, closing", flush=True)
+                self._close_level_handle()
                 self.quit()
                 return
             try:
-                with open(self.level_file, "rb") as f:
-                    f.seek(0, 2)
-                    count = f.tell() // 4
-                    if count > self.level_pos:
-                        f.seek(self.level_pos * 4)
-                        data = f.read((count - self.level_pos) * 4)
-                        self.level_pos = count
-                        vals = struct.unpack(f"<{len(data) // 4}i", data)
-                        for v in vals:
-                            v = abs(v)
-                            self.peak = max(self.peak * PEAK_DECAY, float(v), PEAK_FLOOR)
-                            self.targets.append(
-                                min(1.0, (v / self.peak) ** LEVEL_GAMMA))
+                # Opened once and held. Reopening thirty times a second put
+                # every read through the whole Windows filesystem filter
+                # stack, antivirus included, for a file this process already
+                # had open a moment earlier.
+                if self._level_handle is None:
+                    self._level_handle = open(self.level_file, "rb")
+                f = self._level_handle
+                f.seek(0, 2)
+                count = f.tell() // 4
+                if count > self.level_pos:
+                    f.seek(self.level_pos * 4)
+                    data = f.read((count - self.level_pos) * 4)
+                    self.level_pos = count
+                    vals = struct.unpack(f"<{len(data) // 4}i", data)
+                    for v in vals:
+                        v = abs(v)
+                        self.peak = max(self.peak * PEAK_DECAY, float(v), PEAK_FLOOR)
+                        self.targets.append(
+                            min(1.0, (v / self.peak) ** LEVEL_GAMMA))
             except Exception:
-                pass
+                # Drop the handle so the next tick reopens rather than
+                # spinning on a file descriptor that has gone bad.
+                self._close_level_handle()
 
         if time.monotonic() - self.start > MAX_LIFETIME_S:
             print("[HUD] lifetime cap reached, closing", flush=True)
@@ -254,30 +294,49 @@ class HudWindow:
             return
         self.root.after(LEVEL_MS, self._read_levels)
 
-    def _draw(self):
-        c = self.canvas
-        c.delete("all")
-        mid = HEIGHT / 2
+    def _build_items(self):
+        """Create every canvas item once.
 
+        The previous version cleared the canvas and rebuilt all thirty-three
+        items on every frame - about two thousand item allocations a second,
+        each re-tessellated by Tk - for a drawing whose geometry is the only
+        thing that changes. Moving existing items is far cheaper, and this
+        overlay is on screen precisely when the machine is also recording
+        audio and running transcription passes.
+        """
+        c = self.canvas
+        mid = HEIGHT / 2
         # Flat fill: DWM rounds and clips the window, so drawing a rounded
         # outline here would sit inside its curve and read as a double edge.
         c.create_rectangle(0, 0, WIDTH, HEIGHT, fill=BG, outline="")
+        self.glow_item = c.create_oval(
+            DOT_X - DOT_R * 2, mid - DOT_R * 2, DOT_X + DOT_R * 2,
+            mid + DOT_R * 2, fill=DOT_COLOUR, outline="")
+        c.create_oval(DOT_X - DOT_R, mid - DOT_R, DOT_X + DOT_R, mid + DOT_R,
+                      fill=DOT_COLOUR, outline="")
+        step = (WAVE_R - WAVE_L) / float(BARS)
+        self.bar_items = [
+            c.create_rectangle(WAVE_L + i * step, mid - BAR_W / 2,
+                               WAVE_L + i * step + BAR_W, mid + BAR_W / 2,
+                               fill=BAR_COLOUR, outline="")
+            for i in range(BARS)
+        ]
+
+    def _draw(self):
+        c = self.canvas
+        mid = HEIGHT / 2
 
         breathe = 0.6 + 0.4 * (0.5 + 0.5 * math.sin(
             (time.monotonic() - self.start) * 3.0))
         glow = int(60 + 40 * breathe)
-        c.create_oval(DOT_X - DOT_R * 2, mid - DOT_R * 2,
-                      DOT_X + DOT_R * 2, mid + DOT_R * 2,
-                      fill=f"#{glow:02x}1416", outline="")
-        c.create_oval(DOT_X - DOT_R, mid - DOT_R, DOT_X + DOT_R, mid + DOT_R,
-                      fill=DOT_COLOUR, outline="")
+        c.itemconfig(self.glow_item, fill=f"#{glow:02x}1416")
 
         step = (WAVE_R - WAVE_L) / float(BARS)
         for i, level in enumerate(self.shown):
             bar_h = max(BAR_W, level * BAR_MAX * 2)
             x = WAVE_L + i * step
-            c.create_rectangle(x, mid - bar_h / 2, x + BAR_W, mid + bar_h / 2,
-                               fill=BAR_COLOUR, outline="")
+            c.coords(self.bar_items[i], x, mid - bar_h / 2, x + BAR_W,
+                     mid + bar_h / 2)
 
     def run(self):
         self.root.mainloop()
@@ -287,8 +346,12 @@ def main() -> int:
     level_file = os.environ.get("WHISPER_FLOW_HUD_LEVEL_FILE", "")
     print(f"[HUD] starting level_file={level_file}", flush=True)
     if not _blur.is_supported():
-        print(f"[HUD] {_blur.unsupported_reason()}", flush=True)
-        return 1
+        # Carry on without the acrylic. The blur is decoration; the overlay is
+        # the only sign that recording started, and refusing to draw it left
+        # the user with no feedback at all - including when the build check
+        # itself failed, since RtlGetVersion reports build 0 on any error.
+        print(f"[HUD] {_blur.unsupported_reason()}; drawing without blur",
+              flush=True)
     try:
         # Per-monitor DPI aware, or the overlay is scaled and blurry.
         ctypes.windll.shcore.SetProcessDpiAwareness(2)

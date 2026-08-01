@@ -80,9 +80,14 @@ BLUR_INSET = 2
 SQUIRCLE_N = 2.3
 SQUIRCLE_STEPS = 96
 CAP_EXT = 1.12   # cap reaches this many half-heights along the edge
+# Tint laid over the compositor's blur. Higher alpha reads darker but hides
+# more of the frost, so this is the one knob that trades the two off.
+MATERIAL_RGB = (0.03, 0.03, 0.04)
+MATERIAL_ALPHA = 0.80
 EDGE_COVER = BLUR_INSET + 1.5   # opaque rim that hides the blur region's edge
-INNER_SHADOW_W = 6              # how far the inner shadow reaches inwards
-INNER_SHADOW_STEPS = 5
+INNER_SHADOW_W = 14             # how far the inner shadow reaches inwards
+INNER_SHADOW_STEPS = 9          # more bands, so the wider spread stays smooth
+INNER_SHADOW_RGB = (0.13, 0.13, 0.15)
 
 FADE_STEP = 0.30     # opacity per frame at ~60fps; ~4 frames to fully opaque
 LEVEL_EASE = 0.30    # how fast a bar chases its target height
@@ -459,7 +464,7 @@ class HudWindow(Gtk.Window):
         # frost, and a heavy fill would just mute it into flat grey.
         inner = STROKE_W / 2
         _squircle(cr, inner, inner, w - 2 * inner, h - 2 * inner)
-        cr.set_source_rgba(0.04, 0.04, 0.05, 0.66 * a)
+        cr.set_source_rgba(*MATERIAL_RGB, MATERIAL_ALPHA * a)
         cr.fill_preserve()
 
         sheen = cairo.LinearGradient(0, 0, 0, h)
@@ -480,7 +485,7 @@ class HudWindow(Gtk.Window):
         # ragged; this hides that boundary rather than leaving it on show.
         _squircle(cr, 0, 0, w, h)
         cr.set_line_width(2 * EDGE_COVER)
-        cr.set_source_rgba(0.04, 0.04, 0.05, 0.92 * a)
+        cr.set_source_rgba(*MATERIAL_RGB, 0.95 * a)
         cr.stroke()
 
         # Inner shadow: concentric strokes fading inwards approximate a
@@ -489,7 +494,7 @@ class HudWindow(Gtk.Window):
             t = i / INNER_SHADOW_STEPS
             _squircle(cr, 0, 0, w, h)
             cr.set_line_width(2 * INNER_SHADOW_W * (1.0 - t))
-            cr.set_source_rgba(0, 0, 0, 0.05 * (1.0 - t) * a)
+            cr.set_source_rgba(*INNER_SHADOW_RGB, 0.05 * (1.0 - t) * a)
             cr.stroke()
         cr.restore()
 

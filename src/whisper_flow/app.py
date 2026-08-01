@@ -111,6 +111,13 @@ class WhisperFlow:
                 log("Transcription produced nothing")
                 return False
 
+            if live.delivery_failed:
+                # There were words, and none of them landed. Reporting success
+                # here is how this looked like "it just does nothing".
+                log(f"[LIVE] transcribed {len(final_text or '')} chars but "
+                    f"nothing could be typed into the focused window")
+                return False
+
             log("Live transcription complete")
             return True
 

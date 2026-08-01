@@ -63,6 +63,8 @@ class LiveTranscriber:
         self._prev: list[str] = []       # previous pass's full hypothesis
         self._committed: list[str] = []  # words already typed
         self._emitted_any = False
+        self._delivered_any = False
+        self._delivery_failures = 0
         # Guards the committed state and typing. A pass can outlive the join in
         # finalize - the transcription call has its own, much longer timeout -
         # and without this it would commit on top of the tail already typed,
@@ -158,8 +160,17 @@ class LiveTranscriber:
             chunk = " " + chunk
         self._emitted_any = True
         try:
-            self._emit(chunk)
+            # A False return means the text never reached the application.
+            # Ignoring it produced the worst failure this has had: the
+            # recording works, the overlay animates, and nothing is typed,
+            # with nothing logged to say so.
+            if self._emit(chunk) is False:
+                self._delivery_failures += 1
+                log(f"[LIVE] emit reported failure for {len(chunk)} chars")
+            else:
+                self._delivered_any = True
         except Exception as e:
+            self._delivery_failures += 1
             log(f"[LIVE] emit failed: {e}")
 
     def finalize(self, final_text: str | None) -> None:
@@ -184,6 +195,15 @@ class LiveTranscriber:
             if len(words) > len(self._committed):
                 self._send(words[len(self._committed):])
                 self._committed = words
+
+    @property
+    def delivery_failed(self) -> bool:
+        """True when text was produced but none of it reached the screen.
+
+        Distinguishes "nothing was said" from "everything was said and the
+        typing was rejected", which look identical to the user otherwise.
+        """
+        return bool(self._delivery_failures and not self._delivered_any)
 
     @property
     def committed_text(self) -> str:

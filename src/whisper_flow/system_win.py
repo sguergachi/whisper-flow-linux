@@ -2,20 +2,23 @@
 
 Text goes in through SendInput with KEYEVENTF_UNICODE, which delivers a
 character rather than a keystroke, so it needs no keyboard layout mapping and
-is unaffected by which modifiers happen to be held. Every event carries a tag
-in dwExtraInfo that the hotkey hook filters out, or dictated text would be
-read straight back in as hotkey input.
+is unaffected by which modifiers happen to be held.
 """
 
 import ctypes
 import ctypes.wintypes as wintypes
 import subprocess
 
+from .logging import log
+
 INPUT_KEYBOARD = 1
 KEYEVENTF_KEYUP = 0x0002
 KEYEVENTF_UNICODE = 0x0004
 
-# Must match hotkey_win.INJECTED_TAG.
+# Stamped on every event this module injects. Nothing reads it back
+# today - the hotkey listener polls key state rather than hooking the
+# stream, so it cannot see its own injections anyway - but it costs
+# nothing and identifies our events in a trace.
 INJECTED_TAG = 0x5748464C
 
 VK_CONTROL, VK_MENU, VK_SHIFT, VK_LWIN, VK_RWIN = 0x11, 0x12, 0x10, 0x5B, 0x5C
@@ -31,7 +34,11 @@ class KEYBDINPUT(ctypes.Structure):
         ("wScan", wintypes.WORD),
         ("dwFlags", wintypes.DWORD),
         ("time", wintypes.DWORD),
-        ("dwExtraInfo", ctypes.POINTER(wintypes.ULONG)),
+        # ULONG_PTR is an integer wide enough to hold a pointer, not a
+        # pointer. Declaring it as POINTER(ULONG) put the address of a tag
+        # in the field instead of the tag, which is meaningless to anything
+        # reading it back.
+        ("dwExtraInfo", ctypes.c_size_t),
     ]
 
 
@@ -43,7 +50,7 @@ class INPUT(ctypes.Structure):
     _fields_ = [("type", wintypes.DWORD), ("union", _INPUTunion)]
 
 
-_TAG = ctypes.pointer(wintypes.ULONG(INJECTED_TAG))
+_TAG = INJECTED_TAG
 
 
 def _key_event(vk: int, scan: int, flags: int) -> INPUT:
@@ -74,7 +81,14 @@ def release_modifiers() -> None:
 
 
 def type_text(text: str) -> bool:
-    """Type text as characters, not keystrokes."""
+    """Type text as characters, not keystrokes.
+
+    Falls back to the clipboard when SendInput is refused. It is refused
+    whenever the focused window belongs to a more privileged process - an
+    elevated editor or terminal - because UIPI blocks synthetic input from
+    a lower integrity level. Returning False there meant a dictation that
+    recorded, animated, and typed nothing.
+    """
     if not text:
         return True
     release_modifiers()
@@ -84,7 +98,13 @@ def type_text(text: str) -> bool:
             events.append(_key_event(0, code, KEYEVENTF_UNICODE))
             events.append(_key_event(0, code, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP))
     # SendInput takes the whole batch atomically, so nothing can interleave.
-    return _send(events)
+    if _send(events):
+        return True
+
+    error = ctypes.get_last_error()
+    log(f"[WIN] SendInput refused {len(text)} chars (error {error}); "
+        f"falling back to the clipboard")
+    return copy_to_clipboard(text) and send_paste()
 
 
 def _utf16_units(ch: str):

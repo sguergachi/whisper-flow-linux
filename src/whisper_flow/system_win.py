@@ -8,6 +8,7 @@ is unaffected by which modifiers happen to be held.
 import ctypes
 import ctypes.wintypes as wintypes
 import subprocess
+import time
 
 from .logging import log
 
@@ -140,14 +141,32 @@ def copy_to_clipboard(text: str) -> bool:
     """
     try:
         kernel32, user32 = ctypes.windll.kernel32, ctypes.windll.user32
+        # Declare the signatures. Without these ctypes assumes every function
+        # returns a C int, so on 64-bit Windows the HGLOBAL from GlobalAlloc
+        # and the pointer from GlobalLock are truncated to 32 bits and every
+        # subsequent call is handed a bad handle - which is exactly why this
+        # returned False on the first real Windows run.
+        kernel32.GlobalAlloc.restype = wintypes.HGLOBAL
+        kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+        kernel32.GlobalLock.restype = wintypes.LPVOID
+        kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+        kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+        kernel32.GlobalFree.restype = wintypes.HGLOBAL
+        kernel32.GlobalFree.argtypes = [wintypes.HGLOBAL]
+        user32.OpenClipboard.argtypes = [wintypes.HWND]
+        user32.SetClipboardData.restype = wintypes.HANDLE
+        user32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
+
         buffer = ctypes.create_unicode_buffer(text)
         size = ctypes.sizeof(buffer)
 
         handle = kernel32.GlobalAlloc(GMEM_MOVEABLE, size)
         if not handle:
+            log(f"[WIN] GlobalAlloc failed: {ctypes.get_last_error()}")
             return False
         locked = kernel32.GlobalLock(handle)
         if not locked:
+            log(f"[WIN] GlobalLock failed: {ctypes.get_last_error()}")
             kernel32.GlobalFree(handle)
             return False
         try:
@@ -155,7 +174,16 @@ def copy_to_clipboard(text: str) -> bool:
         finally:
             kernel32.GlobalUnlock(handle)
 
-        if not user32.OpenClipboard(None):
+        # Another process can hold the clipboard open; it is worth a retry
+        # rather than losing the report over a moment's contention.
+        opened = False
+        for _ in range(10):
+            if user32.OpenClipboard(None):
+                opened = True
+                break
+            time.sleep(0.02)
+        if not opened:
+            log(f"[WIN] OpenClipboard failed: {ctypes.get_last_error()}")
             kernel32.GlobalFree(handle)
             return False
         try:
@@ -163,6 +191,7 @@ def copy_to_clipboard(text: str) -> bool:
             # Ownership passes to the clipboard on success; freeing it after
             # that would be a double free.
             if not user32.SetClipboardData(CF_UNICODETEXT, handle):
+                log(f"[WIN] SetClipboardData failed: {ctypes.get_last_error()}")
                 kernel32.GlobalFree(handle)
                 return False
         finally:

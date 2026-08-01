@@ -37,8 +37,22 @@ def log(*args, **kwargs):
             _ring.append(f"{datetime.now():%H:%M:%S} {line}")
     except Exception:
         pass                    # logging must never be the thing that fails
-    if _logging_enabled:
+    if not _logging_enabled:
+        return
+    try:
         print(*args, **kwargs, flush=True)
+    except UnicodeEncodeError:
+        # A Windows console defaults to a code page that cannot represent the
+        # arrows and check marks these messages carry, and the exception
+        # propagated into whatever was logging - the watchdog thread, in the
+        # case that surfaced this.
+        safe = [str(a).encode("ascii", "replace").decode("ascii") for a in args]
+        try:
+            print(*safe, **kwargs, flush=True)
+        except Exception:
+            pass
+    except Exception:
+        pass                    # logging is never the thing that fails
 
 
 def recent_log(limit: int = 80) -> str:

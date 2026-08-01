@@ -2,7 +2,16 @@
 
 from unittest.mock import Mock, patch
 
+import pytest
+
 from whisper_flow.hotkey_manager import HotkeyManager, HotkeyMode
+from whisper_flow.hotkey_manager import keyboard as _keyboard
+
+# pynput is a Linux/X11 dependency here; on Windows the import
+# leaves it as None, so tests that patch keyboard.Listener have
+# nothing to patch and must not pretend to cover anything.
+needs_pynput = pytest.mark.skipif(
+    _keyboard is None, reason="pynput is not available on this platform")
 
 
 class TestHotkeyManager:
@@ -79,6 +88,7 @@ class TestHotkeyManager:
         assert manager.key_mapping.get("ctrl_l", "ctrl_l") == "ctrl"
         assert manager.key_mapping.get("cmd_r", "cmd_r") == "cmd"
 
+    @needs_pynput
     @patch("whisper_flow.hotkey_manager._is_wayland", return_value=False)
     @patch("whisper_flow.hotkey_manager._is_windows", return_value=False)
     @patch("whisper_flow.hotkey_manager.keyboard.Listener")
@@ -109,6 +119,7 @@ class TestHotkeyManager:
         assert manager.active_combination is None
         assert manager.current_push_to_talk is None
 
+    @needs_pynput
     def test_start_already_running(self):
         """Test starting when already running."""
         manager = HotkeyManager()

@@ -231,6 +231,27 @@ class Config(BaseSettings):
         env="WHISPER_FLOW_LIVE_INTERVAL",
     )
 
+    # Managed local speech engine
+    manage_local_server: bool = Field(
+        default=True,
+        description="Download and run a local whisper.cpp server automatically",
+        env="WHISPER_FLOW_MANAGE_LOCAL_SERVER",
+    )
+    model_name: str = Field(
+        # What ships with the build. A machine with an NVIDIA GPU replaces
+        # this with large-v3-turbo in the background after first start.
+        default="ggml-small.en",
+        description="whisper.cpp model to download and run",
+        env="WHISPER_FLOW_MODEL_NAME",
+    )
+    local_server_port: int = Field(
+        default=8082,
+        description="Port for the managed local server",
+        ge=1024,
+        le=65535,
+        env="WHISPER_FLOW_LOCAL_SERVER_PORT",
+    )
+
     # Local whisper.cpp configuration
     local_whisper_url: str | None = Field(
         default=None,

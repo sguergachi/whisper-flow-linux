@@ -19,7 +19,23 @@ Hold a key, talk, and the words appear in whatever you were typing into.
 - 📝 **Multiple Modes**: Transcribe, Auto-Transcribe, and Command modes
 - ⚙️ **Configurable**: Customizable prompts, models, and settings
 
-## Quick Setup (One-Click Install)
+## Windows 11
+
+Download the installer from the
+[latest release](https://github.com/sguergachi/whisper-flow-linux/releases),
+run it, and hold `Ctrl+Alt` to dictate. Nothing else is required: the
+installer ships a speech engine and model, so it transcribes offline from the
+first launch, with no API key and no Python.
+
+On a machine with an NVIDIA GPU it offers, once, to download the much more
+accurate `large-v3-turbo` model — one button, with a progress bar. Decline it
+and the bundled model keeps working; ask for it later from **Speech model...**
+in the tray menu. Nothing large is ever downloaded without being asked.
+
+Windows 11 22H2 or newer, because the overlay uses composition attributes
+added in that release.
+
+## Linux: Quick Setup (One-Click Install)
 
 ### Prerequisites
 

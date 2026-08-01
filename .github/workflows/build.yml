@@ -115,6 +115,39 @@ jobs:
         working-directory: packaging/windows
         run: pyinstaller --noconfirm --clean whisper-flow.spec
 
+      - name: Bundle the speech engine and a model
+        # So the app transcribes the moment it is installed, with no network
+        # and no setup step. The CPU engine plus a small model is what fits:
+        # the CUDA engine and large model come to 2.2GB together, over the 2GB
+        # ceiling on a release asset, so those are fetched later on machines
+        # that can use them.
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $dist   = "packaging/windows/dist/whisper-flow"
+          $engine = "$dist/engine"
+          $models = "$dist/models"
+          New-Item -ItemType Directory -Force -Path $engine, $models | Out-Null
+
+          $rel = "https://github.com/ggml-org/whisper.cpp/releases/download/v1.9.1"
+          Write-Host "Downloading whisper.cpp CPU engine..."
+          Invoke-WebRequest "$rel/whisper-blas-bin-x64.zip" -OutFile engine.zip
+          Expand-Archive engine.zip -DestinationPath engine-tmp -Force
+          # The archive nests its binaries a directory deep.
+          $src = Get-ChildItem engine-tmp -Recurse -Filter whisper-server.exe |
+                 Select-Object -First 1
+          if (-not $src) { throw "whisper-server.exe not found in the archive" }
+          Copy-Item "$($src.Directory)/*" $engine -Recurse -Force
+          Remove-Item engine.zip, engine-tmp -Recurse -Force
+
+          Write-Host "Downloading ggml-small.en..."
+          Invoke-WebRequest `
+            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en.bin" `
+            -OutFile "$models/ggml-small.en.bin"
+
+          "{0:N0}MB bundled" -f ((Get-ChildItem $dist -Recurse |
+            Measure-Object Length -Sum).Sum / 1MB) | Write-Host
+
       - name: Build the installer
         # PowerShell, not bash: Git Bash rewrites arguments that look like
         # POSIX paths, and turned Inno's /O switch into a path it rejected.

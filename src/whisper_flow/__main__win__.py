@@ -22,6 +22,10 @@ def main() -> int:
         from whisper_flow.hud_win import main as hud_main
         return hud_main()
 
+    if "--setup" in sys.argv:
+        from whisper_flow.setup_win import main as setup_main
+        return setup_main()
+
     from whisper_flow.daemon import WhisperFlowDaemon
     WhisperFlowDaemon().run(foreground=True)
     return 0

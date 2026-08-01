@@ -14,6 +14,7 @@ Three Wayland pieces do the work a normal toplevel cannot:
 import ctypes
 import math
 import os
+import signal
 import struct
 import sys
 import time
@@ -89,7 +90,7 @@ INNER_SHADOW_W = 14             # how far the inner shadow reaches inwards
 INNER_SHADOW_STEPS = 9          # more bands, so the wider spread stays smooth
 INNER_SHADOW_RGB = (0.13, 0.13, 0.15)
 
-FADE_STEP = 0.30     # opacity per frame at ~60fps; ~4 frames to fully opaque
+FADE_MS = 200.0      # fade in and out duration
 LEVEL_EASE = 0.30    # how fast a bar chases its target height
 PEAK_DECAY = 0.95    # adaptive gain, so quiet speech still reads
 PEAK_FLOOR = 150.0   # below this the gain stops opening up, or idle noise dances
@@ -131,6 +132,12 @@ def _save_position(connector: str, x: int, y: int):
 CSS = b"""
 window, window.background { background-color: transparent; }
 """
+
+
+def _ease(t: float) -> float:
+    """Smoothstep: eases out of rest and into rest, unlike a linear ramp."""
+    t = max(0.0, min(1.0, t))
+    return t * t * (3.0 - 2.0 * t)
 
 
 def _squircle(cr, x, y, w, h, n=SQUIRCLE_N, cap=CAP_EXT, steps=SQUIRCLE_STEPS):
@@ -229,6 +236,9 @@ class HudWindow(Gtk.Window):
               f"{self._pos if self._pos else 'bottom-centre (default)'}", flush=True)
 
         self.alpha = 0.0
+        self._fade_in_t0 = time.monotonic()
+        self._fade_out_t0 = None
+        self._fade_out_from = 1.0
         self.hover = 0.0
         self.want_hover = False
         self.peak = PEAK_FLOOR
@@ -258,6 +268,11 @@ class HudWindow(Gtk.Window):
 
         GLib.timeout_add(16, self._frame)
         GLib.timeout_add(33, self._read_levels)
+        # The daemon takes this overlay down with SIGTERM. Handle it through
+        # the main loop so the pill can fade out instead of blinking away;
+        # the manager waits a couple of seconds, which is ample.
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            GLib.unix_signal_add(GLib.PRIORITY_HIGH, sig, self._on_signal)
         self.connect("realize", self._on_realize)
         _mark("window constructed")
 
@@ -320,19 +335,18 @@ class HudWindow(Gtk.Window):
     def quit(self):
         """Take the overlay down and end the process.
 
-        Neither Gtk.Window.close() nor MainLoop.quit() ends this process once a
-        layer-shell surface is mapped: the loop returns but the process lives
-        on, leaving the pill stuck on screen. Exiting cannot be deferred to the
-        main loop either, since quitting the loop is what stops it running.
-
-        So leave immediately. This child owns nothing but its own window, and
-        dropping the Wayland connection is what actually removes the surface.
+        Fades out first, then exits outright. Neither Gtk.Window.close() nor
+        MainLoop.quit() ends this process once a layer-shell surface is mapped
+        - the loop returns but the process lives on - and dropping the Wayland
+        connection is what actually removes the surface.
         """
         if self._quitting:
             return
         self._quitting = True
-        self.set_visible(False)
-        os._exit(0)
+        self._fade_out_from = self.alpha
+        self._fade_out_t0 = time.monotonic()
+        # Backstop in case the frame timer stops before the fade completes.
+        GLib.timeout_add(int(FADE_MS) + 150, lambda: os._exit(0))
 
     def _check_lifetime(self):
         """Backstop against an overlay outliving whatever spawned it."""
@@ -341,6 +355,10 @@ class HudWindow(Gtk.Window):
             self.quit()
             return False
         return True
+
+    def _on_signal(self, *_):
+        self.quit()
+        return GLib.SOURCE_REMOVE
 
     def _default_pos(self):
         """Bottom-centre of the chosen output, in monitor-local coordinates."""
@@ -404,7 +422,14 @@ class HudWindow(Gtk.Window):
         self.want_hover = False
 
     def _frame(self):
-        self.alpha = min(1.0, self.alpha + FADE_STEP)
+        now = time.monotonic()
+        if self._fade_out_t0 is None:
+            self.alpha = _ease((now - self._fade_in_t0) * 1000.0 / FADE_MS)
+        else:
+            t = (now - self._fade_out_t0) * 1000.0 / FADE_MS
+            self.alpha = self._fade_out_from * (1.0 - _ease(t))
+            if t >= 1.0:
+                os._exit(0)
         self.hover += ((1.0 if self.want_hover else 0.0) - self.hover) * 0.25
         for i, target in enumerate(self.targets):
             self.shown[i] += (target - self.shown[i]) * LEVEL_EASE

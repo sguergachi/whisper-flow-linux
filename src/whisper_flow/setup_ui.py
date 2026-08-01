@@ -24,6 +24,7 @@ from whisper_flow.backend import (  # noqa: E402
     LocalBackend,
     detect_accelerator,
     recommended_model,
+    usable_cores,
 )
 from whisper_flow.config import Config  # noqa: E402
 from whisper_flow.logging import log  # noqa: E402
@@ -93,7 +94,8 @@ class SetupWindow:
             ("Download", "already installed" if self.already_have
              else f"{self.size_mb} MB" if self.size_mb else "unknown"),
             ("Uses", self.wants or "-"),
-            ("Runs on", "GPU (CUDA)" if self.has_gpu else "CPU"),
+            ("Runs on", "GPU (CUDA)" if self.has_gpu
+             else f"CPU, {usable_cores()} threads"),
         )
         for label, value in rows:
             row = tk.Frame(panel, bg=PANEL)
@@ -141,19 +143,22 @@ class SetupWindow:
         self.dismiss.pack(side="right", padx=(0, 6))
 
     def _copy(self) -> tuple[str, str]:
+        short = self.model.replace("ggml-", "")
         if self.already_have:
             return ("Everything is ready.",
-                    "The recommended model for this machine is already installed.\n"
+                    "The right model for this machine is already installed.\n"
                     "Hold your dictation hotkey and start talking.")
         if self.has_gpu:
             return ("An NVIDIA GPU was found.",
-                    f"WhisperFlow can run {self.model.replace('ggml-', '')} on it: "
-                    f"much more accurate than the\nmodel included with the app, and "
-                    f"still faster than you can speak.")
-        return ("No NVIDIA GPU was found.",
-                f"WhisperFlow will run {self.model.replace('ggml-', '')} on the "
-                f"processor. Larger models are\nmore accurate but transcribe slower "
-                f"than speech, so this is the one to use.")
+                    f"WhisperFlow can run {short} on it: much more accurate than "
+                    f"the\nmodel included with the app, and still faster than you "
+                    f"can speak.")
+        # No CUDA. Say plainly why the GPU is not being used, because
+        # "it is only using my CPU" otherwise reads as a bug.
+        return ("Running on the processor.",
+                f"whisper.cpp only publishes GPU builds for NVIDIA cards, so "
+                f"integrated\ngraphics cannot be used. {short} is sized to this "
+                f"machine's CPU so it\nkeeps up with speech.")
 
     def _action_label(self) -> str:
         if self.already_have:

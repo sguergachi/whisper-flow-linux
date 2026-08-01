@@ -238,9 +238,10 @@ class Config(BaseSettings):
         env="WHISPER_FLOW_MANAGE_LOCAL_SERVER",
     )
     model_name: str = Field(
-        # What ships with the build. A machine with an NVIDIA GPU replaces
-        # this with large-v3-turbo in the background after first start.
-        default="ggml-small.en",
+        # What ships with the build: the one model that keeps up with speech
+        # on every machine, from a two-core laptop upwards. The setup window
+        # offers better where the hardware allows it.
+        default="ggml-base.en",
         description="whisper.cpp model to download and run",
         env="WHISPER_FLOW_MODEL_NAME",
     )

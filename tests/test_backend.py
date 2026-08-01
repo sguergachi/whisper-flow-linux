@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from whisper_flow import backend as backend_module
-from whisper_flow.backend import LocalBackend, _stage, recommended_model
+from whisper_flow.backend import MODELS, LocalBackend, _stage, recommended_model
 
 
 class FakeConfig:
@@ -38,11 +38,91 @@ def _install_engine(backend, config):
 
 
 # --------------------------------------------------------------- model choice
-def test_gpu_gets_the_large_model_and_cpu_does_not():
+def _machine(monkeypatch, cores, ram):
+    monkeypatch.setattr(backend_module, "usable_cores", lambda: cores)
+    monkeypatch.setattr(backend_module, "total_ram_gb", lambda: ram)
+
+
+def test_a_cuda_machine_gets_the_large_model(monkeypatch):
+    _machine(monkeypatch, 2, 4)             # ignored entirely on a GPU
     assert recommended_model("cuda12") == "ggml-large-v3-turbo"
     assert recommended_model("cuda11") == "ggml-large-v3-turbo"
-    # A large model on a CPU transcribes slower than speech, which is useless.
+
+
+def test_a_workstation_cpu_gets_small(monkeypatch):
+    _machine(monkeypatch, 8, 32)
     assert recommended_model("cpu") == "ggml-small.en"
+
+
+def test_a_typical_laptop_gets_base(monkeypatch):
+    """The common case: 8 logical cores, 16GB. small.en would fall behind."""
+    _machine(monkeypatch, 3, 16)
+    assert recommended_model("cpu") == "ggml-base.en"
+
+
+def test_a_thin_laptop_gets_tiny(monkeypatch):
+    _machine(monkeypatch, 2, 8)
+    assert recommended_model("cpu") == "ggml-tiny.en"
+
+
+def test_an_8gb_laptop_is_not_asked_to_hold_small_en(monkeypatch):
+    """600MB resident for as long as the daemon runs is a lot on 8GB."""
+    _machine(monkeypatch, 6, 8)
+    assert recommended_model("cpu") == "ggml-small.en"
+    _machine(monkeypatch, 6, 6)
+    assert recommended_model("cpu") == "ggml-base.en"
+
+
+def test_a_memory_starved_machine_gets_tiny_however_many_cores(monkeypatch):
+    _machine(monkeypatch, 16, 3)
+    assert recommended_model("cpu") == "ggml-tiny.en"
+
+
+def test_the_bundled_model_runs_on_the_weakest_machine_we_target(monkeypatch):
+    """Whatever CI bundles has to be right everywhere; base.en is that model."""
+    from whisper_flow.config import Config
+
+    bundled = Config().model_name
+    assert bundled == "ggml-base.en"
+    # Never larger than what the tiers would pick for a modest laptop.
+    _machine(monkeypatch, 3, 8)
+    assert MODELS[bundled][0] <= MODELS[recommended_model("cpu")][0]
+
+
+def test_unknown_memory_does_not_force_the_smallest_model(monkeypatch):
+    """A platform that will not report RAM should not be punished for it."""
+    _machine(monkeypatch, 8, 0.0)
+    assert recommended_model("cpu") == "ggml-small.en"
+
+
+def test_every_recommendation_is_a_model_we_can_actually_fetch(monkeypatch):
+    for cores, ram in ((16, 32), (8, 16), (4, 16), (2, 8), (1, 2), (32, 4)):
+        _machine(monkeypatch, cores, ram)
+        assert recommended_model("cpu") in backend_module.MODELS
+    assert recommended_model("cuda12") in backend_module.MODELS
+
+
+# ------------------------------------------------------------------- threads
+def test_threads_leave_the_machine_usable(monkeypatch):
+    """Saturating a laptop while dictating into it makes the desktop stutter."""
+    monkeypatch.setattr(backend_module.os, "cpu_count", lambda: 16)
+    monkeypatch.delattr(backend_module.os, "sched_getaffinity", raising=False)
+    assert backend_module.usable_cores() == 7        # 16 logical -> 8 real -> 7
+
+    monkeypatch.setattr(backend_module.os, "cpu_count", lambda: 4)
+    assert backend_module.usable_cores() == 2
+
+    monkeypatch.setattr(backend_module.os, "cpu_count", lambda: 2)
+    assert backend_module.usable_cores() == 2        # never below 2
+
+    monkeypatch.setattr(backend_module.os, "cpu_count", lambda: 128)
+    assert backend_module.usable_cores() == 8        # never a runaway count
+
+
+def test_threads_survive_a_platform_that_will_not_say(monkeypatch):
+    monkeypatch.setattr(backend_module.os, "cpu_count", lambda: None)
+    monkeypatch.delattr(backend_module.os, "sched_getaffinity", raising=False)
+    assert backend_module.usable_cores() == 4
 
 
 # ------------------------------------------------------------------- progress
@@ -146,9 +226,43 @@ def test_the_configured_model_wins_among_several_downloads(local_backend, config
     assert local_backend.working_model() == "ggml-base.en"
 
 
-def test_install_is_a_no_op_off_windows(local_backend, monkeypatch):
+def test_linux_installs_the_cpu_tarball(local_backend, monkeypatch):
+    """Laptops without CUDA are the point; Linux must not be a dead end."""
     monkeypatch.setattr(sys, "platform", "linux")
-    assert local_backend.install("ggml-small.en") is False
+    assert backend_module._server_archive("cpu") == "whisper-bin-ubuntu-x64.tar.gz"
+    # An NVIDIA card changes nothing: upstream ships no Linux CUDA asset.
+    assert backend_module._server_archive("cuda12") == "whisper-bin-ubuntu-x64.tar.gz"
+
+
+def test_windows_picks_the_engine_matching_the_driver(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "win32")
+    assert "cublas-12.4" in backend_module._server_archive("cuda12")
+    assert "cublas-11.8" in backend_module._server_archive("cuda11")
+    assert backend_module._server_archive("cpu") == "whisper-blas-bin-x64.zip"
+
+
+def test_no_gpu_upgrade_is_offered_on_linux(local_backend, config, monkeypatch):
+    """There is no Linux CUDA engine to move up to, so offering one would lie."""
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(backend_module, "detect_accelerator", lambda: "cuda12")
+    assert local_backend.needs_gpu_upgrade() is False
+
+
+def test_a_tarball_that_escapes_its_directory_is_refused(tmp_path):
+    """Extraction must not be able to write outside the runtime directory."""
+    import tarfile as tf
+
+    archive = tmp_path / "evil.tar.gz"
+    payload = tmp_path / "payload"
+    payload.write_text("owned")
+    with tf.open(archive, "w:gz") as tar:
+        tar.add(payload, arcname="../../escaped")
+
+    into = tmp_path / "into"
+    into.mkdir()
+    with pytest.raises(Exception):
+        backend_module._extract(archive, into)
+    assert not (tmp_path.parent / "escaped").exists()
 
 
 def test_detect_accelerator_falls_back_to_cpu_without_nvidia_smi(monkeypatch):
@@ -163,3 +277,16 @@ def test_old_drivers_get_the_cuda_11_build(monkeypatch):
         lambda *a, **k: types.SimpleNamespace(returncode=0, stdout="470.86\n"),
     )
     assert backend_module.detect_accelerator() == "cuda11"
+
+
+# ------------------------------------------------------------------- version
+def test_the_two_recorded_versions_agree():
+    """pyproject names the installer; __version__ had drifted two releases."""
+    import tomllib
+    from pathlib import Path as P
+
+    import whisper_flow
+
+    root = P(__file__).resolve().parent.parent
+    declared = tomllib.load(open(root / "pyproject.toml", "rb"))["project"]["version"]
+    assert whisper_flow.__version__ == declared

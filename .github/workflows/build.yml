@@ -117,10 +117,17 @@ jobs:
 
       - name: Bundle the speech engine and a model
         # So the app transcribes the moment it is installed, with no network
-        # and no setup step. The CPU engine plus a small model is what fits:
-        # the CUDA engine and large model come to 2.2GB together, over the 2GB
-        # ceiling on a release asset, so those are fetched later on machines
-        # that can use them.
+        # and no setup step.
+        #
+        # base.en, not something larger. This one model has to be right on
+        # every machine that runs the installer, from a two-core laptop to a
+        # workstation, and a model too big for the CPU it lands on does not
+        # transcribe slowly - it falls behind speech and is useless. base.en
+        # keeps up everywhere and asks ~250MB of RAM. Machines that can do
+        # better are offered better in the setup window: small.en on a strong
+        # CPU, large-v3-turbo on an NVIDIA GPU. The CUDA engine and the large
+        # model could not ship here anyway - together they are 2.2GB, past the
+        # 2GB ceiling on a release asset.
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -140,10 +147,10 @@ jobs:
           Copy-Item "$($src.Directory)/*" $engine -Recurse -Force
           Remove-Item engine.zip, engine-tmp -Recurse -Force
 
-          Write-Host "Downloading ggml-small.en..."
+          Write-Host "Downloading ggml-base.en..."
           Invoke-WebRequest `
-            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en.bin" `
-            -OutFile "$models/ggml-small.en.bin"
+            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin" `
+            -OutFile "$models/ggml-base.en.bin"
 
           "{0:N0}MB bundled" -f ((Get-ChildItem $dist -Recurse |
             Measure-Object Length -Sum).Sum / 1MB) | Write-Host

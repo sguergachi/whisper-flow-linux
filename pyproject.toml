@@ -1,6 +1,6 @@
 [project]
 name = "whisper-flow"
-version = "0.2.0"
+version = "0.3.0"
 description = "AI-powered voice-to-text flow application with context-aware processing"
 readme = "README.md"
 authors = [

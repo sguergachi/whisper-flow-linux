@@ -33,9 +33,23 @@ def daemon(temp_config_dir):
 
 
 # ------------------------------------------------------------ launching it
-def test_no_setup_window_off_windows(daemon, monkeypatch):
+def test_no_setup_window_on_a_headless_machine(daemon, monkeypatch):
+    """A daemon on a server has no screen to put this on."""
     monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.delenv("DISPLAY", raising=False)
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
     assert daemon._open_setup_window() is False
+
+
+def test_the_window_opens_on_a_linux_desktop(daemon, monkeypatch):
+    """Linux laptops need the same one button; install() works there now."""
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(sys, "frozen", False, raising=False)
+    monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")
+    with patch("whisper_flow.daemon.subprocess.Popen") as popen:
+        popen.return_value.poll.return_value = None
+        assert daemon._open_setup_window() is True
+    assert popen.call_args[0][0][1:] == ["-m", "whisper_flow.setup_ui"]
 
 
 def test_the_frozen_build_relaunches_itself_with_setup(daemon, monkeypatch):

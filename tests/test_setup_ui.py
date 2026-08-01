@@ -22,13 +22,13 @@ pytestmark = pytest.mark.skipif(
 def window(tmp_path, monkeypatch):
     monkeypatch.setenv("WHISPER_FLOW_CONFIG_DIR", str(tmp_path))
     from whisper_flow import backend as backend_module
-    from whisper_flow import setup_win
+    from whisper_flow import setup_ui
 
     monkeypatch.setattr(backend_module, "detect_accelerator", lambda: "cuda12")
-    monkeypatch.setattr(setup_win, "detect_accelerator", lambda: "cuda12")
+    monkeypatch.setattr(setup_ui, "detect_accelerator", lambda: "cuda12")
 
     try:
-        w = setup_win.SetupWindow()
+        w = setup_ui.SetupWindow()
     except tk.TclError as e:
         pytest.skip(f"no usable display: {e}")
     w.config.config_dir = tmp_path

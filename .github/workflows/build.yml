@@ -116,28 +116,36 @@ jobs:
         run: pyinstaller --noconfirm --clean whisper-flow.spec
 
       - name: Build the installer
-        shell: bash
+        # PowerShell, not bash: Git Bash rewrites arguments that look like
+        # POSIX paths, and turned Inno's /O switch into a path it rejected.
+        shell: pwsh
         run: |
-          VERSION=$(python -c "import tomllib;print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
-          cp packaging/windows/README-windows.md packaging/windows/dist/whisper-flow/README.md
-          # Inno Setup ships on the runner images, but not at a path worth
-          # hard-coding across image versions.
-          ISCC=$(find "/c/Program Files (x86)" "/c/Program Files" \
-                   -maxdepth 3 -name ISCC.exe 2>/dev/null | head -1)
-          if [[ -z "$ISCC" ]]; then
-            echo "::error::Inno Setup (ISCC.exe) not found on this runner"
-            exit 1
-          fi
-          echo "using $ISCC"
-          "$ISCC" //DAppVersion="$VERSION" //O"$(pwd)/installer-out" \
-            packaging/windows/installer.iss
-          ls -la installer-out
-          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          $version = python -c "import tomllib;print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])"
+          Copy-Item packaging/windows/README-windows.md `
+                    packaging/windows/dist/whisper-flow/README.md
+
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            $found = Get-ChildItem "C:\Program Files (x86)","C:\Program Files" `
+                       -Filter ISCC.exe -Recurse -ErrorAction SilentlyContinue |
+                     Select-Object -First 1
+            if (-not $found) { throw "Inno Setup (ISCC.exe) not found on this runner" }
+            $iscc = $found.FullName
+          }
+          Write-Host "using $iscc"
+
+          & $iscc "/DAppVersion=$version" "/O$PWD\installer-out" `
+                  packaging\windows\installer.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with $LASTEXITCODE" }
+
+          Get-ChildItem installer-out
+          "VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Also keep the plain folder, for anyone who will not run an installer
-        shell: bash
+        shell: pwsh
         run: |
-          mv packaging/windows/dist/whisper-flow "whisper-flow-${VERSION}-windows"
+          Move-Item packaging/windows/dist/whisper-flow `
+                    "whisper-flow-$env:VERSION-windows"
 
       - uses: actions/upload-artifact@v4
         with:

@@ -134,10 +134,33 @@ def _proto():
 class BlurHandle:
     """Keeps the blur objects alive; dropping it would drop the effect."""
 
-    def __init__(self, manager, effect_surface, queue):
+    def __init__(self, manager, effect_surface, queue, display, region, version):
         self._manager = manager
         self._effect_surface = effect_surface
         self._queue = queue
+        self._display = display
+        self._region = region
+        self._version = version
+        self.active = False
+
+    def set_active(self, on: bool):
+        """Turn the effect on or off.
+
+        The blur cannot be faded - the compositor applies it at full strength
+        or not at all - so it has to be switched at a moment when the change
+        is not visible. A NULL region removes the effect; the stored region
+        restores it.
+        """
+        if on == self.active:
+            return
+        wl = _wl()
+        wl.wl_proxy_marshal_flags(
+            ctypes.c_void_p(self._effect_surface), SURFACE_SET_BLUR_REGION,
+            None, ctypes.c_uint32(self._version), ctypes.c_uint32(0),
+            ctypes.c_void_p(self._region) if on else None,
+        )
+        wl.wl_display_flush(ctypes.c_void_p(self._display))
+        self.active = on
 
 
 def pill_rects(width: int, height: int, exponent: float,
@@ -175,7 +198,7 @@ def pill_rects(width: int, height: int, exponent: float,
 
 def enable_blur(wl_display: int, wl_surface: int,
                 width: int, height: int, exponent: float,
-                inset: int = 0) -> BlurHandle | None:
+                inset: int = 0, active: bool = True) -> BlurHandle | None:
     """Ask the compositor to blur behind wl_surface.
 
     A region must be supplied and it must be non-empty: the protocol starts
@@ -311,8 +334,10 @@ def enable_blur(wl_display: int, wl_surface: int,
     )
     wl.wl_display_flush(ctypes.c_void_p(wl_display))
 
-    handle = BlurHandle(manager, effect, queue)
+    handle = BlurHandle(manager, effect, queue, wl_display, region, version)
+    handle.active = True
     handle._listener = listener  # the callbacks must outlive the registry
-    handle._region = region
     handle._compositor = compositor
+    if not active:
+        handle.set_active(False)
     return handle

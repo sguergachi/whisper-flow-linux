@@ -134,6 +134,16 @@ window, window.background { background-color: transparent; }
 """
 
 
+def _unix_signal_add(sig, callback):
+    """Route a POSIX signal through the main loop, across GLib versions."""
+    try:
+        gi.require_version("GLibUnix", "2.0")
+        from gi.repository import GLibUnix
+        return GLibUnix.signal_add(GLib.PRIORITY_HIGH, sig, callback)
+    except (ValueError, ImportError, AttributeError):
+        return GLib.unix_signal_add(GLib.PRIORITY_HIGH, sig, callback)
+
+
 def _ease(t: float) -> float:
     """Smoothstep: eases out of rest and into rest, unlike a linear ramp."""
     t = max(0.0, min(1.0, t))
@@ -272,7 +282,7 @@ class HudWindow(Gtk.Window):
         # the main loop so the pill can fade out instead of blinking away;
         # the manager waits a couple of seconds, which is ample.
         for sig in (signal.SIGTERM, signal.SIGINT):
-            GLib.unix_signal_add(GLib.PRIORITY_HIGH, sig, self._on_signal)
+            _unix_signal_add(sig, self._on_signal)
         self.connect("realize", self._on_realize)
         _mark("window constructed")
 
@@ -326,7 +336,8 @@ class HudWindow(Gtk.Window):
                 ctypes.c_void_p(_gobject_pointer(surface)))
             _mark("realize: blur start")
             self._blur = enable_blur(
-                wl_display, wl_surface, WIDTH, HEIGHT, SQUIRCLE_N, BLUR_INSET)
+                wl_display, wl_surface, WIDTH, HEIGHT, SQUIRCLE_N, BLUR_INSET,
+                active=False)
             _mark("realize: blur done")
             print(f"[HUD] blur {'enabled' if self._blur else 'unavailable'}", flush=True)
         except Exception as e:
@@ -343,6 +354,10 @@ class HudWindow(Gtk.Window):
         if self._quitting:
             return
         self._quitting = True
+        if self._blur is not None:
+            # Drop the blur while the pill is still opaque enough to hide the
+            # change; otherwise it lingers as a blurred patch as alpha falls.
+            self._blur.set_active(False)
         self._fade_out_from = self.alpha
         self._fade_out_t0 = time.monotonic()
         # Backstop in case the frame timer stops before the fade completes.
@@ -425,6 +440,11 @@ class HudWindow(Gtk.Window):
         now = time.monotonic()
         if self._fade_out_t0 is None:
             self.alpha = _ease((now - self._fade_in_t0) * 1000.0 / FADE_MS)
+            # Only once the glass is opaque: the compositor blur cannot be
+            # faded, so switching it while the pill is still translucent shows
+            # a bare blurred patch with hard edges instead of a fade.
+            if self.alpha >= 0.999 and self._blur is not None:
+                self._blur.set_active(True)
         else:
             t = (now - self._fade_out_t0) * 1000.0 / FADE_MS
             self.alpha = self._fade_out_from * (1.0 - _ease(t))

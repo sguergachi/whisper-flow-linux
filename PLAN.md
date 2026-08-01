@@ -8,13 +8,26 @@ verified — not when written.
 - [ ] **Make the overlay appear instantly (target 10x)** — still slow on
       Windows after the import fix. See "Overlay latency" below for the
       techniques and which one is the real win.
-- [ ] **Windows-specific tests in GitHub Actions** — the Windows code is
-      currently only tested on Linux with `ctypes.WinDLL` stubbed, so nothing
-      exercises the real Win32 calls. Add a `windows-latest` test job.
 - [ ] **Velopack installer** (the maintained successor to Squirrel) — fast
       install, delta updates, in-app auto-update.
 - [ ] **Always start on Windows login** — via the installer's Startup
       shortcut, not a manual step.
+
+## Windows CI: what it does and does not prove
+
+The `test (windows)` job runs on a real `windows-latest` runner — build
+26100, so `blur_win.is_supported()` is True there and the DWM path is
+exercised. 161 passed, 5 skipped, and 10 Windows-only tests collected.
+
+It **does** prove: the clipboard round-trips through Win32 (including a
+400-line report), `GetAsyncKeyState` polling works, `RtlGetVersion` returns
+a real build, the overlay process starts and stays up, and the package does
+not drag in the openai SDK.
+
+It **cannot** prove: anything needing a GPU, a microphone (the runner has no
+audio device, so recording itself is untested), or Windows 11 desktop
+behaviour like acrylic actually rendering. It is Windows Server, not
+Windows 11 — the APIs are the same, the desktop is not.
 
 ## Overlay latency
 
@@ -62,6 +75,10 @@ Techniques, in order of expected gain:
 - [x] Windows trace pass: overlay draws without blur, right Windows key,
       `Local\` mutex, PowerShell quoting, clipboard encoding, frame loop
 - [x] Same hotkey on both platforms (Super+Alt)
+- [x] Windows tests running on a Windows runner in CI, gating the installer
+      — first run immediately caught the clipboard being broken on 64-bit
+      Windows (undeclared ctypes signatures truncating handles) and logging
+      dying on a cp1252 console
 
 ## Notes
 

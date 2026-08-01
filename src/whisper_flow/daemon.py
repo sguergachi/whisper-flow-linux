@@ -847,11 +847,16 @@ class WhisperFlowDaemon:
 
         copied = False
         try:
-            copied = self.transcribe_app.system_manager.copy_to_clipboard(text)
+            copied = bool(
+                self.transcribe_app.system_manager.copy_to_clipboard(text))
         except Exception as e:
             log(f"[DAEMON] could not copy the failure report: {e}")
 
-        suffix = " - details copied to clipboard" if copied else ""
+        # Say which happened. Silently dropping the report is how this went
+        # unnoticed: the notification looked the same whether the clipboard
+        # held the details or nothing at all.
+        suffix = (" - details copied to clipboard" if copied
+                  else " - could not reach the clipboard")
         self.notify(f"❌ {headline}{suffix}")
 
     def copy_last_error(self, icon=None, item=None):

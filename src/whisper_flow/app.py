@@ -209,7 +209,7 @@ class WhisperFlow:
             # Paste the result
             if not self.system_manager.paste_text(final_result):
                 log("Failed to paste text, copying to clipboard...")
-                self.system_manager._copy_to_clipboard(final_result)
+                self.system_manager.copy_to_clipboard(final_result)
 
             return True
 

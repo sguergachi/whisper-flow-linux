@@ -289,8 +289,8 @@ class SystemManager:
 
                 _sys.stdout.write("[PASTE] Direct type failed, copying to clipboard\n")
                 _sys.stdout.flush()
-                if not self._copy_to_clipboard(sanitized):
-                    _sys.stdout.write("[PASTE] _copy_to_clipboard failed\n")
+                if not self.copy_to_clipboard(sanitized):
+                    _sys.stdout.write("[PASTE] copy_to_clipboard failed\n")
                     _sys.stdout.flush()
                     return False
 
@@ -358,8 +358,15 @@ class SystemManager:
         _sys.stdout.flush()
         return False
 
-    def _copy_to_clipboard(self, text: str) -> bool:
-        """Copy text to system clipboard.
+    def copy_to_clipboard(self, text: str) -> bool:
+        """Copy text to the system clipboard.
+
+        Public because failure reporting depends on it. It was private, and
+        the daemon called the public name that did not exist - so every
+        attempt to put a failure report on the clipboard raised
+        AttributeError into a handler that turned it into "not copied", and
+        the feature never worked once. The tests missed it by mocking the
+        very attribute whose absence was the bug.
 
         Args:
             text: Text to copy
@@ -372,29 +379,42 @@ class SystemManager:
             if IS_WINDOWS:
                 return system_win.copy_to_clipboard(text)
             if self._is_wayland() and shutil.which("wl-copy"):
-                p = subprocess.Popen(
-                    ["wl-copy"],
-                    stdin=subprocess.PIPE,
-                )
-                p.communicate(text.encode())
-                return p.returncode == 0
+                return self._pipe_to_clipboard(["wl-copy"], text)
             if shutil.which("xclip"):
-                p = subprocess.Popen(
-                    ["xclip", "-selection", "clipboard"],
-                    stdin=subprocess.PIPE,
-                )
-                p.communicate(text.encode())
-                return p.returncode == 0
+                return self._pipe_to_clipboard(
+                    ["xclip", "-selection", "clipboard"], text)
             if shutil.which("xsel"):
-                p = subprocess.Popen(
-                    ["xsel", "--clipboard", "--input"],
-                    stdin=subprocess.PIPE,
-                )
-                p.communicate(text.encode())
-                return p.returncode == 0
+                return self._pipe_to_clipboard(
+                    ["xsel", "--clipboard", "--input"], text)
             return False
         except Exception:
             return False
+
+    @staticmethod
+    def _pipe_to_clipboard(command: list[str], text: str) -> bool:
+        """Hand text to a clipboard helper without waiting on it forever.
+
+        wl-copy and xclip both keep a process alive to serve the selection to
+        whoever pastes it. They normally fork so the one launched here still
+        exits, which is why the previous unbounded communicate() worked in
+        practice - but it is bounded now, because this runs on the recording
+        thread while reporting a failure, and that is a poor place to be
+        waiting on a helper that has decided to stay in the foreground.
+
+        A helper still running after the write is the successful case, not a
+        failure. It must not be killed: for wl-copy and xclip that process
+        *is* the clipboard, so killing it discards what was just copied.
+        """
+        process = subprocess.Popen(command, stdin=subprocess.PIPE)
+        try:
+            process.stdin.write(text.encode())
+            process.stdin.close()
+        except (BrokenPipeError, OSError):
+            return False
+        try:
+            return process.wait(timeout=2) == 0
+        except subprocess.TimeoutExpired:
+            return True             # alive and holding the selection
 
     def get_highlighted_text(self) -> str | None:
         """Get currently highlighted/selected text.

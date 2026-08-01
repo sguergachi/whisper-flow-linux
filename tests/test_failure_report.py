@@ -48,11 +48,20 @@ def daemon():
 
 
 def _clipboard(daemon):
-    """Capture what gets copied, and report success."""
+    """Capture what gets copied, and report success.
+
+    The mock is spec'd against the real SystemManager, so if the daemon ever
+    calls a clipboard method that does not exist, this fails instead of
+    silently reporting "not copied" the way the shipped bug did.
+    """
+    from whisper_flow.system import SystemManager
+
     seen = {}
-    daemon.transcribe_app.system_manager.copy_to_clipboard = (
+    manager = Mock(spec=SystemManager)
+    manager.copy_to_clipboard.side_effect = (
         lambda text: seen.setdefault("text", text) is None or True
     )
+    daemon.transcribe_app.system_manager = manager
     return seen
 
 
@@ -100,16 +109,21 @@ def test_the_notification_says_the_details_were_copied(daemon):
 
 
 def test_a_failure_is_still_announced_when_the_clipboard_refuses(daemon):
-    daemon.transcribe_app.system_manager.copy_to_clipboard = lambda text: False
+    from whisper_flow.system import SystemManager
+    manager = Mock(spec=SystemManager)
+    manager.copy_to_clipboard.return_value = False
+    daemon.transcribe_app.system_manager = manager
     daemon._report_failure("Recording failed")
     message = daemon.notify.call_args[0][0]
     assert "Recording failed" in message
-    assert "copied" not in message               # do not claim what did not happen
+    assert "could not reach the clipboard" in message
 
 
 def test_a_broken_clipboard_does_not_swallow_the_failure(daemon):
-    daemon.transcribe_app.system_manager.copy_to_clipboard = Mock(
-        side_effect=OSError("no clipboard"))
+    from whisper_flow.system import SystemManager
+    manager = Mock(spec=SystemManager)
+    manager.copy_to_clipboard.side_effect = OSError("no clipboard")
+    daemon.transcribe_app.system_manager = manager
     daemon._report_failure("Recording failed")
     daemon.notify.assert_called_once()
 
@@ -150,3 +164,103 @@ def test_copying_says_so_when_nothing_has_failed(daemon):
     _clipboard(daemon)
     daemon.copy_last_error()
     assert "No errors" in daemon.notify.call_args[0][0]
+
+
+# ------------------------------------------------- the interface really exists
+def test_system_manager_actually_has_the_method_the_daemon_calls():
+    """The bug: the daemon called copy_to_clipboard, the method was private.
+
+    Every other test mocked the name it wished for, so nothing noticed until
+    a real failure produced an empty clipboard.
+    """
+    from whisper_flow.system import SystemManager
+
+    assert callable(getattr(SystemManager, "copy_to_clipboard", None))
+
+
+def test_the_daemon_only_calls_methods_system_manager_defines(daemon):
+    """A spec'd mock raises on anything SystemManager does not define."""
+    from whisper_flow.system import SystemManager
+
+    manager = Mock(spec=SystemManager)
+    daemon.transcribe_app.system_manager = manager
+    daemon._report_failure("Recording failed (transcribe)")
+    manager.copy_to_clipboard.assert_called_once()
+
+
+def test_the_report_reaches_a_real_system_manager(tmp_path, monkeypatch):
+    """End to end through the actual class, not a mock of it.
+
+    This is the test that would have caught the shipped bug: it exercises
+    the real SystemManager, with only the platform clipboard call replaced.
+    """
+    from whisper_flow.config import Config
+    from whisper_flow.system import SystemManager
+
+    monkeypatch.setenv("WHISPER_FLOW_CONFIG_DIR", str(tmp_path))
+    manager = SystemManager(Config(config_dir=tmp_path))
+
+    captured = {}
+    monkeypatch.setattr(manager, "_is_wayland", lambda: False)
+    monkeypatch.setattr("whisper_flow.system.shutil.which",
+                        lambda name: "/usr/bin/xclip" if name == "xclip" else None)
+
+    class FakeStdin:
+        def write(self, data):
+            captured["data"] = data
+
+        def close(self):
+            captured["closed"] = True
+
+    class FakeProc:
+        stdin = FakeStdin()
+
+        def wait(self, timeout=None):
+            return 0
+
+    monkeypatch.setattr("whisper_flow.system.subprocess.Popen",
+                        lambda *a, **k: FakeProc())
+
+    assert manager.copy_to_clipboard("hello report") is True
+    assert b"hello report" in captured["data"]
+
+
+def test_a_clipboard_helper_that_stays_alive_counts_as_success(monkeypatch):
+    """wl-copy and xclip keep running to serve the selection; that is normal."""
+    import subprocess
+
+    from whisper_flow.system import SystemManager
+
+    class Stdin:
+        def write(self, data): pass
+        def close(self): pass
+
+    class Lingering:
+        stdin = Stdin()
+
+        def wait(self, timeout=None):
+            raise subprocess.TimeoutExpired("wl-copy", timeout)
+
+    monkeypatch.setattr("whisper_flow.system.subprocess.Popen",
+                        lambda *a, **k: Lingering())
+    assert SystemManager._pipe_to_clipboard(["wl-copy"], "text") is True
+
+
+def test_a_helper_that_will_not_take_the_text_is_a_failure(monkeypatch):
+    from whisper_flow.system import SystemManager
+
+    class Stdin:
+        def write(self, data):
+            raise BrokenPipeError("gone")
+
+        def close(self): pass
+
+    class Dead:
+        stdin = Stdin()
+
+        def wait(self, timeout=None):
+            return 1
+
+    monkeypatch.setattr("whisper_flow.system.subprocess.Popen",
+                        lambda *a, **k: Dead())
+    assert SystemManager._pipe_to_clipboard(["wl-copy"], "text") is False

@@ -46,13 +46,23 @@ def mock_config():
 
 @pytest.fixture
 def mock_system_manager():
-    """Create a mock system manager."""
-    manager = Mock()
+    """A mock that can only do what SystemManager can actually do.
+
+    spec= matters here. A bare Mock invents any attribute asked of it, so a
+    test calling a method that does not exist passes happily while the real
+    call raises AttributeError - which is exactly how the clipboard in the
+    failure reports shipped broken: the daemon called copy_to_clipboard, the
+    method was named _copy_to_clipboard, and every test mocked the name it
+    wanted rather than the name that existed.
+    """
+    from whisper_flow.system import SystemManager
+
+    manager = Mock(spec=SystemManager)
     manager.notify.return_value = None
     manager.get_active_window_title.return_value = "Test Window"
     manager.get_highlighted_text.return_value = None
     manager.paste_text.return_value = True
-    manager._copy_to_clipboard.return_value = None
+    manager.copy_to_clipboard.return_value = True
     return manager
 
 

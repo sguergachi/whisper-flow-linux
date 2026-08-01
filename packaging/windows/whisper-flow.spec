@@ -43,7 +43,10 @@ hud = Analysis(
     binaries=[],
     # Loaded by path at runtime, not imported, so PyInstaller cannot see it.
     datas=[("../../src/whisper_flow/blur_win.py", ".")],
-    hiddenimports=[],
+    # And because it cannot see it, nothing that file imports gets collected
+    # either. ctypes.wintypes is a submodule, not pulled in by importing
+    # ctypes, so the overlay died on its first line.
+    hiddenimports=["ctypes.wintypes", "tkinter", "tkinter.constants"],
     excludes=EXCLUDES + ["openai", "requests", "numpy"],
     cipher=block_cipher,
 )

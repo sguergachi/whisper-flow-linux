@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 from .config import Config
 
@@ -27,14 +28,23 @@ class SystemManager:
         self._wayland = os.environ.get("WAYLAND_DISPLAY", "") != ""
         self._xdg_session = os.environ.get("XDG_SESSION_TYPE", "")
         self._saved_window = None
+        self._last_notified: dict[str, float] = {}
 
     def notify(self, message: str) -> None:
-        """Send desktop notification.
+        """Send a desktop notification, unless it is a repeat.
+
+        A failure that recurs - a mic that will not open, a transcription
+        server that is down - fires this on every attempt, and on Windows each
+        one spawns a PowerShell toast. Identical messages are suppressed for a
+        short window so a persistent fault stays one notification.
 
         Args:
             message: Notification message
 
         """
+        if not self.should_notify(message):
+            return
+
         if IS_WINDOWS:
             system_win.notify("Whisper-Flow", message)
             return
@@ -49,6 +59,26 @@ class SystemManager:
             )
         else:
             print(f"[Whisper-Flow] {message}")
+
+    def should_notify(self, message: str) -> bool:
+        """Whether this message should be shown, or is a recent repeat.
+
+        Shared with the tray notification path so both obey one rate limit.
+        """
+        if not getattr(self.config, "notifications_enabled", True):
+            return False
+        now = time.monotonic()
+        window = getattr(self.config, "notification_min_interval", 5.0)
+        last = self._last_notified.get(message)
+        if last is not None and now - last < window:
+            return False
+        self._last_notified[message] = now
+        if len(self._last_notified) > 64:      # bounded; these are short-lived
+            cutoff = now - window
+            self._last_notified = {
+                k: v for k, v in self._last_notified.items() if v > cutoff
+            }
+        return True
 
     MODIFIER_CODES = ["29", "97", "56", "100", "125", "126", "42", "54"]
 

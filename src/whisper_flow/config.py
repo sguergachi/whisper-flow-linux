@@ -1,7 +1,44 @@
 """Configuration management for whisper-flow using Pydantic Settings."""
 
 import os
+import sys
 from pathlib import Path
+
+IS_WINDOWS = sys.platform == "win32"
+
+
+def default_config_dir() -> Path:
+    """Where settings live, per platform convention.
+
+    Windows puts per-user application data under LOCALAPPDATA; a dotfile
+    directory in the profile root is a Unix habit and looks misplaced there.
+    """
+    if IS_WINDOWS:
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+        return Path(base) / "whisper-flow"
+    return Path.home() / ".config" / "whisper-flow"
+
+
+def default_hotkeys() -> dict[str, str]:
+    """Sensible defaults for the platform.
+
+    Super is unusable as a hotkey on Windows: the shell reserves most Win
+    combinations and a bare tap opens the Start menu. Ctrl+Alt is free.
+    """
+    if IS_WINDOWS:
+        return {
+            "transcribe": "ctrl+alt",
+            "auto_transcribe": "ctrl+alt+space",
+            "command": "ctrl+shift+alt",
+        }
+    return {
+        "transcribe": "super+alt",
+        "auto_transcribe": "ctrl+alt+space",
+        "command": "cmd+shift+alt",
+    }
+
+
+_HOTKEYS = default_hotkeys()
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -13,7 +50,7 @@ def _resolve_env_file() -> str | os.PathLike[str]:
     Prefer ~/.config/whisper-flow/.env, fall back to project root,
     then CWD-relative ".env".
     """
-    config_env = Path.home() / ".config" / "whisper-flow" / ".env"
+    config_env = default_config_dir() / ".env"
     if config_env.exists():
         return config_env
     try:
@@ -44,7 +81,7 @@ class Config(BaseSettings):
 
     # File paths
     config_dir: Path = Field(
-        default_factory=lambda: Path.home() / ".config" / "whisper-flow",
+        default_factory=default_config_dir,
         description="Configuration directory path",
     )
 
@@ -167,6 +204,19 @@ class Config(BaseSettings):
         env="WHISPER_FLOW_QUEUE_REQUEST_TIMEOUT",
     )
 
+    notifications_enabled: bool = Field(
+        default=True,
+        description="Show desktop notifications at all",
+        env="WHISPER_FLOW_NOTIFICATIONS_ENABLED",
+    )
+    notification_min_interval: float = Field(
+        default=5.0,
+        description="Seconds before the same notification may repeat",
+        ge=0.0,
+        le=3600.0,
+        env="WHISPER_FLOW_NOTIFICATION_MIN_INTERVAL",
+    )
+
     # Live (streaming) transcription
     live_transcription: bool = Field(
         default=True,
@@ -190,17 +240,17 @@ class Config(BaseSettings):
 
     # Hotkey Configuration
     hotkey_transcribe: str = Field(
-        default="super+alt",
+        default_factory=lambda: _HOTKEYS["transcribe"],
         description="Hotkey for push-to-talk transcription",
         env="WHISPER_FLOW_HOTKEY_TRANSCRIBE",
     )
     hotkey_auto_transcribe: str = Field(
-        default="ctrl+alt+space",
+        default_factory=lambda: _HOTKEYS["auto_transcribe"],
         description="Hotkey for auto-stop transcription",
         env="WHISPER_FLOW_HOTKEY_AUTO_TRANSCRIBE",
     )
     hotkey_command: str = Field(
-        default="cmd+shift+alt",
+        default_factory=lambda: _HOTKEYS["command"],
         description="Hotkey for push-to-talk command mode",
         env="WHISPER_FLOW_HOTKEY_COMMAND",
     )

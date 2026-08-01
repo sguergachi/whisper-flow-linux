@@ -216,7 +216,13 @@ class WhisperFlowDaemon:
         self._finish_processing(mode or "unknown")
 
     def daemonize(self):
-        """Run as background process while preserving desktop session access."""
+        """Run as background process while preserving desktop session access.
+
+        POSIX only - this forks. Windows reaches the background through the
+        tray app being a GUI subsystem binary instead.
+        """
+        if sys.platform == "win32":
+            raise RuntimeError("daemonize() is POSIX-only; use run(foreground=True)")
         log("[DAEMON] Starting daemonization process...")
         # Simple approach: just fork once and redirect output
         # This preserves all environment and session access
@@ -641,10 +647,24 @@ class WhisperFlowDaemon:
         log("[DAEMON] Recording stopped and state reset")
 
     def notify(self, message: str):
-        """Send desktop notification."""
+        """Send a desktop notification.
+
+        Prefers the tray icon's own notification: it is native, costs nothing,
+        and on Windows avoids spawning a PowerShell process per message - which
+        is slow and, without the right flags, flashes a console window.
+        """
         log(f"[DAEMON] Notification: {message}")
-        # Use the system manager from one of our apps
-        self.transcribe_app.system_manager.notify(message)
+        manager = self.transcribe_app.system_manager
+        if not getattr(self.config, "notifications_enabled", True):
+            return
+        if self.tray_icon is not None:
+            try:
+                if manager.should_notify(message):
+                    self.tray_icon.notify(message, "Whisper-Flow")
+                return
+            except Exception:
+                pass  # not every tray backend implements it
+        manager.notify(message)
 
     def open_settings(self, icon, item):
         """Open settings directory in file manager."""
@@ -858,6 +878,30 @@ Use 'whisper-flow stop' to exit daemon
 
         sys.exit(0)
 
+    def _acquire_single_instance(self) -> bool:
+        """Refuse to start if another copy is already running.
+
+        Two daemons means two hotkey listeners: one press starts two
+        recordings, and both type their transcript into the same window. On
+        Windows a named mutex is the reliable check - a stale PID file is not,
+        because PIDs are reused aggressively there.
+        """
+        if sys.platform != "win32":
+            return True
+        try:
+            import ctypes
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            # Global\ so it is one instance per machine, not per session.
+            self._instance_mutex = kernel32.CreateMutexW(
+                None, False, "Global\\whisper-flow-daemon",
+            )
+            ERROR_ALREADY_EXISTS = 183
+            if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
+                return False
+            return True
+        except Exception:
+            return True  # never let the check itself stop the app
+
     @staticmethod
     def _check_platform_support() -> str | None:
         """Why this machine cannot run the app, or None if it can.
@@ -874,6 +918,11 @@ Use 'whisper-flow stop' to exit daemon
     def _run_worker(self, foreground: bool = False):
         """Run the worker process with health monitoring."""
         log(f"[DAEMON] Starting worker process (foreground={foreground})")
+        if not self._acquire_single_instance():
+            log("[DAEMON] Another instance is already running; exiting")
+            self.notify("whisper-flow is already running")
+            return
+
         unsupported = self._check_platform_support()
         if unsupported:
             log(f"[DAEMON] Unsupported platform: {unsupported}")

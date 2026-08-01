@@ -2,47 +2,56 @@
 
 **Requires Windows 11 22H2 (build 22621) or later.**
 
-Unzip anywhere and run `whisper-flow.exe`. It sits in the notification area;
-there is no window.
+Run the installer, then hold **Ctrl+Alt**, talk, and let go. The words are
+typed into whatever had focus.
+
+It lives in the notification area — there is no main window.
 
 ## What you need
 
-* A transcription backend. Either a local
+* A transcription backend: either a local
   [whisper.cpp](https://github.com/ggerganov/whisper.cpp) server, or an OpenAI
   API key.
 * A microphone.
 
 ## Configuration
 
-Settings are read from `%USERPROFILE%\.config\whisper-flow\.env`:
+`%LOCALAPPDATA%\whisper-flow\.env`:
 
 ```ini
-# Local server, or leave blank and set a key instead
+# A local server, or leave blank and set a key instead
 WHISPER_FLOW_LOCAL_WHISPER_URL=http://127.0.0.1:8082
 # WHISPER_FLOW_OPENAI_API_KEY=sk-...
 
 WHISPER_FLOW_HOTKEY_TRANSCRIBE=ctrl+alt
 WHISPER_FLOW_LIVE_TRANSCRIPTION=true
+
+# Set to false if the notifications get in the way
+WHISPER_FLOW_NOTIFICATIONS_ENABLED=true
 ```
 
-Hold the hotkey, talk, let go. With live transcription on, words are typed as
-you speak rather than all at once at the end.
+With live transcription on, words are typed as you speak rather than all at
+once at the end. A word is only typed once two consecutive passes agree on
+it, so what lands is what the final transcript says.
 
-## How it differs from the Linux build
+## How it works here, and how that differs from Linux
 
-* **The overlay is composited by DWM.** Acrylic backdrop, rounded corners and
-  border all come from `DwmSetWindowAttribute`, which is why the build floor
-  is 22H2. Earlier builds are refused with a message rather than started into
-  a half-working state - the daemon checks before it opens anything.
-* **Super/Win as a hotkey is a poor choice here.** The shell claims it, and
-  unlike the Linux build this one does not intercept the key. `ctrl+alt` is
-  the default instead.
+* **Hotkeys are polled, not hooked.** A low-level keyboard hook is the usual
+  approach and is the wrong one in Python: its callback needs the GIL, and
+  while another thread holds it Windows blocks *all* system input waiting —
+  the mouse and keyboard freeze. Polling key state cannot stall anything and
+  cannot swallow a keystroke.
+* **The overlay is composited by DWM** — acrylic backdrop, rounded corners,
+  border — which is why the build floor is 22H2.
+* **Ctrl+Alt is the default, not Super.** Windows reserves most Win
+  combinations and a bare tap opens the Start menu.
 
 ## Known limitations
 
-* The hotkey listener uses a low-level keyboard hook. Windows will silently
-  drop the hook if the machine is under heavy load; the daemon notices and
-  reinstalls it, but a keypress can be missed while that happens.
-* Applications running as administrator will not receive typed text unless
-  whisper-flow is also running as administrator. This is a Windows security
-  boundary, not something the app can work around.
+* A key press shorter than about 16ms can be missed, since hotkeys are
+  sampled at 60Hz. This does not matter for hold-to-talk.
+* Applications running as administrator will not accept typed text unless
+  whisper-flow also runs as administrator. That is a Windows security
+  boundary, not something an application can work around.
+* Only one copy runs at a time. A second is refused rather than started,
+  because two hotkey listeners would record and type twice.

@@ -115,18 +115,36 @@ jobs:
         working-directory: packaging/windows
         run: pyinstaller --noconfirm --clean whisper-flow.spec
 
-      - name: Stage the release folder
+      - name: Build the installer
         shell: bash
         run: |
           VERSION=$(python -c "import tomllib;print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          cp packaging/windows/README-windows.md packaging/windows/dist/whisper-flow/README.md
+          # Inno Setup ships on the runner images, but not at a path worth
+          # hard-coding across image versions.
+          ISCC=$(find "/c/Program Files (x86)" "/c/Program Files" \
+                   -maxdepth 3 -name ISCC.exe 2>/dev/null | head -1)
+          if [[ -z "$ISCC" ]]; then
+            echo "::error::Inno Setup (ISCC.exe) not found on this runner"
+            exit 1
+          fi
+          echo "using $ISCC"
+          "$ISCC" //DAppVersion="$VERSION" //O"$(pwd)/installer-out" \
+            packaging/windows/installer.iss
+          ls -la installer-out
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Also keep the plain folder, for anyone who will not run an installer
+        shell: bash
+        run: |
           mv packaging/windows/dist/whisper-flow "whisper-flow-${VERSION}-windows"
-          cp packaging/windows/README-windows.md "whisper-flow-${VERSION}-windows/README.md"
-          echo "ARTIFACT=whisper-flow-${VERSION}-windows" >> "$GITHUB_ENV"
 
       - uses: actions/upload-artifact@v4
         with:
           name: windows-build
-          path: ${{ env.ARTIFACT }}
+          path: |
+            installer-out/*.exe
+            whisper-flow-${{ env.VERSION }}-windows
 
   release:
     name: release
@@ -151,10 +169,15 @@ jobs:
         with:
           path: artifacts
 
-      - name: Zip the Windows folder
+      - name: Lay out the Windows downloads
         run: |
+          # The installer is the headline download; the folder is zipped for
+          # anyone who would rather not run one.
+          mkdir -p release-files
+          cp artifacts/windows-build/installer-out/*.exe release-files/
           cd artifacts/windows-build
-          zip -qr ../whisper-flow-windows.zip .
+          rm -rf installer-out
+          zip -qr "$GITHUB_WORKSPACE/release-files/whisper-flow-windows-portable.zip" .
 
       - name: Work out what kind of release this is
         id: plan
@@ -194,8 +217,10 @@ jobs:
           Needs GTK4, gtk4-layer-shell and ydotool; the installer checks and
           tells you what is missing.
 
-          **Windows** - unpack \`whisper-flow-windows.zip\` and run
-          \`whisper-flow.exe\`. Requires Windows 11 22H2 or later."
+          **Windows** - run \`whisper-flow-*-setup.exe\`. Installs per-user, no
+          admin needed, and can start with you at sign-in. Requires Windows 11
+          22H2 or later. The portable zip is the same build without an
+          installer."
 
           gh release create "$TAG" \
             --title "${{ steps.plan.outputs.title }}" \
@@ -204,4 +229,4 @@ jobs:
             ${{ steps.plan.outputs.prerelease == 'true' && '--prerelease' || '' }} \
             artifacts/linux-installer/*.tar.gz \
             artifacts/linux-installer/dist/*.whl \
-            artifacts/whisper-flow-windows.zip
+            release-files/*

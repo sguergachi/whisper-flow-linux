@@ -75,7 +75,8 @@ BLUR_INSET = 2
 FADE_STEP = 0.30     # opacity per frame at ~60fps; ~4 frames to fully opaque
 LEVEL_EASE = 0.30    # how fast a bar chases its target height
 PEAK_DECAY = 0.95    # adaptive gain, so quiet speech still reads
-PEAK_FLOOR = 260.0
+PEAK_FLOOR = 150.0   # below this the gain stops opening up, or idle noise dances
+LEVEL_GAMMA = 0.65   # loudness is perceptual; linear RMS leaves speech near flat
 
 CSS = b"""
 window, window.background { background-color: transparent; }
@@ -250,7 +251,7 @@ class HudWindow(Gtk.Window):
         for v in vals:
             v = abs(v)
             self.peak = max(self.peak * PEAK_DECAY, float(v), PEAK_FLOOR)
-            self.targets.append(min(1.0, v / self.peak))
+            self.targets.append(min(1.0, (v / self.peak) ** LEVEL_GAMMA))
         return True
 
     def _draw(self, area, cr, w, h):

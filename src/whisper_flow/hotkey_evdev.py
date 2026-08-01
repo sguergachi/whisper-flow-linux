@@ -226,9 +226,17 @@ class EvdevHotkeyListener:
         code = CODE_ALIASES.get(event.code, event.code)
         value = event.value
 
+        if value == 2:
+            # Auto-repeat. Never a state change: holding a push-to-talk combo
+            # generates these continuously, and treating one as a release ends
+            # the recording about half a second after it starts.
+            if code not in self._swallowed and code not in self._pending:
+                self._forward(event)
+            return
+
         if value == 1:
             if code in self._swallowed:
-                return  # auto-repeat of a hidden key
+                return
             self._key_state.add(code)
 
             if code in self._participants:
@@ -238,9 +246,6 @@ class EvdevHotkeyListener:
                 # bare modifier tap and opens the launcher.
                 self._pending.append(code)
                 self._check_bindings(rising=True)
-                if code not in self._swallowed and code in self._pending:
-                    # Still ambiguous - leave it pending until we know more.
-                    pass
                 return
 
             # An unrelated key: whatever was held back was a real modifier

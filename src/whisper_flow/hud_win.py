@@ -7,8 +7,10 @@ the rounded outline.
 
 What differs from Linux, and why:
 
-  * No compositor blur. Windows has no equivalent of ext-background-effect,
-    so the pill is a solid dark panel rather than glass.
+  * Blur comes from DWM rather than ext-background-effect - see blur_win -
+    and the tint is the compositor's acrylic instead of one this draws. The
+    window keeps a uniform alpha so the blur shows through what is painted
+    over it; an opaque canvas would hide the effect entirely.
   * Corners come from SetWindowRgn, which is a hard-edged mask with no
     antialiasing. The alternative, per-pixel alpha through UpdateLayeredWindow,
     means giving up tkinter's drawing entirely for a fairly small gain.
@@ -25,6 +27,26 @@ import time
 import tkinter as tk
 from collections import deque
 
+
+def _load_sibling(name):
+    """Load a module next to this file by path.
+
+    The supervisor runs this with PYTHONSAFEPATH=1, which keeps the script's
+    own directory off sys.path, so a plain import would not find it. Going
+    through the package instead would drag in the daemon and pystray.
+    """
+    import importlib.util
+    # A frozen build unpacks bundled files to _MEIPASS, not beside __file__.
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    path = os.path.join(base, f"{name}.py")
+    spec = importlib.util.spec_from_file_location(f"_hud_{name}", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+enable_blur = _load_sibling("blur_win").enable_blur
+
 WIDTH = 268
 HEIGHT = 54
 RADIUS = HEIGHT // 2
@@ -38,13 +60,16 @@ BARS = 30
 BAR_W = 3
 BAR_MAX = 15
 
+# Painted behind everything. Kept dark but relied on being seen through the
+# window's alpha, so the acrylic blur underneath still reads.
 BG = "#0a0a0c"
 BAR_COLOUR = "#f2f2f5"
 DOT_COLOUR = "#ff4548"
 OUTLINE = "#6b6c73"
 
 FADE_MS = 200.0
-TARGET_ALPHA = 0.94
+TARGET_ALPHA = 0.78   # with blur behind it
+OPAQUE_ALPHA = 0.97   # without
 FRAME_MS = 16
 LEVEL_MS = 33
 LEVEL_EASE = 0.30
@@ -116,12 +141,14 @@ class HudWindow:
         self.level_pos = 0
         self._drag_from = None
         self._quitting = False
+        self._blur = None
 
         self.canvas.bind("<Button-1>", self._on_press)
         self.canvas.bind("<B1-Motion>", self._on_drag)
         self.canvas.bind("<ButtonRelease-1>", self._on_release)
 
         self.root.after(0, self._round_corners)
+        self.root.after(0, self._enable_blur)
         self.root.after(FRAME_MS, self._frame)
         self.root.after(LEVEL_MS, self._read_levels)
 
@@ -137,6 +164,17 @@ class HudWindow:
             ctypes.windll.user32.SetWindowRgn(hwnd, region, True)
         except Exception as e:
             print(f"[HUD] could not round corners: {e}", flush=True)
+
+    def _enable_blur(self):
+        """Ask DWM to blur the backdrop, and note whether it agreed."""
+        try:
+            self.root.update_idletasks()
+            hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
+            self._blur = enable_blur(hwnd)
+            print(f"[HUD] blur: {self._blur or 'unavailable, drawing opaque'}",
+                  flush=True)
+        except Exception as e:
+            print(f"[HUD] blur setup failed: {e}", flush=True)
 
     def _start_position(self):
         saved = _load_positions().get("default")
@@ -188,7 +226,11 @@ class HudWindow:
                 self.root.destroy()
                 return
         try:
-            self.root.attributes("-alpha", self.alpha * TARGET_ALPHA)
+            # Blurred: hold the window translucent so the acrylic shows
+            # through. Not blurred: go opaque, or the pill is just a dim
+            # rectangle over whatever is behind it.
+            ceiling = TARGET_ALPHA if self._blur else OPAQUE_ALPHA
+            self.root.attributes("-alpha", self.alpha * ceiling)
         except tk.TclError:
             return
 

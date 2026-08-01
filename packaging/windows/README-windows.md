@@ -28,9 +28,11 @@ you speak rather than all at once at the end.
 
 ## How it differs from the Linux build
 
-* **No background blur.** Windows has no equivalent of the Wayland
-  `ext-background-effect` protocol, so the overlay is a solid dark panel
-  instead of frosted glass.
+* **Blur comes from DWM.** Windows 11 22H2 and later get acrylic through
+  `DWMWA_SYSTEMBACKDROP_TYPE`; Windows 10 1803 and later fall back to the
+  undocumented accent policy. On a build with neither, the overlay turns
+  itself opaque rather than sitting there as a dim rectangle. The HUD log
+  says which route it took.
 * **The overlay's rounded corners are not antialiased.** They come from a
   Win32 window region, which is a hard-edged mask.
 * **Super/Win as a hotkey is a poor choice here.** The shell claims it, and

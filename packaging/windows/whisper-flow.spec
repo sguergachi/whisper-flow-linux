@@ -22,6 +22,7 @@ EXCLUDES = [
 hidden = collect_submodules("pydantic") + [
     "whisper_flow.hotkey_win",
     "whisper_flow.system_win",
+    "whisper_flow.blur_win",
     "pystray._win32",
     "PIL._tkinter_finder",
 ]
@@ -40,7 +41,8 @@ hud = Analysis(
     ["../../src/whisper_flow/hud_win.py"],
     pathex=["../../src"],
     binaries=[],
-    datas=[],
+    # Loaded by path at runtime, not imported, so PyInstaller cannot see it.
+    datas=[("../../src/whisper_flow/blur_win.py", ".")],
     hiddenimports=[],
     excludes=EXCLUDES + ["openai", "requests", "numpy"],
     cipher=block_cipher,

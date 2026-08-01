@@ -107,7 +107,7 @@ jobs:
         # build would fail the same way on a user's machine.
         run: |
           python -c "import whisper_flow.system_win, whisper_flow.hotkey_win; print('windows modules OK')"
-          python -c "import whisper_flow.hud_win; print('hud OK')"
+          python -c "import whisper_flow.hud_win, whisper_flow.blur_win; print('hud + blur OK')"
           python -c "from whisper_flow.daemon import WhisperFlowDaemon; print('daemon imports OK')"
 
       - name: Build

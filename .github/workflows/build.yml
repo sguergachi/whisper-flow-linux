@@ -47,6 +47,40 @@ jobs:
         # its X11 one refuses to load without a display.
         run: xvfb-run -a pytest -q -p no:cacheprovider
 
+  test-windows:
+    name: test (windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install "pyaudio>=0.2.14"
+          pip install -e ".[dev]"
+
+      - name: Test
+        # The whole suite, plus test_windows_native.py, which only does
+        # anything here. Everywhere else the Win32 calls are stubbed, so this
+        # is the only job that proves the clipboard, the key-state polling
+        # and the overlay actually work against the real API - the gap that
+        # let a broken clipboard ship.
+        run: pytest -q -p no:cacheprovider
+
+      - name: Confirm the Windows-only tests really ran
+        # skipif on the wrong condition would make this job silently vacuous.
+        shell: pwsh
+        run: |
+          $out = pytest tests/test_windows_native.py -q -p no:cacheprovider `
+                 --collect-only 2>&1 | Out-String
+          if ($out -match "no tests ran" -or $out -match "0 tests collected") {
+            throw "test_windows_native.py collected nothing on Windows"
+          }
+          Write-Host $out
+
   linux:
     name: package (linux)
     needs: test
@@ -86,7 +120,9 @@ jobs:
 
   windows:
     name: package (windows)
-    needs: test
+    # Both: the Linux job covers the shared logic, the Windows one covers the
+    # Win32 calls this package actually runs on.
+    needs: [test, test-windows]
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4

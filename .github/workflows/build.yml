@@ -30,7 +30,8 @@ jobs:
           # gobject/gtk4 so the HUD module imports during collection.
           sudo apt-get install -y \
             portaudio19-dev libevdev-dev \
-            python3-gi gir1.2-gtk-4.0 libgtk-4-dev libcairo2-dev
+            python3-gi gir1.2-gtk-4.0 libgtk-4-dev libcairo2-dev \
+            xvfb
 
       - name: Install
         run: |
@@ -42,9 +43,9 @@ jobs:
         run: ruff check src/ tests/ --select F,E9
 
       - name: Test
-        # The GTK and evdev suites need a session bus and real input devices,
-        # so they are skipped here rather than faked into passing.
-        run: pytest -q -p no:cacheprovider
+        # Under xvfb because pystray resolves its backend at import time and
+        # its X11 one refuses to load without a display.
+        run: xvfb-run -a pytest -q -p no:cacheprovider
 
   linux:
     name: package (linux)

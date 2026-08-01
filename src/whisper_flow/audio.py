@@ -202,8 +202,15 @@ class AudioRecorder:
                 return
             import struct
             rms = int(np.sqrt(np.mean(samples.astype(np.float32) ** 2)))
-            with open(level_file, "ab") as f:
-                f.write(struct.pack("<i", rms))
+            # Append without creating. The daemon deletes this file when the
+            # recording stops, and the capture loop can run one more iteration
+            # after that; opening with "ab" would resurrect it as an orphan in
+            # /tmp, and the HUD uses its absence to know it has been dropped.
+            fd = os.open(level_file, os.O_WRONLY | os.O_APPEND)
+            try:
+                os.write(fd, struct.pack("<i", rms))
+            finally:
+                os.close(fd)
         except Exception:
             # Level reporting is cosmetic; never let it break a recording.
             pass

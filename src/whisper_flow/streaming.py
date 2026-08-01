@@ -63,6 +63,12 @@ class LiveTranscriber:
         self._prev: list[str] = []       # previous pass's full hypothesis
         self._committed: list[str] = []  # words already typed
         self._emitted_any = False
+        # Guards the committed state and typing. A pass can outlive the join in
+        # finalize - the transcription call has its own, much longer timeout -
+        # and without this it would commit on top of the tail already typed,
+        # duplicating words at the end of a dictation.
+        self._emit_lock = threading.Lock()
+        self._closed = False
 
     def start(self):
         self._running = True
@@ -122,6 +128,12 @@ class LiveTranscriber:
                     pass
 
     def _commit(self, text: str):
+        with self._emit_lock:
+            if self._closed:
+                return  # finalize already had the last word
+            self._commit_locked(text)
+
+    def _commit_locked(self, text: str):
         words = text.split()
         agreed = _common_prefix(self._prev, words)
         self._prev = words
@@ -138,6 +150,7 @@ class LiveTranscriber:
             self._send(new)
 
     def _send(self, words: list[str]):
+        """Type words. Caller must hold _emit_lock."""
         if not words:
             return
         chunk = " ".join(words)
@@ -161,20 +174,28 @@ class LiveTranscriber:
             self._thread.join(timeout=5)
             self._thread = None
 
-        if not final_text:
-            return
-        words = final_text.split()
-        if len(words) > len(self._committed):
-            self._send(words[len(self._committed):])
+        with self._emit_lock:
+            if self._closed:
+                return
+            self._closed = True
+            if not final_text:
+                return
+            words = final_text.split()
+            if len(words) > len(self._committed):
+                self._send(words[len(self._committed):])
+                self._committed = words
 
     @property
     def committed_text(self) -> str:
-        return " ".join(self._committed)
+        with self._emit_lock:
+            return " ".join(self._committed)
 
     def stop(self):
         """Tear down without emitting anything further."""
         self._running = False
         self._wake.set()
+        with self._emit_lock:
+            self._closed = True
         if self._thread:
             self._thread.join(timeout=5)
             self._thread = None

@@ -1,0 +1,90 @@
+"""Guards on live transcription.
+
+Anything this types cannot be taken back, so the rules it has to keep are:
+never type a word two passes have not agreed on, and never type anything
+after the final transcript has been emitted.
+"""
+
+import sys
+import threading
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from whisper_flow.streaming import LiveTranscriber  # noqa: E402
+
+
+def _transcriber(typed, transcribe=lambda p: None):
+    return LiveTranscriber(
+        transcribe=transcribe, emit=typed.append, sample_rate=16000, interval=0.05,
+    )
+
+
+def test_a_word_is_typed_only_once_two_passes_agree():
+    """Whisper revises earlier words; typing a guess cannot be undone."""
+    typed = []
+    lt = _transcriber(typed)
+    lt._commit("I want to")          # "to" is still a guess
+    assert "".join(typed) == ""
+    lt._commit("I want two")         # revised before it was ever typed
+    assert "".join(typed) == "I want"
+
+
+def test_finalize_emits_the_remaining_tail_once():
+    typed = []
+    lt = _transcriber(typed)
+    for hypothesis in ("a b", "a b c", "a b c d"):
+        lt._commit(hypothesis)
+    lt.finalize("a b c d e")
+    assert "".join(typed) == "a b c d e"
+
+
+def test_a_pass_finishing_after_finalize_types_nothing():
+    """The join in finalize has a timeout; a slow pass can outlive it."""
+    typed = []
+    lt = _transcriber(typed)
+    lt._commit("hello there")
+    lt.finalize("hello there world")
+    before = list(typed)
+
+    lt._commit("hello there world again entirely different")
+    assert typed == before, "typed more text after the final transcript"
+
+
+def test_stop_prevents_any_further_typing():
+    typed = []
+    lt = _transcriber(typed)
+    lt._commit("one two")          # first pass agrees with nothing yet
+    lt._commit("one two three")    # now "one two" is settled
+    before = "".join(typed)
+    assert before, "expected something typed before stop"
+
+    lt.stop()
+    lt._commit("one two three four five")
+    assert "".join(typed) == before
+
+
+def test_concurrent_commit_and_finalize_do_not_interleave():
+    """The worker thread and the caller both reach the typing path."""
+    typed = []
+    lt = _transcriber(typed)
+    for hypothesis in ("x y", "x y z"):
+        lt._commit(hypothesis)
+
+    stop = threading.Event()
+
+    def hammer():
+        while not stop.is_set():
+            lt._commit("x y z w v u")
+
+    t = threading.Thread(target=hammer, daemon=True)
+    t.start()
+    time.sleep(0.02)
+    lt.finalize("x y z w v u t")
+    settled = list(typed)          # nothing may be appended past this point
+    stop.set()
+    t.join(timeout=2)
+
+    assert typed == settled, "typed more text after the final transcript"
+    assert "".join(typed).startswith("x y")

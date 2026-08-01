@@ -197,19 +197,23 @@ class WhisperFlowDaemon:
         """
         log(f"[DAEMON] Forcing recording stop: {reason}")
         self.notify(f"⚠️ Recording stopped: {reason}")
+        mode = self.current_mode
 
         # Signal stop
         if self.stop_recording_event:
             self.stop_recording_event.set()
 
-        # Reset state
-        self.is_recording = False
-        self.current_mode = None
-        self.recording_start_time = None
+        # Go through the normal teardown rather than clearing the flags here.
+        # Clearing them directly left the HUD on screen and the level file on
+        # disk, because the recording thread's own cleanup then saw
+        # is_recording already False and returned without doing anything.
+        self._stop_recording()
 
-        # Restore tray icon
-        if self.tray_icon:
-            self.tray_icon.icon = self.create_tray_icon()
+        # This path exists because the recording thread is wedged or gone, so
+        # it may never release the processing lock itself. Releasing it here
+        # keeps one stuck recording from rejecting every later request with
+        # "system busy"; a late release from the thread is a no-op.
+        self._finish_processing(mode or "unknown")
 
     def daemonize(self):
         """Run as background process while preserving desktop session access."""
@@ -392,16 +396,22 @@ class WhisperFlowDaemon:
             self._finish_processing(mode)
 
     def _finish_processing(self, mode: str):
-        """Release the processing lock once a request has fully completed."""
-        if not self.is_processing:
-            return
-        log(f"[DAEMON] Processing lock released for mode: {mode}")
-        self.is_processing = False
-        self.recording_start_time = None
-        try:
-            self.processing_lock.release()
-        except RuntimeError:
-            pass
+        """Release the processing lock once a request has fully completed.
+
+        Reached from the recording thread and, when that thread is wedged,
+        from the watchdog. The check and the release have to be atomic or both
+        can get through and release the lock twice.
+        """
+        with self._stop_lock:
+            if not self.is_processing:
+                return
+            log(f"[DAEMON] Processing lock released for mode: {mode}")
+            self.is_processing = False
+            self.recording_start_time = None
+            try:
+                self.processing_lock.release()
+            except RuntimeError:
+                pass
         # Process next item in queue
         self._process_next_in_queue()
 
@@ -442,6 +452,12 @@ class WhisperFlowDaemon:
             return False
 
         log(f"[DAEMON] Starting recording for mode: {mode}")
+        # Clear the previous cycle's thread handle first. The watchdog treats
+        # "recording, but the thread is not alive" as a crash, and between
+        # setting the flag and starting the new thread the handle still points
+        # at the last one, which has finished - enough to force-stop a
+        # recording a moment after it began.
+        self.recording_thread = None
         self.is_recording = True
         self.current_mode = mode
         self.stop_recording_event = threading.Event()

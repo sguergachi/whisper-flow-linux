@@ -27,13 +27,31 @@ run it, and hold `Ctrl+Alt` to dictate. Nothing else is required: the
 installer ships a speech engine and model, so it transcribes offline from the
 first launch, with no API key and no Python.
 
-On a machine with an NVIDIA GPU it offers, once, to download the much more
-accurate `large-v3-turbo` model — one button, with a progress bar. Decline it
-and the bundled model keeps working; ask for it later from **Speech model...**
-in the tray menu. Nothing large is ever downloaded without being asked.
-
 Windows 11 22H2 or newer, because the overlay uses composition attributes
 added in that release.
+
+## Which model runs
+
+The app ships `base.en`, which keeps up with speech on any machine from a
+two-core laptop upwards. Where the hardware can do better, the setup window
+offers better — one button, with a progress bar. Decline and the bundled model
+keeps working; ask later from **Speech model...** in the tray.
+
+| Machine | Model | Why |
+|---|---|---|
+| NVIDIA GPU | `large-v3-turbo` | Far more accurate, still faster than speech |
+| Desktop or workstation CPU | `small.en` | Keeps up given enough cores and RAM |
+| Typical laptop | `base.en` | Bundled; the safe default everywhere |
+| Thin, old or 4GB machine | `tiny.en` | Anything larger falls behind |
+
+**Integrated graphics are not used, and cannot be.** whisper.cpp publishes
+prebuilt binaries only for CPU and NVIDIA cuBLAS — no Vulkan, SYCL or
+OpenVINO on any platform — so on an Intel or AMD GPU there is no engine to
+point at. Those machines run on the CPU, with the model sized to it and the
+thread count held below the core count so the desktop stays responsive while
+you dictate into it.
+
+Nothing large is ever downloaded without being asked.
 
 ## Linux: Quick Setup (One-Click Install)
 

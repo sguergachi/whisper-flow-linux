@@ -89,7 +89,7 @@ CAP_EXT = 1.12   # cap reaches this many half-heights along the edge
 MATERIAL_RGB = (0.03, 0.03, 0.04)
 MATERIAL_ALPHA = 0.80
 EDGE_COVER = BLUR_INSET + 1.5   # opaque rim that hides the blur region's edge
-INNER_SHADOW_W = 14             # how far the inner shadow reaches inwards
+INNER_SHADOW_W = 7              # how far the inner shadow reaches inwards
 INNER_SHADOW_STEPS = 9          # more bands, so the wider spread stays smooth
 INNER_SHADOW_RGB = (0.13, 0.13, 0.15)
 
@@ -133,8 +133,23 @@ def _save_position(connector: str, x: int, y: int):
     except Exception as e:
         print(f"[HUD] could not save position: {e}", flush=True)
 
+# GTK paints more than the background: the "decoration" node carries a drop
+# shadow and a border, which land outside the pill at the surface bounds and
+# read as a faint straight-edged smudge past the rounded ends. Everything the
+# toolkit might draw has to be cleared, not just the background colour.
 CSS = b"""
-window, window.background { background-color: transparent; }
+window, window.background, window.csd, window.solid-csd,
+decoration, decoration:backdrop {
+    background-color: transparent;
+    background-image: none;
+    border: none;
+    border-radius: 0;
+    box-shadow: none;
+    outline: none;
+    margin: 0;
+    padding: 0;
+}
+drawingarea { background-color: transparent; background-image: none; }
 """
 
 
@@ -325,6 +340,9 @@ class HudWindow(Gtk.Window):
 
     def _on_realize(self, *_):
         """Attach the blur once there is a wl_surface to attach it to."""
+        if os.environ.get("WHISPER_FLOW_HUD_NO_BLUR"):
+            print("[HUD] blur disabled by env", flush=True)
+            return
         try:
             display = Gdk.Display.get_default()
             surface = self.get_surface()

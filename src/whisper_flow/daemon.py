@@ -676,47 +676,66 @@ class WhisperFlowDaemon:
             self.notify(f"Config directory: {config_dir}")
 
     def test_configuration(self, icon, item):
-        """Test system configuration."""
+        """Run the checks, and put a pasteable report on the clipboard.
+
+        A notification can only carry a couple of lines, which is not enough
+        to act on or to send to anyone. When something fails the full report
+        goes to the clipboard, so it can be pasted straight into a bug report.
+        """
         log("[DAEMON] Configuration test requested")
         try:
-            validation_results = self.transcribe_app.run_comprehensive_validation()
-
-            # Count pass/fail/warn results
-            total_tests = 0
-            passed_tests = 0
-            failed_tests = 0
-            warning_tests = 0
-
-            for category, tests in validation_results.items():
-                for test in tests:
-                    total_tests += 1
-                    if test["status"] == "pass":
-                        passed_tests += 1
-                    elif test["status"] == "fail":
-                        failed_tests += 1
-                    elif test["status"] == "warn":
-                        warning_tests += 1
-
-            log(
-                f"[DAEMON] Configuration test results: {passed_tests}/{total_tests} passed, {failed_tests} failed, {warning_tests} warnings",
-            )
-
-            if failed_tests == 0 and warning_tests == 0:
-                self.notify(
-                    f"✅ Configuration is valid! ({passed_tests}/{total_tests} tests passed)",
-                )
-            elif failed_tests == 0:
-                self.notify(
-                    f"⚠️ Configuration has warnings ({passed_tests} passed, {warning_tests} warnings)",
-                )
-            else:
-                self.notify(
-                    f"❌ Configuration has issues ({passed_tests} passed, {failed_tests} failed, {warning_tests} warnings)",
-                )
-
+            results = self.transcribe_app.run_comprehensive_validation()
         except Exception as e:
             log(f"[DAEMON] Configuration test failed: {e}")
-            self.notify(f"❌ Configuration test failed: {e}")
+            self.notify(f"Configuration test failed to run: {e}")
+            return
+
+        counts = {"pass": 0, "fail": 0, "warn": 0}
+        problems = []
+        for group, tests in results.items():
+            for test in tests:
+                status = test.get("status", "warn")
+                counts[status] = counts.get(status, 0) + 1
+                if status in ("fail", "warn"):
+                    problems.append((status, test["name"], test.get("message", "")))
+
+        log(f"[DAEMON] Configuration: {counts['pass']} passed, "
+            f"{counts['fail']} failed, {counts['warn']} warnings")
+
+        if not problems:
+            self.notify(f"Configuration is valid ({counts['pass']} checks passed)")
+            return
+
+        report = self._diagnostic_report(results, counts)
+        copied = self.transcribe_app.system_manager.copy_to_clipboard(report)
+
+        first = next((p for p in problems if p[0] == "fail"), problems[0])
+        summary = f"{first[1]}: {first[2]}"
+        if len(summary) > 140:
+            summary = summary[:137] + "..."
+        tail = " (full report copied to clipboard)" if copied else ""
+        self.notify(summary + tail)
+
+    def _diagnostic_report(self, results: dict, counts: dict) -> str:
+        """A plain-text report of the checks, plus what it is running on."""
+        import platform
+
+        lines = [
+            f"whisper-flow diagnostics - {counts['pass']} passed, "
+            f"{counts['fail']} failed, {counts['warn']} warnings",
+            f"{platform.system()} {platform.release()} (build {platform.version()})",
+            f"Python {platform.python_version()}",
+            f"Config: {self.config.config_dir}",
+            "",
+        ]
+        for group, tests in results.items():
+            lines.append(f"[{group}]")
+            for test in tests:
+                mark = {"pass": "ok  ", "fail": "FAIL", "warn": "warn"}.get(
+                    test.get("status"), "?")
+                lines.append(f"  {mark} {test['name']}: {test.get('message', '')}")
+            lines.append("")
+        return "\n".join(lines)
 
     def stop_daemon(self, icon=None, item=None):
         """Stop the daemon."""

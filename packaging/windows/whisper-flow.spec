@@ -1,14 +1,11 @@
 # PyInstaller spec for the Windows build.
 #
-# Two things are easy to get wrong here:
+# One executable. It runs the tray daemon normally, and the overlay when
+# launched with --hud, which hud.py does per recording. Shipping the overlay
+# as a second .exe only raised the question of which one to run.
 #
-#   * The HUD is launched as a separate process by path (hud.py runs
-#     `sys.executable <path>/hud_win.py`). Inside a frozen build there is no
-#     source tree, and sys.executable is the exe itself, so hud_win is built
-#     as its own executable and the supervisor is told to use it.
-#   * The Linux modules must not be pulled in. evdev, gi and pynput have no
-#     Windows wheels, and importing them is what a hidden import would force.
-import sys
+# The Linux modules must not be pulled in: evdev, gi and pynput have no
+# Windows wheels, and a hidden import would force exactly that.
 from PyInstaller.utils.hooks import collect_submodules
 
 block_cipher = None
@@ -23,11 +20,17 @@ hidden = collect_submodules("pydantic") + [
     "whisper_flow.hotkey_win",
     "whisper_flow.system_win",
     "whisper_flow.blur_win",
+    "whisper_flow.hud_win",
     "pystray._win32",
     "PIL._tkinter_finder",
+    # blur_win reaches for these, and ctypes.wintypes is a submodule that
+    # importing ctypes does not bring along.
+    "ctypes.wintypes",
+    "tkinter",
+    "tkinter.constants",
 ]
 
-daemon = Analysis(
+app = Analysis(
     ["../../src/whisper_flow/__main__win__.py"],
     pathex=["../../src"],
     binaries=[],
@@ -37,42 +40,17 @@ daemon = Analysis(
     cipher=block_cipher,
 )
 
-hud = Analysis(
-    ["../../src/whisper_flow/hud_win.py"],
-    pathex=["../../src"],
-    binaries=[],
-    # Loaded by path at runtime, not imported, so PyInstaller cannot see it.
-    datas=[("../../src/whisper_flow/blur_win.py", ".")],
-    # And because it cannot see it, nothing that file imports gets collected
-    # either. ctypes.wintypes is a submodule, not pulled in by importing
-    # ctypes, so the overlay died on its first line.
-    hiddenimports=["ctypes.wintypes", "tkinter", "tkinter.constants"],
-    excludes=EXCLUDES + ["openai", "requests", "numpy"],
-    cipher=block_cipher,
-)
+pyz = PYZ(app.pure, app.zipped_data, cipher=block_cipher)
 
-MERGE((daemon, "whisper-flow", "whisper-flow"), (hud, "whisper-flow-hud", "whisper-flow-hud"))
-
-daemon_pyz = PYZ(daemon.pure, daemon.zipped_data, cipher=block_cipher)
-daemon_exe = EXE(
-    daemon_pyz, daemon.scripts, [],
+exe = EXE(
+    pyz, app.scripts, [],
     exclude_binaries=True,
     name="whisper-flow",
     console=False,          # tray app; a console window would sit there
     icon=None,
 )
 
-hud_pyz = PYZ(hud.pure, hud.zipped_data, cipher=block_cipher)
-hud_exe = EXE(
-    hud_pyz, hud.scripts, [],
-    exclude_binaries=True,
-    name="whisper-flow-hud",
-    console=False,
-    icon=None,
-)
-
 COLLECT(
-    daemon_exe, daemon.binaries, daemon.zipfiles, daemon.datas,
-    hud_exe, hud.binaries, hud.zipfiles, hud.datas,
+    exe, app.binaries, app.zipfiles, app.datas,
     strip=False, upx=False, name="whisper-flow",
 )

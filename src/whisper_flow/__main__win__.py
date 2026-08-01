@@ -1,8 +1,13 @@
-"""Frozen-build entry point for the Windows tray daemon.
+"""Frozen-build entry point for Windows.
 
-PyInstaller needs a script, not a console_script entry point, and this keeps
-the import surface small: pulling in whisper_flow/__init__ would drag the
-whole package along, including the Linux-only modules.
+One executable, two roles. The overlay runs as a separate process so GTK/Tk
+cannot stall audio capture, but shipping it as a second .exe beside the first
+just raises the question of which one to run. Instead this binary re-launches
+itself with --hud.
+
+A folder build makes that cheap: the second launch reuses the same unpacked
+directory. A one-file build would re-extract the whole payload on every
+recording, which is why this is not one.
 """
 import multiprocessing
 import sys
@@ -12,6 +17,11 @@ def main() -> int:
     # Without this a frozen build re-runs the whole program in every worker
     # process it spawns.
     multiprocessing.freeze_support()
+
+    if "--hud" in sys.argv:
+        from whisper_flow.hud_win import main as hud_main
+        return hud_main()
+
     from whisper_flow.daemon import WhisperFlowDaemon
     WhisperFlowDaemon().run(foreground=True)
     return 0

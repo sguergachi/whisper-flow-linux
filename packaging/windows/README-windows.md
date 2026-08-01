@@ -2,7 +2,10 @@
 
 **Requires Windows 11 22H2 (build 22621) or later.**
 
-Run the installer, then hold **Ctrl+Alt**, talk, and let go. The words are
+Run the installer, then hold **Ctrl+Alt**, talk, and let go.
+
+There is one executable, `whisper-flow.exe`. It runs the tray app; it also
+provides the recording overlay, which it launches for itself. The words are
 typed into whatever had focus.
 
 It lives in the notification area — there is no main window.
@@ -55,3 +58,10 @@ it, so what lands is what the final transcript says.
   boundary, not something an application can work around.
 * Only one copy runs at a time. A second is refused rather than started,
   because two hotkey listeners would record and type twice.
+
+## When something is wrong
+
+Right-click the tray icon and choose **Test Configuration**. It checks the
+transcription backend, whether the server actually answers, the microphone,
+and the hotkeys. If anything fails, the full report is copied to the
+clipboard ready to paste into a bug report.

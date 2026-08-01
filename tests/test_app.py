@@ -259,7 +259,8 @@ class TestWhisperFlow:
                 assert result is False
 
     def test_validate_api_config_with_key(self, mock_config):
-        """Test API configuration validation with API key."""
+        """An OpenAI key alone is a usable backend."""
+        mock_config.local_whisper_url = ""      # force the OpenAI branch
         mock_config.openai_api_key = "test-key"
         mock_config.transcription_model = "gpt-4o-mini"
 
@@ -274,19 +275,15 @@ class TestWhisperFlow:
             app = WhisperFlow()
             results = app._validate_api_config()
 
-            assert len(results) == 2
-            assert any(
-                r["name"] == "OpenAI API Key" and r["status"] == "pass" for r in results
-            )
-            assert any(
-                r["name"] == "Transcription Model" and r["status"] == "pass"
-                for r in results
-            )
+            assert len(results) == 1
+            assert results[0]["name"] == "Transcription backend"
+            assert results[0]["status"] == "pass"
+            assert "OpenAI" in results[0]["message"]
 
     def test_validate_api_config_without_key(self, mock_config):
-        """Test API configuration validation without API key."""
+        """No local server and no key is the one real failure."""
+        mock_config.local_whisper_url = ""
         mock_config.openai_api_key = None
-        mock_config.transcription_model = "gpt-4o-mini"
 
         with (
             patch("whisper_flow.app.Config", return_value=mock_config),
@@ -299,14 +296,9 @@ class TestWhisperFlow:
             app = WhisperFlow()
             results = app._validate_api_config()
 
-            assert len(results) == 2
-            assert any(
-                r["name"] == "OpenAI API Key" and r["status"] == "fail" for r in results
-            )
-            assert any(
-                r["name"] == "Transcription Model" and r["status"] == "pass"
-                for r in results
-            )
+            assert len(results) == 1
+            assert results[0]["status"] == "fail"
+            assert "Nothing configured" in results[0]["message"]
 
     def test_audio_speedup_configuration(self, mock_config):
         """Test that audio speedup configuration is properly handled."""

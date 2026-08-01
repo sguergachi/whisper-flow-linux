@@ -129,8 +129,9 @@ class HUD:
         itself, so the overlay ships as its own executable beside it.
         """
         if getattr(sys, "frozen", False):
-            exe = "whisper-flow-hud.exe" if IS_WINDOWS else "whisper-flow-hud"
-            return [os.path.join(os.path.dirname(sys.executable), exe)]
+            # The same binary, told to be the overlay. One executable ships,
+            # so there is no question about which one to run.
+            return [sys.executable, "--hud"]
         module = "hud_win.py" if IS_WINDOWS else "hud_app.py"
         return [sys.executable,
                 os.path.join(os.path.dirname(os.path.abspath(__file__)), module)]

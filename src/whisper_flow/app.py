@@ -1,5 +1,6 @@
 """Main application class for whisper-flow."""
 
+import os
 from pathlib import Path
 
 from .audio import AudioRecorder
@@ -229,6 +230,9 @@ class WhisperFlow:
         # Services validation
         results["services"] = self._validate_services()
 
+        # Hotkeys
+        results["hotkeys"] = self._validate_hotkeys()
+
         # Configuration Files validation
         results["config_files"] = self._validate_config_files()
 
@@ -238,184 +242,167 @@ class WhisperFlow:
         return results
 
     def _validate_api_config(self) -> list[dict]:
-        """Validate API configuration."""
+        """Check that some transcription backend is actually configured."""
         tests = []
+        local = (self.config.local_whisper_url or "").strip()
+        key = self.config.openai_api_key
 
-        # API Key validation
-        if self.config.openai_api_key:
-            tests.append(
-                {
-                    "name": "OpenAI API Key",
-                    "status": "pass",
-                    "message": "API key is configured",
-                },
-            )
+        if local:
+            tests.append({
+                "name": "Transcription backend",
+                "status": "pass",
+                "message": f"Local whisper.cpp server at {local}",
+            })
+        elif key:
+            tests.append({
+                "name": "Transcription backend",
+                "status": "pass",
+                "message": f"OpenAI API ({self.config.transcription_model})",
+            })
         else:
-            tests.append(
-                {
-                    "name": "OpenAI API Key",
-                    "status": "fail",
-                    "message": "OpenAI API key not set",
-                },
-            )
+            tests.append({
+                "name": "Transcription backend",
+                "status": "fail",
+                "message": ("Nothing configured. Set WHISPER_FLOW_LOCAL_WHISPER_URL "
+                            "to a whisper.cpp server, or WHISPER_FLOW_OPENAI_API_KEY."),
+            })
+        return tests
 
-        # Model validation
-        valid_models = ["gpt-4o-mini", "gpt-4o-mini-transcribe", "gpt-4o", "gpt-4"]
-        if self.config.transcription_model in valid_models:
-            tests.append(
-                {
-                    "name": "Transcription Model",
-                    "status": "pass",
-                    "message": f"Valid model: {self.config.transcription_model}",
-                },
-            )
-        else:
-            tests.append(
-                {
-                    "name": "Transcription Model",
-                    "status": "warn",
-                    "message": f"Unknown model: {self.config.transcription_model}",
-                },
-            )
+    def _validate_services(self) -> list[dict]:
+        """Check the backend can actually be reached, not merely configured."""
+        tests = []
+        local = (self.config.local_whisper_url or "").strip()
+
+        if local:
+            try:
+                import requests
+                # Any answer at all proves something is listening; the
+                # inference endpoint rejects a bare GET, which is still a
+                # reachable server.
+                requests.get(local, timeout=3)
+                reachable, detail = True, "responding"
+            except Exception as e:
+                reachable, detail = False, f"{type(e).__name__}: {e}"
+            tests.append({
+                "name": "Local whisper server",
+                "status": "pass" if reachable else "fail",
+                "message": (f"{local} {detail}" if reachable else
+                            f"Cannot reach {local} - is whisper-server running? ({detail})"),
+            })
+        elif self.config.openai_api_key:
+            tests.append({
+                "name": "OpenAI API",
+                "status": "pass",
+                "message": "Key present (not verified until first use)",
+            })
 
         return tests
 
     def _validate_system_dependencies(self) -> list[dict]:
-        """Validate system dependencies."""
+        """Check the tools needed to type text on this platform.
+
+        These differ completely per platform, and the previous version checked
+        X11 tools everywhere - reporting five warnings on Windows about
+        programs that have no business being there.
+        """
+        import shutil
+        import sys
+
         tests = []
-        deps = ["xdotool", "xclip", "xsel", "notify-send", "wmctrl"]
+        if sys.platform == "win32":
+            tests.append({
+                "name": "Text injection",
+                "status": "pass",
+                "message": "SendInput (built in)",
+            })
+            return tests
 
-        for dep in deps:
-            try:
-                import subprocess
+        wayland = bool(os.environ.get("WAYLAND_DISPLAY")) or \
+            os.environ.get("XDG_SESSION_TYPE") == "wayland"
 
-                subprocess.run(
-                    [dep, "--version"],
-                    capture_output=True,
-                    check=True,
-                )
-                tests.append(
-                    {
-                        "name": f"System Tool: {dep}",
-                        "status": "pass",
-                        "message": "Available",
-                    },
-                )
-            except (subprocess.CalledProcessError, FileNotFoundError):
-                tests.append(
-                    {
-                        "name": f"System Tool: {dep}",
-                        "status": "warn",
-                        "message": "Not available",
-                    },
-                )
+        if wayland:
+            typing_tools = [("ydotool", True), ("wtype", False)]
+            extras = [("wl-copy", False), ("kdotool", False)]
+        else:
+            typing_tools = [("xdotool", True)]
+            extras = [("xclip", False), ("xsel", False)]
 
+        for tool, required in typing_tools + extras:
+            present = shutil.which(tool) is not None
+            tests.append({
+                "name": f"System tool: {tool}",
+                "status": "pass" if present else ("fail" if required else "warn"),
+                "message": "Available" if present else
+                           ("Required for typing text" if required else "Optional, not installed"),
+            })
         return tests
 
     def _validate_audio_system(self) -> list[dict]:
-        """Validate audio system."""
+        """Check there is a usable microphone, not merely a working library."""
         tests = []
-
-        # PyAudio availability
         try:
             import pyaudio
-
-            tests.append(
-                {
-                    "name": "PyAudio Library",
-                    "status": "pass",
-                    "message": "Available",
-                },
-            )
         except ImportError:
-            tests.append(
-                {
-                    "name": "PyAudio Library",
-                    "status": "fail",
-                    "message": "Not installed",
-                },
-            )
-            return tests
+            return [{"name": "Audio library", "status": "fail",
+                     "message": "PyAudio is not installed"}]
 
-        # Audio devices
         try:
             pa = pyaudio.PyAudio()
-            device_count = pa.get_device_count()
-            tests.append(
-                {
-                    "name": "Audio Devices",
-                    "status": "pass",
-                    "message": f"{device_count} devices found",
-                },
-            )
-            pa.terminate()
         except Exception as e:
-            tests.append(
-                {
-                    "name": "Audio Devices",
-                    "status": "fail",
-                    "message": f"Error: {e}",
-                },
-            )
+            return [{"name": "Audio system", "status": "fail",
+                     "message": f"Cannot open the audio system: {e}"}]
 
-        return tests
+        try:
+            inputs = []
+            for i in range(pa.get_device_count()):
+                info = pa.get_device_info_by_index(i)
+                if int(info.get("maxInputChannels", 0)) > 0:
+                    inputs.append(info.get("name", f"device {i}"))
 
-    def _validate_services(self) -> list[dict]:
-        """Validate external services."""
-        tests = []
-
-        # Transcription service
-        if self.config.openai_api_key:
-            tests.append(
-                {
-                    "name": "Transcription Service",
-                    "status": "pass",
-                    "message": "OpenAI API configured",
-                },
-            )
-        else:
-            tests.append(
-                {
-                    "name": "Transcription Service",
-                    "status": "fail",
-                    "message": "No API key configured",
-                },
-            )
-
-        # Completion service
-        if self.config.openai_api_key:
-            tests.append(
-                {
-                    "name": "Completion Service",
-                    "status": "pass",
-                    "message": "OpenAI API configured",
-                },
-            )
-        else:
-            tests.append(
-                {
-                    "name": "Completion Service",
-                    "status": "fail",
-                    "message": "No API key configured",
-                },
-            )
-
+            if inputs:
+                chosen = self.config.mic_device_index
+                which = (f"device {chosen}" if chosen is not None
+                         else f"default ({inputs[0]})")
+                tests.append({"name": "Microphone", "status": "pass",
+                              "message": f"{len(inputs)} input(s); using {which}"})
+            else:
+                tests.append({"name": "Microphone", "status": "fail",
+                              "message": "No input devices found"})
+        finally:
+            pa.terminate()
         return tests
 
     def _validate_config_files(self) -> list[dict]:
-        """Validate configuration files."""
+        """Report where settings are read from, and whether anything is there."""
+        env_file = Path(self.config.config_dir) / ".env"
+        return [{
+            "name": "Config file",
+            "status": "pass" if env_file.exists() else "warn",
+            "message": (str(env_file) if env_file.exists()
+                        else f"No .env at {env_file}; using defaults"),
+        }]
+
+    def _validate_hotkeys(self) -> list[dict]:
+        """Report the configured hotkeys, and flag ones the OS will swallow."""
+        import sys
+
         tests = []
-
-        # No longer need to validate prompt configuration files
-        # The system now uses a single template approach
-        tests.append(
-            {
-                "name": "Prompt System",
-                "status": "pass",
-                "message": "Using simplified single template approach",
-            },
-        )
-
+        combos = {
+            "Transcribe": self.config.hotkey_transcribe,
+            "Auto-transcribe": self.config.hotkey_auto_transcribe,
+            "Command": self.config.hotkey_command,
+        }
+        for label, combo in combos.items():
+            status, message = "pass", combo
+            if sys.platform == "win32" and any(
+                part in {"super", "cmd", "win", "meta"}
+                for part in combo.lower().split("+")
+            ):
+                status = "warn"
+                message = (f"{combo} - Windows reserves most Win key "
+                           f"combinations; try ctrl+alt")
+            tests.append({"name": f"Hotkey: {label}", "status": status,
+                          "message": message})
         return tests
 
     def _validate_environment(self) -> list[dict]:

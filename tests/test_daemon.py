@@ -127,7 +127,7 @@ class TestWhisperFlowDaemon:
 
             mock_app.run_comprehensive_validation.assert_called_once()
             mock_notify.assert_called_once_with(
-                "✅ Configuration is valid! (3/3 tests passed)",
+                "Configuration is valid (3 checks passed)",
             )
 
     def test_test_configuration_with_warnings(self, temp_config_dir):
@@ -161,9 +161,10 @@ class TestWhisperFlowDaemon:
 
             daemon.test_configuration(None, None)
 
-            mock_notify.assert_called_once_with(
-                "⚠️ Configuration has warnings (1 passed, 1 warnings)",
-            )
+            # A problem now names itself instead of being counted, so it can
+            # be acted on without opening a log.
+            sent = mock_notify.call_args[0][0]
+            assert "Test 2" in sent and "Warning" in sent
 
     def test_test_configuration_with_failures(self, temp_config_dir):
         """Test configuration testing with failures."""
@@ -196,9 +197,8 @@ class TestWhisperFlowDaemon:
 
             daemon.test_configuration(None, None)
 
-            mock_notify.assert_called_once_with(
-                "❌ Configuration has issues (1 passed, 1 failed, 0 warnings)",
-            )
+            sent = mock_notify.call_args[0][0]
+            assert "Test 2" in sent, sent   # the failure names itself
 
     def test_test_configuration_exception(self, temp_config_dir):
         """Test configuration testing when an exception occurs."""
@@ -227,7 +227,7 @@ class TestWhisperFlowDaemon:
             daemon.test_configuration(None, None)
 
             mock_notify.assert_called_once_with(
-                "❌ Configuration test failed: Test error",
+                "Configuration test failed to run: Test error",
             )
 
     def test_stop_daemon(self, temp_config_dir):

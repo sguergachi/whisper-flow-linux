@@ -43,7 +43,12 @@ def _load_sibling(name):
     return module
 
 
-_blur = _load_sibling("blur_win")
+try:
+    # Normal import in a frozen build or an installed package.
+    from whisper_flow import blur_win as _blur
+except ImportError:
+    # Running this file directly, where there is no package context.
+    _blur = _load_sibling("blur_win")
 
 WIDTH = 268
 HEIGHT = 54

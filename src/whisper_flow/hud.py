@@ -12,6 +12,8 @@ import sys
 import tempfile
 import threading
 
+from .logging import log
+
 IS_WINDOWS = sys.platform == "win32"
 
 
@@ -118,8 +120,28 @@ class HUD:
                 **extra,
             )
         except Exception as e:
-            print(f"[HUD] Failed to spawn HUD: {e}", flush=True)
+            log(f"[HUD] Failed to spawn overlay {argv}: {e}")
             self._cleanup_files()
+
+    def crash_log(self) -> str:
+        """Whatever the overlay printed before dying, for a failure report.
+
+        The overlay is a separate process writing to a temp file that is
+        normally deleted, so without this a crashing HUD is indistinguishable
+        from one that simply did not appear.
+        """
+        try:
+            if self._process and self._process.poll() not in (None, 0):
+                path = self._log_path
+                if path and os.path.exists(path):
+                    text = open(path, errors="replace").read().strip()
+                    if text:
+                        return (f"overlay exited {self._process.poll()}\n"
+                                + text[-2000:])
+                return f"overlay exited {self._process.poll()} with no output"
+        except Exception as e:
+            return f"could not read the overlay log: {e}"
+        return ""
 
     @staticmethod
     def _overlay_command() -> list[str]:

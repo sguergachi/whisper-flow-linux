@@ -1,6 +1,7 @@
 """Background daemon for whisper-flow with system tray and global hotkeys."""
 
 import os
+import platform
 import queue
 import shutil
 import subprocess
@@ -8,17 +9,20 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
+from datetime import datetime
 from pathlib import Path
 
 import pystray
 from PIL import Image, ImageDraw, ImageFilter
 
+from . import __version__
 from .app import WhisperFlow
 from .backend import LocalBackend, detect_accelerator, recommended_model
 from .config import Config
 from .hotkey_manager import HotkeyManager, HotkeyMode
 from .hud import HUD
-from .logging import log, set_logging_enabled
+from .logging import log, recent_log, set_logging_enabled
 
 # Modes driven by holding a hotkey down; they cannot be deferred and replayed.
 PUSH_TO_TALK_MODES = ("transcribe", "command")
@@ -116,6 +120,7 @@ class WhisperFlowDaemon:
         self._backend_model = None
         self._setup_process = None
         self._setup_lock = threading.Lock()
+        self._last_failure = None
 
         # Initialize WhisperFlow instances for different modes
         log("[DAEMON] Creating WhisperFlow instances...")
@@ -296,6 +301,7 @@ class WhisperFlowDaemon:
             pystray.MenuItem("Settings", self.open_settings),
             pystray.MenuItem("Speech model...", self.setup_speech_model),
             pystray.MenuItem("Test Configuration", self.test_configuration),
+            pystray.MenuItem("Copy last error", self.copy_last_error),
             pystray.MenuItem("Reload Daemon", self.reload_daemon),
             pystray.MenuItem("Exit", self.stop_daemon),
         )
@@ -572,13 +578,14 @@ class WhisperFlowDaemon:
 
             if not success:
                 log(f"[DAEMON] Recording failed for mode: {mode}")
-                self.notify("❌ Recording failed")
+                self._report_failure(f"Recording failed ({mode})")
             else:
                 log(f"[DAEMON] Recording completed successfully for mode: {mode}")
 
         except Exception as e:
             log(f"[DAEMON] Recording thread error for mode {mode}: {e}")
-            self.notify(f"❌ Recording error: {e}")
+            self._report_failure(f"Recording error ({mode}): {e}",
+                                 traceback.format_exc())
         finally:
             log(f"[DAEMON] Recording thread finishing for mode: {mode}")
             self._stop_recording()
@@ -786,6 +793,73 @@ class WhisperFlowDaemon:
         # that might be metered is not a decision to make on someone's behalf.
         if self.backend.setup_reason() == "gpu":
             self._open_setup_window()
+
+    def _report_failure(self, headline: str, detail: str | None = None) -> None:
+        """Notify about a failure and put the whole story on the clipboard.
+
+        A toast holds one line, which is never enough to act on and never
+        enough to send to anyone. Anything that fails in front of the user
+        goes through here so the notification names the problem and the
+        clipboard carries the log that explains it.
+        """
+        report = [
+            f"whisper-flow {__version__} - {headline}",
+            f"{datetime.now():%Y-%m-%d %H:%M:%S}  {platform.platform()}",
+            f"python {sys.version.split()[0]}  frozen={getattr(sys, 'frozen', False)}",
+            "",
+            "Configuration",
+            f"  transcribe hotkey : {self.config.hotkey_transcribe}",
+            f"  command hotkey    : {self.config.hotkey_command}",
+            f"  auto hotkey       : {self.config.hotkey_auto_transcribe}",
+            f"  whisper url       : {self.config.local_whisper_url or '(none)'}",
+            f"  model             : {self.config.model_name}",
+            f"  live transcription: {self.config.live_transcription}",
+        ]
+        try:
+            report.append(f"  engine            : {self.backend.describe()}")
+        except Exception as e:
+            report.append(f"  engine            : unavailable ({e})")
+
+        try:
+            overlay = self.hud.crash_log()
+        except Exception as e:
+            overlay = f"could not inspect the overlay: {e}"
+        if overlay:
+            report += ["", "Overlay", overlay]
+
+        if detail:
+            report += ["", "Traceback", detail.rstrip()]
+        report += ["", "Recent log", recent_log(120) or "(nothing recorded)"]
+        text = "\n".join(report)
+        self._last_failure = text
+
+        copied = False
+        try:
+            copied = self.transcribe_app.system_manager.copy_to_clipboard(text)
+        except Exception as e:
+            log(f"[DAEMON] could not copy the failure report: {e}")
+
+        suffix = " - details copied to clipboard" if copied else ""
+        self.notify(f"❌ {headline}{suffix}")
+
+    def copy_last_error(self, icon=None, item=None):
+        """Put the most recent failure report back on the clipboard.
+
+        The report is copied when the failure happens, but anything else
+        copied since will have replaced it, and the failure is usually
+        described some time after it happened.
+        """
+        if not self._last_failure:
+            self.notify("No errors recorded since this started")
+            return
+        try:
+            copied = self.transcribe_app.system_manager.copy_to_clipboard(
+                self._last_failure)
+        except Exception as e:
+            log(f"[DAEMON] could not copy the last error: {e}")
+            copied = False
+        self.notify("Last error copied to clipboard" if copied
+                    else "Could not reach the clipboard")
 
     def _use_backend_url(self, url: str) -> None:
         """Point every mode's transcription service at the running server."""

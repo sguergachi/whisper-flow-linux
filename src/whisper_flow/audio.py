@@ -305,6 +305,14 @@ class AudioRecorder:
                 self._save_wav_file(output_path, frames)
                 log(f"[AUDIO] recording stopped after {duration:.2f}s")
                 return output_path
+            # Zero frames from a stream that opened is the signature of a
+            # microphone the OS is refusing to hand over. On Windows 11 that
+            # is Settings > Privacy > Microphone > "Let desktop apps access
+            # your microphone", which denies audio without failing the open.
+            device = self.config.mic_device_index
+            log(f"[AUDIO] no frames captured in {duration:.2f}s from device "
+                f"{'default' if device is None else device} - the microphone "
+                f"gave nothing. Check that the OS allows this app to record.")
             os.unlink(output_path)
             return None
 

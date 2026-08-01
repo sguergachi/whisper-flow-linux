@@ -20,17 +20,14 @@ def default_config_dir() -> Path:
 
 
 def default_hotkeys() -> dict[str, str]:
-    """Sensible defaults for the platform.
+    """The same physical keys on every platform.
 
-    Super is unusable as a hotkey on Windows: the shell reserves most Win
-    combinations and a bare tap opens the Start menu. Ctrl+Alt is free.
+    Super+Alt, which is Win+Alt on a Windows keyboard. Windows briefly had
+    Ctrl+Alt instead, on the grounds that releasing Win alone opens the Start
+    menu - but muscle memory does not change at the OS boundary, and one
+    binding to remember beats two. Alt is held with it, so the Start menu
+    does not open on release.
     """
-    if IS_WINDOWS:
-        return {
-            "transcribe": "ctrl+alt",
-            "auto_transcribe": "ctrl+alt+space",
-            "command": "ctrl+shift+alt",
-        }
     return {
         "transcribe": "super+alt",
         "auto_transcribe": "ctrl+alt+space",

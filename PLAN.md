@@ -5,9 +5,6 @@ verified — not when written.
 
 ## Now
 
-- [ ] **Make the overlay appear instantly (target 10x)** — still slow on
-      Windows after the import fix. See "Overlay latency" below for the
-      techniques and which one is the real win.
 - [ ] **Velopack installer** (the maintained successor to Squirrel) — fast
       install, delta updates, in-app auto-update.
 - [ ] **Always start on Windows login** — via the installer's Startup
@@ -43,16 +40,21 @@ Where the time goes when the hotkey is pressed, worst first:
 
 Techniques, in order of expected gain:
 
-- [ ] **Keep the overlay process alive** (the 10x). Start it once, hidden,
-      when the daemon starts; show and hide it on command instead of
-      spawning and killing a process per recording. Removes items 1 and 3
-      from the press path entirely — latency becomes "unhide a window",
-      single-digit ms. Needs: a control channel (the level file already acts
-      as one signal), hidden-window lifecycle, and a guarantee the overlay
-      cannot outlive the daemon.
-- [ ] **Pre-warm on first hotkey registration** — weaker version of the
-      above; still pays process startup, just earlier. Fallback if a
-      persistent process proves unstable.
+- [x] **Keep the overlay process alive** — done, and it beat the target.
+      Measured time from `show()` to actually on screen: **114–159ms**
+      spawning per recording, **6–8ms** resident. ~19x, and Windows should
+      gain more than Linux because the frozen bootloader it avoids is far
+      more expensive than a native interpreter.
+      - Commands go down the process's stdin: `show <levels>`, `hide`.
+      - End of stream means the daemon is gone, so the overlay cannot be
+        stranded on screen even if the daemon is killed.
+      - Started on first use, not at daemon start: a machine that never
+        dictates never pays for it, and a crash costs one slow press rather
+        than a permanently missing overlay.
+      - Windows only. The GTK overlay on Linux is a layer-shell surface with
+        its own lifecycle and already appears fast enough.
+- [ ] Measure it on Windows, where the win should be larger than the 19x
+      seen on Linux. Nothing here has been timed on the real target.
 - [ ] Trim what the frozen build loads at startup (exclude unused modules
       from the analysis) — helps item 1 a little, not a 10x.
 - [ ] Measure on Windows before and after. No more guessing from Linux

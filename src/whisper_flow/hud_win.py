@@ -19,8 +19,10 @@ import ctypes
 import json
 import math
 import os
+import queue
 import struct
 import sys
+import threading
 import time
 import tkinter as tk
 from collections import deque
@@ -80,6 +82,7 @@ PEAK_FLOOR = 150.0
 LEVEL_GAMMA = 0.65
 MAX_LIFETIME_S = 600
 DRAG_SLOP = 4
+COMMAND_MS = 8          # how often a resident overlay checks for orders
 
 def _config_dir() -> str:
     """Where settings live, matching config.default_config_dir().
@@ -136,8 +139,16 @@ def _save_position(key: str, x: int, y: int) -> None:
 
 
 class HudWindow:
-    def __init__(self, level_file: str):
+    def __init__(self, level_file: str, resident: bool = False):
         self.level_file = level_file
+        # Resident: stay alive between recordings and wait for orders,
+        # instead of being spawned and killed for each one. Starting a
+        # frozen process is the single largest cost on the path between
+        # pressing the hotkey and seeing anything.
+        self._resident = resident
+        self._visible = not resident
+        self._commands = queue.Queue()
+        self._announced = False
         self.root = tk.Tk()
         self.root.overrideredirect(True)          # no title bar or border
         self.root.attributes("-topmost", True)
@@ -172,8 +183,15 @@ class HudWindow:
         self.canvas.bind("<ButtonRelease-1>", self._on_release)
 
         self.root.after(0, self._apply_window_style)
-        self.root.after(FRAME_MS, self._frame)
-        self.root.after(LEVEL_MS, self._read_levels)
+        if resident:
+            # Built, styled and hidden now, so a later show is a deiconify.
+            self.root.withdraw()
+            threading.Thread(target=self._read_commands, daemon=True,
+                             name="whisper-flow-hud-commands").start()
+            self.root.after(COMMAND_MS, self._poll_commands)
+        else:
+            self.root.after(FRAME_MS, self._frame)
+            self.root.after(LEVEL_MS, self._read_levels)
 
     # -- window shape and placement --------------------------------------
     def _apply_window_style(self):
@@ -226,6 +244,84 @@ class HudWindow:
                 pass
             self._level_handle = None
 
+    # -- resident mode ----------------------------------------------------
+    def _read_commands(self):
+        """Read commands from the daemon on stdin, on a thread of its own.
+
+        Entered only when the daemon asked for it, never when this is run by
+        hand: an inherited stdin would hit EOF at once and close the overlay.
+
+        End of stream means the daemon is gone, which is the guarantee that
+        a resident overlay can never be left behind on the screen.
+        """
+        try:
+            for line in sys.stdin:
+                self._commands.put(line.strip())
+        except Exception:
+            pass
+        self._commands.put("quit")
+
+    def _poll_commands(self):
+        """Drain the command queue on Tk's own thread."""
+        try:
+            while True:
+                command = self._commands.get_nowait()
+                if command.startswith("show"):
+                    _, _, path = command.partition(" ")
+                    self._begin(path.strip())
+                elif command == "hide":
+                    self._end()
+                elif command == "quit":
+                    self.root.destroy()
+                    return
+        except queue.Empty:
+            pass
+        self.root.after(COMMAND_MS, self._poll_commands)
+
+    def _begin(self, level_file: str):
+        """Show for a new recording. No process start, no window creation."""
+        self._close_level_handle()
+        self.level_file = level_file
+        self.level_pos = 0
+        self.peak = PEAK_FLOOR
+        self.targets = deque([0.0] * BARS, maxlen=BARS)
+        self.shown = [0.0] * BARS
+        self.start = time.monotonic()
+        self.fade_in_t0 = time.monotonic()
+        self.fade_out_t0 = None
+        self._quitting = False
+        self._visible = True
+        self._announced = True
+        try:
+            self.root.deiconify()
+            self.root.attributes("-topmost", True)
+            self.root.update_idletasks()
+        except tk.TclError:
+            return
+        print(f"[HUD] visible {time.time():.6f}", flush=True)
+        self.root.after(FRAME_MS, self._frame)
+        self.root.after(LEVEL_MS, self._read_levels)
+
+    def _end(self):
+        """Fade out and hide, keeping the process and window for next time."""
+        if not self._visible or self._quitting:
+            return
+        self._quitting = True
+        self.fade_out_t0 = time.monotonic()
+
+    def _retire(self):
+        """Reached at the end of a fade: withdraw rather than exit."""
+        self._close_level_handle()
+        self.level_file = ""
+        self._visible = False
+        self._quitting = False
+        self.fade_out_t0 = None
+        try:
+            self.root.attributes("-alpha", 0.0)
+            self.root.withdraw()
+        except tk.TclError:
+            pass
+
     def quit(self):
         if self._quitting:
             return
@@ -241,18 +337,25 @@ class HudWindow:
             t = (now - self.fade_out_t0) * 1000.0 / FADE_MS
             self.alpha = 1.0 - _ease(t)
             if t >= 1.0:
-                self._close_level_handle()
-                self.root.destroy()
+                if self._resident:
+                    self._retire()          # stay alive for the next press
+                else:
+                    self._close_level_handle()
+                    self.root.destroy()
                 return
         try:
             self.root.attributes("-alpha", self.alpha * TARGET_ALPHA)
         except tk.TclError:
             return
+        if not self._announced:
+            self._announced = True
+            print(f"[HUD] visible {time.time():.6f}", flush=True)
 
         for i, target in enumerate(self.targets):
             self.shown[i] += (target - self.shown[i]) * LEVEL_EASE
         self._draw()
-        self.root.after(FRAME_MS, self._frame)
+        if self._visible:
+            self.root.after(FRAME_MS, self._frame)
 
     def _read_levels(self):
         if self.level_file:
@@ -261,7 +364,7 @@ class HudWindow:
             if not os.path.exists(self.level_file):
                 print("[HUD] level file gone, closing", flush=True)
                 self._close_level_handle()
-                self.quit()
+                self._end() if self._resident else self.quit()
                 return
             try:
                 # Opened once and held. Reopening thirty times a second put
@@ -288,11 +391,15 @@ class HudWindow:
                 # spinning on a file descriptor that has gone bad.
                 self._close_level_handle()
 
-        if time.monotonic() - self.start > MAX_LIFETIME_S:
+        # The cap guards against an orphan overlay. A resident one is held
+        # open by the daemon's pipe instead, and a recording may legitimately
+        # run to the configured maximum.
+        if not self._resident and time.monotonic() - self.start > MAX_LIFETIME_S:
             print("[HUD] lifetime cap reached, closing", flush=True)
             self.quit()
             return
-        self.root.after(LEVEL_MS, self._read_levels)
+        if self._visible:
+            self.root.after(LEVEL_MS, self._read_levels)
 
     def _build_items(self):
         """Create every canvas item once.
@@ -344,6 +451,9 @@ class HudWindow:
 
 def main() -> int:
     level_file = os.environ.get("WHISPER_FLOW_HUD_LEVEL_FILE", "")
+    # Only when the daemon says so: run by hand, stdin is inherited and would
+    # reach end of stream at once, closing the overlay immediately.
+    resident = os.environ.get("WHISPER_FLOW_HUD_RESIDENT") == "1"
     print(f"[HUD] starting level_file={level_file}", flush=True)
     if not _blur.is_supported():
         # Carry on without the acrylic. The blur is decoration; the overlay is
@@ -357,7 +467,7 @@ def main() -> int:
         ctypes.windll.shcore.SetProcessDpiAwareness(2)
     except Exception:
         pass
-    HudWindow(level_file).run()
+    HudWindow(level_file, resident=resident).run()
     return 0
 
 

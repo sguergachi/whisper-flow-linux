@@ -16,6 +16,16 @@ from .logging import log
 
 IS_WINDOWS = sys.platform == "win32"
 
+# Keep one overlay process alive and command it, instead of starting one per
+# recording. Starting a frozen process is the largest cost between the hotkey
+# and anything appearing on screen, and no amount of making our own code
+# faster removes it.
+#
+# Windows only for now. The GTK overlay there is a Wayland layer-shell
+# surface with its own lifecycle, and it already appears fast enough that
+# this would be risk without reward.
+RESIDENT = IS_WINDOWS
+
 
 LAYER_SHELL_CANDIDATES = (
     "/usr/lib/libgtk4-layer-shell.so",
@@ -61,9 +71,8 @@ class HUD:
         with self._lock:
             self._show_locked(level_file, monitor, point)
 
-    def _show_locked(self, level_file, monitor, point):
-        self.hide()
-
+    def _overlay_env(self, level_file, monitor=None, point=None):
+        """Environment for the overlay process."""
         env = os.environ.copy()
         if not IS_WINDOWS:
             # The overlay is a Wayland layer-shell surface; it has no X11 path.
@@ -95,7 +104,18 @@ class HUD:
                 env["WHISPER_FLOW_HUD_POINT"] = f"{int(point[0])},{int(point[1])}"
             except (TypeError, ValueError, IndexError, KeyError):
                 pass
+        return env
 
+    def _show_locked(self, level_file, monitor, point):
+        # A resident overlay is already running and already built; showing it
+        # is a message down a pipe rather than a process start. Everything
+        # below - spawning, loading Python, creating a window - is what made
+        # the overlay take a visible moment to appear on Windows.
+        if RESIDENT and self._command(f"show {level_file}"):
+            return
+        self.hide()
+
+        env = self._overlay_env(level_file, monitor, point)
         # Launched by path rather than with -m: importing the package would
         # pull in the daemon and with it pystray's GTK 3, and one process
         # cannot hold both GTK 3 and the overlay's GTK 4.
@@ -158,9 +178,96 @@ class HUD:
         return [sys.executable,
                 os.path.join(os.path.dirname(os.path.abspath(__file__)), module)]
 
+    def _command(self, line: str) -> bool:
+        """Send one order to a resident overlay. False if there is not one.
+
+        Starts it on first use rather than at daemon start, so a machine that
+        never dictates never pays for it, and a crash costs one slow press
+        rather than a permanently missing overlay.
+        """
+        for attempt in (1, 2):
+            process = self._resident_process()
+            if not process:
+                return False
+            try:
+                process.stdin.write(f"{line}\n")
+                process.stdin.flush()
+                return True
+            except (OSError, ValueError):
+                # It died between the check and the write. Drop it and let
+                # the second attempt start a fresh one.
+                log(f"[HUD] resident overlay went away on attempt {attempt}")
+                self._discard_resident()
+        return False
+
+    def _resident_process(self):
+        """The live overlay process, started if it is not running."""
+        if self._process and self._process.poll() is None:
+            return self._process
+        self._discard_resident()
+
+        env = self._overlay_env("")
+        env["WHISPER_FLOW_HUD_RESIDENT"] = "1"
+        fd, self._log_path = tempfile.mkstemp(suffix=".log", prefix="whisper-flow-hud-")
+        os.close(fd)
+        try:
+            self._log_file = open(self._log_path, "a")
+            self._process = subprocess.Popen(
+                self._overlay_command(),
+                stdin=subprocess.PIPE,
+                stdout=self._log_file,
+                stderr=subprocess.STDOUT,
+                env=env,
+                text=True,
+                creationflags=(subprocess.CREATE_NEW_PROCESS_GROUP
+                               if IS_WINDOWS else 0),
+            )
+        except Exception as e:
+            log(f"[HUD] could not start the resident overlay: {e}")
+            self._process = None
+            self._cleanup_files()
+        return self._process
+
+    def _discard_resident(self):
+        """Forget a dead overlay without touching a live one."""
+        if self._process and self._process.poll() is None:
+            return
+        self._process = None
+        self._cleanup_files()
+
+    def shutdown(self):
+        """Stop the overlay for good. Called when the daemon exits.
+
+        Closing stdin is the ordinary path: the overlay reads end of stream
+        and leaves. That is also the safety net if the daemon dies without
+        calling this - the pipe closes either way, so a resident overlay
+        cannot be stranded on screen.
+        """
+        with self._lock:
+            process = self._process
+            self._process = None
+            if not process:
+                return
+            try:
+                if process.stdin:
+                    process.stdin.close()
+            except Exception:
+                pass
+            try:
+                process.wait(timeout=3)
+            except Exception:
+                try:
+                    process.kill()
+                except Exception:
+                    pass
+            self._cleanup_files()
+
     def hide(self):
         """Hide the recording HUD overlay."""
         with self._lock:
+            if RESIDENT and self._process and self._process.poll() is None:
+                self._command("hide")
+                return
             self._hide_locked()
 
     def _hide_locked(self):

@@ -1242,6 +1242,14 @@ Use 'whisper-flow stop' to exit daemon
             log("[DAEMON] Stopping active recording during cleanup")
             self._stop_recording()
 
+        # Retire the overlay. A resident one outlives a single recording by
+        # design, so it has to be told to go; if this is missed the pipe
+        # closing when this process dies takes it down anyway.
+        try:
+            self.hud.shutdown()
+        except Exception as e:
+            log(f"[DAEMON] Error stopping the overlay: {e}")
+
         # Stop the managed speech server
         try:
             self.backend.stop()

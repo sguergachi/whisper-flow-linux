@@ -72,14 +72,22 @@ jobs:
 
       - name: Confirm the Windows-only tests really ran
         # skipif on the wrong condition would make this job silently vacuous.
+        # The count is parsed rather than pattern-matched: "0 tests collected"
+        # is a substring of "10 tests collected", which failed this step on a
+        # run where all ten had in fact passed.
         shell: pwsh
         run: |
           $out = pytest tests/test_windows_native.py -q -p no:cacheprovider `
                  --collect-only 2>&1 | Out-String
-          if ($out -match "no tests ran" -or $out -match "0 tests collected") {
+          Write-Host $out
+          if ($out -notmatch '(\d+)\s+tests?\s+collected') {
+            throw "could not read a test count from pytest"
+          }
+          $collected = [int]$Matches[1]
+          if ($collected -lt 1) {
             throw "test_windows_native.py collected nothing on Windows"
           }
-          Write-Host $out
+          Write-Host "Windows-only tests collected: $collected"
 
   linux:
     name: package (linux)

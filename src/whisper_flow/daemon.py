@@ -695,10 +695,6 @@ class WhisperFlowDaemon:
             return False
         with self._setup_lock:
             if self._setup_process and self._setup_process.poll() is None:
-                try:
-                    self._setup_process.wait(timeout=0)
-                except Exception:
-                    pass
                 return True             # already open; don't stack windows
 
             if getattr(sys, "frozen", False):
@@ -706,18 +702,18 @@ class WhisperFlowDaemon:
             else:
                 cmd = [sys.executable, "-m", "whisper_flow.setup_win"]
             try:
-                self._setup_process = subprocess.Popen(cmd)
+                process = self._setup_process = subprocess.Popen(cmd)
             except Exception as e:
                 log(f"[DAEMON] could not open the setup window: {e}")
                 return False
 
-        threading.Thread(target=self._after_setup_window, daemon=True,
-                         name="whisper-flow-setup-watch").start()
+        threading.Thread(target=self._after_setup_window, args=(process,),
+                         daemon=True, name="whisper-flow-setup-watch").start()
         return True
 
-    def _after_setup_window(self) -> None:
+    def _after_setup_window(self, process=None) -> None:
         """Adopt whatever the setup window installed, once it closes."""
-        process = self._setup_process
+        process = process or self._setup_process
         try:
             process.wait()
         except Exception:

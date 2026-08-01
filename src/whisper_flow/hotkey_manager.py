@@ -200,7 +200,6 @@ class HotkeyManager:
 
             self._evdev_listener.register_hotkey(
                 name, key_str, press_cb, release_cb,
-                swallow=binding.mode == HotkeyMode.PUSH_TO_TALK,
             )
 
         self._evdev_listener.start()

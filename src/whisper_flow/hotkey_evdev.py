@@ -51,24 +51,10 @@ class EvdevHotkeyListener:
         self._callbacks = queue.Queue()
         self._active_hotkey = None
         self._press_triggered = set()  # hotkeys whose press callback was already fired
-        self._swallowed = set()   # codes hidden from the compositor while held
-        self._pending = []        # codes held back pending a combination
-        self._participants = set()  # codes that could start a swallowing combo
 
-    def register_hotkey(self, name, key_string, callback_press, callback_release=None,
-                        swallow=False):
-        """Register a binding.
-
-        `swallow` hides the combination's own keys from the compositor while it
-        is held. Push-to-talk needs this: the app types the transcription with
-        ydotool while the user is still holding the hotkey, and if the
-        compositor still sees those modifiers down, every injected character
-        arrives as Super+Alt+<key> and nothing gets typed.
-        """
+    def register_hotkey(self, name, key_string, callback_press, callback_release=None):
         keys = self._parse_key_string(key_string)
-        self._bindings[name] = (keys, callback_press, callback_release, swallow)
-        if swallow:
-            self._participants |= set(keys)
+        self._bindings[name] = (keys, callback_press, callback_release)
 
     def _parse_key_string(self, key_string):
         codes = set()
@@ -175,9 +161,6 @@ class EvdevHotkeyListener:
                     try:
                         for event in fds[fd].read():
                             if event.type == ecodes.EV_KEY:
-                                # _handle_key owns forwarding for key events:
-                                # whether one reaches the compositor depends on
-                                # state it is in the middle of updating.
                                 self._handle_key(event)
                             else:
                                 self._forward(event)
@@ -201,74 +184,33 @@ class EvdevHotkeyListener:
         except Exception:
             pass
 
-    def _emit(self, code, value):
-        """Synthesise a key event on the proxy (used to hide/restore keys)."""
-        try:
-            self._uinput.write(ecodes.EV_KEY, code, value)
-            self._uinput.syn()
-        except Exception:
-            pass
-
-    def _flush_pending(self):
-        """Deliver speculatively-held keys, in the order they were pressed."""
-        for code in self._pending:
-            self._emit(code, 1)
-        self._pending.clear()
-
-    def _begin_swallow(self, keys):
-        """Hide a combination's keys for as long as they are held."""
-        for code in keys:
-            if code in self._pending:
-                self._pending.remove(code)
-            self._swallowed.add(code)
-
     def _handle_key(self, event):
+        """Track state and forward. Every event is forwarded, unconditionally.
+
+        An earlier version held a combination's keys back from the compositor
+        so that text typed during dictation did not arrive as Super+<key>.
+        It is not worth it: a single missed release left a key held in the
+        pending list, and the next keystroke flushed a synthetic press that
+        never got its release - a modifier stuck down system-wide, which made
+        the keyboard unusable. Withholding real input is not something this
+        can get wrong safely, so it does not do it at all. The typing side
+        clears modifiers itself instead; see SystemManager.type_text.
+        """
         code = CODE_ALIASES.get(event.code, event.code)
         value = event.value
 
-        if value == 2:
-            # Auto-repeat. Never a state change: holding a push-to-talk combo
-            # generates these continuously, and treating one as a release ends
-            # the recording about half a second after it starts.
-            if code not in self._swallowed and code not in self._pending:
-                self._forward(event)
-            return
-
+        # Auto-repeat (2) is never a state change: holding a push-to-talk
+        # combination generates these continuously, and treating one as a
+        # release ends the recording about half a second after it starts.
         if value == 1:
-            if code in self._swallowed:
-                return
             self._key_state.add(code)
-
-            if code in self._participants:
-                # Hold it back rather than forwarding: if this turns out to be
-                # the start of a push-to-talk combination, the compositor must
-                # never have seen it down, or releasing it later reads as a
-                # bare modifier tap and opens the launcher.
-                self._pending.append(code)
-                self._check_bindings(rising=True)
-                return
-
-            # An unrelated key: whatever was held back was a real modifier
-            # after all, so deliver it first to keep combinations working.
-            self._flush_pending()
             self._check_bindings(rising=True)
-            self._forward(event)
-            return
+        elif value == 0:
+            # Drop the key before re-evaluating, otherwise the combination
+            # still looks held and the release callback never fires.
+            self._key_state.discard(code)
+            self._check_bindings(rising=False)
 
-        # Release. Drop the key before re-evaluating, otherwise the
-        # combination still looks held and the release callback never fires.
-        self._key_state.discard(code)
-        self._check_bindings(rising=False)
-
-        if code in self._swallowed:
-            self._swallowed.discard(code)
-            return  # the compositor never saw it go down
-        if code in self._pending:
-            # Held back but never part of a combination: replay it now.
-            self._pending.remove(code)
-            self._emit(code, 1)
-            self._emit(code, 0)
-            return
         self._forward(event)
 
     def _check_bindings(self, rising: bool):
@@ -276,14 +218,14 @@ class EvdevHotkeyListener:
         # not also fire the cmd+alt binding nested inside it.
         satisfied = [
             (name, keys)
-            for name, (keys, _, _, _) in self._bindings.items()
+            for name, (keys, _, _) in self._bindings.items()
             if keys and keys.issubset(self._key_state)
         ]
         winner = None
         if satisfied:
             winner = max(satisfied, key=lambda item: len(item[1]))[0]
 
-        for name, (keys, cb_press, cb_release, swallow) in self._bindings.items():
+        for name, (keys, cb_press, cb_release) in self._bindings.items():
             if name == winner:
                 # Only arm on a key-down. Otherwise releasing shift out of
                 # cmd+shift+alt would "fall through" and fire cmd+alt, starting
@@ -291,8 +233,6 @@ class EvdevHotkeyListener:
                 if name not in self._press_triggered and rising:
                     self._press_triggered.add(name)
                     self._active_hotkey = name
-                    if swallow:
-                        self._begin_swallow(keys)
                     if cb_press:
                         self._callbacks.put((name, "press", cb_press))
             elif name in self._press_triggered:
@@ -334,5 +274,4 @@ class EvdevHotkeyListener:
             self._dispatch_thread = None
         self._key_state.clear()
         self._press_triggered.clear()
-        self._swallowed.clear()
         self._active_hotkey = None

@@ -392,10 +392,31 @@ class SystemManager:
     def _is_wayland(self) -> bool:
         return self._wayland or self._xdg_session == "wayland"
 
+    def _release_modifiers(self) -> None:
+        """Tell the compositor no modifiers are held, before injecting text.
+
+        Live transcription types while the user is still holding the
+        push-to-talk combination, so without this every character arrives as
+        Super+Alt+<key> - a shortcut, not text. Doing it here is deliberate:
+        the alternative is withholding the user's real key events upstream,
+        and getting that wrong strands a modifier down system-wide.
+
+        Injecting extra key-up events is safe in a way that withholding
+        key-down events is not: the worst case is a redundant release.
+        """
+        try:
+            subprocess.run(
+                ["ydotool", "key", *[f"{c}:0" for c in self.MODIFIER_CODES]],
+                check=False, capture_output=True, timeout=5,
+            )
+        except Exception:
+            pass
+
     def _ydotool_type(self, text: str) -> bool:
         import sys as _sys
         _sys.stdout.write(f"[PASTE] _ydotool_type called with text={text!r}\n")
         _sys.stdout.flush()
+        self._release_modifiers()
         with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
             f.write(text)
             tmp = f.name

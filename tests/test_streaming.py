@@ -88,3 +88,52 @@ def test_concurrent_commit_and_finalize_do_not_interleave():
 
     assert typed == settled, "typed more text after the final transcript"
     assert "".join(typed).startswith("x y")
+
+
+# ---------------------------------------------------- delivery of the words
+def test_a_refused_emit_is_noticed_rather_than_ignored():
+    """Recording works, the overlay animates, and nothing is typed."""
+    live = LiveTranscriber(transcribe=lambda p: None,
+                           emit=lambda text: False,      # SendInput refused
+                           sample_rate=16000)
+    live._send(["hello", "there"])
+    assert live.delivery_failed
+
+
+def test_a_successful_emit_is_not_reported_as_failure():
+    live = LiveTranscriber(transcribe=lambda p: None,
+                           emit=lambda text: True, sample_rate=16000)
+    live._send(["hello"])
+    assert not live.delivery_failed
+
+
+def test_an_emit_returning_none_counts_as_delivered():
+    """Most callables return None; only an explicit False means refused."""
+    live = LiveTranscriber(transcribe=lambda p: None,
+                           emit=lambda text: None, sample_rate=16000)
+    live._send(["hello"])
+    assert not live.delivery_failed
+
+
+def test_partial_delivery_is_not_a_total_failure():
+    calls = []
+
+    def emit(text):
+        calls.append(text)
+        return len(calls) > 1          # first refused, second accepted
+
+    live = LiveTranscriber(transcribe=lambda p: None, emit=emit,
+                           sample_rate=16000)
+    live._send(["one"])
+    live._send(["two"])
+    assert not live.delivery_failed    # something reached the screen
+
+
+def test_a_raising_emit_counts_as_a_delivery_failure():
+    def emit(text):
+        raise OSError("clipboard on fire")
+
+    live = LiveTranscriber(transcribe=lambda p: None, emit=emit,
+                           sample_rate=16000)
+    live._send(["hello"])
+    assert live.delivery_failed

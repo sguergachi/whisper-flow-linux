@@ -691,8 +691,9 @@ class WhisperFlowDaemon:
         demands the main thread of wherever it runs. Returns False where
         there is no window to show, so the caller can fall back.
         """
-        if sys.platform != "win32":
-            return False
+        if sys.platform != "win32" and not (
+                os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+            return False                # headless: fall back to downloading
         with self._setup_lock:
             if self._setup_process and self._setup_process.poll() is None:
                 return True             # already open; don't stack windows
@@ -700,7 +701,7 @@ class WhisperFlowDaemon:
             if getattr(sys, "frozen", False):
                 cmd = [sys.executable, "--setup"]
             else:
-                cmd = [sys.executable, "-m", "whisper_flow.setup_win"]
+                cmd = [sys.executable, "-m", "whisper_flow.setup_ui"]
             try:
                 process = self._setup_process = subprocess.Popen(cmd)
             except Exception as e:

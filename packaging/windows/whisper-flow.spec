@@ -22,7 +22,7 @@ hidden = collect_submodules("pydantic") + [
     "whisper_flow.system_win",
     "whisper_flow.blur_win",
     "whisper_flow.hud_win",
-    "whisper_flow.setup_win",
+    "whisper_flow.setup_ui",
     "pystray._win32",
     "PIL._tkinter_finder",
     # blur_win reaches for these, and ctypes.wintypes is a submodule that

@@ -15,10 +15,12 @@ without one gets a small model instead. A fast wrong-sized default is worse
 than a slower right-sized one.
 """
 
+import os
 import platform
 import shutil
 import subprocess
 import sys
+import tarfile
 import threading
 import time
 import urllib.request
@@ -39,6 +41,7 @@ MODELS = {
     "ggml-medium.en": (1530, "~1.5GB"),
     "ggml-small.en": (466, "~600MB"),
     "ggml-base.en": (142, "~250MB"),
+    "ggml-tiny.en": (75, "~125MB"),
 }
 
 
@@ -67,7 +70,15 @@ def _model_dir(config_dir: Path) -> Path:
 
 
 def detect_accelerator() -> str:
-    """What this machine can run whisper.cpp on: 'cuda12', 'cuda11' or 'cpu'."""
+    """What this machine can run whisper.cpp on: 'cuda12', 'cuda11' or 'cpu'.
+
+    There is deliberately no integrated-GPU option. whisper.cpp publishes no
+    prebuilt Vulkan, SYCL or OpenVINO binaries for any platform - only CPU
+    and cuBLAS - so on an Intel or AMD laptop there is simply no GPU engine
+    to point at, and pretending otherwise would mean shipping a build of our
+    own that nobody here can test against those drivers. Those machines get
+    the CPU engine, sized to the CPU they actually have.
+    """
     if not shutil.which("nvidia-smi"):
         return "cpu"
     try:
@@ -84,19 +95,126 @@ def detect_accelerator() -> str:
         return "cpu"
 
 
+def usable_cores() -> int:
+    """Cores whisper.cpp should actually use.
+
+    Not every core: on a laptop this runs while the user is typing into the
+    thing they are dictating to, and saturating the CPU makes the desktop
+    stutter and the fans spin up for a few seconds of speech. Leaving a
+    couple free costs very little transcription speed.
+
+    Also not the logical count. whisper.cpp is compute-bound, so SMT siblings
+    add contention rather than throughput, and efficiency cores are slower
+    than the threads waiting on them.
+    """
+    physical = None
+    try:
+        physical = os.cpu_count()
+        if hasattr(os, "sched_getaffinity"):     # respects cgroup/taskset limits
+            physical = len(os.sched_getaffinity(0))
+    except Exception:
+        pass
+    if not physical:
+        return 4
+    # Assume SMT, then keep two cores back for everything else.
+    return max(2, min(8, physical // 2 - 1 or 2))
+
+
+def total_ram_gb() -> float:
+    """Roughly how much memory this machine has, or 0.0 if it will not say."""
+    try:
+        if hasattr(os, "sysconf") and "SC_PAGE_SIZE" in os.sysconf_names:
+            pages = os.sysconf("SC_PHYS_PAGES")
+            return pages * os.sysconf("SC_PAGE_SIZE") / (1024 ** 3)
+    except (OSError, ValueError, AttributeError):
+        pass
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            import ctypes.wintypes
+
+            class Status(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.wintypes.DWORD),
+                    ("dwMemoryLoad", ctypes.wintypes.DWORD),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            status = Status()
+            status.dwLength = ctypes.sizeof(Status)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+                return status.ullTotalPhys / (1024 ** 3)
+        except Exception:
+            pass
+    return 0.0
+
+
 def recommended_model(accelerator: str) -> str:
-    """Largest model the machine can run at a sensible speed."""
+    """The largest model this machine can run without falling behind speech.
+
+    Sizing matters far more on a CPU than on a GPU. large-v3-turbo on an
+    NVIDIA card transcribes faster than anyone talks; the same model on a
+    laptop CPU takes minutes per sentence, which is not a slower feature but
+    a broken one. So the CPU tiers are set by what keeps up in real time:
+
+      small.en   a full desktop or workstation CPU
+      base.en    a typical laptop - clearly the common case
+      tiny.en    a thin, old or memory-starved machine
+
+    A too-small model is merely less accurate. A too-large one is unusable,
+    so every boundary here rounds down.
+    """
     if accelerator.startswith("cuda"):
         return "ggml-large-v3-turbo"
-    # On CPU, anything larger than this transcribes slower than speech.
-    return "ggml-small.en"
+
+    cores = usable_cores()
+    ram = total_ram_gb()
+    if ram and ram < 4:
+        return "ggml-tiny.en"
+    # small.en holds ~600MB of weights resident for as long as the daemon
+    # runs, which is a lot to ask of an 8GB machine that is also running a
+    # browser. base.en asks ~250MB and is the safe middle.
+    if cores >= 6 and (not ram or ram >= 8):
+        return "ggml-small.en"
+    if cores >= 3:
+        return "ggml-base.en"
+    return "ggml-tiny.en"
 
 
 def _server_archive(accelerator: str) -> str:
+    """The whisper.cpp release asset to fetch for this machine.
+
+    The Linux build is CPU-only because that is all upstream publishes for
+    it; it does ship per-microarchitecture ggml backends and loads the best
+    one for the host at runtime, so a laptop still gets AVX2 rather than a
+    lowest-common-denominator binary.
+    """
+    if sys.platform != "win32":
+        return "whisper-bin-ubuntu-x64.tar.gz"
     return {
         "cuda12": "whisper-cublas-12.4.0-bin-x64.zip",
         "cuda11": "whisper-cublas-11.8.0-bin-x64.zip",
     }.get(accelerator, "whisper-blas-bin-x64.zip")
+
+
+def _extract(archive: Path, into: Path) -> None:
+    """Unpack a release asset, whichever form this platform's comes in."""
+    if archive.name.endswith(".tar.gz"):
+        with tarfile.open(archive) as tar:
+            # filter= is required from 3.14 and refuses paths escaping `into`.
+            try:
+                tar.extractall(into, filter="data")
+            except TypeError:                   # older Python without filter=
+                tar.extractall(into)
+    else:
+        with zipfile.ZipFile(archive) as z:
+            z.extractall(into)
 
 
 def _stage(progress, name: str):
@@ -216,10 +334,6 @@ class LocalBackend:
         occasional notification, which is enough for a background upgrade
         and not enough for someone watching a download they just started.
         """
-        if sys.platform != "win32":
-            log("[BACKEND] Automatic install is Windows-only for now")
-            return False
-
         accelerator = detect_accelerator()
         model = model or recommended_model(accelerator)
         log(f"[BACKEND] accelerator={accelerator} model={model}")
@@ -233,22 +347,30 @@ class LocalBackend:
         try:
             if not have_exe:
                 archive = _server_archive(accelerator)
-                self._notify(f"Downloading speech engine ({accelerator})...")
-                zip_path = _runtime_dir(self.config.config_dir) / archive
-                _download(f"{RELEASE_URL}/{archive}", zip_path,
+                # Name what is actually being fetched. On Linux that is the
+                # CPU build even on a CUDA machine, and claiming otherwise
+                # would make a slow transcription look like a broken GPU.
+                kind = "GPU" if "cublas" in archive else "CPU"
+                self._notify(f"Downloading the {kind} speech engine...")
+                runtime = _runtime_dir(self.config.config_dir)
+                archive_path = runtime / archive
+                _download(f"{RELEASE_URL}/{archive}", archive_path,
                           _stage(progress, "engine"))
-                with zipfile.ZipFile(zip_path) as z:
-                    z.extractall(_runtime_dir(self.config.config_dir))
-                zip_path.unlink(missing_ok=True)
-                # The archives nest the binaries a directory deep.
+                _extract(archive_path, runtime)
+                archive_path.unlink(missing_ok=True)
+                # The archives nest the binaries a directory deep, and the
+                # shared libraries beside them have to stay beside them: the
+                # Linux build finds them through RUNPATH=$ORIGIN.
                 if not downloaded_exe.exists():
-                    for found in _runtime_dir(self.config.config_dir).rglob(
-                            self.server_exe.name):
+                    for found in runtime.rglob(self._exe_name):
                         for item in found.parent.iterdir():
-                            shutil.move(str(item), _runtime_dir(self.config.config_dir))
+                            shutil.move(str(item), runtime)
                         break
                 if not downloaded_exe.exists():
                     raise RuntimeError(f"{self._exe_name} not found in {archive}")
+                if sys.platform != "win32":
+                    # A tarball's mode bits do not survive every extraction path.
+                    downloaded_exe.chmod(0o755)
 
             if not have_model:
                 size_mb = MODELS.get(model, (0, ""))[0]
@@ -291,6 +413,11 @@ class LocalBackend:
                 "--host", "127.0.0.1",
                 "--port", str(self.config.local_server_port),
             ]
+            if detect_accelerator() == "cpu":
+                # Left to itself whisper.cpp takes as many threads as it
+                # likes, which on a laptop competes with the application
+                # being dictated into. See usable_cores().
+                cmd += ["-t", str(usable_cores())]
             # No console window for a background helper.
             flags = 0x08000000 if sys.platform == "win32" else 0
             try:
@@ -382,6 +509,9 @@ class LocalBackend:
         True when there is an NVIDIA GPU but the app is still running the
         bundled CPU engine and small model.
         """
+        # Only Windows has a CUDA engine to move up to. Upstream's Linux
+        # asset is CPU-only, so on Linux an NVIDIA card changes nothing that
+        # can be offered here, and offering it anyway would be a lie.
         if sys.platform != "win32":
             return False
         if not detect_accelerator().startswith("cuda"):

@@ -23,7 +23,7 @@ def main() -> int:
         return hud_main()
 
     if "--setup" in sys.argv:
-        from whisper_flow.setup_win import main as setup_main
+        from whisper_flow.setup_ui import main as setup_main
         return setup_main()
 
     from whisper_flow.daemon import WhisperFlowDaemon

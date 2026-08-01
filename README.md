@@ -1,6 +1,14 @@
 # WhisperFlow
 
-AI-powered voice-to-text flow application with context-aware processing and system tray integration.
+Hold a key, talk, and the words appear in whatever you were typing into.
+
+![The recording overlay, with a live waveform](docs/hud.gif)
+
+> A fork of [sapountzis/whisper-flow-linux](https://github.com/sapountzis/whisper-flow-linux)
+> by Andreas Sapountzis, whose commits open this repository's history.
+> This fork adds live transcription, a Wayland layer-shell overlay with
+> compositor blur, GPU transcription through whisper.cpp, and a Windows 11
+> build. Bugs in any of that belong here, not upstream.
 
 ## Features
 
@@ -36,8 +44,8 @@ sudo apt update && sudo apt install -y \
 
 ```bash
 # Clone the repository
-git clone https://github.com/sapountzis/whisper-flow.git
-cd whisper-flow
+git clone https://github.com/sguergachi/whisper-flow-linux.git
+cd whisper-flow-linux
 
 # Create virtual environment with system site packages
 python3.12 -m venv .venv --system-site-packages
@@ -180,7 +188,10 @@ Configuration files are stored in `~/.config/whisper-flow/`:
 
 ## License
 
-MIT License - see LICENSE file for details.
+The upstream project states MIT in its README but has never included a
+LICENSE file, so there is no licence text or copyright line to inherit and
+this fork cannot supply one on the original author's behalf. Treat the
+licensing as unsettled until upstream adds one.
 
 ## Contributing
 
@@ -192,8 +203,10 @@ MIT License - see LICENSE file for details.
 
 ## Support
 
-- **Issues**: [GitHub Issues](https://github.com/sapountzis/open-whisper-flow/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/sapountzis/open-whisper-flow/discussions)
+- **Issues**: [GitHub Issues](https://github.com/sguergachi/whisper-flow-linux/issues)
+- **Discussions**: [GitHub Discussions](https://github.com/sguergachi/whisper-flow-linux/discussions)
+- **Upstream**: [sapountzis/whisper-flow-linux](https://github.com/sapountzis/whisper-flow-linux)
+  — for anything predating this fork
 
 ### Manual Testing
 

@@ -4,7 +4,9 @@ version = "0.1.0"
 description = "AI-powered voice-to-text flow application with context-aware processing"
 readme = "README.md"
 authors = [
-    { name = "sapountzis", email = "sapountzis.andreas@gmail.com" }
+    # Original author; the first commits in this repository are his.
+    { name = "Andreas Sapountzis", email = "sapountzis.andreas@gmail.com" },
+    { name = "Sammy Guergachi", email = "sguergachi@gmail.com" },
 ]
 requires-python = ">=3.11"
 dependencies = [
@@ -51,8 +53,10 @@ whisper-flow-dictation = "whisper_flow.cli:dictation_entry"
 whisper-flow-daemon = "whisper_flow.daemon:main"
 
 [project.urls]
-Homepage = "https://github.com/sapountzis/whisper-flow"
-Repository = "https://github.com/sapountzis/whisper-flow"
+Homepage = "https://github.com/sguergachi/whisper-flow-linux"
+Repository = "https://github.com/sguergachi/whisper-flow-linux"
+Issues = "https://github.com/sguergachi/whisper-flow-linux/issues"
+Upstream = "https://github.com/sapountzis/whisper-flow-linux"
 
 [build-system]
 requires = ["hatchling"]

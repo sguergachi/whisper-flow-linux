@@ -108,6 +108,7 @@ jobs:
         run: |
           python -c "import whisper_flow.system_win, whisper_flow.hotkey_win; print('windows modules OK')"
           python -c "import whisper_flow.hud_win, whisper_flow.blur_win; print('hud + blur OK')"
+          python -c "import whisper_flow.blur_win as b; print('runner build', b.windows_build(), 'supported', b.is_supported())"
           python -c "from whisper_flow.daemon import WhisperFlowDaemon; print('daemon imports OK')"
 
       - name: Build

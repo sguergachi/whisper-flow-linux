@@ -5,15 +5,13 @@ honours the same environment variables, exits when that file disappears - but
 built on tkinter, which ships with Python on Windows, plus a Win32 region for
 the rounded outline.
 
+Windows 11 22H2 or later only - see blur_win for why.
+
 What differs from Linux, and why:
 
-  * Blur comes from DWM rather than ext-background-effect - see blur_win -
-    and the tint is the compositor's acrylic instead of one this draws. The
-    window keeps a uniform alpha so the blur shows through what is painted
-    over it; an opaque canvas would hide the effect entirely.
-  * Corners come from SetWindowRgn, which is a hard-edged mask with no
-    antialiasing. The alternative, per-pixel alpha through UpdateLayeredWindow,
-    means giving up tkinter's drawing entirely for a fairly small gain.
+  * Blur, rounded corners and the border all come from DWM rather than being
+    drawn or masked here. The window keeps a uniform alpha so the acrylic
+    shows through what is painted over it; an opaque canvas would hide it.
   * Fading uses the window's uniform alpha rather than per-pixel alpha.
 """
 
@@ -45,11 +43,10 @@ def _load_sibling(name):
     return module
 
 
-enable_blur = _load_sibling("blur_win").enable_blur
+_blur = _load_sibling("blur_win")
 
 WIDTH = 268
 HEIGHT = 54
-RADIUS = HEIGHT // 2
 BOTTOM_MARGIN = int(os.environ.get("WHISPER_FLOW_HUD_BOTTOM_MARGIN", "28"))
 
 DOT_X = 27
@@ -68,8 +65,8 @@ DOT_COLOUR = "#ff4548"
 OUTLINE = "#6b6c73"
 
 FADE_MS = 200.0
-TARGET_ALPHA = 0.78   # with blur behind it
-OPAQUE_ALPHA = 0.97   # without
+# Held below 1 so the acrylic behind the window reads through the panel.
+TARGET_ALPHA = 0.78
 FRAME_MS = 16
 LEVEL_MS = 33
 LEVEL_EASE = 0.30
@@ -141,40 +138,26 @@ class HudWindow:
         self.level_pos = 0
         self._drag_from = None
         self._quitting = False
-        self._blur = None
+        self.style = None
 
         self.canvas.bind("<Button-1>", self._on_press)
         self.canvas.bind("<B1-Motion>", self._on_drag)
         self.canvas.bind("<ButtonRelease-1>", self._on_release)
 
-        self.root.after(0, self._round_corners)
-        self.root.after(0, self._enable_blur)
+        self.root.after(0, self._apply_window_style)
         self.root.after(FRAME_MS, self._frame)
         self.root.after(LEVEL_MS, self._read_levels)
 
     # -- window shape and placement --------------------------------------
-    def _round_corners(self):
-        """Clip the window to a rounded rectangle via a Win32 region."""
+    def _apply_window_style(self):
+        """Hand the backdrop, corners and border to DWM."""
         try:
             self.root.update_idletasks()
             hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
-            region = ctypes.windll.gdi32.CreateRoundRectRgn(
-                0, 0, WIDTH + 1, HEIGHT + 1, RADIUS * 2, RADIUS * 2,
-            )
-            ctypes.windll.user32.SetWindowRgn(hwnd, region, True)
+            self.style = _blur.apply_window_style(hwnd)
+            print(f"[HUD] window style: {self.style or 'not applied'}", flush=True)
         except Exception as e:
-            print(f"[HUD] could not round corners: {e}", flush=True)
-
-    def _enable_blur(self):
-        """Ask DWM to blur the backdrop, and note whether it agreed."""
-        try:
-            self.root.update_idletasks()
-            hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
-            self._blur = enable_blur(hwnd)
-            print(f"[HUD] blur: {self._blur or 'unavailable, drawing opaque'}",
-                  flush=True)
-        except Exception as e:
-            print(f"[HUD] blur setup failed: {e}", flush=True)
+            print(f"[HUD] window style failed: {e}", flush=True)
 
     def _start_position(self):
         saved = _load_positions().get("default")
@@ -226,11 +209,7 @@ class HudWindow:
                 self.root.destroy()
                 return
         try:
-            # Blurred: hold the window translucent so the acrylic shows
-            # through. Not blurred: go opaque, or the pill is just a dim
-            # rectangle over whatever is behind it.
-            ceiling = TARGET_ALPHA if self._blur else OPAQUE_ALPHA
-            self.root.attributes("-alpha", self.alpha * ceiling)
+            self.root.attributes("-alpha", self.alpha * TARGET_ALPHA)
         except tk.TclError:
             return
 
@@ -275,15 +254,9 @@ class HudWindow:
         c.delete("all")
         mid = HEIGHT / 2
 
+        # Flat fill: DWM rounds and clips the window, so drawing a rounded
+        # outline here would sit inside its curve and read as a double edge.
         c.create_rectangle(0, 0, WIDTH, HEIGHT, fill=BG, outline="")
-        # The region already rounds the window; this traces the same curve so
-        # the edge reads as an outline rather than a cut.
-        c.create_arc(1, 1, RADIUS * 2, HEIGHT - 1, start=90, extent=180,
-                     style="arc", outline=OUTLINE)
-        c.create_arc(WIDTH - RADIUS * 2, 1, WIDTH - 1, HEIGHT - 1,
-                     start=270, extent=180, style="arc", outline=OUTLINE)
-        c.create_line(RADIUS, 1, WIDTH - RADIUS, 1, fill=OUTLINE)
-        c.create_line(RADIUS, HEIGHT - 1, WIDTH - RADIUS, HEIGHT - 1, fill=OUTLINE)
 
         breathe = 0.6 + 0.4 * (0.5 + 0.5 * math.sin(
             (time.monotonic() - self.start) * 3.0))
@@ -308,6 +281,9 @@ class HudWindow:
 def main() -> int:
     level_file = os.environ.get("WHISPER_FLOW_HUD_LEVEL_FILE", "")
     print(f"[HUD] starting level_file={level_file}", flush=True)
+    if not _blur.is_supported():
+        print(f"[HUD] {_blur.unsupported_reason()}", flush=True)
+        return 1
     try:
         # Per-monitor DPI aware, or the overlay is scaled and blurry.
         ctypes.windll.shcore.SetProcessDpiAwareness(2)

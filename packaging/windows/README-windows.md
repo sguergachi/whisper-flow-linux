@@ -1,5 +1,7 @@
 # whisper-flow for Windows
 
+**Requires Windows 11 22H2 (build 22621) or later.**
+
 Unzip anywhere and run `whisper-flow.exe`. It sits in the notification area;
 there is no window.
 
@@ -28,13 +30,10 @@ you speak rather than all at once at the end.
 
 ## How it differs from the Linux build
 
-* **Blur comes from DWM.** Windows 11 22H2 and later get acrylic through
-  `DWMWA_SYSTEMBACKDROP_TYPE`; Windows 10 1803 and later fall back to the
-  undocumented accent policy. On a build with neither, the overlay turns
-  itself opaque rather than sitting there as a dim rectangle. The HUD log
-  says which route it took.
-* **The overlay's rounded corners are not antialiased.** They come from a
-  Win32 window region, which is a hard-edged mask.
+* **The overlay is composited by DWM.** Acrylic backdrop, rounded corners and
+  border all come from `DwmSetWindowAttribute`, which is why the build floor
+  is 22H2. Earlier builds are refused with a message rather than started into
+  a half-working state - the daemon checks before it opens anything.
 * **Super/Win as a hotkey is a poor choice here.** The shell claims it, and
   unlike the Linux build this one does not intercept the key. `ctrl+alt` is
   the default instead.

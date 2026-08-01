@@ -1,128 +1,123 @@
-"""Backdrop blur on Windows.
+"""Window composition on Windows 11: acrylic backdrop, rounded corners, border.
 
-Windows has three ways to blur what is behind a window, and which exist
-depends on the build:
+Windows 11 22H2 exposes all three through DwmSetWindowAttribute, so this is
+the documented path with no undocumented ordinals and no per-build branching.
 
-  * DwmSetWindowAttribute(DWMWA_SYSTEMBACKDROP_TYPE) - Windows 11 22H2 and
-    later. The documented one, and the only one Microsoft supports.
-  * SetWindowCompositionAttribute with ACCENT_ENABLE_ACRYLICBLURBEHIND -
-    Windows 10 1803 and later. Undocumented, exported by ordinal, and what
-    most applications actually used before 22H2.
-  * ACCENT_ENABLE_BLURBEHIND - earlier Windows 10. Plain Gaussian blur, no
-    acrylic noise or tint.
+Earlier builds are refused rather than worked around. Windows 10 could get a
+similar effect through SetWindowCompositionAttribute, but that is undocumented,
+looks visibly different, and having one supported target is worth more than
+covering a build nobody here runs.
 
-They are tried in that order and the first that takes is used, so a machine
-gets the best it supports rather than the lowest common denominator.
-
-The window this is applied to should be layered with a uniform alpha below 1
-(tkinter's "-alpha"). DWM blurs the backdrop, the window's own painted
-content is composited over it, and the alpha is what lets the blur show
-through the tint. Without the alpha the blur is there but hidden behind
-opaque paint.
+The window must stay layered with a uniform alpha below 1. DWM blurs the
+backdrop and composites the window over it, so an opaque window hides the
+effect completely - the alpha is what lets the acrylic through.
 """
 
 import ctypes
 import ctypes.wintypes as wintypes
 
-# DwmSetWindowAttribute
-DWMWA_SYSTEMBACKDROP_TYPE = 38
+# DwmSetWindowAttribute attributes, all Windows 11.
 DWMWA_USE_IMMERSIVE_DARK_MODE = 20
-DWMSBT_TRANSIENTWINDOW = 3  # acrylic: the right one for a transient overlay
+DWMWA_WINDOW_CORNER_PREFERENCE = 33
+DWMWA_BORDER_COLOR = 34
+DWMWA_SYSTEMBACKDROP_TYPE = 38
 
-# SetWindowCompositionAttribute
-WCA_ACCENT_POLICY = 19
-ACCENT_ENABLE_BLURBEHIND = 3
-ACCENT_ENABLE_ACRYLICBLURBEHIND = 4
+# DWM_SYSTEMBACKDROP_TYPE
+DWMSBT_TRANSIENTWINDOW = 3   # acrylic; the flyout/transient variant
 
-# Acrylic tint, as AABBGGRR - note the byte order is not RGBA. Dark and mostly
-# transparent, so the blur stays visible through it.
-DEFAULT_TINT = 0x99201814
+# DWM_WINDOW_CORNER_PREFERENCE
+DWMWCP_ROUND = 2             # the full radius, as used by system flyouts
+DWMWCP_ROUNDSMALL = 3
+
+# Build 22621 is 22H2, the first with DWMWA_SYSTEMBACKDROP_TYPE. 22000 is
+# 21H2, which only had the undocumented DWMWA_MICA_EFFECT.
+MIN_BUILD = 22621
+
+DWMWA_COLOR_NONE = 0xFFFFFFFE  # sentinel: suppress the border entirely
 
 
-class ACCENT_POLICY(ctypes.Structure):
+class _OSVERSIONINFOEXW(ctypes.Structure):
     _fields_ = [
-        ("AccentState", ctypes.c_int),
-        ("AccentFlags", ctypes.c_int),
-        ("GradientColor", ctypes.c_uint),
-        ("AnimationId", ctypes.c_int),
+        ("dwOSVersionInfoSize", ctypes.c_ulong),
+        ("dwMajorVersion", ctypes.c_ulong),
+        ("dwMinorVersion", ctypes.c_ulong),
+        ("dwBuildNumber", ctypes.c_ulong),
+        ("dwPlatformId", ctypes.c_ulong),
+        ("szCSDVersion", ctypes.c_wchar * 128),
+        ("wServicePackMajor", ctypes.c_ushort),
+        ("wServicePackMinor", ctypes.c_ushort),
+        ("wSuiteMask", ctypes.c_ushort),
+        ("wProductType", ctypes.c_byte),
+        ("wReserved", ctypes.c_byte),
     ]
 
 
-class WINCOMPATTRDATA(ctypes.Structure):
-    _fields_ = [
-        ("Attribute", ctypes.c_int),
-        ("Data", ctypes.POINTER(ACCENT_POLICY)),
-        ("SizeOfData", ctypes.c_size_t),
-    ]
+def windows_build() -> int:
+    """The real OS build number.
 
-
-def _try_system_backdrop(hwnd: int) -> bool:
-    """Windows 11 acrylic. Documented, and the only supported route."""
-    try:
-        dwm = ctypes.WinDLL("dwmapi")
-        value = ctypes.c_int(DWMSBT_TRANSIENTWINDOW)
-        result = dwm.DwmSetWindowAttribute(
-            wintypes.HWND(hwnd), ctypes.c_uint(DWMWA_SYSTEMBACKDROP_TYPE),
-            ctypes.byref(value), ctypes.sizeof(value),
-        )
-        if result != 0:
-            return False
-        # Ask for the dark variant so the acrylic tints towards black rather
-        # than white; harmless if it is not supported.
-        dark = ctypes.c_int(1)
-        dwm.DwmSetWindowAttribute(
-            wintypes.HWND(hwnd), ctypes.c_uint(DWMWA_USE_IMMERSIVE_DARK_MODE),
-            ctypes.byref(dark), ctypes.sizeof(dark),
-        )
-        return True
-    except Exception:
-        return False
-
-
-def _try_accent(hwnd: int, state: int, tint: int) -> bool:
-    """Windows 10 acrylic or blur, via the undocumented accent policy.
-
-    SetWindowCompositionAttribute is exported by name but not declared in any
-    header, and is absent on older builds - hence the getattr rather than a
-    direct call.
+    Read through RtlGetVersion because GetVersionEx lies to processes without
+    a compatibility manifest, reporting Windows 8 on anything newer - which
+    would make every Windows 11 machine look unsupported.
     """
     try:
-        user32 = ctypes.WinDLL("user32")
-        fn = getattr(user32, "SetWindowCompositionAttribute", None)
-        if fn is None:
-            return False
-        accent = ACCENT_POLICY(state, 2, tint, 0)
-        data = WINCOMPATTRDATA(
-            WCA_ACCENT_POLICY, ctypes.pointer(accent), ctypes.sizeof(accent),
-        )
-        return bool(fn(wintypes.HWND(hwnd), ctypes.byref(data)))
+        info = _OSVERSIONINFOEXW()
+        info.dwOSVersionInfoSize = ctypes.sizeof(info)
+        ctypes.WinDLL("ntdll").RtlGetVersion(ctypes.byref(info))
+        return int(info.dwBuildNumber)
+    except Exception:
+        return 0
+
+
+def is_supported() -> bool:
+    """Whether this build has the composition attributes the HUD relies on."""
+    return windows_build() >= MIN_BUILD
+
+
+def _set_attribute(hwnd: int, attribute: int, value: int) -> bool:
+    try:
+        dwm = ctypes.WinDLL("dwmapi")
+        val = ctypes.c_int(value)
+        return dwm.DwmSetWindowAttribute(
+            wintypes.HWND(hwnd), ctypes.c_uint(attribute),
+            ctypes.byref(val), ctypes.sizeof(val),
+        ) == 0
     except Exception:
         return False
 
 
-def enable_blur(hwnd: int, tint: int = DEFAULT_TINT) -> str | None:
-    """Blur whatever is behind this window.
+def apply_window_style(hwnd: int) -> str | None:
+    """Give the window an acrylic backdrop, rounded corners and no border.
 
     Args:
         hwnd: Native window handle.
-        tint: Acrylic tint as AABBGGRR.
 
     Returns:
-        The name of the method that worked, or None if the machine supports
-        none of them - in which case the caller should draw an opaque panel.
+        A short description of what was applied, or None on a build that does
+        not support it.
 
     """
-    if not hwnd:
+    if not hwnd or not is_supported():
         return None
-    if _try_system_backdrop(hwnd):
-        return "dwm-acrylic"
-    if _try_accent(hwnd, ACCENT_ENABLE_ACRYLICBLURBEHIND, tint):
-        return "accent-acrylic"
-    if _try_accent(hwnd, ACCENT_ENABLE_BLURBEHIND, tint):
-        return "accent-blur"
-    return None
+
+    # Dark first: the acrylic tints towards the theme, and asking afterwards
+    # leaves the first composited frame light.
+    _set_attribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, 1)
+
+    if not _set_attribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, DWMSBT_TRANSIENTWINDOW):
+        return None
+
+    # Rounded by the compositor, so the corners are antialiased. The Windows 10
+    # route was a window region, which is a hard-edged mask.
+    _set_attribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND)
+    # Suppress DWM's own border; the overlay draws its own outline.
+    _set_attribute(hwnd, DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE)
+    return "dwm-acrylic"
 
 
-def disable_blur(hwnd: int) -> None:
-    """Drop the effect, for symmetry with the Wayland side."""
-    _try_accent(hwnd, 0, 0)  # ACCENT_DISABLED
+def unsupported_reason() -> str:
+    """Why this machine cannot run the overlay, for the log."""
+    build = windows_build()
+    if build == 0:
+        return "could not determine the Windows build"
+    return (f"Windows build {build} is too old; this needs {MIN_BUILD} "
+            f"(Windows 11 22H2) for acrylic and rounded corners")

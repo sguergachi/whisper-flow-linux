@@ -858,9 +858,27 @@ Use 'whisper-flow stop' to exit daemon
 
         sys.exit(0)
 
+    @staticmethod
+    def _check_platform_support() -> str | None:
+        """Why this machine cannot run the app, or None if it can.
+
+        Windows support targets 11 22H2 and later: the overlay's backdrop,
+        corners and border all come from composition attributes introduced
+        there. Saying so up front beats a HUD that silently never appears.
+        """
+        if sys.platform != "win32":
+            return None
+        from . import blur_win
+        return None if blur_win.is_supported() else blur_win.unsupported_reason()
+
     def _run_worker(self, foreground: bool = False):
         """Run the worker process with health monitoring."""
         log(f"[DAEMON] Starting worker process (foreground={foreground})")
+        unsupported = self._check_platform_support()
+        if unsupported:
+            log(f"[DAEMON] Unsupported platform: {unsupported}")
+            self.notify(f"whisper-flow needs Windows 11 22H2 or later: {unsupported}")
+            return
         try:
             self.is_running = True
             log("[DAEMON] Worker process started")

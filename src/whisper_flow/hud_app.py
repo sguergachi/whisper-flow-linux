@@ -64,13 +64,25 @@ WAVE_R = WIDTH - 24
 BARS = 30
 BAR_W = 2.6
 BAR_MAX = 15.0
+BAR_OUTLINE = 0.9    # dark ring hugging each bar
+BAR_SHADOW_DX = 0.9  # cast shadow offset, down and to the right
+BAR_SHADOW_DY = 1.4
 
-STROKE_W = 1.5              # outline width in surface-local units
-STROKE_RGB = (0.93, 0.94, 0.97)
+STROKE_W = 1.0              # outline width in surface-local units
+STROKE_RGB = (0.42, 0.43, 0.47)
 # The blur region is built from rectangles and cannot be antialiased, so its
 # rounded ends are a staircase. Keeping it inside the outline hides that edge
 # under the stroke instead of leaving a ragged rim of blur outside the pill.
 BLUR_INSET = 2
+# Cap shape. n = 2 is a circle; just above 2 keeps the capsule silhouette while
+# giving zero curvature where the cap meets the straight edge. Going much
+# higher squares the ends off into a rounded rectangle.
+SQUIRCLE_N = 2.3
+SQUIRCLE_STEPS = 96
+CAP_EXT = 1.12   # cap reaches this many half-heights along the edge
+EDGE_COVER = BLUR_INSET + 1.5   # opaque rim that hides the blur region's edge
+INNER_SHADOW_W = 6              # how far the inner shadow reaches inwards
+INNER_SHADOW_STEPS = 5
 
 FADE_STEP = 0.30     # opacity per frame at ~60fps; ~4 frames to fully opaque
 LEVEL_EASE = 0.30    # how fast a bar chases its target height
@@ -80,9 +92,74 @@ LEVEL_GAMMA = 0.65   # loudness is perceptual; linear RMS leaves speech near fla
 # Longer than the daemon's max recording; purely a stuck-overlay backstop.
 MAX_LIFETIME_S = 600
 
+DRAG_SLOP = 4  # movement under this is a tap, not a drag
+POSITION_FILE = os.path.join(
+    os.path.expanduser("~"), ".config", "whisper-flow", "hud-position.json",
+)
+
+
+def _load_positions() -> dict:
+    """Saved pill positions, keyed by monitor connector."""
+    try:
+        import json
+        with open(POSITION_FILE) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_position(connector: str, x: int, y: int):
+    """Remember where the user dragged the pill on this output."""
+    try:
+        import json
+        positions = _load_positions()
+        positions[connector or "default"] = [int(x), int(y)]
+        os.makedirs(os.path.dirname(POSITION_FILE), exist_ok=True)
+        tmp = POSITION_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(positions, f)
+        os.replace(tmp, POSITION_FILE)
+    except Exception as e:
+        print(f"[HUD] could not save position: {e}", flush=True)
+
 CSS = b"""
 window, window.background { background-color: transparent; }
 """
+
+
+def _squircle(cr, x, y, w, h, n=SQUIRCLE_N, cap=CAP_EXT, steps=SQUIRCLE_STEPS):
+    """Append a capsule whose end caps have continuous curvature.
+
+    A circular cap meets the straight edge with matching tangents but a sudden
+    jump in curvature, from zero to 1/r, and that discontinuity is what reads
+    as a seam. A superellipse with n > 2 has zero curvature at its axis
+    extremes, so the cap leaves the straight edge flat and rounds up smoothly -
+    the same idea as Apple's continuous corners.
+
+    The superellipse is applied per cap, not to the whole outline: stretching
+    one across the full width would flatten the ends into a rounded rectangle
+    instead of a capsule. Each cap reaches `cap` times the half-height along
+    the edge, which is what gives the curvature room to ramp.
+    """
+    b = h / 2.0
+    rx = min(b * cap, w / 2.0)
+    cy = y + b
+    left_j, right_j = x + rx, x + w - rx
+    e = 2.0 / n
+    pts = []
+    for j, (base, lo) in enumerate(((right_j, -math.pi / 2), (left_j, math.pi / 2))):
+        for i in range(steps + 1):
+            t = lo + math.pi * i / steps
+            ct, st = math.cos(t), math.sin(t)
+            pts.append((
+                base + rx * math.copysign(abs(ct) ** e, ct),
+                cy + b * math.copysign(abs(st) ** e, st),
+            ))
+    cr.move_to(*pts[0])
+    for px, py in pts[1:]:
+        cr.line_to(px, py)
+    cr.close_path()
 
 
 def _round_rect(cr, x, y, w, h, r):
@@ -123,13 +200,9 @@ class HudWindow(Gtk.Window):
             Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
         )
 
-        # Overlay layer, anchored bottom-centre. Anchoring only left+right
-        # centres it horizontally; anchoring bottom pins it vertically.
         LayerShell.init_for_window(self)
         LayerShell.set_layer(self, LayerShell.Layer.OVERLAY)
         LayerShell.set_namespace(self, "whisper-flow-hud")
-        LayerShell.set_anchor(self, LayerShell.Edge.BOTTOM, True)
-        LayerShell.set_margin(self, LayerShell.Edge.BOTTOM, BOTTOM_MARGIN)
         LayerShell.set_keyboard_mode(self, LayerShell.KeyboardMode.NONE)
         # Negative: never reserve screen space, so windows do not get resized.
         LayerShell.set_exclusive_zone(self, -1)
@@ -137,6 +210,18 @@ class HudWindow(Gtk.Window):
         monitor = self._pick_monitor(monitor_hint)
         if monitor is not None:
             LayerShell.set_monitor(self, monitor)
+        self._monitor = monitor
+        self._connector = monitor.get_connector() if monitor else "default"
+
+        # A Wayland client cannot place its own window, but a layer surface's
+        # margins are under our control: anchoring top-left turns them into
+        # absolute coordinates, which is what makes dragging possible.
+        saved = _load_positions().get(self._connector)
+        self._pos = tuple(saved[:2]) if isinstance(saved, list) and len(saved) >= 2 else None
+        self._drag_origin = None
+        self._apply_position()
+        print(f"[HUD] output={self._connector} position="
+              f"{self._pos if self._pos else 'bottom-centre (default)'}", flush=True)
 
         self.alpha = 0.0
         self.hover = 0.0
@@ -155,9 +240,11 @@ class HudWindow(Gtk.Window):
         self.area = area
         self.set_child(area)
 
-        click = Gtk.GestureClick()
-        click.connect("pressed", lambda *_: self.quit())
-        area.add_controller(click)
+        drag = Gtk.GestureDrag()
+        drag.connect("drag-begin", self._on_drag_begin)
+        drag.connect("drag-update", self._on_drag_update)
+        drag.connect("drag-end", self._on_drag_end)
+        area.add_controller(drag)
 
         motion = Gtk.EventControllerMotion()
         motion.connect("enter", self._on_enter)
@@ -219,7 +306,7 @@ class HudWindow(Gtk.Window):
                 ctypes.c_void_p(_gobject_pointer(surface)))
             _mark("realize: blur start")
             self._blur = enable_blur(
-                wl_display, wl_surface, WIDTH, HEIGHT, RADIUS, BLUR_INSET)
+                wl_display, wl_surface, WIDTH, HEIGHT, SQUIRCLE_N, BLUR_INSET)
             _mark("realize: blur done")
             print(f"[HUD] blur {'enabled' if self._blur else 'unavailable'}", flush=True)
         except Exception as e:
@@ -249,6 +336,61 @@ class HudWindow(Gtk.Window):
             self.quit()
             return False
         return True
+
+    def _default_pos(self):
+        """Bottom-centre of the chosen output, in monitor-local coordinates."""
+        if self._monitor is None:
+            return (0, 0)
+        g = self._monitor.get_geometry()
+        return ((g.width - WIDTH) // 2, g.height - HEIGHT - BOTTOM_MARGIN)
+
+    def _apply_position(self):
+        """Anchor bottom-centre by default, or top-left at a dragged position."""
+        if self._pos is None:
+            LayerShell.set_anchor(self, LayerShell.Edge.LEFT, False)
+            LayerShell.set_anchor(self, LayerShell.Edge.TOP, False)
+            LayerShell.set_anchor(self, LayerShell.Edge.BOTTOM, True)
+            LayerShell.set_margin(self, LayerShell.Edge.BOTTOM, BOTTOM_MARGIN)
+            return
+        x, y = self._pos
+        LayerShell.set_anchor(self, LayerShell.Edge.BOTTOM, False)
+        LayerShell.set_anchor(self, LayerShell.Edge.LEFT, True)
+        LayerShell.set_anchor(self, LayerShell.Edge.TOP, True)
+        LayerShell.set_margin(self, LayerShell.Edge.LEFT, int(x))
+        LayerShell.set_margin(self, LayerShell.Edge.TOP, int(y))
+
+    def _clamp(self, x, y):
+        if self._monitor is None:
+            return (x, y)
+        g = self._monitor.get_geometry()
+        return (max(0, min(int(x), g.width - WIDTH)),
+                max(0, min(int(y), g.height - HEIGHT)))
+
+    def _on_drag_begin(self, gesture, sx, sy):
+        self._drag_origin = self._pos if self._pos is not None else self._default_pos()
+        self._drag_start_xy = (sx, sy)
+
+    def _on_drag_update(self, gesture, dx, dy):
+        if self._drag_origin is None:
+            return
+        ox, oy = self._drag_origin
+        self._pos = self._clamp(ox + dx, oy + dy)
+        self._apply_position()
+
+    def _on_drag_end(self, gesture, dx, dy):
+        if self._drag_origin is None:
+            return
+        moved = abs(dx) + abs(dy)
+        self._drag_origin = None
+        if moved < DRAG_SLOP:
+            # A tap. Only the close affordance dismisses; anywhere else would
+            # make the pill vanish whenever a drag came up a pixel short.
+            sx, sy = self._drag_start_xy
+            if sx >= WIDTH - 34:
+                self.quit()
+            return
+        _save_position(self._connector, *self._pos)
+        print(f"[HUD] position saved for {self._connector}: {self._pos}", flush=True)
 
     def _on_enter(self, *_):
         self.want_hover = True
@@ -316,16 +458,40 @@ class HudWindow(Gtk.Window):
         # A light tint only - the compositor blur behind the pill supplies the
         # frost, and a heavy fill would just mute it into flat grey.
         inner = STROKE_W / 2
-        _round_rect(cr, inner, inner, w - 2 * inner, h - 2 * inner, RADIUS - inner)
-        cr.set_source_rgba(0.07, 0.07, 0.09, 0.42 * a)
+        _squircle(cr, inner, inner, w - 2 * inner, h - 2 * inner)
+        cr.set_source_rgba(0.04, 0.04, 0.05, 0.66 * a)
         cr.fill_preserve()
 
         sheen = cairo.LinearGradient(0, 0, 0, h)
-        sheen.add_color_stop_rgba(0.0, 1, 1, 1, 0.13 * a)
-        sheen.add_color_stop_rgba(0.45, 1, 1, 1, 0.02 * a)
-        sheen.add_color_stop_rgba(1.0, 0, 0, 0, 0.10 * a)
+        sheen.add_color_stop_rgba(0.0, 1, 1, 1, 0.10 * a)
+        sheen.add_color_stop_rgba(0.45, 1, 1, 1, 0.015 * a)
+        sheen.add_color_stop_rgba(1.0, 0, 0, 0, 0.14 * a)
         cr.set_source(sheen)
         cr.fill()
+
+        # Everything from here to the border is clipped to the pill, so strokes
+        # centred on the outline only paint inwards.
+        cr.save()
+        _squircle(cr, 0, 0, w, h)
+        cr.clip()
+
+        # Opaque rim covering the blur region's staircase. The region is built
+        # from rectangles and cannot be antialiased, so its curved ends are
+        # ragged; this hides that boundary rather than leaving it on show.
+        _squircle(cr, 0, 0, w, h)
+        cr.set_line_width(2 * EDGE_COVER)
+        cr.set_source_rgba(0.04, 0.04, 0.05, 0.92 * a)
+        cr.stroke()
+
+        # Inner shadow: concentric strokes fading inwards approximate a
+        # gradient and give the glass some depth at the edge.
+        for i in range(INNER_SHADOW_STEPS):
+            t = i / INNER_SHADOW_STEPS
+            _squircle(cr, 0, 0, w, h)
+            cr.set_line_width(2 * INNER_SHADOW_W * (1.0 - t))
+            cr.set_source_rgba(0, 0, 0, 0.05 * (1.0 - t) * a)
+            cr.stroke()
+        cr.restore()
 
         elapsed = time.monotonic() - self.start
         breathe = 0.62 + 0.38 * (0.5 + 0.5 * math.sin(elapsed * 3.0))
@@ -343,21 +509,31 @@ class HudWindow(Gtk.Window):
             bar_h = max(BAR_W, level * BAR_MAX * 2)
             x = WAVE_L + i * step
 
-            # Dark halo first: the glass is translucent, so white bars would
-            # otherwise vanish against a light window behind it.
-            cr.set_source_rgba(0, 0, 0, 0.38 * dim * a)
-            _round_rect(cr, x - 1, mid - bar_h / 2 - 1,
-                        BAR_W + 2, bar_h + 2, (BAR_W + 2) / 2)
+            top = mid - bar_h / 2
+
+            # Cast shadow, offset down-right, so the bars sit above the glass
+            # rather than being painted flat onto it.
+            cr.set_source_rgba(0, 0, 0, 0.34 * dim * a)
+            _round_rect(cr, x + BAR_SHADOW_DX, top + BAR_SHADOW_DY,
+                        BAR_W, bar_h, BAR_W / 2)
             cr.fill()
 
-            cr.set_source_rgba(1, 1, 1, (0.30 + 0.68 * level) * dim * a)
-            _round_rect(cr, x, mid - bar_h / 2, BAR_W, bar_h, BAR_W / 2)
+            # Tight outline around the bar itself. Doubles as contrast against
+            # a light window behind the translucent glass.
+            cr.set_source_rgba(0, 0, 0, 0.46 * dim * a)
+            _round_rect(cr, x - BAR_OUTLINE, top - BAR_OUTLINE,
+                        BAR_W + 2 * BAR_OUTLINE, bar_h + 2 * BAR_OUTLINE,
+                        (BAR_W + 2 * BAR_OUTLINE) / 2)
+            cr.fill()
+
+            cr.set_source_rgba(1, 1, 1, (0.34 + 0.66 * level) * dim * a)
+            _round_rect(cr, x, top, BAR_W, bar_h, BAR_W / 2)
             cr.fill()
 
         # Outline last, so nothing can paint over it. Solid and fully opaque:
         # a translucent hairline picks up whatever is behind the glass and
         # reads as a ragged edge rather than a clean one.
-        _round_rect(cr, inner, inner, w - 2 * inner, h - 2 * inner, RADIUS - inner)
+        _squircle(cr, inner, inner, w - 2 * inner, h - 2 * inner)
         cr.set_line_width(STROKE_W)
         cr.set_source_rgba(*STROKE_RGB, a)
         cr.stroke()

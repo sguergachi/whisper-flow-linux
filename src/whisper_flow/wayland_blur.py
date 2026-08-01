@@ -140,9 +140,13 @@ class BlurHandle:
         self._queue = queue
 
 
-def pill_rects(width: int, height: int, radius: float,
-               inset: int = 0) -> list[tuple[int, int, int, int]]:
-    """Rows approximating a rounded rectangle, as wl_region can only take rects.
+def pill_rects(width: int, height: int, exponent: float,
+               inset: int = 0, cap: float = 1.12) -> list[tuple[int, int, int, int]]:
+    """Rows tracing the capsule the HUD draws, as wl_region only takes rects.
+
+    Mirrors _squircle in hud_app: straight sides with superelliptical end caps
+    reaching `cap` half-heights along the edge. If this drifts from what is
+    drawn, the blur shows outside the pill.
 
     `inset` shrinks the shape on every side. A region is a hard-edged mask with
     no antialiasing, so its curved ends are a staircase; pulling it in behind
@@ -152,15 +156,17 @@ def pill_rects(width: int, height: int, radius: float,
 
     width -= 2 * inset
     height -= 2 * inset
-    radius = max(0.0, radius - inset)
+    if width <= 0 or height <= 0:
+        return []
+    b = height / 2.0
+    rx = min(b * cap, width / 2.0)
     rects = []
     for y in range(height):
-        dy = abs(y + 0.5 - height / 2.0)
-        if dy <= radius:
-            edge = radius - math.sqrt(max(0.0, radius * radius - dy * dy))
-        else:
-            edge = radius
-        x0 = int(math.ceil(edge))
+        dy = abs(y + 0.5 - b) / b
+        if dy >= 1.0:
+            continue
+        f = (1.0 - dy ** exponent) ** (1.0 / exponent)
+        x0 = int(math.ceil(rx * (1.0 - f)))
         w = width - 2 * x0
         if w > 0:
             rects.append((x0 + inset, y + inset, w, 1))
@@ -168,7 +174,7 @@ def pill_rects(width: int, height: int, radius: float,
 
 
 def enable_blur(wl_display: int, wl_surface: int,
-                width: int, height: int, radius: float,
+                width: int, height: int, exponent: float,
                 inset: int = 0) -> BlurHandle | None:
     """Ask the compositor to blur behind wl_surface.
 
@@ -182,7 +188,7 @@ def enable_blur(wl_display: int, wl_surface: int,
         wl_surface: Pointer to this window's struct wl_surface
         width: Surface width in surface-local units
         height: Surface height in surface-local units
-        radius: Corner radius, so the blur stops at the rounded edge
+        exponent: Superellipse exponent, matching the drawn pill
 
     Returns:
         A handle to retain, or None if the compositor lacks the protocol.
@@ -290,7 +296,7 @@ def enable_blur(wl_display: int, wl_surface: int,
         return None
     wl.wl_proxy_set_queue(ctypes.c_void_p(region), ctypes.c_void_p(queue))
 
-    for x, y, w, h in pill_rects(width, height, radius, inset):
+    for x, y, w, h in pill_rects(width, height, exponent, inset):
         wl.wl_proxy_marshal_flags(
             ctypes.c_void_p(region), WL_REGION_ADD,
             None, ctypes.c_uint32(cver), ctypes.c_uint32(0),

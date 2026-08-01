@@ -1,6 +1,9 @@
 """WhisperFlow - AI-powered voice-to-text with context-aware processing."""
 
-__version__ = "0.1.0"
+# Keep in step with pyproject.toml, which is what the build reads: CI pulls
+# the version out of it with tomllib to name the installer. This one had
+# been left on 0.1.0 through two releases because nothing checks it.
+__version__ = "0.3.0"
 __author__ = "sapountzis"
 __email__ = "sapountzis.andreas@gmail.com"
 

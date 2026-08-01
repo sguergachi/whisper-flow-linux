@@ -277,3 +277,16 @@ def test_old_drivers_get_the_cuda_11_build(monkeypatch):
         lambda *a, **k: types.SimpleNamespace(returncode=0, stdout="470.86\n"),
     )
     assert backend_module.detect_accelerator() == "cuda11"
+
+
+# ------------------------------------------------------------------- version
+def test_the_two_recorded_versions_agree():
+    """pyproject names the installer; __version__ had drifted two releases."""
+    import tomllib
+    from pathlib import Path as P
+
+    import whisper_flow
+
+    root = P(__file__).resolve().parent.parent
+    declared = tomllib.load(open(root / "pyproject.toml", "rb"))["project"]["version"]
+    assert whisper_flow.__version__ == declared

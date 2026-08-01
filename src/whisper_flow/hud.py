@@ -10,6 +10,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 
 
 LAYER_SHELL_CANDIDATES = (
@@ -34,6 +35,11 @@ class HUD:
         self._process = None
         self._log_path = None
         self._log_file = None
+        # show() runs on the thread starting a recording, hide() on the one
+        # handling the hotkey release. Without this, a hide landing inside
+        # show()'s Popen finds no process to kill and leaks an overlay that
+        # nothing will ever take down. Reentrant because show() calls hide().
+        self._lock = threading.RLock()
 
     def show(self, level_file: str = "", monitor: str | None = None,
              point: tuple[int, int] | None = None):
@@ -48,6 +54,10 @@ class HUD:
             monitor: Connector name of the output to show on, e.g. "DP-1"
 
         """
+        with self._lock:
+            self._show_locked(level_file, monitor, point)
+
+    def _show_locked(self, level_file, monitor, point):
         self.hide()
 
         env = os.environ.copy()
@@ -104,6 +114,10 @@ class HUD:
 
     def hide(self):
         """Hide the recording HUD overlay."""
+        with self._lock:
+            self._hide_locked()
+
+    def _hide_locked(self):
         if self._process:
             try:
                 os.killpg(os.getpgid(self._process.pid), signal.SIGTERM)

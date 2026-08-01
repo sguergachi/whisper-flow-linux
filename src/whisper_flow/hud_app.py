@@ -77,6 +77,8 @@ LEVEL_EASE = 0.30    # how fast a bar chases its target height
 PEAK_DECAY = 0.95    # adaptive gain, so quiet speech still reads
 PEAK_FLOOR = 150.0   # below this the gain stops opening up, or idle noise dances
 LEVEL_GAMMA = 0.65   # loudness is perceptual; linear RMS leaves speech near flat
+# Longer than the daemon's max recording; purely a stuck-overlay backstop.
+MAX_LIFETIME_S = 600
 
 CSS = b"""
 window, window.background { background-color: transparent; }
@@ -103,9 +105,14 @@ def _gobject_pointer(obj) -> int:
 class HudWindow(Gtk.Window):
     """The pill itself."""
 
-    def __init__(self, level_file: str, monitor_hint: str | None):
+    def __init__(self, level_file: str, monitor_hint: str | None, on_quit=None):
         super().__init__()
         self.level_file = level_file
+        # Gtk.Window.close() only emits close-request; on a layer-shell surface
+        # that does not end the main loop, so the process would linger with the
+        # pill still on screen. Always tear down through this instead.
+        self._on_quit = on_quit
+        self._quitting = False
         self.set_default_size(WIDTH, HEIGHT)
         self.set_resizable(False)
 
@@ -149,7 +156,7 @@ class HudWindow(Gtk.Window):
         self.set_child(area)
 
         click = Gtk.GestureClick()
-        click.connect("pressed", lambda *_: self.close())
+        click.connect("pressed", lambda *_: self.quit())
         area.add_controller(click)
 
         motion = Gtk.EventControllerMotion()
@@ -218,6 +225,31 @@ class HudWindow(Gtk.Window):
         except Exception as e:
             print(f"[HUD] blur setup failed: {e}", flush=True)
 
+    def quit(self):
+        """Take the overlay down and end the process.
+
+        Neither Gtk.Window.close() nor MainLoop.quit() ends this process once a
+        layer-shell surface is mapped: the loop returns but the process lives
+        on, leaving the pill stuck on screen. Exiting cannot be deferred to the
+        main loop either, since quitting the loop is what stops it running.
+
+        So leave immediately. This child owns nothing but its own window, and
+        dropping the Wayland connection is what actually removes the surface.
+        """
+        if self._quitting:
+            return
+        self._quitting = True
+        self.set_visible(False)
+        os._exit(0)
+
+    def _check_lifetime(self):
+        """Backstop against an overlay outliving whatever spawned it."""
+        if time.monotonic() - self.start > MAX_LIFETIME_S:
+            print("[HUD] lifetime cap reached, closing", flush=True)
+            self.quit()
+            return False
+        return True
+
     def _on_enter(self, *_):
         self.want_hover = True
 
@@ -234,7 +266,19 @@ class HudWindow(Gtk.Window):
 
     def _read_levels(self):
         if not self.level_file:
-            return True
+            # Nothing driving this window; still bound by the lifetime cap.
+            return self._check_lifetime()
+
+        # The daemon deletes the level file when the recording ends. If it is
+        # gone, this overlay has been orphaned - never sit on screen forever
+        # because whoever spawned us failed to take us down.
+        if not os.path.exists(self.level_file):
+            print("[HUD] level file gone, closing", flush=True)
+            self.quit()
+            return False
+        if not self._check_lifetime():
+            return False
+
         try:
             with open(self.level_file, "rb") as f:
                 f.seek(0, 2)
@@ -338,8 +382,8 @@ def main() -> int:
     # application id costs a D-Bus round trip before anything can be drawn,
     # and this window is opened every time the user starts talking.
     loop = GLib.MainLoop()
-    win = HudWindow(level_file, monitor)
-    win.connect("close-request", lambda *_: (loop.quit(), False)[1])
+    win = HudWindow(level_file, monitor, on_quit=loop.quit)
+    win.connect("close-request", lambda *_: (win.quit(), False)[1])
     win.present()
     _mark("present() returned")
     loop.run()

@@ -92,6 +92,7 @@ class WhisperFlowDaemon:
 
         # Processing state management
         self.processing_lock = threading.Lock()
+        self._stop_lock = threading.RLock()
         self.request_queue = queue.Queue()
         self.is_processing = False
 
@@ -576,7 +577,17 @@ class WhisperFlowDaemon:
         self._stop_recording()
 
     def _stop_recording(self):
-        """Stop the current recording."""
+        """Stop the current recording.
+
+        Reached from the hotkey-release thread and from the recording thread's
+        cleanup, so the is_recording check and the teardown that follows have
+        to be one atomic step - otherwise both can pass the check and the HUD
+        gets hidden twice while the second caller works on cleared state.
+        """
+        with self._stop_lock:
+            self._stop_recording_locked()
+
+    def _stop_recording_locked(self):
         if not self.is_recording:
             log("[DAEMON] Not recording, nothing to stop")
             return

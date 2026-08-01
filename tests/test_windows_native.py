@@ -51,16 +51,34 @@ def test_system_manager_reaches_the_windows_clipboard(tmp_path):
 
 
 def _read_clipboard() -> str:
+    """Read CF_UNICODETEXT back.
+
+    The signatures matter as much here as in the code under test: without
+    them ctypes truncates the 64-bit handle from GetClipboardData to an int
+    and this reads nothing back - which is exactly how this helper first
+    reported an empty clipboard for text that had been copied correctly.
+    """
     import ctypes
+    import ctypes.wintypes as wintypes
 
     CF_UNICODETEXT = 13
     user32, kernel32 = ctypes.windll.user32, ctypes.windll.kernel32
-    user32.OpenClipboard(None)
+    user32.OpenClipboard.argtypes = [wintypes.HWND]
+    user32.GetClipboardData.restype = wintypes.HANDLE
+    user32.GetClipboardData.argtypes = [wintypes.UINT]
+    kernel32.GlobalLock.restype = wintypes.LPVOID
+    kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+    kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+
+    if not user32.OpenClipboard(None):
+        return ""
     try:
         handle = user32.GetClipboardData(CF_UNICODETEXT)
         if not handle:
             return ""
         locked = kernel32.GlobalLock(handle)
+        if not locked:
+            return ""
         try:
             return ctypes.c_wchar_p(locked).value or ""
         finally:

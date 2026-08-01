@@ -5,6 +5,7 @@ user sees also puts the log that explains it on the clipboard, so it can be
 pasted into a message rather than described from memory.
 """
 
+import sys
 import tempfile
 from unittest.mock import Mock, patch
 
@@ -188,6 +189,9 @@ def test_the_daemon_only_calls_methods_system_manager_defines(daemon):
     manager.copy_to_clipboard.assert_called_once()
 
 
+@pytest.mark.skipif(sys.platform == "win32",
+                    reason="drives the POSIX helper path; Windows is covered "
+                           "for real in test_windows_native.py")
 def test_the_report_reaches_a_real_system_manager(tmp_path, monkeypatch):
     """End to end through the actual class, not a mock of it.
 

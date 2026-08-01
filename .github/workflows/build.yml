@@ -70,11 +70,9 @@ jobs:
           cp -r packaging/linux/* "$STAGE"/
           cp dist/*.whl "$STAGE"/
           cp README.md "$STAGE"/
-          # Install from the bundled wheel rather than a source checkout.
-          sed -i 's|pip install --quiet "$SRC_DIR"|pip install --quiet "$SRC_DIR"/*.whl|' "$STAGE/install.sh"
-          sed -i 's|SRC_DIR="$(cd "$(dirname "${BASH_SOURCE\[0\]}")/../.." \&\& pwd)"|SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" \&\& pwd)"|' "$STAGE/install.sh"
-          mkdir -p "$STAGE/packaging/linux"
-          cp packaging/linux/*.in "$STAGE/packaging/linux/"
+          # install.sh detects the bundled wheel itself, so nothing here has
+          # to rewrite it - a sed against a script it cannot test is exactly
+          # how the bundle shipped broken the first time.
           tar czf "${STAGE}.tar.gz" "$STAGE"
           echo "ARTIFACT=${STAGE}.tar.gz" >> "$GITHUB_ENV"
 

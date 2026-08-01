@@ -10,7 +10,19 @@ PREFIX="${WHISPER_FLOW_PREFIX:-$HOME/.local/share/whisper-flow}"
 BIN_DIR="${WHISPER_FLOW_BIN:-$HOME/.local/bin}"
 UNIT_DIR="${WHISPER_FLOW_UNIT_DIR:-$HOME/.config/systemd/user}"
 CONFIG_DIR="$HOME/.config/whisper-flow"
-SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Works from a source checkout and from the released bundle: the bundle ships
+# a wheel and the unit templates next to this script, a checkout has them two
+# directories up.
+if compgen -G "$HERE"/*.whl > /dev/null; then
+    SRC_DIR="$HERE"
+    TEMPLATE_DIR="$HERE"
+    INSTALL_TARGET=("$HERE"/*.whl)
+else
+    SRC_DIR="$(cd "$HERE/../.." && pwd)"
+    TEMPLATE_DIR="$SRC_DIR/packaging/linux"
+    INSTALL_TARGET=("$SRC_DIR")
+fi
 
 say()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m warning:\033[0m %s\n' "$*"; }
@@ -67,7 +79,7 @@ mkdir -p "$PREFIX" "$BIN_DIR" "$UNIT_DIR" "$CONFIG_DIR"
 # pip-installable in any reliable way.
 python3 -m venv --system-site-packages "$PREFIX/venv"
 "$PREFIX/venv/bin/pip" install --quiet --upgrade pip
-"$PREFIX/venv/bin/pip" install --quiet "$SRC_DIR"
+"$PREFIX/venv/bin/pip" install --quiet "${INSTALL_TARGET[@]}"
 
 say "Linking commands into $BIN_DIR"
 for cmd in whisper-flow whisper-flow-daemon; do
@@ -98,7 +110,7 @@ install_unit() {
 
 install_unit whisper-flow.service "$(
     sed "s|@VENV@|$PREFIX/venv|g; s|@HOME@|$HOME|g" \
-        "$SRC_DIR/packaging/linux/whisper-flow.service.in"
+        "$TEMPLATE_DIR/whisper-flow.service.in"
 )"
 
 # Only offered, never assumed: whoever built whisper.cpp chose the binary and
@@ -107,7 +119,7 @@ if [[ ! -f "$UNIT_DIR/whisper-server.service" ]] \
    && [[ -x "$HOME/Dev/whisper.cpp/build/bin/whisper-server" ]]; then
     say "Found a local whisper.cpp build; installing a starter server unit"
     install_unit whisper-server.service "$(
-        sed "s|@HOME@|$HOME|g" "$SRC_DIR/packaging/linux/whisper-server.service.in"
+        sed "s|@HOME@|$HOME|g" "$TEMPLATE_DIR/whisper-server.service.in"
     )"
 fi
 

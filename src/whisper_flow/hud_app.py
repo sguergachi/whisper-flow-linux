@@ -74,7 +74,10 @@ STROKE_RGB = (0.42, 0.43, 0.47)
 # The blur region is built from rectangles and cannot be antialiased, so its
 # rounded ends are a staircase. Keeping it inside the outline hides that edge
 # under the stroke instead of leaving a ragged rim of blur outside the pill.
-BLUR_INSET = 2
+# The margin also has to absorb fractional scaling: at 1.25x this surface is
+# 67.5 physical pixels tall, and the compositor rounds the region outward, so
+# too small an inset leaves blur poking past the corners.
+BLUR_INSET = 4
 # Cap shape. n = 2 is a circle; just above 2 keeps the capsule silhouette while
 # giving zero curvature where the cap meets the straight edge. Going much
 # higher squares the ends off into a rounded rectangle.
@@ -91,6 +94,7 @@ INNER_SHADOW_STEPS = 9          # more bands, so the wider spread stays smooth
 INNER_SHADOW_RGB = (0.13, 0.13, 0.15)
 
 FADE_MS = 200.0      # fade in and out duration
+FADE_SCALE = 0.1     # shrink by this much at zero opacity, growing to full
 LEVEL_EASE = 0.30    # how fast a bar chases its target height
 PEAK_DECAY = 0.95    # adaptive gain, so quiet speech still reads
 PEAK_FLOOR = 150.0   # below this the gain stops opening up, or idle noise dances
@@ -505,6 +509,16 @@ class HudWindow(Gtk.Window):
 
         cr.set_antialias(cairo.ANTIALIAS_BEST)
 
+        # Scale with the fade, about the centre, driven off the same eased
+        # alpha so the two cannot drift apart. Exactly 1 at rest, so hit
+        # testing against unscaled widget coordinates stays correct. Applied
+        # after the clear, which must cover the whole surface untransformed.
+        scale = 1.0 - FADE_SCALE * (1.0 - a)
+        cr.save()
+        cr.translate(w / 2.0, h / 2.0)
+        cr.scale(scale, scale)
+        cr.translate(-w / 2.0, -h / 2.0)
+
         # A light tint only - the compositor blur behind the pill supplies the
         # frost, and a heavy fill would just mute it into flat grey.
         inner = STROKE_W / 2
@@ -597,6 +611,8 @@ class HudWindow(Gtk.Window):
             cr.move_to(cx + r, mid - r)
             cr.line_to(cx - r, mid + r)
             cr.stroke()
+
+        cr.restore()
 
 
 def main() -> int:

@@ -134,12 +134,14 @@ def _proto():
 class BlurHandle:
     """Keeps the blur objects alive; dropping it would drop the effect."""
 
-    def __init__(self, manager, effect_surface, queue, display, region, version):
+    def __init__(self, manager, effect_surface, queue, display, region,
+                 empty_region, version):
         self._manager = manager
         self._effect_surface = effect_surface
         self._queue = queue
         self._display = display
         self._region = region
+        self._empty_region = empty_region
         self._version = version
         self.active = False
 
@@ -148,8 +150,13 @@ class BlurHandle:
 
         The blur cannot be faded - the compositor applies it at full strength
         or not at all - so it has to be switched at a moment when the change
-        is not visible. A NULL region removes the effect; the stored region
-        restores it.
+        is not visible.
+
+        Switching off uses an empty region rather than NULL. NULL removes the
+        effect entirely, and restoring a region afterwards did not reliably
+        come back shaped: blur reappeared over the surface's whole bounding
+        box, square corners and all. Handing over a real, empty region keeps
+        the request symmetric and the shape intact.
         """
         if on == self.active:
             return
@@ -157,7 +164,7 @@ class BlurHandle:
         wl.wl_proxy_marshal_flags(
             ctypes.c_void_p(self._effect_surface), SURFACE_SET_BLUR_REGION,
             None, ctypes.c_uint32(self._version), ctypes.c_uint32(0),
-            ctypes.c_void_p(self._region) if on else None,
+            ctypes.c_void_p(self._region if on else self._empty_region),
         )
         wl.wl_display_flush(ctypes.c_void_p(self._display))
         self.active = on
@@ -319,6 +326,14 @@ def enable_blur(wl_display: int, wl_surface: int,
         return None
     wl.wl_proxy_set_queue(ctypes.c_void_p(region), ctypes.c_void_p(queue))
 
+    empty_region = wl.wl_proxy_marshal_flags(
+        ctypes.c_void_p(compositor), WL_COMPOSITOR_CREATE_REGION,
+        ctypes.c_void_p(region_iface), ctypes.c_uint32(cver), ctypes.c_uint32(0),
+        None,
+    )
+    if empty_region:
+        wl.wl_proxy_set_queue(ctypes.c_void_p(empty_region), ctypes.c_void_p(queue))
+
     for x, y, w, h in pill_rects(width, height, exponent, inset):
         wl.wl_proxy_marshal_flags(
             ctypes.c_void_p(region), WL_REGION_ADD,
@@ -334,7 +349,8 @@ def enable_blur(wl_display: int, wl_surface: int,
     )
     wl.wl_display_flush(ctypes.c_void_p(wl_display))
 
-    handle = BlurHandle(manager, effect, queue, wl_display, region, version)
+    handle = BlurHandle(manager, effect, queue, wl_display, region,
+                        empty_region, version)
     handle.active = True
     handle._listener = listener  # the callbacks must outlive the registry
     handle._compositor = compositor

@@ -119,16 +119,33 @@ class HUD:
 
     def _hide_locked(self):
         if self._process:
+            proc = self._process
+            self._process = None
             try:
-                os.killpg(os.getpgid(self._process.pid), signal.SIGTERM)
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
             except (OSError, ProcessLookupError):
                 pass
+            # Do not wait here. This runs on the thread dispatching hotkey
+            # callbacks, and the overlay takes a fade to exit; blocking would
+            # hold up every press that lands during it. Reap in the background
+            # so the child does not linger as a zombie.
+            threading.Thread(
+                target=self._reap, args=(proc,), daemon=True,
+                name="whisper-flow-hud-reap",
+            ).start()
+        self._cleanup_files()
+
+    @staticmethod
+    def _reap(proc):
+        """Collect the exited overlay, forcing it if the fade never finishes."""
+        try:
+            proc.wait(timeout=3)
+        except Exception:
             try:
-                self._process.wait(timeout=2)
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                proc.wait(timeout=2)
             except Exception:
                 pass
-            self._process = None
-        self._cleanup_files()
 
     def _cleanup_files(self):
         """Close and remove the temp files backing the HUD subprocess."""

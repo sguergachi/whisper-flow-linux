@@ -10,6 +10,7 @@ return unnoticed.
 
 import sys
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
@@ -181,3 +182,105 @@ def test_real_releases_still_reach_the_compositor(listener):
     assert (ecodes.KEY_LEFTALT, 0) in listener.forwarded
     assert (ecodes.KEY_LEFTMETA, 0) in listener.forwarded
     assert listener._muted == set()
+
+
+# --------------------------------------------------- keyboards coming and going
+class _FakeDevice:
+    def __init__(self, path, fd):
+        self.path, self.fd = path, fd
+        self.grabbed = False
+        self.closed = False
+
+    def grab(self):
+        self.grabbed = True
+
+    def ungrab(self):
+        self.grabbed = False
+
+    def close(self):
+        self.closed = True
+
+
+def _listener_with(monkeypatch, paths):
+    """A listener wired to a controllable set of keyboard paths."""
+    from whisper_flow import hotkey_evdev
+
+    listener = hotkey_evdev.EvdevHotkeyListener()
+    listener._uinput = Mock()
+    made = {}
+
+    def fake_find():
+        return [(p, {}) for p in paths]
+
+    def fake_device(path):
+        made.setdefault(path, _FakeDevice(path, 100 + len(made)))
+        return made[path]
+
+    monkeypatch.setattr(listener, "_find_keyboard_devices", fake_find)
+    monkeypatch.setattr(hotkey_evdev.evdev, "InputDevice", fake_device)
+    return listener, made
+
+
+def test_a_keyboard_plugged_in_later_gets_grabbed(monkeypatch):
+    paths = ["/dev/input/event1"]
+    listener, made = _listener_with(monkeypatch, paths)
+    assert listener._open_devices()
+    assert listener._grabbed_paths() == {"/dev/input/event1"}
+
+    paths.append("/dev/input/event2")            # a keyboard appears
+    assert listener._grabbed_paths() != listener._keyboard_paths()
+
+    listener._abandon_devices()
+    listener._open_devices()
+    assert listener._grabbed_paths() == {"/dev/input/event1", "/dev/input/event2"}
+
+
+def test_rebuilding_never_drops_the_uinput_proxy(monkeypatch):
+    """Closing the proxy while a device is grabbed swallows the user's typing."""
+    listener, _ = _listener_with(monkeypatch, ["/dev/input/event1"])
+    listener._open_devices()
+    proxy = listener._uinput
+
+    listener._abandon_devices()
+    assert listener._uinput is proxy
+    proxy.close.assert_not_called()
+
+
+def test_rebuilding_ungrabs_every_device(monkeypatch):
+    """A grabbed device nobody is reading is a dead keyboard."""
+    listener, made = _listener_with(monkeypatch, ["/dev/input/event1",
+                                                  "/dev/input/event2"])
+    listener._open_devices()
+    listener._abandon_devices()
+    assert all(not d.grabbed for d in made.values())
+    assert listener._kbd_devices == []
+
+
+def test_a_rebuild_ends_an_active_push_to_talk(monkeypatch):
+    """Otherwise the recording it started never stops."""
+    listener, _ = _listener_with(monkeypatch, ["/dev/input/event1"])
+    listener._open_devices()
+
+    released = []
+    listener.register_hotkey("transcribe", "super+alt",
+                             lambda: None, lambda: released.append(True))
+    listener._press_triggered.add("transcribe")
+    listener._active_hotkey = "transcribe"
+    listener._key_state.add(ecodes.KEY_LEFTMETA)
+
+    listener._abandon_devices()
+
+    name, kind, cb = listener._callbacks.get_nowait()
+    cb()
+    assert released == [True]
+    assert listener._key_state == set()
+    assert listener._active_hotkey is None
+
+
+def test_full_teardown_does_drop_the_proxy(monkeypatch):
+    listener, _ = _listener_with(monkeypatch, ["/dev/input/event1"])
+    listener._open_devices()
+    proxy = listener._uinput
+    listener._release_devices()
+    proxy.close.assert_called_once()
+    assert listener._uinput is None

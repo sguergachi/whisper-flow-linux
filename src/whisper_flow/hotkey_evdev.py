@@ -4,6 +4,7 @@ import logging
 import queue
 import select
 import threading
+import time
 
 import evdev
 from evdev import ecodes
@@ -29,6 +30,10 @@ CODE_ALIASES = {
 
 PROXY_NAME = "whisper-flow-keyboard-proxy"
 BUS_VIRTUAL = 0x06  # uinput devices; see linux/input.h BUS_VIRTUAL
+
+# How often to look for keyboards that were not there at startup. Cheap: it
+# stats /dev/input and compares paths, and only rebuilds when the set differs.
+RESCAN_SECONDS = 3.0
 
 
 class EvdevHotkeyListener:
@@ -117,16 +122,7 @@ class EvdevHotkeyListener:
                 raise RuntimeError(f"Cannot create uinput proxy: {e}") from e
 
         # Grab and open real keyboard devices
-        self._kbd_devices = []
-        for path, _ in kbd_info:
-            try:
-                dev = evdev.InputDevice(path)
-                dev.grab()
-                self._kbd_devices.append(dev)
-            except Exception:
-                continue
-
-        if not self._kbd_devices:
+        if not self._open_devices():
             if self._uinput:
                 self._uinput.close()
                 self._uinput = None
@@ -159,32 +155,100 @@ class EvdevHotkeyListener:
                 log.exception("hotkey %s %s callback failed", name, kind)
 
     def _read_loop(self):
-        fds = {dev.fd: dev for dev in self._kbd_devices}
+        """Pump events, rebuilding the device set whenever it changes.
+
+        Keyboards come and go: a Bluetooth one reconnects, a dock or KVM is
+        switched, a receiver is replugged. This used to return on the first
+        such event and leave a comment about a supervisor rebuilding the
+        device set - but nothing supervised it, so hotkeys stayed dead until
+        the daemon was restarted, while typing kept working because the
+        devices had been released. That is precisely the failure that looks
+        like "the hotkey stopped working and I cannot see why".
+
+        A keyboard plugged in after startup was never grabbed at all.
+        """
         try:
             while self._running:
-                try:
-                    r, _, _ = select.select(list(fds), [], [], 0.1)
-                except (OSError, ValueError):
-                    # A device disappeared (unplugged); stop cleanly so the
-                    # supervisor can rebuild against the current device set.
-                    return
-                for fd in r:
-                    try:
-                        for event in fds[fd].read():
-                            if event.type == ecodes.EV_KEY:
-                                self._handle_key(event)
-                            else:
-                                self._forward(event)
-                    except BlockingIOError:
-                        pass
-                    except OSError:
-                        return
-                    except Exception:
-                        log.exception("error reading keyboard events")
+                if not self._kbd_devices and not self._open_devices():
+                    time.sleep(RESCAN_SECONDS)      # nothing to read yet
+                    continue
+                self._pump_until_devices_change()
+                # Always ungrab before rebuilding. Devices must never stay
+                # grabbed by a loop that is no longer reading them, or the
+                # user loses their keyboard entirely.
+                self._abandon_devices()
         finally:
-            # Devices must never stay grabbed after this thread exits, or the
-            # user loses their keyboard entirely.
             self._release_devices()
+
+    def _pump_until_devices_change(self):
+        """Read events until a device fails or the keyboard set changes."""
+        fds = {dev.fd: dev for dev in self._kbd_devices}
+        next_scan = time.monotonic() + RESCAN_SECONDS
+        while self._running:
+            try:
+                r, _, _ = select.select(list(fds), [], [], 0.1)
+            except (OSError, ValueError):
+                log.info("keyboard device went away; rebuilding")
+                return
+            for fd in r:
+                try:
+                    for event in fds[fd].read():
+                        if event.type == ecodes.EV_KEY:
+                            self._handle_key(event)
+                        else:
+                            self._forward(event)
+                except BlockingIOError:
+                    pass
+                except OSError:
+                    log.info("keyboard device read failed; rebuilding")
+                    return
+                except Exception:
+                    log.exception("error reading keyboard events")
+
+            if time.monotonic() >= next_scan:
+                next_scan = time.monotonic() + RESCAN_SECONDS
+                if self._grabbed_paths() != self._keyboard_paths():
+                    log.info("keyboard set changed; rebuilding")
+                    return
+
+    def _keyboard_paths(self) -> set:
+        return {path for path, _ in self._find_keyboard_devices()}
+
+    def _grabbed_paths(self) -> set:
+        return {dev.path for dev in self._kbd_devices}
+
+    def _abandon_devices(self):
+        """Release the current devices and forget any state tied to them.
+
+        A rebuild happens with keys possibly held. Leaving them in _key_state
+        would mean the combination still looks pressed against a device that
+        no longer exists, so it could never fire again - and any active
+        push-to-talk has to be ended, or the recording it started never stops.
+        """
+        self._ungrab_devices()          # never the proxy: see _ungrab_devices
+        for name in list(self._press_triggered):
+            binding = self._bindings.get(name)
+            self._press_triggered.discard(name)
+            if binding and binding[2]:
+                self._callbacks.put((name, "release", binding[2]))
+        self._active_hotkey = None
+        self._key_state.clear()
+        self._muted.clear()
+
+    def _open_devices(self) -> bool:
+        """Grab every keyboard currently present. True if any were grabbed."""
+        opened = []
+        for path, _ in self._find_keyboard_devices():
+            try:
+                dev = evdev.InputDevice(path)
+                dev.grab()
+                opened.append(dev)
+            except Exception:
+                continue                    # in use elsewhere, or just vanished
+        self._kbd_devices = opened
+        if opened:
+            log.info("grabbed %d keyboard(s)", len(opened))
+        return bool(opened)
 
     def _forward(self, event):
         """Pass an event through to the compositor via the uinput proxy."""
@@ -282,7 +346,14 @@ class EvdevHotkeyListener:
                 if cb_release:
                     self._callbacks.put((name, "release", cb_release))
 
-    def _release_devices(self):
+    def _ungrab_devices(self):
+        """Let go of the keyboards, keeping the uinput proxy alive.
+
+        The proxy must outlive a rebuild. Everything read from a grabbed
+        keyboard is forwarded through it, so closing it while any device is
+        still grabbed would swallow the user's typing entirely - the failure
+        this code has already caused once and must never cause again.
+        """
         for dev in self._kbd_devices:
             try:
                 dev.ungrab()
@@ -293,6 +364,10 @@ class EvdevHotkeyListener:
             except Exception:
                 pass
         self._kbd_devices.clear()
+
+    def _release_devices(self):
+        """Full teardown: let go of the keyboards and drop the proxy."""
+        self._ungrab_devices()
         if self._uinput:
             try:
                 self._uinput.close()

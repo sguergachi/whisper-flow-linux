@@ -70,7 +70,6 @@ jobs:
             mingw-w64-ucrt-x86_64-python-numpy
             mingw-w64-ucrt-x86_64-python-pillow
             mingw-w64-ucrt-x86_64-python-pywin32
-            mingw-w64-ucrt-x86_64-rust
 
       - name: Install
         shell: msys2 {0}
@@ -92,10 +91,10 @@ jobs:
           tar -C "$work/src" --strip-components=1 -xf "$work"/[Pp]y[Aa]udio-*.tar.gz
           sed -i "s|[\"']/MT[\"']||g" "$work/src/setup.py"
           pip install "$work/src"
-          # velopack has no MSYS2 wheels and its tests are fully mocked.
-          # And the dev extra's linters are Rust builds PyPI cannot serve
-          # here either; pytest is all the suite needs.
-          sed -i "/velopack/d" pyproject.toml
+          # velopack and openai have no MSYS2 wheels and are lazily imported
+          # and fully mocked in tests. The dev extra's linters are Rust
+          # builds PyPI cannot serve here either; pytest is all it needs.
+          sed -i -e "/velopack/d" -e "/openai/d" pyproject.toml
           pip install -e . pytest
 
       - name: Test
@@ -209,6 +208,8 @@ jobs:
           # Its win32 branch links portaudio only when VCPKG_PATH is set;
           # the UCRT64 prefix plays that role (include + lib are both there).
           export VCPKG_PATH="$(cygpath -w /ucrt64)"
+          # jiter's Rust link looks for libpython3.14.dll.a; it lives here.
+          export RUSTFLAGS="-L native=$(cygpath -w /ucrt64)/lib"
           pip download --no-deps --no-binary pyaudio "pyaudio>=0.2.14" -d "$work"
           mkdir "$work/src"
           tar -C "$work/src" --strip-components=1 -xf "$work"/[Pp]y[Aa]udio-*.tar.gz

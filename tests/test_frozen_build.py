@@ -23,7 +23,7 @@ LAZY_IMPORTS = {
 
 
 def _hidden_imports() -> str:
-    return SPEC.read_text()
+    return SPEC.read_text(encoding="utf-8")
 
 
 @pytest.mark.parametrize("module,where", sorted(LAZY_IMPORTS.items()))
@@ -39,7 +39,7 @@ def test_the_lazy_list_matches_what_the_code_actually_does():
     src = Path(__file__).resolve().parents[1] / "src/whisper_flow"
     found = set()
     for path in src.glob("*.py"):
-        for line in path.read_text().splitlines():
+        for line in path.read_text(encoding="utf-8").splitlines():
             stripped = line.strip()
             if not stripped.startswith(("import ", "from ")):
                 continue
@@ -51,3 +51,24 @@ def test_the_lazy_list_matches_what_the_code_actually_does():
     assert found, "no lazy imports detected; has the mechanism changed?"
     for module in found:
         assert module in LAZY_IMPORTS
+
+
+def test_text_is_read_and_written_as_utf8_everywhere():
+    """Windows defaults to cp1252, and these files hold arrows and check marks.
+
+    Reading the diagnostics log with the platform default raised
+    UnicodeDecodeError on Windows - while reporting a failure, which is the
+    one moment it must not add another.
+    """
+    src = Path(__file__).resolve().parents[1] / "src/whisper_flow"
+    offenders = []
+    for path in src.glob("*.py"):
+        for number, line in enumerate(
+                path.read_text(encoding="utf-8").splitlines(), 1):
+            if re.search(r"\.(read_text|write_text)\(\s*\)", line):
+                offenders.append(f"{path.name}:{number}")
+            elif re.search(r"\.write_text\([^)]*\)", line) and \
+                    "encoding" not in line and "join" in line:
+                offenders.append(f"{path.name}:{number}")
+    assert not offenders, (
+        "text read or written with the platform encoding: " + ", ".join(offenders))

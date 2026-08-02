@@ -82,14 +82,14 @@ def set_device(
     lines = []
     found = False
     if env_file.exists():
-        lines = env_file.read_text().splitlines()
+        lines = env_file.read_text(encoding="utf-8").splitlines()
         for i, line in enumerate(lines):
             if line.startswith("WHISPER_FLOW_MIC_DEVICE_INDEX="):
                 lines[i] = f"WHISPER_FLOW_MIC_DEVICE_INDEX={device_index}"
                 found = True
     if not found:
         lines.append(f"WHISPER_FLOW_MIC_DEVICE_INDEX={device_index}")
-    env_file.write_text("\n".join(lines) + "\n")
+    env_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
     typer.echo(f"✓ Set microphone to device [{device_index}]")
     typer.echo("Restart the daemon for changes to take effect: systemctl --user restart whisper-flow")
 

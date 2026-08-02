@@ -230,10 +230,10 @@ class SetupWindow:
             env_path.parent.mkdir(parents=True, exist_ok=True)
             keep = []
             if env_path.exists():
-                keep = [ln for ln in env_path.read_text().splitlines()
+                keep = [ln for ln in env_path.read_text(encoding="utf-8").splitlines()
                         if not ln.startswith("WHISPER_FLOW_MODEL_NAME=")]
             keep.append(f"WHISPER_FLOW_MODEL_NAME={self.model}")
-            env_path.write_text("\n".join(keep) + "\n")
+            env_path.write_text("\n".join(keep) + "\n", encoding="utf-8")
         except Exception as e:
             log(f"[SETUP] could not save the model choice: {e}")
             self._status(f"Downloaded, but the setting could not be saved: {e}", BAD)

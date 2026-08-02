@@ -485,7 +485,8 @@ class LocalBackend:
         """
         try:
             self._setup_marker.parent.mkdir(parents=True, exist_ok=True)
-            self._setup_marker.write_text(time.strftime("%Y-%m-%d %H:%M:%S"))
+            self._setup_marker.write_text(
+                time.strftime("%Y-%m-%d %H:%M:%S"), encoding="utf-8")
         except Exception as e:
             log(f"[BACKEND] could not write the setup marker: {e}")
 

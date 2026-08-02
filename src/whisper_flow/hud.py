@@ -154,7 +154,7 @@ class HUD:
             if self._process and self._process.poll() not in (None, 0):
                 path = self._log_path
                 if path and os.path.exists(path):
-                    text = open(path, errors="replace").read().strip()
+                    text = open(path, encoding="utf-8", errors="replace").read().strip()
                     if text:
                         return (f"overlay exited {self._process.poll()}\n"
                                 + text[-2000:])

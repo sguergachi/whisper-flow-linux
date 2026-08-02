@@ -1243,7 +1243,7 @@ Use 'whisper-flow stop' to exit daemon
             print("✓ Daemon is running. Tray icon should be visible.")
             log_file_path.unlink(missing_ok=True)
         else:
-            log_content = log_file_path.read_text()
+            log_content = log_file_path.read_text(encoding="utf-8", errors="replace")
             print("\n❌ Daemon failed to start. See error log below:")
             print("-" * 50)
             print(

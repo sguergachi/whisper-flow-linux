@@ -126,10 +126,8 @@ fi
 if [[ ! -f "$CONFIG_DIR/.env" ]]; then
     say "Writing a starter config to $CONFIG_DIR/.env"
     cat > "$CONFIG_DIR/.env" <<'EOF'
-# Transcription backend. Point at a local whisper.cpp server, or leave the URL
-# blank and set an OpenAI key instead.
+# Transcription backend: a local whisper.cpp server, which is the only one.
 WHISPER_FLOW_LOCAL_WHISPER_URL=http://127.0.0.1:8082
-# WHISPER_FLOW_OPENAI_API_KEY=sk-...
 
 WHISPER_FLOW_HOTKEY_TRANSCRIBE=super+alt
 WHISPER_FLOW_HOTKEY_AUTO_TRANSCRIBE=ctrl+alt+space

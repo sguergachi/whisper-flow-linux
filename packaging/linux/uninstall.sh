@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Remove whisper-flow. Leaves ~/.config/whisper-flow alone so settings and the
-# API key survive a reinstall; delete it by hand to go back to nothing.
+# Remove whisper-flow. Leaves ~/.config/whisper-flow alone so settings survive
+# a reinstall; delete it by hand to go back to nothing.
 set -euo pipefail
 PREFIX="${WHISPER_FLOW_PREFIX:-$HOME/.local/share/whisper-flow}"
 BIN_DIR="${WHISPER_FLOW_BIN:-$HOME/.local/bin}"

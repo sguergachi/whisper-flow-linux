@@ -251,27 +251,33 @@ def validate(config_dir: ConfigDirOption = None):
     flow_app = WhisperFlow(config_dir)
 
     try:
-        # Run comprehensive validation
         validation_results = flow_app.run_comprehensive_validation()
-
-        # Display results
-        total_tests = sum(len(tests) for tests in validation_results.values())
-        passed_tests = sum(
-            len([t for t in tests if t["status"] == "pass"])
-            for tests in validation_results.values()
-        )
-
-        typer.echo(f"\nValidation Results: {passed_tests}/{total_tests} tests passed")
-
-        if passed_tests == total_tests:
-            typer.echo("✅ All validations passed! System is ready.")
-        else:
-            typer.echo("❌ Some validations failed. Check the issues above.")
-            raise typer.Exit(1)
-
     except Exception as e:
+        # Only a validation that could not run at all lands here. This used
+        # to wrap the whole function, including the typer.Exit(1) raised on
+        # failure - and since that is an exception too, a run with a failing
+        # check reported "Validation error: 1" instead of the failure.
         typer.echo(f"Validation error: {e}", err=True)
-        raise typer.Exit(1)
+        raise typer.Exit(1) from e
+
+    # Every result, not just the count. This said "check the issues above"
+    # while printing nothing above it, so the one failing check - the whole
+    # reason to run this - was the one thing it would not tell you.
+    marks = {"pass": "✅", "warning": "⚠️ ", "fail": "❌"}
+    total = passed = 0
+    for tests in validation_results.values():
+        for test in tests:
+            total += 1
+            passed += test["status"] == "pass"
+            mark = marks.get(test["status"], test["status"])
+            typer.echo(f"  {mark} {test['name']}: {test['message']}")
+
+    typer.echo(f"\nValidation Results: {passed}/{total} tests passed")
+    if passed == total:
+        typer.echo("✅ All validations passed! System is ready.")
+        return
+    typer.echo("❌ Some validations failed.")
+    raise typer.Exit(1)
 
 
 def main_entry():

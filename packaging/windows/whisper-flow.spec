@@ -74,7 +74,16 @@ def gtk_runtime():
     if absent:
         raise SystemExit(
             f"{GTK_PREFIX} has no typelib for: {', '.join(absent)}")
-    add(r"share\glib-2.0\schemas\*.xml", "share/glib-2.0/schemas", required=True)
+    # gschemas.compiled, not the .gschema.xml files beside it.
+    #
+    # The XML is source; GLib reads only the compiled binary, and a schema it
+    # cannot find is fatal rather than an error it returns - g_settings_new
+    # aborts the process. Shipping the XML alone therefore produced a
+    # GSETTINGS_SCHEMA_DIR with nothing readable in it, and every window that
+    # touched a GSetting died where it stood: the settings window vanished
+    # without a trace, and the overlay exited 0xC0000005.
+    add(r"share\glib-2.0\schemas\gschemas.compiled", "share/glib-2.0/schemas",
+        required=True)
     # The symbolic icons the UI names, and the cursor/edit affordances.
     add(r"share\icons\Adwaita\symbolic\**\*.svg", "share/icons/Adwaita/symbolic",
         required=True)

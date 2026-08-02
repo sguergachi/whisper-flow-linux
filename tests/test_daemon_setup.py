@@ -149,7 +149,7 @@ def test_an_external_server_is_left_alone(daemon):
 
 # ------------------------------------------------------- adopting the result
 def test_a_new_model_is_picked_up_when_the_window_closes(daemon):
-    daemon._setup_process = Mock()
+    daemon._setup_process = Mock(returncode=0)
     daemon._backend_model = "ggml-small.en"
     daemon.backend.working_model.return_value = "ggml-large-v3-turbo"
     daemon.backend.start.return_value = "http://127.0.0.1:18080"
@@ -162,7 +162,7 @@ def test_a_new_model_is_picked_up_when_the_window_closes(daemon):
 
 
 def test_a_dismissed_window_does_not_restart_a_working_server(daemon):
-    daemon._setup_process = Mock()
+    daemon._setup_process = Mock(returncode=0)
     daemon._backend_model = "ggml-small.en"
     daemon.backend.working_model.return_value = "ggml-small.en"
     with patch.object(daemon, "_use_backend_url") as used:

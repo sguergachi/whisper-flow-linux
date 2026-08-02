@@ -893,6 +893,20 @@ class WhisperFlowDaemon:
         except Exception:
             return
 
+        # A window that dies after the 0.4s check above is invisible: the
+        # user clicks Settings, nothing opens, and the log holds only the
+        # click. That is exactly how a GTK runtime crashing on a missing
+        # schema presented - a native abort leaves no Python traceback to
+        # find, so the exit code is the only evidence there is.
+        code = process.returncode
+        if isinstance(code, int) and code != 0:
+            # Unsigned too: a native crash reads as 3221225477, which says
+            # nothing, while 0xC0000005 is an access violation on sight.
+            log(f"[DAEMON] the tool window exited with {code} "
+                f"(0x{code & 0xFFFFFFFF:08X}) without being closed; "
+                f"no window was shown")
+            self.notify("That window could not open - see the log")
+
         # working_model() reads the disk rather than the config file, so
         # whatever the window downloaded is picked up here and now. The .env
         # it wrote only matters for the next launch.

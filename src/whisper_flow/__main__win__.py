@@ -69,13 +69,35 @@ def _selftest() -> int:
 
         gi.require_version("Gtk", "4.0")
         gi.require_version("Adw", "1")
-        from gi.repository import Adw, Gdk, GLib, Gtk  # noqa: F401
+        from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: F401
 
         report.append(
             f"GTK {Gtk.get_major_version()}.{Gtk.get_minor_version()}, "
             f"GLib {GLib.MAJOR_VERSION}.{GLib.MINOR_VERSION}, "
             f"Adw and Gdk resolved")
         report.append(f"GI_TYPELIB_PATH={os.environ.get('GI_TYPELIB_PATH')}")
+
+        # Resolving the namespaces proved nothing about the runtime: the
+        # first build that passed this check still could not open a window,
+        # because a missing GSettings schema aborts the process rather than
+        # returning an error. Look one up, then actually build a window.
+        schema_dir = os.environ.get("GSETTINGS_SCHEMA_DIR")
+        source = Gio.SettingsSchemaSource.new_from_directory(
+            schema_dir, None, True)
+        if source.lookup("org.gtk.Settings.FileChooser", True) is None:
+            raise RuntimeError(
+                f"no org.gtk.Settings.FileChooser schema in {schema_dir}; "
+                f"is gschemas.compiled bundled?")
+        report.append(f"schemas load from {schema_dir}")
+
+        if not Gtk.init_check():
+            raise RuntimeError("Gtk.init_check() failed - no usable display")
+        Adw.init()
+        window = Adw.ApplicationWindow(title="selftest", default_width=200)
+        window.set_content(Gtk.Label(label="selftest"))
+        window.realize()
+        report.append("Adw window realized")
+        window.destroy()
     except Exception:
         import traceback
 

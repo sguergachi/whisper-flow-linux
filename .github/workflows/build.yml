@@ -76,8 +76,14 @@ jobs:
           python -m venv --system-site-packages .venv
           source .venv/bin/activate
           python -m pip install --upgrade pip
-          # No pyaudio wheel for MSYS2 python: build it against the portaudio above.
-          pip install --no-binary pyaudio "pyaudio>=0.2.14"
+          # No pyaudio wheel for MSYS2 python, and its setup.py passes the
+          # MSVC-only /MT to any compiler on win32: patch that out and build
+          # against the portaudio above.
+          work=$(mktemp -d)
+          pip download --no-deps --no-binary pyaudio "pyaudio>=0.2.14" -d "$work"
+          tar -C "$work" -xf "$work"/pyaudio-*.tar.gz
+          sed -i "s/'\\/MT'//g" "$work"/pyaudio-*/setup.py
+          pip install "$work"/pyaudio-*/
           pip install -e ".[dev]"
 
       - name: Test
@@ -180,8 +186,14 @@ jobs:
           source .venv/bin/activate
           python -m pip install --upgrade pip
           # pipwin-free: PyAudio publishes Windows wheels from 0.2.14.
-          # No pyaudio wheel for MSYS2 python: build it against the portaudio above.
-          pip install --no-binary pyaudio "pyaudio>=0.2.14"
+          # No pyaudio wheel for MSYS2 python, and its setup.py passes the
+          # MSVC-only /MT to any compiler on win32: patch that out and build
+          # against the portaudio above.
+          work=$(mktemp -d)
+          pip download --no-deps --no-binary pyaudio "pyaudio>=0.2.14" -d "$work"
+          tar -C "$work" -xf "$work"/pyaudio-*.tar.gz
+          sed -i "s/'\\/MT'//g" "$work"/pyaudio-*/setup.py
+          pip install "$work"/pyaudio-*/
           pip install -e .
           pip install pyinstaller
 

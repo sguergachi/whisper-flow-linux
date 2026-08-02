@@ -31,6 +31,12 @@ Windows 11 — the APIs are the same, the desktop is not.
 
 Where the time goes when the hotkey is pressed, worst first:
 
+0. ~~Drawing the tray icon~~ — fixed. `_render_mic_icon` supersamples to
+   512px and runs a 41-pixel MaxFilter: **~615ms**, and it ran on every
+   recording start *and* stop, ahead of opening the microphone. Roughly 1.2s
+   per dictation spent drawing a picture of a microphone. Both colours are
+   constants, so they are drawn once at startup now.
+
 1. **Process startup.** Every recording spawns `whisper-flow.exe --hud`. In a
    PyInstaller onedir build that re-runs the bootloader, initialises a fresh
    Python, and re-reads the exe — which Defender inspects. Hundreds of ms

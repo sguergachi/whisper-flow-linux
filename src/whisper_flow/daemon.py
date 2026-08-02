@@ -81,6 +81,34 @@ def _render_mic_icon(color: tuple[int, int, int, int]) -> Image.Image:
     return image.resize((ICON_SIZE, ICON_SIZE), Image.LANCZOS)
 
 
+_icon_cache: dict[tuple, Image.Image] = {}
+_icon_lock = threading.Lock()
+
+
+def _cached_icon(color: tuple[int, int, int, int]) -> Image.Image:
+    """The rendered glyph, drawn once per colour.
+
+    _render_mic_icon supersamples to 512px and then runs a 41-pixel
+    MaxFilter over it, which measures at ~615ms. It was being run on every
+    recording start and every stop, on the thread that starts the recording
+    - so a fixed picture of a microphone was delaying the microphone. Both
+    colours are constants, so one render each is all that is ever needed.
+    """
+    with _icon_lock:
+        if color not in _icon_cache:
+            started = time.perf_counter()
+            _icon_cache[color] = _render_mic_icon(color)
+            log(f"[DAEMON] rendered tray icon in "
+                f"{(time.perf_counter() - started) * 1000:.0f}ms")
+        return _icon_cache[color]
+
+
+def prerender_icons() -> None:
+    """Draw both icons before they are needed, off the recording path."""
+    for color in (ICON_IDLE, ICON_RECORDING):
+        _cached_icon(color)
+
+
 class WhisperFlowDaemon:
     """Background daemon with system tray icon and global hotkey support."""
 
@@ -273,12 +301,12 @@ class WhisperFlowDaemon:
         log(f"[DAEMON] Daemonized with PID {os.getpid()}")
 
     def create_tray_icon(self) -> Image.Image:
-        """Create the system tray icon: a microphone glyph."""
-        return _render_mic_icon(ICON_IDLE)
+        """The system tray icon: a microphone glyph."""
+        return _cached_icon(ICON_IDLE)
 
     def create_recording_icon(self) -> Image.Image:
-        """Create the recording state icon: the same mic, lit red."""
-        return _render_mic_icon(ICON_RECORDING)
+        """The recording state icon: the same mic, lit red."""
+        return _cached_icon(ICON_RECORDING)
 
     def setup_tray_menu(self):
         """Setup the system tray menu."""
@@ -360,6 +388,10 @@ class WhisperFlowDaemon:
             # than starting it on the first recording - which would leave the
             # first dictation of every session as slow as it always was.
             self.hud.prewarm()
+            # And draw the tray icons now, so the first recording does not
+            # spend ~615ms on a picture before opening the microphone.
+            threading.Thread(target=prerender_icons, daemon=True,
+                             name="whisper-flow-icons").start()
 
         except Exception as e:
             log(f"[DAEMON] Error setting up hotkeys: {e}")

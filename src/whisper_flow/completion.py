@@ -3,7 +3,6 @@
 import time
 from typing import TypedDict
 
-from openai import OpenAI
 
 from .config import Config
 from .logging import log
@@ -13,6 +12,19 @@ from .logging import log
 class MessageType(TypedDict):
     role: str
     content: str
+
+
+def _openai_client(api_key: str):
+    """Build an OpenAI client, importing the SDK only when one is wanted.
+
+    Importing openai costs ~540ms and dominated daemon startup, which is
+    paid before the tray icon appears and before hotkeys are registered.
+    Dictation through a local whisper.cpp server never touches it, so most
+    runs were paying half a second for something they never used.
+    """
+    from openai import OpenAI
+
+    return OpenAI(api_key=api_key)
 
 
 class CompletionService:
@@ -27,7 +39,7 @@ class CompletionService:
         """
         self.config = config
         self.client = (
-            OpenAI(api_key=config.openai_api_key) if config.openai_api_key else None
+            _openai_client(config.openai_api_key) if config.openai_api_key else None
         )
 
     def complete_text(

@@ -5,7 +5,6 @@ import time
 from pathlib import Path
 
 import requests
-from openai import OpenAI
 
 from .config import Config
 from .logging import log
@@ -50,6 +49,8 @@ class TranscriptionService:
         if config.local_whisper_url:
             self.local_url = config.local_whisper_url.rstrip("/")
         elif config.openai_api_key:
+            from openai import OpenAI  # ~540ms; only for the hosted API
+
             self.client = OpenAI(api_key=config.openai_api_key)
 
     def transcribe_audio(self, audio_path: str, max_retries: int = 3,

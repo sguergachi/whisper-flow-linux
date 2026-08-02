@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 
 from .audio import AudioRecorder
+from .boost import boost_wav
 from .completion import CompletionService
 from .config import Config
 from .logging import log, set_logging_enabled
@@ -36,6 +37,39 @@ class WhisperFlow:
         self.transcription_service = TranscriptionService(self.config)
         self.completion_service = CompletionService(self.config)
         self.prompt_manager = PromptManager(self.config, self.system_manager)
+
+    def _transcribe_allowing_for_a_whisper(self, audio_file: str) -> str | None:
+        """Transcribe, and if nothing comes back, try again louder.
+
+        A whisper reaches the microphone at a peak around 100 out of 32767,
+        and whisper.cpp returns nothing at all rather than a poor guess - so
+        a recording that plainly contains speech transcribes to silence. The
+        audio is there; it is just small.
+
+        The retry costs one extra pass, so it happens only here, on the
+        closing transcription, and only when the first attempt produced
+        nothing. A recording with no signal in it is not retried at all.
+        """
+        text = self.transcription_service.transcribe_audio(audio_file)
+        if text:
+            return text
+
+        louder = f"{audio_file}.louder.wav"
+        gain = boost_wav(audio_file, louder)
+        if not gain:
+            return text
+        try:
+            retried = self.transcription_service.transcribe_audio(louder)
+            if retried:
+                log(f"[BOOST] {len(retried)} characters recovered at {gain:.0f}x")
+            else:
+                log(f"[BOOST] still nothing after {gain:.0f}x")
+            return retried
+        finally:
+            try:
+                Path(louder).unlink()
+            except Exception:
+                pass
 
     def run_voice_flow_push_to_talk_daemon(self, stop_key: str, stop_event,
                                            level_file: str | None = None,
@@ -117,7 +151,7 @@ class WhisperFlow:
                 return False
 
             # One last pass over the complete utterance, then type the tail.
-            final_text = self.transcription_service.transcribe_audio(audio_file)
+            final_text = self._transcribe_allowing_for_a_whisper(audio_file)
             live.finalize(final_text)
 
             if not final_text and not live.committed_text:
@@ -186,7 +220,7 @@ class WhisperFlow:
         try:
             # Transcribe audio
             log("Transcribing...")
-            transcript = self.transcription_service.transcribe_audio(audio_file)
+            transcript = self._transcribe_allowing_for_a_whisper(audio_file)
 
             if not transcript:
                 log("Transcription failed")

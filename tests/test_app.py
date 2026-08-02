@@ -440,3 +440,83 @@ def test_the_overlay_is_shown_only_once_capture_has_started(monkeypatch):
     flow.run_voice_flow_push_to_talk_live(
         "super+alt", Mock(), on_ready=lambda: order.append("overlay shown"))
     assert order == ["stream opened", "overlay shown"]
+
+
+def test_a_quiet_recording_is_retried_louder_before_giving_up(monkeypatch, tmp_path):
+    """From a real session: peak 89-126 transcribed to nothing, peak 281
+    worked. The speech was captured, it was just small."""
+    import wave
+
+    import numpy as np
+
+    from whisper_flow import app as app_module
+
+    quiet = tmp_path / "quiet.wav"
+    t = np.linspace(0, 1.0, 16000, False)
+    sig = (np.sin(2 * np.pi * 200 * t) * 110).astype(np.int16)
+    with wave.open(str(quiet), "wb") as f:
+        f.setnchannels(1)
+        f.setsampwidth(2)
+        f.setframerate(16000)
+        f.writeframes(sig.tobytes())
+
+    attempts = []
+
+    class Service:
+        def transcribe_audio(self, path, **kw):
+            attempts.append(path)
+            # Blank for the original, text once it has been amplified.
+            return "hello there" if path.endswith(".louder.wav") else None
+
+    flow = app_module.WhisperFlow.__new__(app_module.WhisperFlow)
+    flow.transcription_service = Service()
+
+    result = flow._transcribe_allowing_for_a_whisper(str(quiet))
+    assert result == "hello there"
+    assert len(attempts) == 2
+    assert attempts[1].endswith(".louder.wav")
+    assert not (tmp_path / "quiet.wav.louder.wav").exists()   # cleaned up
+
+
+def test_a_recording_that_transcribes_is_not_retried(tmp_path):
+    from whisper_flow import app as app_module
+
+    attempts = []
+
+    class Service:
+        def transcribe_audio(self, path, **kw):
+            attempts.append(path)
+            return "first time"
+
+    flow = app_module.WhisperFlow.__new__(app_module.WhisperFlow)
+    flow.transcription_service = Service()
+    assert flow._transcribe_allowing_for_a_whisper("/tmp/x.wav") == "first time"
+    assert len(attempts) == 1        # the retry costs a pass; do not spend it
+
+
+def test_a_silent_recording_is_not_retried(tmp_path):
+    """Amplifying a noise floor wastes a pass to produce louder noise."""
+    import wave
+
+    import numpy as np
+
+    from whisper_flow import app as app_module
+
+    dead = tmp_path / "dead.wav"
+    with wave.open(str(dead), "wb") as f:
+        f.setnchannels(1)
+        f.setsampwidth(2)
+        f.setframerate(16000)
+        f.writeframes(np.zeros(16000, dtype=np.int16).tobytes())
+
+    attempts = []
+
+    class Service:
+        def transcribe_audio(self, path, **kw):
+            attempts.append(path)
+            return None
+
+    flow = app_module.WhisperFlow.__new__(app_module.WhisperFlow)
+    flow.transcription_service = Service()
+    assert flow._transcribe_allowing_for_a_whisper(str(dead)) is None
+    assert len(attempts) == 1

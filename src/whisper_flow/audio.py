@@ -41,6 +41,7 @@ try:
 except ImportError:
     pyaudio = None
 
+from .boost import DEAD_PEAK, needs_boost
 from .config import Config
 from .logging import log
 from .system import SystemManager
@@ -524,7 +525,15 @@ class AudioRecorder:
             if frames:
                 self._save_wav_file(output_path, frames)
                 peak, mean = self._loudness(frames)
-                quiet = " - SILENT, check the capture device" if peak < 200 else ""
+                # A whisper peaks around 100, and calling that a dead device
+                # was wrong: the microphone was working, the voice was small.
+                # Only a genuine noise floor gets the warning now.
+                if peak < DEAD_PEAK:
+                    quiet = " - SILENT, check the capture device"
+                elif needs_boost(peak):
+                    quiet = " - very quiet, will retry amplified if it comes back empty"
+                else:
+                    quiet = ""
                 log(f"[AUDIO] recording stopped after {duration:.2f}s, "
                     f"peak {peak} mean {mean}{quiet}")
                 return output_path

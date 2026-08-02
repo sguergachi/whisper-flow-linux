@@ -96,7 +96,7 @@ jobs:
           # velopack and openai have no MSYS2 wheels and are lazily imported
           # and fully mocked in tests. The dev extra's linters are Rust
           # builds PyPI cannot serve here either; pytest is all it needs.
-          sed -i "/velopack/d" pyproject.toml
+          sed -i -e "/velopack/d" -e "/openai/d" pyproject.toml
           pip install -e . pytest
 
       - name: Test
@@ -219,7 +219,7 @@ jobs:
           tar -C "$work/src" --strip-components=1 -xf "$work"/[Pp]y[Aa]udio-*.tar.gz
           sed -i "s|[\"']/MT[\"']||g" "$work/src/setup.py"
           pip install "$work/src"
-          sed -i "/velopack/d" pyproject.toml
+          sed -i -e "/velopack/d" -e "/openai/d" pyproject.toml
           pip install -e .
           # velopack ships a stable-ABI extension: the win_amd64 wheel loads
           # on MSYS2's CPython too; only pip's tag check disagrees.

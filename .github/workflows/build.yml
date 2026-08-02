@@ -80,6 +80,9 @@ jobs:
           # MSVC-only /MT to any compiler on win32: patch that out and build
           # against the portaudio above.
           work=$(mktemp -d)
+          # Its win32 branch links portaudio only when VCPKG_PATH is set;
+          # the UCRT64 prefix plays that role (include + lib are both there).
+          export VCPKG_PATH="$(cygpath -w /ucrt64)"
           pip download --no-deps --no-binary pyaudio "pyaudio>=0.2.14" -d "$work"
           mkdir "$work/src"
           tar -C "$work/src" --strip-components=1 -xf "$work"/[Pp]y[Aa]udio-*.tar.gz
@@ -191,6 +194,9 @@ jobs:
           # MSVC-only /MT to any compiler on win32: patch that out and build
           # against the portaudio above.
           work=$(mktemp -d)
+          # Its win32 branch links portaudio only when VCPKG_PATH is set;
+          # the UCRT64 prefix plays that role (include + lib are both there).
+          export VCPKG_PATH="$(cygpath -w /ucrt64)"
           pip download --no-deps --no-binary pyaudio "pyaudio>=0.2.14" -d "$work"
           mkdir "$work/src"
           tar -C "$work/src" --strip-components=1 -xf "$work"/[Pp]y[Aa]udio-*.tar.gz

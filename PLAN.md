@@ -23,6 +23,11 @@ The latency was never WASAPI. It was that PortAudio enumerates MME first, so
 an `open()` naming no device took a 1991 interface, and that the stream was
 reopened for every single recording.
 
+- [ ] Verify self-update end to end: install one rolling build, wait for the
+      next, and confirm **Check for updates** finds and applies it. Rolling
+      builds are versioned `0.3.<run number>` so each is newer than the last —
+      without that the feed kept advertising the installed version and the
+      updater could never fire. Untested against a real feed.
 - [ ] Verify the Velopack installer on a real Windows machine: that it
       installs, starts at login, and that "Check for updates" finds and
       applies a newer release. CI proves it builds, not that it updates.

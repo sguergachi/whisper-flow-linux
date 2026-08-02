@@ -211,7 +211,22 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $version = python -c "import tomllib;print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])"
+
+          # Every rolling build needs a version above the last one, or the
+          # updater can never find anything: the "latest" release replaces its
+          # own assets, so the feed would keep advertising the same 0.3.0 that
+          # is already installed and "Check for updates" would always say it is
+          # current. The run number is monotonic, so the patch component
+          # becomes the build counter for rolling builds. A tag is used
+          # verbatim, and is what a kept release ships as.
+          $declared = python -c "import tomllib;print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])"
+          if ($env:GITHUB_REF -like 'refs/tags/v*') {
+            $version = $env:GITHUB_REF -replace '^refs/tags/v', ''
+          } else {
+            $series = ($declared -split '\.')[0..1] -join '.'
+            $version = "$series.$env:GITHUB_RUN_NUMBER"
+          }
+          Write-Host "declared $declared, packaging as $version"
           Copy-Item packaging/windows/README-windows.md `
                     packaging/windows/dist/whisper-flow/README.md
 

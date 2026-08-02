@@ -92,8 +92,10 @@ jobs:
           sed -i "s|[\"']/MT[\"']||g" "$work/src/setup.py"
           pip install "$work/src"
           # velopack has no MSYS2 wheels and its tests are fully mocked.
+          # And the dev extra's linters are Rust builds PyPI cannot serve
+          # here either; pytest is all the suite needs.
           sed -i "/velopack/d" pyproject.toml
-          pip install -e ".[dev]"
+          pip install -e . pytest
 
       - name: Test
         # The whole suite, plus test_windows_native.py, which only does

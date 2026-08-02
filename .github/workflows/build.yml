@@ -65,6 +65,7 @@ jobs:
             mingw-w64-ucrt-x86_64-libadwaita
             mingw-w64-ucrt-x86_64-python-gobject
             mingw-w64-ucrt-x86_64-adwaita-icon-theme
+            mingw-w64-ucrt-x86_64-python-pyaudio
 
       - name: Install
         shell: msys2 {0}
@@ -74,7 +75,7 @@ jobs:
           python -m venv --system-site-packages .venv
           source .venv/bin/activate
           python -m pip install --upgrade pip
-          pip install "pyaudio>=0.2.14"
+          # pyaudio comes from pacman: PyPI has no wheels for MSYS2 python.
           pip install -e ".[dev]"
 
       - name: Test
@@ -165,6 +166,7 @@ jobs:
             mingw-w64-ucrt-x86_64-libadwaita
             mingw-w64-ucrt-x86_64-python-gobject
             mingw-w64-ucrt-x86_64-adwaita-icon-theme
+            mingw-w64-ucrt-x86_64-python-pyaudio
 
       - name: Install
         shell: msys2 {0}
@@ -175,7 +177,7 @@ jobs:
           source .venv/bin/activate
           python -m pip install --upgrade pip
           # pipwin-free: PyAudio publishes Windows wheels from 0.2.14.
-          pip install "pyaudio>=0.2.14"
+          # pyaudio comes from pacman: PyPI has no wheels for MSYS2 python.
           pip install -e .
           pip install pyinstaller
 

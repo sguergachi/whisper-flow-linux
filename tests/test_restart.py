@@ -1,0 +1,77 @@
+"""Restarting the daemon from outside it.
+
+The settings window owns this because the daemon cannot respawn itself: on
+Windows the replacement would trip the single-instance mutex while the old
+process still held it.
+"""
+
+import sys
+from pathlib import Path
+from unittest.mock import Mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from whisper_flow import restart
+
+
+def test_systemd_installations_restart_through_systemd(monkeypatch):
+    monkeypatch.setattr(restart, "systemd_unit_active", lambda: True)
+    run = Mock(return_value=Mock(returncode=0))
+    monkeypatch.setattr(restart.subprocess, "run", run)
+    kill = Mock()
+    monkeypatch.setattr(restart.os, "kill", kill)
+
+    ok, _detail = restart.restart_daemon()
+
+    assert ok
+    assert run.call_args[0][0] == [
+        "systemctl", "--user", "restart", restart.UNIT]
+    kill.assert_not_called()
+
+
+def test_a_running_daemon_is_stopped_then_respawned(monkeypatch):
+    monkeypatch.setattr(restart, "systemd_unit_active", lambda: False)
+    monkeypatch.setattr(restart, "daemon_pid", lambda: 4321)
+    monkeypatch.setattr(restart, "_wait_for_exit", lambda pid: True)
+    kill = Mock()
+    monkeypatch.setattr(restart.os, "kill", kill)
+    popen = Mock()
+    monkeypatch.setattr(restart.subprocess, "Popen", popen)
+    monkeypatch.setattr(sys, "frozen", False, raising=False)
+
+    ok, _detail = restart.restart_daemon()
+
+    assert ok
+    kill.assert_called_once_with(4321, 15)
+    assert popen.call_args[0][0] == [
+        sys.executable, "-m", "whisper_flow.cli", "daemon", "--foreground"]
+
+
+def test_no_running_daemon_just_starts_one(monkeypatch):
+    monkeypatch.setattr(restart, "systemd_unit_active", lambda: False)
+    monkeypatch.setattr(restart, "daemon_pid", lambda: None)
+    kill = Mock()
+    monkeypatch.setattr(restart.os, "kill", kill)
+    popen = Mock()
+    monkeypatch.setattr(restart.subprocess, "Popen", popen)
+
+    ok, _detail = restart.restart_daemon()
+
+    assert ok
+    kill.assert_not_called()
+    popen.assert_called_once()
+
+
+def test_a_daemon_that_will_not_die_is_a_failure(monkeypatch):
+    monkeypatch.setattr(restart, "systemd_unit_active", lambda: False)
+    monkeypatch.setattr(restart, "daemon_pid", lambda: 4321)
+    monkeypatch.setattr(restart, "_wait_for_exit", lambda pid: False)
+    monkeypatch.setattr(restart.os, "kill", Mock())
+    popen = Mock()
+    monkeypatch.setattr(restart.subprocess, "Popen", popen)
+
+    ok, detail = restart.restart_daemon()
+
+    assert not ok
+    assert "would not stop" in detail
+    popen.assert_not_called()

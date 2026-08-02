@@ -40,7 +40,8 @@ added in that release.
 The app ships `base.en`, which keeps up with speech on any machine from a
 two-core laptop upwards. Where the hardware can do better, the setup window
 offers better — one button, with a progress bar. Decline and the bundled model
-keeps working; ask later from **Speech model...** in the tray.
+keeps working; switch later from **Settings** in the tray, where every model
+can be downloaded and picked.
 
 | Machine | Model | Why |
 |---|---|---|
@@ -123,7 +124,8 @@ You should see a microphone icon in your system tray. Right-click it to access t
 ### System Tray
 
 - **Right-click** the tray icon to access:
-  - Settings
+  - Settings — every option: speech model, hotkeys, dictation, notifications
+  - Speech model... — quick one-button model setup
   - Test Configuration  
   - Exit
 

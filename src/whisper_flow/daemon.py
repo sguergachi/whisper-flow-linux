@@ -3,7 +3,6 @@
 import os
 import platform
 import queue
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -16,13 +15,14 @@ from pathlib import Path
 from PIL import Image, ImageDraw, ImageFilter
 
 from . import __version__
+from . import updater
 from .app import WhisperFlow
 from .backend import LocalBackend, detect_accelerator, recommended_model
 from .config import Config
 from .hotkey_manager import HotkeyManager, HotkeyMode
 from .hud import HUD
 from .logging import log, recent_log, set_logging_enabled
-from . import updater
+from .paths import pid_file as _pid_file
 
 # Modes driven by holding a hotkey down; they cannot be deferred and replayed.
 PUSH_TO_TALK_MODES = ("transcribe", "command")
@@ -347,7 +347,7 @@ class WhisperFlowDaemon:
             os.dup2(f.fileno(), sys.stdout.fileno())
 
         # Write PID file
-        pid_file = Path.home() / ".config" / "whisper-flow" / "daemon.pid"
+        pid_file = _pid_file()
         pid_file.parent.mkdir(parents=True, exist_ok=True)
         with open(pid_file, "w") as f:
             f.write(str(os.getpid()))
@@ -842,10 +842,14 @@ class WhisperFlowDaemon:
         self._download_model_headless()
 
     def _open_setup_window(self) -> bool:
-        """Launch the one-button setup window as its own process.
+        """Launch the one-button setup window as its own process."""
+        return self._open_tool_window("--setup", "whisper_flow.setup_ui")
 
-        It cannot share this process: pystray owns an event loop here and Tk
-        demands the main thread of wherever it runs. Returns False where
+    def _open_tool_window(self, flag: str, module: str) -> bool:
+        """Launch one of the Tk tool windows (setup, settings) as a process.
+
+        They cannot share this process: pystray owns an event loop here and
+        Tk demands the main thread of wherever it runs. Returns False where
         there is no window to show, so the caller can fall back.
         """
         if sys.platform != "win32" and not (
@@ -856,9 +860,9 @@ class WhisperFlowDaemon:
                 return True             # already open; don't stack windows
 
             if getattr(sys, "frozen", False):
-                cmd = [sys.executable, "--setup"]
+                cmd = [sys.executable, flag]
             else:
-                cmd = [sys.executable, "-m", "whisper_flow.setup_ui"]
+                cmd = [sys.executable, "-m", module]
             try:
                 process = self._setup_process = subprocess.Popen(cmd)
             except Exception as e:
@@ -1070,14 +1074,17 @@ class WhisperFlowDaemon:
             app.config.local_whisper_url = url
             app.transcription_service.local_url = url.rstrip("/")
 
-    def open_settings(self, icon, item):
-        """Open settings directory in file manager."""
+    def open_settings(self, icon=None, item=None):
+        """Open the settings window, as its own process.
+
+        Same process split as the setup window: pystray owns this process's
+        event loop and Tk insists on its own. The tray callback has to
+        return immediately or the icon stops responding, and spawning is all
+        this does.
+        """
         log("[DAEMON] Settings menu item clicked")
-        config_dir = self.config.config_dir
-        if shutil.which("xdg-open"):
-            subprocess.Popen(["xdg-open", str(config_dir)])
-        else:
-            self.notify(f"Config directory: {config_dir}")
+        if not self._open_tool_window("--settings", "whisper_flow.settings_ui"):
+            self.notify(f"Config directory: {self.config.config_dir}")
 
     def test_configuration(self, icon, item):
         """Run the checks, and put a pasteable report on the clipboard.
@@ -1284,7 +1291,7 @@ Use 'whisper-flow stop' to exit daemon
         print("✓ Daemon process launched. Verifying status...")
         time.sleep(2)
 
-        pid_file = Path.home() / ".config" / "whisper-flow" / "daemon.pid"
+        pid_file = _pid_file()
         if pid_file.exists():
             print("✓ Daemon is running. Tray icon should be visible.")
             log_file_path.unlink(missing_ok=True)
@@ -1359,7 +1366,7 @@ Use 'whisper-flow stop' to exit daemon
             log("[DAEMON] Worker process started")
 
             # Write PID file so parent process can verify startup
-            pid_file = Path.home() / ".config" / "whisper-flow" / "daemon.pid"
+            pid_file = _pid_file()
             pid_file.parent.mkdir(parents=True, exist_ok=True)
             pid_file.write_text(str(os.getpid()))
 
@@ -1478,7 +1485,7 @@ def main():
 
 def is_running() -> bool:
     """Check if the daemon is currently running."""
-    pid_file = Path.home() / ".config" / "whisper-flow" / "daemon.pid"
+    pid_file = _pid_file()
     if not pid_file.exists():
         return False
 
@@ -1501,7 +1508,7 @@ def is_running() -> bool:
 def stop_daemon():
     """Stop the running daemon."""
     log("[DAEMON] Stop daemon function called")
-    pid_file = Path.home() / ".config" / "whisper-flow" / "daemon.pid"
+    pid_file = _pid_file()
     if not pid_file.exists():
         print("Daemon is not running")
         return

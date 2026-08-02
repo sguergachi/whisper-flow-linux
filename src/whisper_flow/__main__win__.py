@@ -26,6 +26,10 @@ def main() -> int:
         from whisper_flow.setup_ui import main as setup_main
         return setup_main()
 
+    if "--settings" in sys.argv:
+        from whisper_flow.settings_ui import main as settings_main
+        return settings_main()
+
     # Velopack's hooks, before anything else in the application starts.
     #
     # The installer runs this executable with --veloapp-* arguments at

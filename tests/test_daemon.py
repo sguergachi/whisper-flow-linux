@@ -260,19 +260,20 @@ class TestWhisperFlowDaemon:
             mock_notify.assert_called_once_with("👋 WhisperFlow daemon stopping...")
             daemon.tray_icon.stop.assert_called_once()
 
-    def test_open_settings(self, temp_config_dir):
-        """Opens the config directory in a file manager.
+    def test_open_settings(self, temp_config_dir, monkeypatch):
+        """Launches the settings window as its own process.
 
-        subprocess must be patched: without it this test really launches
-        xdg-open on the developer's desktop, on the repr of a Mock.
+        subprocess must be patched: without it this test really opens a Tk
+        window on the developer's desktop.
         """
+        monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")
         with (
             patch("whisper_flow.daemon.Config") as mock_config_class,
             patch("whisper_flow.daemon.WhisperFlow") as mock_app_class,
             patch("whisper_flow.daemon.HotkeyManager") as mock_hotkey_manager_class,
             patch("whisper_flow.daemon.WhisperFlowDaemon.notify") as mock_notify,
-            patch("whisper_flow.daemon.subprocess.Popen") as mock_popen,  # noqa: F841
-            patch("whisper_flow.daemon.shutil.which", return_value="/usr/bin/xdg-open"),
+            patch("whisper_flow.daemon.subprocess.Popen") as mock_popen,
+            patch("whisper_flow.daemon.threading.Thread"),
         ):
             mock_config = Mock()
             mock_config.hotkey_transcribe = "ctrl+cmd"
@@ -286,14 +287,15 @@ class TestWhisperFlowDaemon:
             mock_hotkey_manager = Mock()
             mock_hotkey_manager_class.return_value = mock_hotkey_manager
 
+            mock_popen.return_value.poll.return_value = None
+
             daemon = WhisperFlowDaemon(temp_config_dir)
 
             daemon.open_settings(None, None)
 
             mock_popen.assert_called_once()
             argv = mock_popen.call_args[0][0]
-            assert argv[0] == "xdg-open"
-            assert argv[1] == str(mock_config.config_dir)
+            assert argv[1:] == ["-m", "whisper_flow.settings_ui"]
             mock_notify.assert_not_called()
 
     def test_get_app_for_mode_transcribe(self, temp_config_dir):

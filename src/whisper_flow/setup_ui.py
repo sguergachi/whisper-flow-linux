@@ -19,6 +19,7 @@ from tkinter import ttk
 if __package__ in (None, ""):        # launched as a script by the frozen build
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from whisper_flow import envfile  # noqa: E402
 from whisper_flow.backend import (  # noqa: E402
     MODELS,
     LocalBackend,
@@ -226,14 +227,8 @@ class SetupWindow:
     def _save_choice(self):
         """Persist the model so the daemon picks it up when this exits."""
         try:
-            env_path = Path(self.config.config_dir) / ".env"
-            env_path.parent.mkdir(parents=True, exist_ok=True)
-            keep = []
-            if env_path.exists():
-                keep = [ln for ln in env_path.read_text(encoding="utf-8").splitlines()
-                        if not ln.startswith("WHISPER_FLOW_MODEL_NAME=")]
-            keep.append(f"WHISPER_FLOW_MODEL_NAME={self.model}")
-            env_path.write_text("\n".join(keep) + "\n", encoding="utf-8")
+            envfile.set_values(Path(self.config.config_dir) / ".env",
+                               {"WHISPER_FLOW_MODEL_NAME": self.model})
         except Exception as e:
             log(f"[SETUP] could not save the model choice: {e}")
             self._status(f"Downloaded, but the setting could not be saved: {e}", BAD)

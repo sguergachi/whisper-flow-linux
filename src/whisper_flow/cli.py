@@ -9,6 +9,7 @@ from typing import Annotated
 import typer
 from typer import Option
 
+from . import envfile
 from .app import WhisperFlow
 
 # Suppress warnings for cleaner CLI output
@@ -81,18 +82,10 @@ def set_device(
         pa.terminate()
 
     # Save to env file for persistence
-    env_file = flow_app.config.config_dir / ".env"
-    lines = []
-    found = False
-    if env_file.exists():
-        lines = env_file.read_text(encoding="utf-8").splitlines()
-        for i, line in enumerate(lines):
-            if line.startswith("WHISPER_FLOW_MIC_DEVICE_INDEX="):
-                lines[i] = f"WHISPER_FLOW_MIC_DEVICE_INDEX={device_index}"
-                found = True
-    if not found:
-        lines.append(f"WHISPER_FLOW_MIC_DEVICE_INDEX={device_index}")
-    env_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    envfile.set_values(
+        flow_app.config.config_dir / ".env",
+        {"WHISPER_FLOW_MIC_DEVICE_INDEX": str(device_index)},
+    )
     typer.echo(f"✓ Set microphone to device [{device_index}]")
     typer.echo("Restart the daemon for changes to take effect: systemctl --user restart whisper-flow")
 

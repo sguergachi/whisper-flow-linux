@@ -300,6 +300,27 @@ class LocalBackend:
     def is_installed(self, model: str | None = None) -> bool:
         return self.server_exe.exists() and self.model_path(model).exists()
 
+    def model_inventory(self) -> list[dict]:
+        """Every known model with its status, for the settings window.
+
+        One row per model: size, whether it is on disk (downloaded or
+        bundled), whether it is the one in use, and whether it is the one
+        this machine would be recommended.
+        """
+        recommended = recommended_model(detect_accelerator())
+        current = self.working_model()
+        return [
+            {
+                "name": name,
+                "size_mb": size_mb,
+                "wants": wants,
+                "installed": self.model_path(name).exists(),
+                "current": name == current,
+                "recommended": name == recommended,
+            }
+            for name, (size_mb, wants) in MODELS.items()
+        ]
+
     def working_model(self) -> str | None:
         """The best model actually present.
 

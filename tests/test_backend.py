@@ -290,3 +290,20 @@ def test_the_two_recorded_versions_agree():
     root = P(__file__).resolve().parent.parent
     declared = tomllib.load(open(root / "pyproject.toml", "rb"))["project"]["version"]
     assert whisper_flow.__version__ == declared
+
+
+# ------------------------------------------------------------ model inventory
+def test_inventory_marks_installed_current_and_recommended(
+        config, local_backend, monkeypatch):
+    _install_engine(local_backend, config)   # writes ggml-small.en (the fixture model)
+    monkeypatch.setattr(backend_module, "recommended_model",
+                        lambda accelerator: "ggml-base.en")
+    monkeypatch.setattr(backend_module, "detect_accelerator", lambda: "cpu")
+
+    rows = {row["name"]: row for row in local_backend.model_inventory()}
+
+    assert set(rows) == set(MODELS)
+    small = rows["ggml-small.en"]
+    assert small["installed"] and small["current"] and not small["recommended"]
+    base = rows["ggml-base.en"]
+    assert not base["installed"] and not base["current"] and base["recommended"]

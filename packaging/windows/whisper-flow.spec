@@ -23,6 +23,7 @@ hidden = collect_submodules("pydantic") + [
     "whisper_flow.blur_win",
     "whisper_flow.hud_win",
     "whisper_flow.setup_ui",
+    "whisper_flow.settings_ui",
     "pystray._win32",
     # Imported at the point of use rather than at module scope, to keep them
     # off the startup path. PyInstaller only follows imports it can see

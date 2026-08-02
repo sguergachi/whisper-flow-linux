@@ -37,7 +37,7 @@ def default_hotkeys() -> dict[str, str]:
 
 _HOTKEYS = default_hotkeys()
 
-from pydantic import Field, field_validator
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -89,17 +89,24 @@ class Config(BaseSettings):
     )
 
     # Audio configuration
+    #
+    # The four legacy short names (VAD_MODE, MIC_DEVICE_INDEX, SILENCE_TIMEOUT,
+    # SAMPLE_RATE) come first in their alias lists because Field(env=...) is
+    # silently ignored by pydantic-settings 2.x - for a long time only the
+    # prefixed name worked, and anyone who set the short one was configuring
+    # nothing. AliasChoices honours both.
     vad_mode: int = Field(
         default=2,
         ge=0,
         le=3,
         description="Voice Activity Detection mode (0-3)",
-        env="VAD_MODE",
+        validation_alias=AliasChoices("VAD_MODE", "WHISPER_FLOW_VAD_MODE"),
     )
     mic_device_index: int | None = Field(
         default=None,
         description="Microphone device index",
-        env="MIC_DEVICE_INDEX",
+        validation_alias=AliasChoices(
+            "MIC_DEVICE_INDEX", "WHISPER_FLOW_MIC_DEVICE_INDEX"),
     )
     frame_ms: int = Field(
         default=30,
@@ -110,13 +117,14 @@ class Config(BaseSettings):
         default=1.5,
         gt=0.0,
         description="Silence timeout in seconds",
-        env="SILENCE_TIMEOUT",
+        validation_alias=AliasChoices(
+            "SILENCE_TIMEOUT", "WHISPER_FLOW_SILENCE_TIMEOUT"),
     )
     sample_rate: int = Field(
         default=16000,
         gt=0,
         description="Audio sample rate in Hz",
-        env="SAMPLE_RATE",
+        validation_alias=AliasChoices("SAMPLE_RATE", "WHISPER_FLOW_SAMPLE_RATE"),
     )
     speedup_audio: float = Field(
         default=1,
@@ -163,12 +171,15 @@ class Config(BaseSettings):
         description="Seconds of silence before auto-stopping recording",
         ge=0.5,
         le=10.0,
-        env="WHISPER_FLOW_AUTO_STOP_SILENCE",
+        validation_alias=AliasChoices(
+            "WHISPER_FLOW_AUTO_STOP_SILENCE",
+            "WHISPER_FLOW_AUTO_STOP_SILENCE_DURATION"),
     )
     pystray_backend: str = Field(
         default="gtk",
         description="Pystray backend for system tray (gtk, appindicator, xorg)",
-        env="PYSTRAY_BACKEND",
+        validation_alias=AliasChoices("PYSTRAY_BACKEND",
+                                      "WHISPER_FLOW_PYSTRAY_BACKEND"),
     )
 
     # Stability and timeout configuration

@@ -51,9 +51,16 @@ def gtk_runtime():
 
     # Typelibs: every namespace the UI touches, plus their dependencies as
     # named by `g-ir-inspect` on a stock UCRT64 install.
-    for ns in ("Adw-1", "Gtk-4.0", "Gsk-4.0", "Graphene-1.0", "GdkPixbuf-2.0",
-               "Pango-1.0", "PangoCairo-1.0", "cairo-1.0", "HarfBuzz-0.0",
-               "Gio-2.0", "GLib-2.0", "GObject-2.0"):
+    #
+    # Gdk-4.0 is a separate typelib from Gtk-4.0 and every one of the three
+    # GTK modules imports it; leaving it out shipped a build that resolved
+    # Gtk and then died on `from gi.repository import Gdk`. GModule-2.0 is
+    # named by Gio's typelib. Anything added here must also be added to the
+    # --selftest namespaces, which is what actually proves it at build time.
+    for ns in ("Adw-1", "Gtk-4.0", "Gdk-4.0", "Gsk-4.0", "Graphene-1.0",
+               "GdkPixbuf-2.0", "Pango-1.0", "PangoCairo-1.0", "cairo-1.0",
+               "HarfBuzz-0.0", "Gio-2.0", "GLib-2.0", "GObject-2.0",
+               "GModule-2.0"):
         add(rf"lib\girepository-1.0\{ns}.typelib", "girepository-1.0",
             required=True)
     add(r"share\glib-2.0\schemas\*.xml", "share/glib-2.0/schemas", required=True)
@@ -70,13 +77,31 @@ def gtk_runtime():
         raise SystemExit(f"no gdk-pixbuf loaders in {GTK_PREFIX}")
     datas += [(path, "lib/gdk-pixbuf-2.0/2.10.0/loaders") for path in loaders]
 
+    # Roots of the DLL closure. _dll_closure skips anything that is not
+    # there, so a root that gets renamed upstream drops its whole subtree in
+    # silence and the build stays green - check them here instead.
+    roots = ["libgtk-4-1.dll", "libadwaita-1-0.dll", "libgobject-2.0-0.dll",
+             "libglib-2.0-0.dll", "libgio-2.0-0.dll", "libcairo-2.dll",
+             "libcairo-gobject-2.dll"]
+    missing = [name for name in roots
+               if not os.path.exists(os.path.join(GTK_PREFIX, "bin", name))]
+    if missing:
+        raise SystemExit(
+            f"missing from {GTK_PREFIX}\\bin: {', '.join(missing)}")
+
+    # girepository was folded into GLib in 2.80 and versioned with it, so a
+    # prefix carries one name or the other depending on its age. Pinning
+    # either one breaks on an MSYS2 update; accepting neither is how `import
+    # gi` starts failing on the user's machine.
+    girepository = [
+        name for name in ("libgirepository-2.0-0.dll", "libgirepository-1.0-1.dll")
+        if os.path.exists(os.path.join(GTK_PREFIX, "bin", name))]
+    if not girepository:
+        raise SystemExit(f"no libgirepository in {GTK_PREFIX}\\bin")
+
     binaries = [(dll, ".") for dll in _dll_closure(
         [os.path.join(GTK_PREFIX, "bin", name)
-         for name in ("libgtk-4-1.dll", "libadwaita-1-0.dll",
-                      "libgirepository-1.0-1.dll", "libgobject-2.0-0.dll",
-                      "libglib-2.0-0.dll", "libgio-2.0-0.dll",
-                      "libcairo-2.dll", "libcairo-gobject-2.dll")]
-        + loaders)]
+         for name in roots + girepository] + loaders)]
     return datas, binaries
 
 

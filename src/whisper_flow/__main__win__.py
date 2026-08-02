@@ -24,8 +24,25 @@ def _bootstrap_gtk_runtime() -> None:
     if not getattr(sys, "frozen", False):
         return
     base = sys._MEIPASS
-    os.environ.setdefault(
-        "GI_TYPELIB_PATH", os.path.join(base, "girepository-1.0"))
+
+    # GI_TYPELIB_PATH is *assigned*, not defaulted, and ours goes first.
+    #
+    # PyInstaller ships its own gi runtime hook, and runtime hooks run before
+    # this script. It does `os.environ['GI_TYPELIB_PATH'] = <base>/gi_typelibs`
+    # - a hard assignment - holding whatever its GI hooks inferred from the
+    # import graph. That graph also contains pystray's GTK 3 backend, so what
+    # it collects is a GTK 3 flavoured guess and need not contain Gtk-4.0 at
+    # all. setdefault() therefore did nothing here, the curated GTK 4 typelibs
+    # in the spec were never on the search path, and the app died on
+    # "Namespace Gtk not available" at the first window - off a green build.
+    #
+    # PyInstaller's directory stays on the path behind ours, so anything it
+    # found that the spec does not enumerate still resolves.
+    typelibs = os.path.join(base, "girepository-1.0")
+    inherited = os.environ.get("GI_TYPELIB_PATH")
+    os.environ["GI_TYPELIB_PATH"] = (
+        f"{typelibs}{os.pathsep}{inherited}" if inherited else typelibs)
+
     os.environ.setdefault(
         "GSETTINGS_SCHEMA_DIR", os.path.join(base, "share", "glib-2.0", "schemas"))
     # A loaders.cache would carry the build machine's absolute paths; a
@@ -35,11 +52,59 @@ def _bootstrap_gtk_runtime() -> None:
         os.path.join(base, "lib", "gdk-pixbuf-2.0", "2.10.0", "loaders"))
 
 
+def _selftest() -> int:
+    """Resolve every GTK namespace the UI needs, then exit.
+
+    A frozen build with missing typelibs still builds, installs and launches:
+    it fails when the first window opens, on the user's machine, which is
+    exactly how it shipped. CI runs this against the built folder so that
+    failure lands in the build instead.
+
+    The executable is windowed, so there is no console to print to. The
+    report goes to the file named by WHISPER_FLOW_SELFTEST_OUT when set.
+    """
+    report, status = [], 0
+    try:
+        import gi
+
+        gi.require_version("Gtk", "4.0")
+        gi.require_version("Adw", "1")
+        from gi.repository import Adw, Gdk, GLib, Gtk  # noqa: F401
+
+        report.append(
+            f"GTK {Gtk.get_major_version()}.{Gtk.get_minor_version()}, "
+            f"GLib {GLib.MAJOR_VERSION}.{GLib.MINOR_VERSION}, "
+            f"Adw and Gdk resolved")
+        report.append(f"GI_TYPELIB_PATH={os.environ.get('GI_TYPELIB_PATH')}")
+    except Exception:
+        import traceback
+
+        report.append(traceback.format_exc())
+        report.append(f"GI_TYPELIB_PATH={os.environ.get('GI_TYPELIB_PATH')}")
+        status = 1
+
+    text = "\n".join(report)
+    out = os.environ.get("WHISPER_FLOW_SELFTEST_OUT")
+    if out:
+        try:
+            with open(out, "w", encoding="utf-8") as fh:
+                fh.write(text + "\n")
+        except OSError:
+            pass
+    print(text, flush=True)
+    return status
+
+
 def main() -> int:
     # Without this a frozen build re-runs the whole program in every worker
     # process it spawns.
     multiprocessing.freeze_support()
     _bootstrap_gtk_runtime()
+
+    # Before every other branch: it must not depend on config, a device or
+    # anything else that could fail for its own reasons and mask the answer.
+    if "--selftest" in sys.argv:
+        return _selftest()
 
     if "--hud" in sys.argv:
         from whisper_flow.hud_app import main as hud_main

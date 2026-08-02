@@ -52,6 +52,64 @@ def test_the_lazy_list_matches_what_the_code_actually_does():
         assert module in LAZY_IMPORTS
 
 
+# GTK namespaces the Linux build alone uses: the layer-shell protocol has no
+# Windows equivalent, and GLibUnix is what its name says. Both sit behind a
+# sys.platform guard, so neither belongs in the Windows bundle.
+LINUX_ONLY_NAMESPACES = {"Gtk4LayerShell", "GLibUnix"}
+
+
+def _namespaces_the_ui_needs() -> set[str]:
+    """Every gi namespace the source asks for, however it asks."""
+    src = Path(__file__).resolve().parents[1] / "src/whisper_flow"
+    found = set()
+    for path in src.glob("*.py"):
+        text = path.read_text(encoding="utf-8")
+        found |= set(re.findall(r"require_version\(\s*[\"'](\w+)[\"']", text))
+        for imported in re.findall(r"from gi\.repository import ([^\n#]+)", text):
+            for name in imported.split(","):
+                name = name.split(" as ")[0].strip()
+                if name.isidentifier():
+                    found.add(name)
+    return found - LINUX_ONLY_NAMESPACES
+
+
+def test_every_gtk_namespace_the_ui_imports_ships_a_typelib():
+    """Typelibs are data, so nothing about the build notices one missing.
+
+    Gdk-4.0 was left out of the spec while three modules imported Gdk. The
+    build stayed green, the installer built, and the app raised "Namespace
+    Gtk not available" at the first window on the user's machine.
+    """
+    spec = SPEC.read_text(encoding="utf-8")
+    needed = _namespaces_the_ui_needs()
+    assert "Gtk" in needed and "Gdk" in needed, (
+        "namespace detection found neither Gtk nor Gdk; has the import style "
+        "changed?"
+    )
+    missing = [ns for ns in sorted(needed) if f'"{ns}-' not in spec]
+    assert not missing, (
+        f"the UI imports {', '.join(missing)} but the spec bundles no typelib "
+        f"for them; the frozen build will fail at the first window"
+    )
+
+
+def test_the_typelib_path_is_not_left_to_pyinstaller():
+    """PyInstaller's gi rthook assigns GI_TYPELIB_PATH before this runs.
+
+    It points at its own gi_typelibs, inferred from an import graph that also
+    contains pystray's GTK 3 backend. setdefault() against that is a no-op,
+    which is how the curated GTK 4 typelibs went unused in a shipped build.
+    """
+    entry = (Path(__file__).resolve().parents[1]
+             / "src/whisper_flow/__main__win__.py").read_text(encoding="utf-8")
+    assert 'setdefault(\n        "GI_TYPELIB_PATH"' not in entry
+    assert "setdefault(\"GI_TYPELIB_PATH\"" not in entry
+    assert 'os.environ["GI_TYPELIB_PATH"] =' in entry, (
+        "the bundled typelib directory must be assigned, and placed ahead of "
+        "whatever PyInstaller's runtime hook set"
+    )
+
+
 def test_text_is_read_and_written_as_utf8_everywhere():
     """Windows defaults to cp1252, and these files hold arrows and check marks.
 

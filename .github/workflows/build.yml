@@ -258,6 +258,28 @@ jobs:
           GTK_PREFIX="$(cygpath -w /ucrt64)" \
             python -m PyInstaller --noconfirm --clean whisper-flow.spec
 
+      - name: Prove the frozen app can open a GTK window
+        # The build being green says nothing about the bundled GTK runtime:
+        # typelibs are data, and a missing one fails when the first window
+        # opens, on the user's machine. That is exactly how 0.3.90 shipped -
+        # "ValueError: Namespace Gtk not available" from the overlay.
+        #
+        # Start-Process because the exe is windowed (console=False), so pwsh
+        # does not wait for it and there is no stdout to read; --selftest
+        # writes its report to the file named here.
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $exe = "packaging/windows/dist/whisper-flow/whisper-flow.exe"
+          if (-not (Test-Path $exe)) { throw "no frozen exe at $exe" }
+          $env:WHISPER_FLOW_SELFTEST_OUT = "$PWD/selftest.txt"
+          $p = Start-Process -FilePath $exe -ArgumentList "--selftest" `
+                             -Wait -PassThru
+          if (Test-Path selftest.txt) { Get-Content selftest.txt | Write-Host }
+          if ($p.ExitCode -ne 0) {
+            throw "the frozen GTK runtime is broken (exit $($p.ExitCode))"
+          }
+
       - name: Bundle the speech engine and a model
         # So the app transcribes the moment it is installed, with no network
         # and no setup step.

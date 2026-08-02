@@ -195,6 +195,7 @@ jobs:
             mingw-w64-ucrt-x86_64-python-pillow
             mingw-w64-ucrt-x86_64-python-pywin32
             mingw-w64-ucrt-x86_64-rust
+            mingw-w64-ucrt-x86_64-pyinstaller
 
       - name: Install
         shell: msys2 {0}
@@ -244,9 +245,18 @@ jobs:
         working-directory: packaging/windows
         # UCRT64's Python is a native Windows build: it wants the prefix in
         # Windows form (C:\msys64\ucrt64), not the MSYS form (/ucrt64).
+        #
+        # `python -m PyInstaller`, not the `pyinstaller` on PATH. PyInstaller
+        # comes from pacman, so that script is /ucrt64/bin/pyinstaller.exe and
+        # its shebang runs the *system* interpreter - which cannot see the
+        # editable whisper_flow in .venv, and would analyse a spec whose every
+        # hiddenimport is missing. The module form runs under the activated
+        # venv, which sees both it (via --system-site-packages) and us.
         run: |
           source "$GITHUB_WORKSPACE/.venv/bin/activate"
-          GTK_PREFIX="$(cygpath -w /ucrt64)" pyinstaller --noconfirm --clean whisper-flow.spec
+          python -c "import PyInstaller; print('PyInstaller', PyInstaller.__version__)"
+          GTK_PREFIX="$(cygpath -w /ucrt64)" \
+            python -m PyInstaller --noconfirm --clean whisper-flow.spec
 
       - name: Bundle the speech engine and a model
         # So the app transcribes the moment it is installed, with no network

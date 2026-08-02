@@ -289,3 +289,50 @@ def test_showing_the_overlay_survives_never_having_been_pressed(daemon):
     daemon._ptl = None
     daemon._show_hud_now()          # must not raise
     daemon.hud.show.assert_called()
+
+
+# ------------------------------------------------------- copying a good run
+def test_the_log_can_be_copied_without_anything_having_failed(daemon):
+    """A run that worked but felt slow is exactly what a timing question
+    needs, and there was no way to hand one over."""
+    from whisper_flow import logging as wf
+
+    seen = _clipboard(daemon)
+    wf.log("[PTL] 310ms press-to-listen (dispatch 2, mic open 300, overlay 6)")
+    daemon.copy_log()
+
+    assert "[PTL] 310ms" in seen["text"]
+    assert "Configuration" in seen["text"]
+    assert "super+alt" in seen["text"]
+
+
+def test_copying_the_log_says_whether_it_worked(daemon):
+    from whisper_flow.system import SystemManager
+
+    manager = Mock(spec=SystemManager)
+    manager.copy_to_clipboard.return_value = False
+    daemon.transcribe_app.system_manager = manager
+    daemon.copy_log()
+    assert "Could not reach" in daemon.notify.call_args[0][0]
+
+
+def test_a_broken_clipboard_does_not_take_the_tray_down(daemon):
+    from whisper_flow.system import SystemManager
+
+    manager = Mock(spec=SystemManager)
+    manager.copy_to_clipboard.side_effect = OSError("clipboard locked")
+    daemon.transcribe_app.system_manager = manager
+    daemon.copy_log()               # a tray callback must never raise
+    daemon.notify.assert_called_once()
+
+
+def test_the_log_copy_carries_more_history_than_a_failure_needs(daemon):
+    """A timing question spans several dictations, not one moment."""
+    from whisper_flow import logging as wf
+
+    seen = _clipboard(daemon)
+    for i in range(150):
+        wf.log(f"[PTL] line {i}")
+    daemon.copy_log()
+    assert "line 149" in seen["text"]
+    assert "line 30" in seen["text"]        # well beyond a 120-line window

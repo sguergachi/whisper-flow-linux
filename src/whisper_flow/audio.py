@@ -349,6 +349,25 @@ class AudioRecorder:
                 pass
             return None
 
+    @staticmethod
+    def _loudness(frames: list) -> tuple[int, int]:
+        """Peak and mean amplitude of a recording, 0-32767.
+
+        Distinguishes "the user said nothing" from "the microphone handed us
+        silence", which look identical once whisper reports blank audio and
+        are entirely different problems - the first is nothing to fix, the
+        second is the wrong capture device.
+        """
+        if not frames:
+            return 0, 0
+        try:
+            samples = np.frombuffer(b"".join(frames), dtype=np.int16)
+            if samples.size == 0:
+                return 0, 0
+            return int(np.abs(samples).max()), int(np.abs(samples).mean())
+        except Exception:
+            return 0, 0
+
     def _write_level(self, level_file: str | None, buf: bytes):
         """Write audio level to the level file for HUD visualization.
 
@@ -475,7 +494,10 @@ class AudioRecorder:
             # Save the recorded audio
             if frames:
                 self._save_wav_file(output_path, frames)
-                log(f"[AUDIO] recording stopped after {duration:.2f}s")
+                peak, mean = self._loudness(frames)
+                quiet = " - SILENT, check the capture device" if peak < 200 else ""
+                log(f"[AUDIO] recording stopped after {duration:.2f}s, "
+                    f"peak {peak} mean {mean}{quiet}")
                 return output_path
             # Zero frames from a stream that opened is the signature of a
             # microphone the OS is refusing to hand over. On Windows 11 that

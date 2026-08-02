@@ -60,8 +60,23 @@ itself:
     [PTL] 76ms press-to-listen (dispatch 2, save window 3, window centre 1,
                                 thread start 4, mic open 60, overlay 6)
 
-Measured on Linux: **76ms cold, 24–33ms on a warm stream.** No Windows
-figure yet — the log will carry it.
+Measured on Linux: **76ms cold, 24–33ms on a warm stream.**
+
+First Windows figure, from a real dictation:
+
+    [PTL] 297ms press-to-listen (dispatch 0, save window 16, window centre 0,
+                                 thread start 16, mic open 265, overlay 0)
+
+**265ms of the 297ms is opening the microphone**, and everything else is
+noise. That machine's WASAPI device will not do 16kHz, so it falls back to
+the default host API — MME. Two things left to try, in order:
+
+- [ ] Confirm the warm stream removes it for a second press within 90s. That
+      is the cheap win and it is already implemented; it just has no Windows
+      measurement.
+- [ ] Open WASAPI at the device's own rate and resample to 16k, rather than
+      falling back to MME. Real work, and only worth it if the warm stream
+      does not already make the cold open rare enough to ignore.
 
 ## What the audit changed, and what it cleared
 

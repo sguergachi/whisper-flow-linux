@@ -386,6 +386,7 @@ class WhisperFlowDaemon:
             pystray.MenuItem("Speech model...", self.setup_speech_model),
             pystray.MenuItem("Test Configuration", self.test_configuration),
             pystray.MenuItem("Copy last error", self.copy_last_error),
+            pystray.MenuItem("Copy log", self.copy_log),
             pystray.MenuItem("Check for updates", self.check_for_updates,
                              visible=updater.available()),
             pystray.MenuItem("Reload Daemon", self.reload_daemon),
@@ -939,6 +940,25 @@ class WhisperFlowDaemon:
         if self.backend.setup_reason() == "gpu":
             self._open_setup_window()
 
+    def copy_log(self, icon=None, item=None):
+        """Put the recent log on the clipboard, whether or not anything failed.
+
+        Failure reports only appear when something goes wrong, so there was
+        no way to hand over a run that worked but felt slow - which is
+        exactly what a timing question needs. This is that: one click, then
+        paste. It carries the same configuration and log as a failure
+        report, including every PTL line.
+        """
+        text = self._diagnostics("Log requested from the tray")
+        try:
+            copied = bool(
+                self.transcribe_app.system_manager.copy_to_clipboard(text))
+        except Exception as e:
+            log(f"[DAEMON] could not copy the log: {e}")
+            copied = False
+        self.notify("Log copied to clipboard" if copied
+                    else "Could not reach the clipboard")
+
     def _report_failure(self, headline: str, detail: str | None = None) -> None:
         """Notify about a failure and put the whole story on the clipboard.
 
@@ -947,6 +967,25 @@ class WhisperFlowDaemon:
         goes through here so the notification names the problem and the
         clipboard carries the log that explains it.
         """
+        text = self._diagnostics(headline, detail)
+        self._last_failure = text
+
+        copied = False
+        try:
+            copied = bool(
+                self.transcribe_app.system_manager.copy_to_clipboard(text))
+        except Exception as e:
+            log(f"[DAEMON] could not copy the failure report: {e}")
+
+        # Say which happened. Silently dropping the report is how this went
+        # unnoticed: the notification looked the same whether the clipboard
+        # held the details or nothing at all.
+        suffix = (" - details copied to clipboard" if copied
+                  else " - could not reach the clipboard")
+        self.notify(f"❌ {headline}{suffix}")
+
+    def _diagnostics(self, headline: str, detail: str | None = None) -> str:
+        """Everything worth knowing about this run, as pasteable text."""
         report = [
             f"whisper-flow {__version__} - {headline}",
             f"{datetime.now():%Y-%m-%d %H:%M:%S}  {platform.platform()}",
@@ -974,23 +1013,8 @@ class WhisperFlowDaemon:
 
         if detail:
             report += ["", "Traceback", detail.rstrip()]
-        report += ["", "Recent log", recent_log(120) or "(nothing recorded)"]
-        text = "\n".join(report)
-        self._last_failure = text
-
-        copied = False
-        try:
-            copied = bool(
-                self.transcribe_app.system_manager.copy_to_clipboard(text))
-        except Exception as e:
-            log(f"[DAEMON] could not copy the failure report: {e}")
-
-        # Say which happened. Silently dropping the report is how this went
-        # unnoticed: the notification looked the same whether the clipboard
-        # held the details or nothing at all.
-        suffix = (" - details copied to clipboard" if copied
-                  else " - could not reach the clipboard")
-        self.notify(f"❌ {headline}{suffix}")
+        report += ["", "Recent log", recent_log(200) or "(nothing recorded)"]
+        return "\n".join(report)
 
     def check_for_updates(self, icon=None, item=None):
         """Download and restart into a newer version, if there is one.

@@ -194,3 +194,37 @@ def test_the_default_device_failing_is_still_reported(recorder, monkeypatch):
     recorder.pa.open.side_effect = OSError("no audio device at all")
     with pytest.raises(OSError):
         recorder._open_input_stream(480)
+
+
+# ------------------------------------------------- did the microphone work?
+def test_loudness_tells_speech_from_silence():
+    """Whisper reporting blank audio is the same message whether the user
+    said nothing or the capture device handed us silence. These are
+    different problems: one is nothing to fix, the other is the wrong
+    device, and the log has to say which."""
+    import numpy as np
+
+    speech = [np.random.randint(-9000, 9000, 480, dtype=np.int16).tobytes()
+              for _ in range(30)]
+    silence = [np.zeros(480, dtype=np.int16).tobytes() for _ in range(30)]
+
+    peak, mean = AudioRecorder._loudness(speech)
+    assert peak > 200 and mean > 0
+
+    peak, mean = AudioRecorder._loudness(silence)
+    assert peak == 0 and mean == 0
+
+
+def test_loudness_survives_no_frames_and_bad_data():
+    assert AudioRecorder._loudness([]) == (0, 0)
+    assert AudioRecorder._loudness([b"\x01"]) == (0, 0)      # odd byte count
+
+
+def test_a_barely_audible_recording_still_reads_as_silent():
+    """A mic that is muted or on the wrong device gives dither, not zeros."""
+    import numpy as np
+
+    faint = [np.random.randint(-40, 40, 480, dtype=np.int16).tobytes()
+             for _ in range(30)]
+    peak, _ = AudioRecorder._loudness(faint)
+    assert peak < 200

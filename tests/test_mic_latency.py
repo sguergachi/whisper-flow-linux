@@ -21,6 +21,7 @@ def recorder():
     rec.pa = Mock()
     rec._warm_stream = None
     rec._warm_chunk = None
+    rec._devices_logged = True          # not under test here
     rec._warm_timer = None
     import threading
     rec._stream_lock = threading.Lock()
@@ -228,3 +229,56 @@ def test_a_barely_audible_recording_still_reads_as_silent():
              for _ in range(30)]
     peak, _ = AudioRecorder._loudness(faint)
     assert peak < 200
+
+
+# ------------------------------------------------------- device visibility
+def test_the_devices_are_listed_with_the_chosen_one_marked(recorder, monkeypatch):
+    """Silence is nearly always the wrong device, and the log said nothing
+    about which device was in use or what else was available."""
+    from whisper_flow import logging as wf
+
+    wf.clear_log()
+    monkeypatch.setattr(recorder, "_input_device_index", lambda: 2)
+    recorder._devices_logged = False
+    recorder.pa.get_default_input_device_info.return_value = {
+        "index": 0, "name": "Speakers (loopback)", "defaultSampleRate": 44100.0}
+    recorder.pa.get_device_count.return_value = 3
+    devices = [
+        {"name": "Speakers (loopback)", "maxInputChannels": 2,
+         "hostApi": 0, "defaultSampleRate": 44100.0},
+        {"name": "Headphones", "maxInputChannels": 0,
+         "hostApi": 0, "defaultSampleRate": 44100.0},
+        {"name": "Blue Yeti", "maxInputChannels": 1,
+         "hostApi": 1, "defaultSampleRate": 48000.0},
+    ]
+    recorder.pa.get_device_info_by_index.side_effect = lambda i: devices[i]
+    recorder.pa.get_host_api_info_by_index.side_effect = (
+        lambda i: {"name": ["MME", "Windows WASAPI"][i]})
+
+    recorder.log_input_devices()
+    logged = wf.recent_log()
+
+    assert "Blue Yeti" in logged and "<- using" in logged
+    assert "Speakers (loopback)" in logged        # the default is named too
+    assert "Headphones" not in logged             # outputs are not capture
+
+
+def test_the_device_list_is_logged_once_not_per_recording(recorder, monkeypatch):
+    from whisper_flow import logging as wf
+
+    monkeypatch.setattr(recorder, "_input_device_index", lambda: 0)
+    recorder._devices_logged = False
+    recorder.pa.get_default_input_device_info.return_value = {
+        "index": 0, "name": "Mic", "defaultSampleRate": 48000.0}
+    recorder.pa.get_device_count.return_value = 0
+
+    wf.clear_log()
+    for _ in range(5):
+        recorder.log_input_devices()
+    assert wf.recent_log().count("default input") == 1
+
+
+def test_a_failure_to_enumerate_does_not_stop_a_recording(recorder, monkeypatch):
+    recorder._devices_logged = False
+    recorder.pa.get_default_input_device_info.side_effect = OSError("no devices")
+    recorder.log_input_devices()        # must not raise

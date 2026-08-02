@@ -80,6 +80,7 @@ class AudioRecorder:
         # microphone. _check_pyaudio reports it per recording instead.
         self.pa = None
         self._warm_stream = None
+        self._devices_logged = False
         self._warm_chunk = None
         self._warm_timer = None
         self._stream_lock = threading.Lock()
@@ -142,6 +143,33 @@ class AudioRecorder:
         except Exception:
             return False
 
+    def log_input_devices(self) -> None:
+        """List the capture devices once, with the one we would choose marked.
+
+        A recording that returns silence is almost always the wrong device
+        rather than a broken microphone, and there was no way to tell which
+        device was being used, let alone what else was on offer. Logged once
+        per process: it is for reading in a report, not a running commentary.
+        """
+        if self._devices_logged or self.pa is None:
+            return
+        self._devices_logged = True
+        try:
+            chosen = self._input_device_index()
+            default = self.pa.get_default_input_device_info()
+            log(f"[AUDIO] default input: [{default['index']}] "
+                f"{default['name']} @ {int(default['defaultSampleRate'])}Hz")
+            for index in range(self.pa.get_device_count()):
+                info = self.pa.get_device_info_by_index(index)
+                if not info.get("maxInputChannels"):
+                    continue
+                api = self.pa.get_host_api_info_by_index(info["hostApi"])["name"]
+                mark = " <- using" if index == chosen else ""
+                log(f"[AUDIO]   [{index}] {info['name']} "
+                    f"({api}, {int(info['defaultSampleRate'])}Hz){mark}")
+        except Exception as e:
+            log(f"[AUDIO] could not list input devices: {e}")
+
     def _open_input_stream(self, chunk: int):
         """Open a capture stream, reusing a warm one when there is one.
 
@@ -164,6 +192,7 @@ class AudioRecorder:
                     log(f"[AUDIO] warm stream unusable: {e}")
                     self._close_stream(warm)
 
+        self.log_input_devices()
         device = self._input_device_index()
         try:
             with suppress_alsa_warnings():

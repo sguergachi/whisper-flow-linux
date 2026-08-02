@@ -83,7 +83,7 @@ jobs:
           pip download --no-deps --no-binary pyaudio "pyaudio>=0.2.14" -d "$work"
           mkdir "$work/src"
           tar -C "$work/src" --strip-components=1 -xf "$work"/[Pp]y[Aa]udio-*.tar.gz
-          sed -i "s/'\\/MT'//g" "$work/src/setup.py"
+          sed -i "s|[\"']/MT[\"']||g" "$work/src/setup.py"
           pip install "$work/src"
           pip install -e ".[dev]"
 
@@ -194,7 +194,7 @@ jobs:
           pip download --no-deps --no-binary pyaudio "pyaudio>=0.2.14" -d "$work"
           mkdir "$work/src"
           tar -C "$work/src" --strip-components=1 -xf "$work"/[Pp]y[Aa]udio-*.tar.gz
-          sed -i "s/'\\/MT'//g" "$work/src/setup.py"
+          sed -i "s|[\"']/MT[\"']||g" "$work/src/setup.py"
           pip install "$work/src"
           pip install -e .
           pip install pyinstaller

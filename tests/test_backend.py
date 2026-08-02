@@ -132,7 +132,9 @@ def test_threads_never_run_away_on_a_large_machine(monkeypatch):
 
 def test_threads_respect_a_narrowed_affinity(monkeypatch):
     """A cgroup or taskset limit outranks however many cores the box has."""
-    monkeypatch.setattr(backend_module.os, "sched_getaffinity", lambda _: {0, 1, 2})
+    # raising=: sched_getaffinity does not exist off Linux to be patched.
+    monkeypatch.setattr(backend_module.os, "sched_getaffinity",
+                        lambda _: {0, 1, 2}, raising=False)
     monkeypatch.setattr(backend_module, "_physical_cores", lambda _: 8)
     assert backend_module.usable_cores() == 3
 

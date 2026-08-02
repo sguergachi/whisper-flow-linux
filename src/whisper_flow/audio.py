@@ -236,6 +236,7 @@ class AudioRecorder:
         level_file: str | None = None,
         on_tick=None,
         tick_seconds: float = 1.0,
+        on_ready=None,
     ) -> str | None:
         """Record audio with push-to-talk functionality.
 
@@ -247,6 +248,11 @@ class AudioRecorder:
                 tick_seconds, so live transcription can run alongside. It must
                 return immediately - it is on the capture loop.
             tick_seconds: How often to hand out a snapshot
+            on_ready: Called once the microphone is actually capturing. The
+                overlay is shown from here rather than before, because the
+                user treats it as "speak now" - and opening a capture stream
+                on Windows takes long enough that words spoken against the
+                old, earlier overlay were simply not recorded.
 
         Returns:
             Path to the recorded audio file, or None if cancelled
@@ -263,6 +269,7 @@ class AudioRecorder:
         chunk = frame_len
 
         try:
+            opened_at = time.monotonic()
             with suppress_alsa_warnings():
                 stream = self.pa.open(
                     format=pyaudio.paInt16,
@@ -272,6 +279,14 @@ class AudioRecorder:
                     input=True,
                     frames_per_buffer=chunk,
                 )
+
+            log(f"[AUDIO] capture stream open in "
+                f"{(time.monotonic() - opened_at) * 1000:.0f}ms")
+            if on_ready:
+                try:
+                    on_ready()
+                except Exception as e:
+                    log(f"[AUDIO] on_ready failed: {e}")
 
             frames = []
             stop_flag = {"stop": False}

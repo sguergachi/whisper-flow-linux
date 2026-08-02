@@ -5,6 +5,11 @@ verified — not when written.
 
 ## Now
 
+- [ ] Verify on Windows: overlay now appears when the microphone is actually
+      capturing, so speaking the moment it appears is captured. The gap it
+      closes is `pa.open()`, ~55ms on Linux and reportedly much longer on
+      Windows WASAPI — the log now prints the real figure.
+
 - [ ] Verify the Velopack installer on a real Windows machine: that it
       installs, starts at login, and that "Check for updates" finds and
       applies a newer release. CI proves it builds, not that it updates.

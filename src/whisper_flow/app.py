@@ -37,7 +37,9 @@ class WhisperFlow:
         self.completion_service = CompletionService(self.config)
         self.prompt_manager = PromptManager(self.config, self.system_manager)
 
-    def run_voice_flow_push_to_talk_daemon(self, stop_key: str, stop_event, level_file: str | None = None) -> bool:
+    def run_voice_flow_push_to_talk_daemon(self, stop_key: str, stop_event,
+                                           level_file: str | None = None,
+                                           on_ready=None) -> bool:
         """Run voice flow with daemon-controlled push-to-talk recording.
 
         Args:
@@ -51,7 +53,8 @@ class WhisperFlow:
         """
         try:
             # Record audio with daemon-controlled stop event
-            audio_file = self.audio_recorder.record_push_to_talk(stop_key, stop_event, level_file=level_file)
+            audio_file = self.audio_recorder.record_push_to_talk(
+                stop_key, stop_event, level_file=level_file, on_ready=on_ready)
 
             if not audio_file:
                 log("No audio recorded")
@@ -64,7 +67,9 @@ class WhisperFlow:
             self.system_manager.notify(f"Push-to-talk failed: {e}")
             return False
 
-    def run_voice_flow_push_to_talk_live(self, stop_key: str, stop_event, level_file: str | None = None) -> bool:
+    def run_voice_flow_push_to_talk_live(self, stop_key: str, stop_event,
+                                         level_file: str | None = None,
+                                         on_ready=None) -> bool:
         """Push-to-talk that types text while the user is still speaking.
 
         Words are typed as soon as two consecutive transcription passes agree
@@ -103,6 +108,7 @@ class WhisperFlow:
                 level_file=level_file,
                 on_tick=live.offer,
                 tick_seconds=self.config.live_interval,
+                on_ready=on_ready,
             )
 
             if not audio_file:

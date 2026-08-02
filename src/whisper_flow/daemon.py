@@ -537,12 +537,15 @@ class WhisperFlowDaemon:
         fd, self._level_file = tempfile.mkstemp(suffix=".levels", prefix="whisper-flow-")
         os.close(fd)
 
-        # Show the HUD on whichever screen holds the window being dictated into
+        # The overlay is shown from the recording thread, once the microphone
+        # is actually capturing - see _record_audio_thread. Showing it here
+        # meant it appeared while the capture stream was still opening, and
+        # anything said in that gap was never recorded. The user treats the
+        # overlay as "speak now", so it has to be true.
         try:
-            point = app.system_manager.active_window_center()
+            self._hud_point = app.system_manager.active_window_center()
         except Exception:
-            point = None
-        self.hud.show(level_file=self._level_file, point=point)
+            self._hud_point = None
 
         # Update tray icon to recording state
         if self.tray_icon:
@@ -558,6 +561,14 @@ class WhisperFlowDaemon:
         self.recording_thread.start()
         log(f"[DAEMON] Recording thread started for mode: {mode}")
         return True
+
+    def _show_hud_now(self) -> None:
+        """Put the overlay up. Called when the microphone starts capturing."""
+        try:
+            self.hud.show(level_file=getattr(self, "_level_file", None),
+                          point=getattr(self, "_hud_point", None))
+        except Exception as e:
+            log(f"[DAEMON] could not show the overlay: {e}")
 
     def _stop_recording_if_active(self, mode: str):
         """Stop recording if the specified mode is currently active."""
@@ -601,6 +612,7 @@ class WhisperFlowDaemon:
                         stop_key=hotkey,
                         stop_event=self.stop_recording_event,
                         level_file=getattr(self, "_level_file", None),
+                        on_ready=self._show_hud_now,
                     )
                 else:
                     log(f"[DAEMON] Running push-to-talk mode with stop key: {hotkey}")
@@ -608,6 +620,7 @@ class WhisperFlowDaemon:
                         stop_key=hotkey,
                         stop_event=self.stop_recording_event,
                         level_file=getattr(self, "_level_file", None),
+                        on_ready=self._show_hud_now,
                     )
             else:
                 # Fallback to auto-stop

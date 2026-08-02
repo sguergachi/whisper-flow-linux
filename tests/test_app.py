@@ -72,10 +72,14 @@ class TestWhisperFlow:
             result = app.run_voice_flow_push_to_talk_daemon("ctrl+shift+t", stop_event)
 
             assert result is True
+            # on_ready is how the overlay learns the microphone is live; it
+            # must reach the recorder or the overlay goes back to appearing
+            # before anything is being captured.
             mock_audio.record_push_to_talk.assert_called_once_with(
                 "ctrl+shift+t",
                 stop_event,
                 level_file=None,
+                on_ready=None,
             )
             mock_transcription.transcribe_audio.assert_called_once_with("/tmp/test.wav")
 
@@ -403,3 +407,36 @@ def test_the_live_flow_really_does_shorten_its_passes(monkeypatch):
     captured["transcribe"]("/tmp/a.wav")
     assert seen["max_retries"] == 1
     assert seen["timeout"] == app_module.LIVE_TIMEOUT
+
+
+def test_the_overlay_is_shown_only_once_capture_has_started(monkeypatch):
+    """It reads as "speak now", so it must not appear while the mic opens."""
+    from unittest.mock import Mock
+
+    from whisper_flow import app as app_module
+
+    order = []
+
+    class Recorder:
+        def record_push_to_talk(self, *a, on_ready=None, **kw):
+            order.append("stream opened")
+            if on_ready:
+                on_ready()
+            return None
+
+    class FakeLive:
+        def __init__(self, **kw): pass
+        def start(self): pass
+        def stop(self): pass
+        def offer(self, frames): pass       # handed to the capture loop
+
+    monkeypatch.setattr(app_module, "LiveTranscriber", FakeLive)
+    flow = app_module.WhisperFlow.__new__(app_module.WhisperFlow)
+    flow.transcription_service = Mock()
+    flow.system_manager = Mock()
+    flow.audio_recorder = Recorder()
+    flow.config = Mock(sample_rate=16000, live_interval=0.9)
+
+    flow.run_voice_flow_push_to_talk_live(
+        "super+alt", Mock(), on_ready=lambda: order.append("overlay shown"))
+    assert order == ["stream opened", "overlay shown"]

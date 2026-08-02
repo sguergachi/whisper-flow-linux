@@ -843,7 +843,7 @@ class WhisperFlowDaemon:
 
     def _open_setup_window(self) -> bool:
         """Launch the one-button setup window as its own process."""
-        return self._open_tool_window("--setup", "whisper_flow.setup_ui")
+        return self._open_tool_window("--setup", "whisper_flow.setup_gtk")
 
     def _open_tool_window(self, flag: str, module: str) -> bool:
         """Launch one of the Tk tool windows (setup, settings) as a process.
@@ -1083,18 +1083,9 @@ class WhisperFlowDaemon:
         this does.
         """
         log("[DAEMON] Settings menu item clicked")
-        # GTK4+libadwaita on Linux, tkinter on Windows - the same split as
-        # the HUD. A Linux machine without GTK4 falls back to tkinter too:
-        # the window process exits at once and the next module is tried.
-        if sys.platform == "win32":
-            modules = [("--settings", "whisper_flow.settings_ui")]
-        else:
-            modules = [("--settings-gtk", "whisper_flow.settings_gtk"),
-                       ("--settings", "whisper_flow.settings_ui")]
-        for flag, module in modules:
-            if self._open_tool_window(flag, module):
-                return
-        self.notify(f"Config directory: {self.config.config_dir}")
+        # One GTK4 window on every platform.
+        if not self._open_tool_window("--settings", "whisper_flow.settings_gtk"):
+            self.notify(f"Config directory: {self.config.config_dir}")
 
     def test_configuration(self, icon, item):
         """Run the checks, and put a pasteable report on the clipboard.

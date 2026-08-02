@@ -126,70 +126,73 @@ def test_shutdown_is_safe_with_no_overlay(hud):
 
 
 # ------------------------------------------------------- the overlay's states
-@pytest.mark.skipif(not __import__("os").environ.get("DISPLAY")
-                    and sys.platform != "win32", reason="needs a display")
+_GTK_CHILD = """
+import sys
+sys.path.insert(0, sys.argv[1] + "/src")
+scenario = sys.argv[2]
+import gi
+gi.require_version("Gtk", "4.0")
+from gi.repository import Gtk, GLib
+from whisper_flow import hud_app
+
+Gtk.init()
+win = hud_app.HudWindow("", None, resident=True)
+win.realize()
+for _ in range(30):
+    GLib.MainContext.default().iteration(False)
+
+if scenario == "hide_not_die":
+    win.begin_show("")
+    assert win.get_visible()
+    win.begin_hide()
+    win._after_fade_out()
+    assert not win.get_visible(), "resident window must hide, not die"
+    assert not win._quitting
+elif scenario == "reset":
+    win.begin_show("")
+    win.level_pos = 16
+    win.peak = 9999.0
+    win.begin_show("")
+    # Otherwise the new recording starts mid-waveform at the old scale.
+    assert win.level_pos == 0
+    assert win.peak == hud_app.PEAK_FLOOR
+print("OK")
+"""
+
+
+def _gtk_available() -> bool:
+    import os
+    import subprocess
+    if sys.platform != "win32" and not os.environ.get("DISPLAY"):
+        return False
+    result = subprocess.run(
+        [sys.executable, "-c",
+         "import gi; gi.require_version('Gtk', '4.0'); "
+         "from gi.repository import Gtk; Gtk.init()"],
+        capture_output=True, check=False)
+    return result.returncode == 0
+
+
+@pytest.mark.skipif(not _gtk_available(), reason="needs GTK4 and a display")
 def test_the_overlay_hides_instead_of_exiting_between_recordings(tmp_path):
-    import tkinter as tk
-
-    from whisper_flow import hud_win
-
-    try:
-        window = hud_win.HudWindow("", resident=True)
-    except tk.TclError as e:
-        pytest.skip(f"no usable display: {e}")
-    try:
-        assert window._resident
-        assert not window._visible          # built hidden
-
-        levels = tmp_path / "a.levels"
-        levels.write_bytes(b"\x00" * 16)
-        window._begin(str(levels))
-        assert window._visible
-        assert window.level_file == str(levels)
-
-        window._end()
-        assert window._quitting              # fading out, not gone
-        window._retire()
-        assert not window._visible
-        assert window.level_file == ""
-        assert window._level_handle is None  # the file can now be deleted
-        assert window.root.winfo_exists()    # process and window survive
-    finally:
-        try:
-            window.root.destroy()
-        except tk.TclError:
-            pass
+    import subprocess
+    result = subprocess.run(
+        [sys.executable, "-c", _GTK_CHILD,
+         str(__import__("pathlib").Path(__file__).resolve().parents[1]),
+         "hide_not_die"],
+        capture_output=True, text=True, check=False, timeout=60)
+    assert "OK" in result.stdout, result.stderr
 
 
-@pytest.mark.skipif(not __import__("os").environ.get("DISPLAY")
-                    and sys.platform != "win32", reason="needs a display")
+@pytest.mark.skipif(not _gtk_available(), reason="needs GTK4 and a display")
 def test_a_second_recording_resets_the_waveform(tmp_path):
-    import tkinter as tk
-
-    from whisper_flow import hud_win
-
-    try:
-        window = hud_win.HudWindow("", resident=True)
-    except tk.TclError as e:
-        pytest.skip(f"no usable display: {e}")
-    try:
-        first = tmp_path / "a.levels"
-        first.write_bytes(b"\x01" * 64)
-        window._begin(str(first))
-        window.level_pos = 16
-        window.peak = 9999.0
-
-        second = tmp_path / "b.levels"
-        second.write_bytes(b"\x02" * 64)
-        window._begin(str(second))
-        # Otherwise the new recording starts mid-waveform at the old scale.
-        assert window.level_pos == 0
-        assert window.peak == hud_win.PEAK_FLOOR
-    finally:
-        try:
-            window.root.destroy()
-        except tk.TclError:
-            pass
+    import subprocess
+    result = subprocess.run(
+        [sys.executable, "-c", _GTK_CHILD,
+         str(__import__("pathlib").Path(__file__).resolve().parents[1]),
+         "reset"],
+        capture_output=True, text=True, check=False, timeout=60)
+    assert "OK" in result.stdout, result.stderr
 
 
 # ------------------------------------------------------------------ prewarm

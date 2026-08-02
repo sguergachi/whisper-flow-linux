@@ -49,7 +49,7 @@ def test_the_window_opens_on_a_linux_desktop(daemon, monkeypatch):
     with patch("whisper_flow.daemon.subprocess.Popen") as popen:
         popen.return_value.poll.return_value = None
         assert daemon._open_setup_window() is True
-    assert popen.call_args[0][0][1:] == ["-m", "whisper_flow.setup_ui"]
+    assert popen.call_args[0][0][1:] == ["-m", "whisper_flow.setup_gtk"]
 
 
 def test_the_frozen_build_relaunches_itself_with_setup(daemon, monkeypatch):

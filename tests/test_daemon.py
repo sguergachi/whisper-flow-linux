@@ -1,6 +1,5 @@
 """Unit tests for the WhisperFlow daemon."""
 
-import sys
 import time
 from unittest.mock import Mock, patch
 
@@ -296,36 +295,8 @@ class TestWhisperFlowDaemon:
 
             mock_popen.assert_called_once()
             argv = mock_popen.call_args[0][0]
-            expected = ("whisper_flow.settings_ui" if sys.platform == "win32"
-                        else "whisper_flow.settings_gtk")
-            assert argv[1:] == ["-m", expected]
+            assert argv[1:] == ["-m", "whisper_flow.settings_gtk"]
             mock_notify.assert_not_called()
-
-    def test_open_settings_falls_back_to_tk_when_gtk_is_missing(
-            self, temp_config_dir, monkeypatch):
-        """A Linux box without GTK4 exits at once; the Tk window is tried."""
-        monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")
-        with (
-            patch("whisper_flow.daemon.Config") as mock_config_class,
-            patch("whisper_flow.daemon.WhisperFlow"),
-            patch("whisper_flow.daemon.HotkeyManager"),
-            patch("whisper_flow.daemon.WhisperFlowDaemon.notify"),
-            patch("whisper_flow.daemon.subprocess.Popen") as mock_popen,
-            patch("whisper_flow.daemon.threading.Thread"),
-            patch("whisper_flow.daemon.sys") as mock_sys,
-        ):
-            mock_config = Mock()
-            mock_config_class.return_value = mock_config
-            mock_sys.platform = "linux"
-            mock_sys.frozen = False
-            mock_popen.return_value.poll.return_value = 1   # died at once
-
-            daemon = WhisperFlowDaemon(temp_config_dir)
-            daemon.open_settings(None, None)
-
-            modules = [call[0][0][2] for call in mock_popen.call_args_list]
-            assert modules == ["whisper_flow.settings_gtk",
-                               "whisper_flow.settings_ui"]
 
     def test_get_app_for_mode_transcribe(self, temp_config_dir):
         """Test getting app instance for transcribe mode."""

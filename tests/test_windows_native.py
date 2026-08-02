@@ -120,10 +120,9 @@ def test_the_build_number_is_real():
 def test_the_windows_modules_import_without_the_linux_ones():
     import whisper_flow.blur_win          # noqa: F401
     import whisper_flow.hotkey_win        # noqa: F401
-    import whisper_flow.hud_win           # noqa: F401
     import whisper_flow.system_win        # noqa: F401
 
-    for absent in ("evdev", "gi", "pynput"):
+    for absent in ("evdev", "pynput"):
         assert absent not in sys.modules
 
 
@@ -132,7 +131,7 @@ def test_the_overlay_starts_and_stops():
     """It is spawned on the path that begins a recording, so it must run."""
     env = dict(os.environ, WHISPER_FLOW_HUD_LEVEL_FILE="")
     process = subprocess.Popen(
-        [sys.executable, "-m", "whisper_flow.hud_win"],
+        [sys.executable, "-m", "whisper_flow.hud_app"],
         env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
     )
     try:
@@ -156,7 +155,7 @@ def test_importing_the_overlay_stays_cheap():
     """
     code = (
         "import time; t=time.perf_counter();"
-        "import whisper_flow.hud_win;"
+        "import whisper_flow.hud_app;"
         "print((time.perf_counter()-t)*1000)"
     )
     out = subprocess.run([sys.executable, "-c", code], capture_output=True,

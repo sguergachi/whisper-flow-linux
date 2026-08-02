@@ -10,24 +10,47 @@ directory. A one-file build would re-extract the whole payload on every
 recording, which is why this is not one.
 """
 import multiprocessing
+import os
 import sys
+
+
+def _bootstrap_gtk_runtime() -> None:
+    """Point PyGObject at the GTK runtime bundled beside the executable.
+
+    Typelibs, schemas and pixbuf loaders are data, not code: nothing finds
+    them by itself inside a frozen build, and every GTK window fails at once
+    without them. Must run before anything imports gi.
+    """
+    if not getattr(sys, "frozen", False):
+        return
+    base = sys._MEIPASS
+    os.environ.setdefault(
+        "GI_TYPELIB_PATH", os.path.join(base, "girepository-1.0"))
+    os.environ.setdefault(
+        "GSETTINGS_SCHEMA_DIR", os.path.join(base, "share", "glib-2.0", "schemas"))
+    # A loaders.cache would carry the build machine's absolute paths; a
+    # module directory is scanned fresh on the user's machine instead.
+    os.environ.setdefault(
+        "GDK_PIXBUF_MODULEDIR",
+        os.path.join(base, "lib", "gdk-pixbuf-2.0", "2.10.0", "loaders"))
 
 
 def main() -> int:
     # Without this a frozen build re-runs the whole program in every worker
     # process it spawns.
     multiprocessing.freeze_support()
+    _bootstrap_gtk_runtime()
 
     if "--hud" in sys.argv:
-        from whisper_flow.hud_win import main as hud_main
+        from whisper_flow.hud_app import main as hud_main
         return hud_main()
 
     if "--setup" in sys.argv:
-        from whisper_flow.setup_ui import main as setup_main
+        from whisper_flow.setup_gtk import main as setup_main
         return setup_main()
 
     if "--settings" in sys.argv:
-        from whisper_flow.settings_ui import main as settings_main
+        from whisper_flow.settings_gtk import main as settings_main
         return settings_main()
 
     # Velopack's hooks, before anything else in the application starts.

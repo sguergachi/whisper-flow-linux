@@ -17,11 +17,14 @@ import os
 import signal
 import struct
 import sys
+import threading
 import time
 from collections import deque
 
 _T0 = time.monotonic()
 _TIMING = bool(os.environ.get("WHISPER_FLOW_HUD_TIMING"))
+
+IS_WINDOWS = sys.platform == "win32"
 
 
 def _mark(label):
@@ -33,9 +36,19 @@ import cairo
 import gi
 
 gi.require_version("Gtk", "4.0")
-gi.require_version("Gtk4LayerShell", "1.0")
+if sys.platform != "win32":
+    # Before Gdk, so it can intercept surface creation: after it the window
+    # silently becomes an ordinary toplevel with decorations.
+    gi.require_version("Gtk4LayerShell", "1.0")
+
 from gi.repository import Gdk, GLib, Gtk  # noqa: E402
-from gi.repository import Gtk4LayerShell as LayerShell  # noqa: E402
+
+if IS_WINDOWS:
+    # No layer-shell on Windows: the pill is an ordinary undecorated window,
+    # kept on top and given its acrylic and rounded corners by DWM instead.
+    LayerShell = None
+else:
+    from gi.repository import Gtk4LayerShell as LayerShell  # noqa: E402
 
 # Loaded by explicit path rather than imported. Going through the package would
 # pull in the daemon, and with it pystray's GTK 3, which cannot coexist with
@@ -43,14 +56,19 @@ from gi.repository import Gtk4LayerShell as LayerShell  # noqa: E402
 # the standard library's logging module with the package's own.
 def _load_sibling(name):
     import importlib.util
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"{name}.py")
+    # A frozen build unpacks bundled files to _MEIPASS, not beside __file__.
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    path = os.path.join(base, f"{name}.py")
     spec = importlib.util.spec_from_file_location(f"_hud_{name}", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
-enable_blur = _load_sibling("wayland_blur").enable_blur
+if IS_WINDOWS:
+    _win_blur = _load_sibling("blur_win")
+else:
+    enable_blur = _load_sibling("wayland_blur").enable_blur
 _mark("imports done")
 
 WIDTH = 268
@@ -234,9 +252,16 @@ def _gobject_pointer(obj) -> int:
 class HudWindow(Gtk.Window):
     """The pill itself."""
 
-    def __init__(self, level_file: str, monitor_hint: str | None, on_quit=None):
+    def __init__(self, level_file: str, monitor_hint: str | None, on_quit=None,
+                 resident: bool = False):
         super().__init__()
         self.level_file = level_file
+        # Resident: stay alive between recordings and wait for orders on
+        # stdin, instead of being spawned and killed for each one. Starting
+        # a frozen process is the single largest cost between pressing the
+        # hotkey and seeing anything.
+        self._resident = resident
+        self._hwnd = None
         # Gtk.Window.close() only emits close-request; on a layer-shell surface
         # that does not end the main loop, so the process would linger with the
         # pill still on screen. Always tear down through this instead.
@@ -252,18 +277,26 @@ class HudWindow(Gtk.Window):
             Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
         )
 
-        LayerShell.init_for_window(self)
-        LayerShell.set_layer(self, LayerShell.Layer.OVERLAY)
-        LayerShell.set_namespace(self, "whisper-flow-hud")
-        LayerShell.set_keyboard_mode(self, LayerShell.KeyboardMode.NONE)
-        # Negative: never reserve screen space, so windows do not get resized.
-        LayerShell.set_exclusive_zone(self, -1)
+        if LayerShell is not None:
+            LayerShell.init_for_window(self)
+            LayerShell.set_layer(self, LayerShell.Layer.OVERLAY)
+            LayerShell.set_namespace(self, "whisper-flow-hud")
+            LayerShell.set_keyboard_mode(self, LayerShell.KeyboardMode.NONE)
+            # Negative: never reserve space, so windows do not get resized.
+            LayerShell.set_exclusive_zone(self, -1)
+        else:
+            self.set_decorated(False)
+            # Invisible, but EnumWindows finds the window by it.
+            self.set_title("whisper-flow-hud")
 
         monitor = self._pick_monitor(monitor_hint)
-        if monitor is not None:
+        if monitor is not None and LayerShell is not None:
             LayerShell.set_monitor(self, monitor)
         self._monitor = monitor
-        self._connector = monitor.get_connector() if monitor else "default"
+        self._connector = (
+            monitor.get_connector()
+            if monitor is not None and hasattr(monitor, "get_connector")
+            else "default")
 
         # A Wayland client cannot place its own window, but a layer surface's
         # margins are under our control: anchoring top-left turns them into
@@ -311,8 +344,9 @@ class HudWindow(Gtk.Window):
         # The daemon takes this overlay down with SIGTERM. Handle it through
         # the main loop so the pill can fade out instead of blinking away;
         # the manager waits a couple of seconds, which is ample.
-        for sig in (signal.SIGTERM, signal.SIGINT):
-            _unix_signal_add(sig, self._on_signal)
+        if not IS_WINDOWS:
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                _unix_signal_add(sig, self._on_signal)
         self.connect("realize", self._on_realize)
         _mark("window constructed")
 
@@ -350,7 +384,10 @@ class HudWindow(Gtk.Window):
         return candidates[0]
 
     def _on_realize(self, *_):
-        """Attach the blur once there is a wl_surface to attach it to."""
+        """Attach platform window effects once there is a surface for them."""
+        if IS_WINDOWS:
+            self._realize_win32()
+            return
         if os.environ.get("WHISPER_FLOW_HUD_NO_BLUR"):
             print("[HUD] blur disabled by env", flush=True)
             return
@@ -376,6 +413,71 @@ class HudWindow(Gtk.Window):
         except Exception as e:
             print(f"[HUD] blur setup failed: {e}", flush=True)
 
+    # ------------------------------------------------------------- Windows
+    def _win32_hwnd(self):
+        """The window's HWND, via GDK first and EnumWindows as a fallback."""
+        for dll in ("libgtk-4-1.dll", "libgtk-4.so.1"):
+            try:
+                lib = ctypes.CDLL(dll)
+                get = lib.gdk_win32_surface_get_handle
+                get.restype = ctypes.c_void_p
+                get.argtypes = [ctypes.c_void_p]
+                hwnd = get(ctypes.c_void_p(
+                    _gobject_pointer(self.get_surface())))
+                if hwnd:
+                    return hwnd
+            except (OSError, AttributeError):
+                continue
+
+        # The GDK name varies; find the window by title and owner instead.
+        user32 = ctypes.windll.user32
+        found = []
+
+        @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+        def each(hwnd, _):
+            pid = ctypes.c_ulong()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if pid.value != os.getpid():
+                return True
+            length = user32.GetWindowTextLengthW(hwnd)
+            if length:
+                buf = ctypes.create_unicode_buffer(length + 1)
+                user32.GetWindowTextW(hwnd, buf, length + 1)
+                if buf.value == "whisper-flow-hud":
+                    found.append(hwnd)
+            return True
+
+        user32.EnumWindows(each, None)
+        return found[0] if found else None
+
+    def _realize_win32(self):
+        """Topmost, positioned, acrylic and rounded - DWM does the styling."""
+        try:
+            self._hwnd = self._win32_hwnd()
+            if not self._hwnd:
+                print("[HUD] no HWND yet", flush=True)
+                return
+            user32 = ctypes.windll.user32
+            HWND_TOPMOST = -1
+            SWP_NOACTIVATE = 0x10
+            user32.SetWindowPos(self._hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                                0x1 | 0x2 | SWP_NOACTIVATE)  # NOSIZE|NOMOVE
+            self._apply_position()
+            if not os.environ.get("WHISPER_FLOW_HUD_NO_BLUR"):
+                style = _win_blur.apply_window_style(self._hwnd)
+                print(f"[HUD] window style: {style or 'not applied'}", flush=True)
+        except Exception as e:
+            print(f"[HUD] Windows window setup failed: {e}", flush=True)
+
+    def _apply_position_win32(self, x: int, y: int):
+        if not self._hwnd:
+            return
+        SWP_NOACTIVATE = 0x10
+        SWP_NOZORDER = 0x4
+        ctypes.windll.user32.SetWindowPos(
+            self._hwnd, None, int(x), int(y), 0, 0,
+            0x1 | SWP_NOZORDER | SWP_NOACTIVATE)          # NOSIZE
+
     def quit(self):
         """Take the overlay down and end the process.
 
@@ -394,7 +496,39 @@ class HudWindow(Gtk.Window):
         self._fade_out_from = self.alpha
         self._fade_out_t0 = time.monotonic()
         # Backstop in case the frame timer stops before the fade completes.
-        GLib.timeout_add(int(FADE_MS) + 150, lambda: os._exit(0))
+        GLib.timeout_add(int(FADE_MS) + 150, self._after_fade_out)
+
+    def _after_fade_out(self):
+        if self._resident:
+            self._fade_out_t0 = None
+            self.alpha = 0.0
+            self.hide()
+            self._quitting = False
+            return False
+        os._exit(0)
+
+    # ------------------------------------------------------- resident mode
+    def begin_show(self, level_file: str):
+        """Show for a new recording. No process start, no window creation."""
+        self.level_file = level_file
+        self.level_pos = 0
+        self.peak = PEAK_FLOOR
+        self.targets = deque([0.0] * BARS, maxlen=BARS)
+        self.shown = [0.0] * BARS
+        self.start = time.monotonic()
+        self.alpha = 0.0
+        self._fade_in_t0 = time.monotonic()
+        self._fade_out_t0 = None
+        self._quitting = False
+        self._apply_position()
+        self.present()
+        print(f"[HUD] visible {time.time():.6f}", flush=True)
+
+    def begin_hide(self):
+        """Fade out and hide, keeping the process and window for next time."""
+        if self._quitting:
+            return
+        self.quit()
 
     def _check_lifetime(self):
         """Backstop against an overlay outliving whatever spawned it."""
@@ -417,6 +551,13 @@ class HudWindow(Gtk.Window):
 
     def _apply_position(self):
         """Anchor bottom-centre by default, or top-left at a dragged position."""
+        if LayerShell is None:
+            # Win32 coordinates are absolute; layer-shell margins were local.
+            local = self._pos if self._pos is not None else self._default_pos()
+            g = self._monitor.get_geometry() if self._monitor else None
+            self._apply_position_win32(
+                (g.x if g else 0) + local[0], (g.y if g else 0) + local[1])
+            return
         if self._pos is None:
             LayerShell.set_anchor(self, LayerShell.Edge.LEFT, False)
             LayerShell.set_anchor(self, LayerShell.Edge.TOP, False)
@@ -470,6 +611,8 @@ class HudWindow(Gtk.Window):
         self.want_hover = False
 
     def _frame(self):
+        if self._resident and not self.get_visible():
+            return True                 # parked between recordings
         now = time.monotonic()
         if self._fade_out_t0 is None:
             self.alpha = _ease((now - self._fade_in_t0) * 1000.0 / FADE_MS)
@@ -482,7 +625,7 @@ class HudWindow(Gtk.Window):
             t = (now - self._fade_out_t0) * 1000.0 / FADE_MS
             self.alpha = self._fade_out_from * (1.0 - _ease(t))
             if t >= 1.0:
-                os._exit(0)
+                self._after_fade_out()
         self.hover += ((1.0 if self.want_hover else 0.0) - self.hover) * 0.25
         for i, target in enumerate(self.targets):
             self.shown[i] += (target - self.shown[i]) * LEVEL_EASE
@@ -646,18 +789,47 @@ class HudWindow(Gtk.Window):
         cr.restore()
 
 
+def _command_loop(win: "HudWindow"):
+    """Read daemon orders from stdin. End of stream means the daemon is
+    gone, which is the guarantee a resident overlay is never left behind."""
+    try:
+        for line in sys.stdin:
+            command = line.strip()
+            if command.startswith("show"):
+                _, _, path = command.partition(" ")
+                GLib.idle_add(win.begin_show, path.strip())
+            elif command == "hide":
+                GLib.idle_add(win.begin_hide)
+            elif command == "quit":
+                os._exit(0)
+    except Exception:
+        pass
+    os._exit(0)
+
+
 def main() -> int:
     level_file = os.environ.get("WHISPER_FLOW_HUD_LEVEL_FILE", "")
     monitor = os.environ.get("WHISPER_FLOW_HUD_MONITOR") or None
-    print(f"[HUD] starting level_file={level_file} monitor={monitor}", flush=True)
+    # Only when the daemon says so: run by hand, stdin is inherited and would
+    # reach end of stream at once, closing the overlay immediately.
+    resident = os.environ.get("WHISPER_FLOW_HUD_RESIDENT") == "1"
+    print(f"[HUD] starting level_file={level_file} monitor={monitor}",
+          flush=True)
 
     # A plain window and main loop, not Gtk.Application: registering an
     # application id costs a D-Bus round trip before anything can be drawn,
     # and this window is opened every time the user starts talking.
     loop = GLib.MainLoop()
-    win = HudWindow(level_file, monitor, on_quit=loop.quit)
+    win = HudWindow(level_file, monitor, on_quit=loop.quit, resident=resident)
     win.connect("close-request", lambda *_: (win.quit(), False)[1])
-    win.present()
+    if resident:
+        # Realize now so the window, its HWND and its styling all exist
+        # before the first show; a show is then just a map, not a build.
+        win.realize()
+        threading.Thread(target=_command_loop, args=(win,), daemon=True,
+                         name="whisper-flow-hud-commands").start()
+    else:
+        win.present()
     _mark("present() returned")
     loop.run()
     return 0

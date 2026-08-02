@@ -119,8 +119,6 @@ class HUD:
         # Launched by path rather than with -m: importing the package would
         # pull in the daemon and with it pystray's GTK 3, and one process
         # cannot hold both GTK 3 and the overlay's GTK 4.
-        # hud_app is GTK4 plus Wayland layer-shell; hud_win is tkinter. Same
-        # contract either way: level file in, overlay out.
         argv = self._overlay_command()
 
         fd, self._log_path = tempfile.mkstemp(suffix=".log", prefix="whisper-flow-hud-")
@@ -169,14 +167,16 @@ class HUD:
 
         A frozen build has no source files and sys.executable is the app
         itself, so the overlay ships as its own executable beside it.
+        One GTK4 overlay on every platform: Wayland layer-shell on Linux,
+        an undecorated DWM-styled window on Windows.
         """
         if getattr(sys, "frozen", False):
             # The same binary, told to be the overlay. One executable ships,
             # so there is no question about which one to run.
             return [sys.executable, "--hud"]
-        module = "hud_win.py" if IS_WINDOWS else "hud_app.py"
         return [sys.executable,
-                os.path.join(os.path.dirname(os.path.abspath(__file__)), module)]
+                os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "hud_app.py")]
 
     def prewarm(self) -> None:
         """Start the resident overlay now, so the first press is fast too.

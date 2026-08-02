@@ -52,11 +52,22 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      # The UI is GTK4, and PyGObject has no PyPI wheels for Windows: MSYS2's
+      # UCRT64 Python plus its GTK4 stack is the supported route.
+      - uses: msys2/setup-msys2@v2
         with:
-          python-version: "3.12"
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-python
+            mingw-w64-ucrt-x86_64-python-pip
+            mingw-w64-ucrt-x86_64-gtk4
+            mingw-w64-ucrt-x86_64-libadwaita
+            mingw-w64-ucrt-x86_64-python-gobject
+            mingw-w64-ucrt-x86_64-adwaita-icon-theme
 
       - name: Install
+        shell: msys2 {0}
         run: |
           python -m pip install --upgrade pip
           pip install "pyaudio>=0.2.14"
@@ -68,6 +79,7 @@ jobs:
         # is the only job that proves the clipboard, the key-state polling
         # and the overlay actually work against the real API - the gap that
         # let a broken clipboard ship.
+        shell: msys2 {0}
         run: pytest -q -p no:cacheprovider
 
       - name: Confirm the Windows-only tests really ran
@@ -75,19 +87,18 @@ jobs:
         # The count is parsed rather than pattern-matched: "0 tests collected"
         # is a substring of "10 tests collected", which failed this step on a
         # run where all ten had in fact passed.
-        shell: pwsh
+        shell: msys2 {0}
         run: |
-          $out = pytest tests/test_windows_native.py -q -p no:cacheprovider `
-                 --collect-only 2>&1 | Out-String
-          Write-Host $out
-          if ($out -notmatch '(\d+)\s+tests?\s+collected') {
-            throw "could not read a test count from pytest"
-          }
-          $collected = [int]$Matches[1]
-          if ($collected -lt 1) {
-            throw "test_windows_native.py collected nothing on Windows"
-          }
-          Write-Host "Windows-only tests collected: $collected"
+          out=$(pytest tests/test_windows_native.py -q -p no:cacheprovider --collect-only 2>&1)
+          echo "$out"
+          collected=$(echo "$out" | grep -oE '[0-9]+ tests? collected' | grep -oE '^[0-9]+' || true)
+          if [ -z "$collected" ]; then
+            echo "could not read a test count from pytest"; exit 1
+          fi
+          if [ "$collected" -lt 1 ]; then
+            echo "test_windows_native.py collected nothing on Windows"; exit 1
+          fi
+          echo "Windows-only tests collected: $collected"
 
   linux:
     name: package (linux)
@@ -134,11 +145,22 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      # GTK4 UI in the frozen build means MSYS2's Python and GTK stack, and
+      # the spec collects the runtime from this prefix (GTK_PREFIX).
+      - uses: msys2/setup-msys2@v2
         with:
-          python-version: "3.12"
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-python
+            mingw-w64-ucrt-x86_64-python-pip
+            mingw-w64-ucrt-x86_64-gtk4
+            mingw-w64-ucrt-x86_64-libadwaita
+            mingw-w64-ucrt-x86_64-python-gobject
+            mingw-w64-ucrt-x86_64-adwaita-icon-theme
 
       - name: Install
+        shell: msys2 {0}
         run: |
           python -m pip install --upgrade pip
           # pipwin-free: PyAudio publishes Windows wheels from 0.2.14.
@@ -149,15 +171,19 @@ jobs:
       - name: Confirm the package imports without the Linux modules
         # The whole point of the platform split. If this fails, the frozen
         # build would fail the same way on a user's machine.
+        shell: msys2 {0}
         run: |
           python -c "import whisper_flow.system_win, whisper_flow.hotkey_win; print('windows modules OK')"
-          python -c "import whisper_flow.hud_win, whisper_flow.blur_win; print('hud + blur OK')"
+          python -c "import whisper_flow.hud_app, whisper_flow.blur_win; print('hud + blur OK')"
           python -c "import whisper_flow.blur_win as b; print('runner build', b.windows_build(), 'supported', b.is_supported())"
           python -c "from whisper_flow.daemon import WhisperFlowDaemon; print('daemon imports OK')"
 
       - name: Build
+        shell: msys2 {0}
         working-directory: packaging/windows
-        run: pyinstaller --noconfirm --clean whisper-flow.spec
+        # UCRT64's Python is a native Windows build: it wants the prefix in
+        # Windows form (C:\msys64\ucrt64), not the MSYS form (/ucrt64).
+        run: GTK_PREFIX="$(cygpath -w /ucrt64)" pyinstaller --noconfirm --clean whisper-flow.spec
 
       - name: Bundle the speech engine and a model
         # So the app transcribes the moment it is installed, with no network

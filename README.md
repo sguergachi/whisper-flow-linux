@@ -27,6 +27,11 @@ run it, and hold `Ctrl+Alt` to dictate. Nothing else is required: the
 installer ships a speech engine and model, so it transcribes offline from the
 first launch, with no API key and no Python.
 
+It installs per-user without administrator rights, adds itself to Startup so
+it runs at login, and updates itself — **Check for updates** in the tray
+menu. Updates are deltas, so they fetch only what changed rather than the
+whole installer again.
+
 Windows 11 22H2 or newer, because the overlay uses composition attributes
 added in that release.
 

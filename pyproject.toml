@@ -33,6 +33,12 @@ dependencies = [
     # Windows support targets 11 22H2 and later; the overlay relies on
     # composition attributes introduced there.
     "pywin32>=306; sys_platform == 'win32'",
+    # Install and update framework. Squirrel.Windows, which this replaces, is
+    # unmaintained by its own authors; Velopack is its successor and, unlike
+    # Squirrel, is not tied to .NET. It gives delta updates, which matter here
+    # because most of the installer is a speech model that does not change
+    # between versions.
+    "velopack>=0.0.1; sys_platform == 'win32'",
 ]
 
 [project.optional-dependencies]

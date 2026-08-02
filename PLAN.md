@@ -5,10 +5,11 @@ verified — not when written.
 
 ## Now
 
-- [ ] **Velopack installer** (the maintained successor to Squirrel) — fast
-      install, delta updates, in-app auto-update.
-- [ ] **Always start on Windows login** — via the installer's Startup
-      shortcut, not a manual step.
+- [ ] Verify the Velopack installer on a real Windows machine: that it
+      installs, starts at login, and that "Check for updates" finds and
+      applies a newer release. CI proves it builds, not that it updates.
+- [ ] Remove `packaging/windows/installer.iss` once Velopack has shipped a
+      working build; keeping it until then leaves a fallback.
 
 ## Windows CI: what it does and does not prove
 
@@ -77,6 +78,9 @@ Techniques, in order of expected gain:
 - [x] Windows trace pass: overlay draws without blur, right Windows key,
       `Local\` mutex, PowerShell quoting, clipboard encoding, frame loop
 - [x] Same hotkey on both platforms (Super+Alt)
+- [x] Velopack replaces Inno Setup: delta updates, so a code-only release is
+      megabytes rather than the ~160MB full installer, plus in-app "Check for
+      updates" and a Startup shortcut so it runs at login
 - [x] Windows tests running on a Windows runner in CI, gating the installer
       — first run immediately caught the clipboard being broken on 64-bit
       Windows (undeclared ctypes signatures truncating handles) and logging

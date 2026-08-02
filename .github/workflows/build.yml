@@ -199,30 +199,39 @@ jobs:
           "{0:N0}MB bundled" -f ((Get-ChildItem $dist -Recurse |
             Measure-Object Length -Sum).Sum / 1MB) | Write-Host
 
-      - name: Build the installer
-        # PowerShell, not bash: Git Bash rewrites arguments that look like
-        # POSIX paths, and turned Inno's /O switch into a path it rejected.
+      - name: Build the installer with Velopack
+        # Velopack rather than Inno Setup, and rather than Squirrel.Windows,
+        # which its own authors describe as unmaintained. Two things matter
+        # here: updates are delta, so a code-only release is a few megabytes
+        # instead of the ~160MB the whole installer weighs - most of which is
+        # a speech model that does not change between versions - and the app
+        # can update itself instead of the user fetching an installer.
+        #
+        # --shortcuts includes Startup, which is what makes it run at login.
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           $version = python -c "import tomllib;print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])"
           Copy-Item packaging/windows/README-windows.md `
                     packaging/windows/dist/whisper-flow/README.md
 
-          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
-          if (-not (Test-Path $iscc)) {
-            $found = Get-ChildItem "C:\Program Files (x86)","C:\Program Files" `
-                       -Filter ISCC.exe -Recurse -ErrorAction SilentlyContinue |
-                     Select-Object -First 1
-            if (-not $found) { throw "Inno Setup (ISCC.exe) not found on this runner" }
-            $iscc = $found.FullName
+          dotnet tool install -g vpk
+          $env:PATH = "$env:USERPROFILE\.dotnet\tools;$env:PATH"
+
+          vpk pack `
+            --packId WhisperFlow `
+            --packVersion $version `
+            --packDir packaging/windows/dist/whisper-flow `
+            --mainExe whisper-flow.exe `
+            --packTitle "WhisperFlow" `
+            --packAuthors "Sammy Guergachi" `
+            --shortcuts "Desktop,StartMenuRoot,Startup" `
+            --outputDir installer-out
+          if ($LASTEXITCODE -ne 0) { throw "vpk pack failed with $LASTEXITCODE" }
+
+          Get-ChildItem installer-out | ForEach-Object {
+            "{0}  {1:N0}MB" -f $_.Name, ($_.Length / 1MB) | Write-Host
           }
-          Write-Host "using $iscc"
-
-          & $iscc "/DAppVersion=$version" "/O$PWD\installer-out" `
-                  packaging\windows\installer.iss
-          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with $LASTEXITCODE" }
-
-          Get-ChildItem installer-out
           "VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Also keep the plain folder, for anyone who will not run an installer
@@ -235,7 +244,7 @@ jobs:
         with:
           name: windows-build
           path: |
-            installer-out/*.exe
+            installer-out/*
             whisper-flow-${{ env.VERSION }}-windows
 
   release:
@@ -263,10 +272,15 @@ jobs:
 
       - name: Lay out the Windows downloads
         run: |
-          # The installer is the headline download; the folder is zipped for
-          # anyone who would rather not run one.
+          # Everything Velopack produced goes up, not just the setup exe. The
+          # package and the release index are the update feed: the app reads
+          # them from this release's download URL to find and fetch deltas,
+          # so omitting them would leave it unable to update itself.
           mkdir -p release-files
-          cp artifacts/windows-build/installer-out/*.exe release-files/
+          cp artifacts/windows-build/installer-out/* release-files/
+          ls -la release-files
+
+          # The plain folder, for anyone who would rather not run an installer.
           cd artifacts/windows-build
           rm -rf installer-out
           zip -qr "$GITHUB_WORKSPACE/release-files/whisper-flow-windows-portable.zip" .

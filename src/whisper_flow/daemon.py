@@ -23,6 +23,7 @@ from .config import Config
 from .hotkey_manager import HotkeyManager, HotkeyMode
 from .hud import HUD
 from .logging import log, recent_log, set_logging_enabled
+from . import updater
 
 # Modes driven by holding a hotkey down; they cannot be deferred and replayed.
 PUSH_TO_TALK_MODES = ("transcribe", "command")
@@ -302,6 +303,8 @@ class WhisperFlowDaemon:
             pystray.MenuItem("Speech model...", self.setup_speech_model),
             pystray.MenuItem("Test Configuration", self.test_configuration),
             pystray.MenuItem("Copy last error", self.copy_last_error),
+            pystray.MenuItem("Check for updates", self.check_for_updates,
+                             visible=updater.available()),
             pystray.MenuItem("Reload Daemon", self.reload_daemon),
             pystray.MenuItem("Exit", self.stop_daemon),
         )
@@ -858,6 +861,17 @@ class WhisperFlowDaemon:
         suffix = (" - details copied to clipboard" if copied
                   else " - could not reach the clipboard")
         self.notify(f"❌ {headline}{suffix}")
+
+    def check_for_updates(self, icon=None, item=None):
+        """Download and restart into a newer version, if there is one.
+
+        On its own thread: this downloads, and a tray callback that does not
+        return promptly stops the icon responding.
+        """
+        threading.Thread(
+            target=lambda: updater.apply_now(notify=self.notify),
+            daemon=True, name="whisper-flow-update",
+        ).start()
 
     def copy_last_error(self, icon=None, item=None):
         """Put the most recent failure report back on the clipboard.

@@ -114,12 +114,33 @@ class AudioRecorder:
                 if "wasapi" not in str(api.get("name", "")).lower():
                     continue
                 device = api.get("defaultInputDevice", -1)
-                if device is not None and device >= 0:
-                    log(f"[AUDIO] using WASAPI input device {device}")
-                    return device
+                if device is None or device < 0:
+                    continue
+                # WASAPI shared mode does not resample: it plays back only at
+                # the rate the device is configured for, and rejects anything
+                # else with "invalid sample rate". MME quietly converted, which
+                # is why moving to WASAPI broke recording outright. Ask first.
+                if not self._device_supports_our_rate(device):
+                    log(f"[AUDIO] WASAPI device {device} will not do "
+                        f"{self.config.sample_rate}Hz; using the default device")
+                    return None
+                log(f"[AUDIO] using WASAPI input device {device}")
+                return device
         except Exception as e:
             log(f"[AUDIO] could not pick a WASAPI device: {e}")
         return None
+
+    def _device_supports_our_rate(self, device: int) -> bool:
+        """Whether the device will capture at the rate whisper needs."""
+        try:
+            return bool(self.pa.is_format_supported(
+                float(self.config.sample_rate),
+                input_device=device,
+                input_channels=1,
+                input_format=pyaudio.paInt16,
+            ))
+        except Exception:
+            return False
 
     def _open_input_stream(self, chunk: int):
         """Open a capture stream, reusing a warm one when there is one.
@@ -143,15 +164,34 @@ class AudioRecorder:
                     log(f"[AUDIO] warm stream unusable: {e}")
                     self._close_stream(warm)
 
-        with suppress_alsa_warnings():
-            return self.pa.open(
-                format=pyaudio.paInt16,
-                channels=1,
-                rate=self.config.sample_rate,
-                input_device_index=self._input_device_index(),
-                input=True,
-                frames_per_buffer=chunk,
-            )
+        device = self._input_device_index()
+        try:
+            with suppress_alsa_warnings():
+                return self.pa.open(
+                    format=pyaudio.paInt16,
+                    channels=1,
+                    rate=self.config.sample_rate,
+                    input_device_index=device,
+                    input=True,
+                    frames_per_buffer=chunk,
+                )
+        except Exception as e:
+            if device is None:
+                raise
+            # Whatever the reason, a chosen device must never be the thing
+            # that stops a recording. The platform default is what worked
+            # before any of this and is always the fallback.
+            log(f"[AUDIO] input device {device} would not open ({e}); "
+                f"falling back to the default device")
+            with suppress_alsa_warnings():
+                return self.pa.open(
+                    format=pyaudio.paInt16,
+                    channels=1,
+                    rate=self.config.sample_rate,
+                    input_device_index=None,
+                    input=True,
+                    frames_per_buffer=chunk,
+                )
 
     def _keep_stream_warm(self, stream, chunk: int) -> None:
         """Hold a finished stream open briefly, then let the microphone go."""

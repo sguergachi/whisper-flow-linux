@@ -144,3 +144,53 @@ def test_a_stream_that_will_not_stop_is_closed_outright(recorder):
     recorder._keep_stream_warm(stream, 480)
     stream.close.assert_called_once()
     assert recorder._warm_stream is None
+
+
+# ------------------------------------------- the device must never break it
+def test_a_wasapi_device_that_cannot_do_our_rate_is_not_used(recorder, monkeypatch):
+    """WASAPI shared mode does not resample; MME did. Choosing it blindly
+    broke recording outright with "invalid sample rate"."""
+    monkeypatch.setattr(sys, "platform", "win32")
+    recorder.pa.get_host_api_count.return_value = 1
+    recorder.pa.get_host_api_info_by_index.return_value = {
+        "name": "Windows WASAPI", "defaultInputDevice": 9}
+    recorder.pa.is_format_supported.return_value = False
+    assert recorder._input_device_index() is None
+
+
+def test_a_wasapi_device_that_can_do_our_rate_is_used(recorder, monkeypatch):
+    monkeypatch.setattr(sys, "platform", "win32")
+    recorder.pa.get_host_api_count.return_value = 1
+    recorder.pa.get_host_api_info_by_index.return_value = {
+        "name": "Windows WASAPI", "defaultInputDevice": 9}
+    recorder.pa.is_format_supported.return_value = True
+    assert recorder._input_device_index() == 9
+
+
+def test_an_unsupported_rate_query_that_raises_means_no(recorder, monkeypatch):
+    monkeypatch.setattr(sys, "platform", "win32")
+    recorder.pa.is_format_supported.side_effect = ValueError("invalid rate")
+    assert recorder._device_supports_our_rate(9) is False
+
+
+def test_a_device_that_will_not_open_falls_back_to_the_default(recorder, monkeypatch):
+    """A chosen device must never be why a recording does not happen."""
+    monkeypatch.setattr(recorder, "_input_device_index", lambda: 9)
+    opened = []
+
+    def fake_open(**kw):
+        opened.append(kw["input_device_index"])
+        if kw["input_device_index"] is not None:
+            raise OSError("[Errno -9997] Invalid sample rate")
+        return Mock()
+
+    recorder.pa.open.side_effect = lambda **kw: fake_open(**kw)
+    assert recorder._open_input_stream(480) is not None
+    assert opened == [9, None]
+
+
+def test_the_default_device_failing_is_still_reported(recorder, monkeypatch):
+    monkeypatch.setattr(recorder, "_input_device_index", lambda: None)
+    recorder.pa.open.side_effect = OSError("no audio device at all")
+    with pytest.raises(OSError):
+        recorder._open_input_stream(480)

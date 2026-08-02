@@ -24,6 +24,14 @@ hidden = collect_submodules("pydantic") + [
     "whisper_flow.hud_win",
     "whisper_flow.setup_ui",
     "pystray._win32",
+    # Imported at the point of use rather than at module scope, to keep them
+    # off the startup path. PyInstaller only follows imports it can see
+    # statically, so anything made lazy has to be named here or it is simply
+    # not bundled - and the failure appears only for the user who configures
+    # an API key, at the moment they first use it.
+    "pystray",
+    "openai",
+    "velopack",
     "PIL._tkinter_finder",
     # blur_win reaches for these, and ctypes.wintypes is a submodule that
     # importing ctypes does not bring along.

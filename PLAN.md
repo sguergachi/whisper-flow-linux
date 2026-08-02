@@ -45,6 +45,39 @@ audio device, so recording itself is untested), or Windows 11 desktop
 behaviour like acrylic actually rendering. It is Windows Server, not
 Windows 11 — the APIs are the same, the desktop is not.
 
+## PTL — Press-To-Listen
+
+The metric: milliseconds from the hotkey press to the microphone actually
+capturing. Everything else optimised here is a component of it. Logged with
+a per-stage breakdown on every recording, so the expensive stage names
+itself:
+
+    [PTL] 76ms press-to-listen (dispatch 2, save window 3, window centre 1,
+                                thread start 4, mic open 60, overlay 6)
+
+Measured on Linux: **76ms cold, 24–33ms on a warm stream.** No Windows
+figure yet — the log will carry it.
+
+## What the audit changed, and what it cleared
+
+Startup, from lazy imports of things a dictation-only run never uses:
+
+| removed from daemon import | cost |
+|---|---|
+| openai SDK | ~540 ms |
+| pystray | ~126 ms |
+
+Daemon import **1186ms → 466ms**. What remains is pyaudio (178ms), requests
+(140ms) and pydantic (108ms) — all genuinely used.
+
+Measured and deliberately **not** changed:
+
+- writing the audio level file: 0.022ms per frame (0.7ms per second of audio)
+- rebuilding the wav for each live pass: 1.4ms at 60s of audio
+- transcription cost is flat, not linear: 190ms at 5s, 262ms at 20s
+- HTTP connection reuse: no measurable difference on localhost
+- `on_tick(list(frames))` already copies, so the live snapshot is a real one
+
 ## Overlay latency
 
 Where the time goes when the hotkey is pressed, worst first:

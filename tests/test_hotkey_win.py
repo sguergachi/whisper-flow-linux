@@ -101,14 +101,32 @@ def test_a_combination_only_arms_while_keys_are_going_down(listener):
     assert fired == []
 
 
+
+def _fake_system_win(monkeypatch, spoil):
+    """Replace whisper_flow.system_win for `from . import system_win`.
+
+    Patching sys.modules alone is not enough: once the package has the
+    submodule as an attribute - which it does on Windows, where it imports -
+    `from . import system_win` reads that attribute and never consults
+    sys.modules. On Linux only the sys.modules entry matters. Both are set.
+    """
+    import types
+
+    import whisper_flow
+
+    fake = types.ModuleType("whisper_flow.system_win")
+    fake.spoil_start_menu = spoil
+    monkeypatch.setitem(sys.modules, "whisper_flow.system_win", fake)
+    monkeypatch.setattr(whisper_flow, "system_win", fake, raising=False)
+    return fake
+
+
 # ------------------------------------------------------- the Start menu
 def test_a_super_hotkey_suppresses_the_start_menu(listener, monkeypatch):
     """Releasing Super otherwise opens Start, and the dictation lands there."""
     module = listener._module
     calls = []
-    fake = type("M", (), {"spoil_start_menu": staticmethod(
-        lambda: calls.append(1))})
-    monkeypatch.setitem(sys.modules, "whisper_flow.system_win", fake)
+    _fake_system_win(monkeypatch, lambda: calls.append(1))
 
     listener.register_hotkey("transcribe", "super+alt", lambda: None)
     down = {module.NAME_TO_VK["super"], module.NAME_TO_VK["alt"]}
@@ -119,9 +137,7 @@ def test_a_super_hotkey_suppresses_the_start_menu(listener, monkeypatch):
 def test_a_hotkey_without_super_leaves_the_keyboard_alone(listener, monkeypatch):
     module = listener._module
     calls = []
-    fake = type("M", (), {"spoil_start_menu": staticmethod(
-        lambda: calls.append(1))})
-    monkeypatch.setitem(sys.modules, "whisper_flow.system_win", fake)
+    _fake_system_win(monkeypatch, lambda: calls.append(1))
 
     listener.register_hotkey("auto", "ctrl+alt+space", lambda: None)
     down = {module.NAME_TO_VK[n] for n in ("ctrl", "alt", "space")}
@@ -131,9 +147,10 @@ def test_a_hotkey_without_super_leaves_the_keyboard_alone(listener, monkeypatch)
 
 def test_suppression_failing_does_not_stop_the_hotkey(listener, monkeypatch):
     module = listener._module
-    broken = type("M", (), {"spoil_start_menu": staticmethod(
-        lambda: (_ for _ in ()).throw(OSError("no user32")))})
-    monkeypatch.setitem(sys.modules, "whisper_flow.system_win", broken)
+    def explode():
+        raise OSError("no user32")
+
+    _fake_system_win(monkeypatch, explode)
 
     fired = []
     listener.register_hotkey("transcribe", "super+alt",

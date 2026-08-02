@@ -230,10 +230,17 @@ class SettingsWindow(Adw.ApplicationWindow):
     def _build_speech_page(self, section: str):
         page = Adw.PreferencesPage()
 
+        # Say which one is in use, in words. A checked radio is easy to miss
+        # among five rows, and says nothing at all when none is checked -
+        # which is what a machine with no model downloaded yet looks like.
+        if self._current_model:
+            in_use = f"Using {self._current_model.replace('ggml-', '')}. "
+        else:
+            in_use = "No model on this machine yet - download one below. "
         model_group = Adw.PreferencesGroup(
             title="Speech model",
-            description="What listens to your voice. Bigger is more accurate "
-                        "and slower; the recommendation is sized to this machine.")
+            description=in_use + "Bigger is more accurate and slower; "
+                                 "the recommendation is sized to this machine.")
         page.add(model_group)
 
         group_leader = None

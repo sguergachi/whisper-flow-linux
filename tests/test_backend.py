@@ -334,3 +334,29 @@ def test_inventory_marks_installed_current_and_recommended(
     assert small["installed"] and small["current"] and not small["recommended"]
     base = rows["ggml-base.en-q8_0"]
     assert not base["installed"] and not base["current"] and base["recommended"]
+
+
+def test_a_model_in_use_that_is_not_in_the_catalogue_still_gets_a_row(
+        config, local_backend, monkeypatch):
+    """Otherwise the settings window cannot say what it is running.
+
+    MODELS lists the q8_0 builds, but the model in use is whatever is on
+    disk - a bundled file, or one put there by hand, under its own name.
+    Without a row for it every radio in the window is blank while the app
+    transcribes perfectly well, which is the one question that page exists
+    to answer.
+    """
+    config.model_name = "ggml-small.en"          # no q8_0: not in MODELS
+    _install_engine(local_backend, config)
+    monkeypatch.setattr(backend_module, "recommended_model",
+                        lambda accelerator: "ggml-base.en-q8_0")
+    monkeypatch.setattr(backend_module, "detect_accelerator", lambda: "cpu")
+
+    rows = local_backend.model_inventory()
+
+    assert rows[0]["name"] == "ggml-small.en"    # first: it is what is true now
+    assert rows[0]["installed"] and rows[0]["current"]
+    assert [row["name"] for row in rows].count("ggml-small.en") == 1
+    assert sum(row["current"] for row in rows) == 1
+    # The catalogue is still offered, so a better model is a click away.
+    assert set(MODELS) <= {row["name"] for row in rows}

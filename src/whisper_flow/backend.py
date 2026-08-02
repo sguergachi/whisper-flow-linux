@@ -355,7 +355,7 @@ class LocalBackend:
         """
         recommended = recommended_model(detect_accelerator())
         current = self.working_model()
-        return [
+        rows = [
             {
                 "name": name,
                 "size_mb": size_mb,
@@ -366,6 +366,25 @@ class LocalBackend:
             }
             for name, (size_mb, wants) in MODELS.items()
         ]
+
+        # The model in use need not be one of the five above: a bundled or
+        # hand-placed file keeps whatever name it has, and MODELS lists the
+        # q8_0 builds. Leaving it out meant a window whose every radio was
+        # blank while the app was transcribing perfectly well - the one
+        # question the page exists to answer, and it had no row to answer it
+        # with. It goes first, because it is the one that is true now.
+        if current and not any(row["name"] == current for row in rows):
+            path = self.model_path(current)
+            size_mb = int(path.stat().st_size / 1_000_000) if path.exists() else 0
+            rows.insert(0, {
+                "name": current,
+                "size_mb": size_mb,
+                "wants": "already on this machine",
+                "installed": True,
+                "current": True,
+                "recommended": current == recommended,
+            })
+        return rows
 
     def working_model(self) -> str | None:
         """The best model actually present.

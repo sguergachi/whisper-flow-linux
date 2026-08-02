@@ -131,6 +131,13 @@ class Config(BaseSettings):
         description="Audio speed multiplier (1.0 = normal speed, 1.5 = 1.5x speed, etc.)",
         env="WHISPER_FLOW_SPEEDUP_AUDIO",
     )
+    trim_silence: bool = Field(
+        # Nothing to gain on a short dictation and 2.3x on a long one, where
+        # the wait is actually felt. See audio.trim_silence.
+        default=True,
+        description="Drop silence either side of the speech before transcribing",
+        env="WHISPER_FLOW_TRIM_SILENCE",
+    )
 
     # AI model configuration
     transcription_model: str = Field(
@@ -249,7 +256,7 @@ class Config(BaseSettings):
         # What ships with the build: the one model that keeps up with speech
         # on every machine, from a two-core laptop upwards. The setup window
         # offers better where the hardware allows it.
-        default="ggml-base.en",
+        default="ggml-base.en-q8_0",
         description="whisper.cpp model to download and run",
         env="WHISPER_FLOW_MODEL_NAME",
     )
@@ -259,6 +266,23 @@ class Config(BaseSettings):
         ge=1024,
         le=65535,
         env="WHISPER_FLOW_LOCAL_SERVER_PORT",
+    )
+    fast_encoder: bool = Field(
+        # Whisper encodes a full 30 seconds whatever it was given, so a short
+        # dictation spends most of its time on silence. Cutting the window to
+        # the clip is worth 1.7-1.9x end to end - and it changes what comes
+        # back. Measured against this server, "ask not what your country can
+        # do for you" came back as "asked not" on two clips of five, at every
+        # window size short enough to be worth setting.
+        #
+        # So it is off. A dictation tool that is half a second quicker and
+        # occasionally types a different word than was said has not got
+        # faster, it has got worse, and the person dictating cannot see which
+        # words it changed. Anyone who wants the speed can have it from the
+        # settings window. See transcription.audio_context.
+        default=False,
+        description="Match the encoder window to the length of each recording",
+        env="WHISPER_FLOW_FAST_ENCODER",
     )
 
     # Local whisper.cpp configuration

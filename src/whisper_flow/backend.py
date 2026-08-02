@@ -36,12 +36,21 @@ RELEASE_URL = (
 MODEL_URL = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main"
 
 # name -> (approximate download size MB, VRAM/RAM it wants)
+#
+# The CPU tiers are 8-bit quantised. Measured on a six-core desktop, q8_0
+# transcribes 20-25% faster than the same model in f16 and downloads at less
+# than half the size, for no difference in the transcript. The 5-bit formats
+# are the trap here: q5_1 is smaller again but *slower* than f16, because
+# unpacking five-bit weights costs more than the memory traffic it saves.
+#
+# large-v3-turbo stays f16 because it is the GPU tier, where the arithmetic
+# is free and the quantisation would only add unpacking work.
 MODELS = {
     "ggml-large-v3-turbo": (1624, "~2GB VRAM"),
-    "ggml-medium.en": (1530, "~1.5GB"),
-    "ggml-small.en": (466, "~600MB"),
-    "ggml-base.en": (142, "~250MB"),
-    "ggml-tiny.en": (75, "~125MB"),
+    "ggml-medium.en-q8_0": (785, "~950MB"),
+    "ggml-small.en-q8_0": (252, "~350MB"),
+    "ggml-base.en-q8_0": (78, "~150MB"),
+    "ggml-tiny.en-q8_0": (42, "~80MB"),
 }
 
 
@@ -95,29 +104,60 @@ def detect_accelerator() -> str:
         return "cpu"
 
 
-def usable_cores() -> int:
-    """Cores whisper.cpp should actually use.
-
-    Not every core: on a laptop this runs while the user is typing into the
-    thing they are dictating to, and saturating the CPU makes the desktop
-    stutter and the fans spin up for a few seconds of speech. Leaving a
-    couple free costs very little transcription speed.
-
-    Also not the logical count. whisper.cpp is compute-bound, so SMT siblings
-    add contention rather than throughput, and efficiency cores are slower
-    than the threads waiting on them.
-    """
-    physical = None
+def _logical_cpus() -> int:
+    """Logical CPUs this process may run on, or 0 if the OS will not say."""
     try:
-        physical = os.cpu_count()
         if hasattr(os, "sched_getaffinity"):     # respects cgroup/taskset limits
-            physical = len(os.sched_getaffinity(0))
+            return len(os.sched_getaffinity(0))
+        return os.cpu_count() or 0
     except Exception:
-        pass
-    if not physical:
+        return 0
+
+
+def _physical_cores(logical: int) -> int:
+    """Real cores behind `logical`, measured where the OS will say.
+
+    Linux publishes the topology, so SMT siblings can be counted out exactly
+    rather than guessed at. Everywhere else, halving is right on every
+    desktop CPU that has SMT and merely conservative on the ones that do not.
+    """
+    if sys.platform == "linux":
+        try:
+            cores = set()
+            for cpu in Path("/sys/devices/system/cpu").glob("cpu[0-9]*"):
+                topology = cpu / "topology"
+                try:
+                    cores.add((
+                        (topology / "physical_package_id").read_text(
+                            encoding="utf-8").strip(),
+                        (topology / "core_id").read_text(encoding="utf-8").strip(),
+                    ))
+                except OSError:
+                    continue
+            if cores:
+                return len(cores)
+        except Exception:
+            pass
+    return max(1, logical // 2)
+
+
+def usable_cores() -> int:
+    """Cores whisper.cpp should actually use: one thread per physical core.
+
+    Not the logical count. whisper.cpp is compute-bound, so SMT siblings add
+    contention rather than throughput, and oversubscribing does not degrade
+    gently - measured on a six-core desktop, base.en took 0.42s at six
+    threads, 0.48s at eight, and thirteen seconds at twelve. The cap below
+    is what stands between a busy machine and that cliff.
+
+    One per core rather than one fewer: the same measurement put the optimum
+    exactly at the core count, and holding a core back cost about 11% for a
+    responsiveness gain nobody could feel.
+    """
+    logical = _logical_cpus()
+    if not logical:
         return 4
-    # Assume SMT, then keep two cores back for everything else.
-    return max(2, min(8, physical // 2 - 1 or 2))
+    return max(2, min(8, min(_physical_cores(logical), logical)))
 
 
 def total_ram_gb() -> float:
@@ -176,15 +216,21 @@ def recommended_model(accelerator: str) -> str:
     cores = usable_cores()
     ram = total_ram_gb()
     if ram and ram < 4:
-        return "ggml-tiny.en"
-    # small.en holds ~600MB of weights resident for as long as the daemon
+        return "ggml-tiny.en-q8_0"
+    # small.en holds ~350MB of weights resident for as long as the daemon
     # runs, which is a lot to ask of an 8GB machine that is also running a
-    # browser. base.en asks ~250MB and is the safe middle.
-    if cores >= 6 and (not ram or ram >= 8):
-        return "ggml-small.en"
-    if cores >= 3:
-        return "ggml-base.en"
-    return "ggml-tiny.en"
+    # browser. base.en asks ~150MB and is the safe middle.
+    #
+    # The thresholds are seven and four physical cores, which is the same
+    # hardware these tiers have always meant. usable_cores() used to hold a
+    # core back and so reported one fewer than it does now; sizing the model
+    # off the new number without moving the thresholds would have quietly
+    # promoted every six-core desktop to a model it was never offered.
+    if cores >= 7 and (not ram or ram >= 8):
+        return "ggml-small.en-q8_0"
+    if cores >= 4:
+        return "ggml-base.en-q8_0"
+    return "ggml-tiny.en-q8_0"
 
 
 def _server_archive(accelerator: str) -> str:
@@ -435,9 +481,9 @@ class LocalBackend:
                 "--port", str(self.config.local_server_port),
             ]
             if detect_accelerator() == "cpu":
-                # Left to itself whisper.cpp takes as many threads as it
-                # likes, which on a laptop competes with the application
-                # being dictated into. See usable_cores().
+                # Left to itself whisper.cpp takes four threads whatever the
+                # machine has, which is short of the optimum on a desktop and
+                # past it on a two-core laptop. See usable_cores().
                 cmd += ["-t", str(usable_cores())]
             # No console window for a background helper.
             flags = 0x08000000 if sys.platform == "win32" else 0

@@ -1,7 +1,9 @@
 """Audio transcription functionality for whisper-flow."""
 
+import math
 import re
 import time
+import wave
 from pathlib import Path
 
 import requests
@@ -30,6 +32,59 @@ FINAL_TIMEOUT = 300.0
 # with three retries, one unresponsive server could stall a pass for a
 # quarter of an hour while the overlay sat there animating.
 LIVE_TIMEOUT = 30.0
+
+# Whisper pads every clip out to a full 30 second window before encoding it,
+# so a three second dictation costs almost exactly what an eleven second one
+# does - 785ms against 945ms, measured on a six-core desktop. Nearly all of
+# that is spent encoding silence that was never recorded.
+#
+# `audio_ctx` shortens the window, and the encoder time falls with it: 1.7 to
+# 1.9x end to end through the server. The floor below is not about covering
+# the speech, and it is not a guarantee. Truncating the window truncates the
+# position embeddings with it, and the decoder does notice: measured on
+# base.en, "ask not what your country can do for you" came back as "asked
+# not" on two clips of five, at 768 and at 1024 and on one clip at 1280 too.
+# Other clips went the other way and recovered a word the full window had
+# dropped, which is the same instability seen from the useful side.
+#
+# Hence config.fast_encoder defaults to off, and this runs only for someone
+# who has asked for it. 768 is where the speed is; it is not where safety is,
+# because on this evidence there is no window short enough to be worth
+# setting and long enough to be reliably faithful.
+AUDIO_CTX_FULL = 1500                       # the whole 30 seconds
+AUDIO_CTX_MIN = 768                         # below this the transcript drifts
+_CTX_PER_SECOND = AUDIO_CTX_FULL / 30.0
+_CTX_STEP = 256                             # whisper.cpp pads audio_ctx to this
+_CTX_SLACK_SECONDS = 1.0
+
+
+def audio_context(duration: float) -> int:
+    """The shortest encoder window that still holds `duration` of speech.
+
+    0 means "use the whole window", which is what anything long enough to be
+    split across whisper's 30 second chunks needs anyway: the setting applies
+    per chunk, so a short window would make every chunk after the first deaf
+    to its own second half.
+    """
+    if duration <= 0 or duration >= 30.0:
+        return 0
+    needed = math.ceil((duration + _CTX_SLACK_SECONDS) * _CTX_PER_SECOND)
+    # whisper.cpp rounds audio_ctx up to a multiple of 256 internally, so
+    # asking for 1000 silently gets 1024. Ask for what will be used.
+    needed = math.ceil(needed / _CTX_STEP) * _CTX_STEP
+    if needed >= AUDIO_CTX_FULL:
+        return 0
+    return max(AUDIO_CTX_MIN, needed)
+
+
+def wav_duration(path: str) -> float:
+    """Seconds of audio in a WAV file, or 0.0 if it cannot be read."""
+    try:
+        with wave.open(path, "rb") as wf:
+            rate = wf.getframerate()
+            return wf.getnframes() / rate if rate else 0.0
+    except Exception:
+        return 0.0
 
 
 class TranscriptionService:
@@ -132,10 +187,20 @@ class TranscriptionService:
         """
         inference_url = f"{self.local_url}/inference"
 
+        # Sized per request rather than once at startup: the server takes
+        # these as form fields, so every clip gets a window cut to its own
+        # length without the engine being restarted or even told in advance.
+        data = {}
+        if self.config.fast_encoder:
+            context = audio_context(wav_duration(audio_path))
+            if context:
+                data["audio_ctx"] = str(context)
+
         with open(audio_path, "rb") as audio_file:
             resp = requests.post(
                 inference_url,
                 files={"file": audio_file},
+                data=data,
                 timeout=timeout,
             )
             resp.raise_for_status()

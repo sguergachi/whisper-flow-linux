@@ -198,3 +198,60 @@ def test_a_slow_pass_is_never_made_to_wait_further():
     configured, elapsed = 0.9, 1.5
     cadence = min(configured, max(MIN_PASS_INTERVAL, elapsed))
     assert cadence - elapsed <= 0
+
+
+# ------------------------------------------------------- conditioning frames
+def test_frames_are_conditioned_before_a_pass_runs():
+    """Silence either side of the speech is encoded like any other audio."""
+    seen = {}
+
+    def transcribe(path):
+        import wave
+        with wave.open(path, "rb") as wf:
+            seen["frames"] = wf.getnframes()
+        return None
+
+    lt = LiveTranscriber(
+        transcribe=transcribe, emit=lambda text: None, sample_rate=16000,
+        interval=0.05, prepare=lambda frames: frames[:1],
+    )
+    lt._run_pass([b"\0\0" * 160, b"\1\1" * 160, b"\2\2" * 160])
+    assert seen["frames"] == 160
+
+
+def test_a_prepare_that_throws_falls_back_to_the_raw_audio():
+    """Losing the trim is a slower pass; losing the audio is a lost sentence."""
+    seen = {}
+
+    def transcribe(path):
+        import wave
+        with wave.open(path, "rb") as wf:
+            seen["frames"] = wf.getnframes()
+        return None
+
+    def prepare(frames):
+        raise RuntimeError("detector unavailable")
+
+    lt = LiveTranscriber(
+        transcribe=transcribe, emit=lambda text: None, sample_rate=16000,
+        interval=0.05, prepare=prepare,
+    )
+    lt._run_pass([b"\0\0" * 160, b"\1\1" * 160])
+    assert seen["frames"] == 320
+
+
+def test_a_prepare_that_returns_nothing_falls_back_to_the_raw_audio():
+    seen = {}
+
+    def transcribe(path):
+        import wave
+        with wave.open(path, "rb") as wf:
+            seen["frames"] = wf.getnframes()
+        return None
+
+    lt = LiveTranscriber(
+        transcribe=transcribe, emit=lambda text: None, sample_rate=16000,
+        interval=0.05, prepare=lambda frames: [],
+    )
+    lt._run_pass([b"\0\0" * 160, b"\1\1" * 160])
+    assert seen["frames"] == 320

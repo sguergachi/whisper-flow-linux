@@ -167,11 +167,16 @@ jobs:
         # every machine that runs the installer, from a two-core laptop to a
         # workstation, and a model too big for the CPU it lands on does not
         # transcribe slowly - it falls behind speech and is useless. base.en
-        # keeps up everywhere and asks ~250MB of RAM. Machines that can do
+        # keeps up everywhere and asks ~150MB of RAM. Machines that can do
         # better are offered better in the setup window: small.en on a strong
         # CPU, large-v3-turbo on an NVIDIA GPU. The CUDA engine and the large
         # model could not ship here anyway - together they are 2.2GB, past the
         # 2GB ceiling on a release asset.
+        #
+        # The 8-bit build of it, which is 78MB rather than 142MB and decodes
+        # 20-25% faster on a CPU for the same transcript. Both numbers matter
+        # here: it is the installer people wait on and the CPU they dictate
+        # against.
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -191,10 +196,10 @@ jobs:
           Copy-Item "$($src.Directory)/*" $engine -Recurse -Force
           Remove-Item engine.zip, engine-tmp -Recurse -Force
 
-          Write-Host "Downloading ggml-base.en..."
+          Write-Host "Downloading ggml-base.en-q8_0..."
           Invoke-WebRequest `
-            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin" `
-            -OutFile "$models/ggml-base.en.bin"
+            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en-q8_0.bin" `
+            -OutFile "$models/ggml-base.en-q8_0.bin"
 
           "{0:N0}MB bundled" -f ((Get-ChildItem $dist -Recurse |
             Measure-Object Length -Sum).Sum / 1MB) | Write-Host

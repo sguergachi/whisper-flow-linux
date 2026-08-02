@@ -11,7 +11,7 @@ from whisper_flow.backend import MODELS, LocalBackend, _stage, recommended_model
 
 
 class FakeConfig:
-    def __init__(self, config_dir, model_name="ggml-small.en"):
+    def __init__(self, config_dir, model_name="ggml-small.en-q8_0"):
         self.config_dir = config_dir
         self.model_name = model_name
         self.local_server_port = 18080
@@ -51,31 +51,31 @@ def test_a_cuda_machine_gets_the_large_model(monkeypatch):
 
 def test_a_workstation_cpu_gets_small(monkeypatch):
     _machine(monkeypatch, 8, 32)
-    assert recommended_model("cpu") == "ggml-small.en"
+    assert recommended_model("cpu") == "ggml-small.en-q8_0"
 
 
 def test_a_typical_laptop_gets_base(monkeypatch):
-    """The common case: 8 logical cores, 16GB. small.en would fall behind."""
-    _machine(monkeypatch, 3, 16)
-    assert recommended_model("cpu") == "ggml-base.en"
+    """The common case: four real cores, 16GB. small.en would fall behind."""
+    _machine(monkeypatch, 4, 16)
+    assert recommended_model("cpu") == "ggml-base.en-q8_0"
 
 
 def test_a_thin_laptop_gets_tiny(monkeypatch):
     _machine(monkeypatch, 2, 8)
-    assert recommended_model("cpu") == "ggml-tiny.en"
+    assert recommended_model("cpu") == "ggml-tiny.en-q8_0"
 
 
 def test_an_8gb_laptop_is_not_asked_to_hold_small_en(monkeypatch):
-    """600MB resident for as long as the daemon runs is a lot on 8GB."""
-    _machine(monkeypatch, 6, 8)
-    assert recommended_model("cpu") == "ggml-small.en"
-    _machine(monkeypatch, 6, 6)
-    assert recommended_model("cpu") == "ggml-base.en"
+    """350MB resident for as long as the daemon runs is a lot on 8GB."""
+    _machine(monkeypatch, 7, 8)
+    assert recommended_model("cpu") == "ggml-small.en-q8_0"
+    _machine(monkeypatch, 7, 6)
+    assert recommended_model("cpu") == "ggml-base.en-q8_0"
 
 
 def test_a_memory_starved_machine_gets_tiny_however_many_cores(monkeypatch):
     _machine(monkeypatch, 16, 3)
-    assert recommended_model("cpu") == "ggml-tiny.en"
+    assert recommended_model("cpu") == "ggml-tiny.en-q8_0"
 
 
 def test_the_bundled_model_runs_on_the_weakest_machine_we_target(monkeypatch):
@@ -83,16 +83,16 @@ def test_the_bundled_model_runs_on_the_weakest_machine_we_target(monkeypatch):
     from whisper_flow.config import Config
 
     bundled = Config().model_name
-    assert bundled == "ggml-base.en"
+    assert bundled == "ggml-base.en-q8_0"
     # Never larger than what the tiers would pick for a modest laptop.
-    _machine(monkeypatch, 3, 8)
+    _machine(monkeypatch, 4, 8)
     assert MODELS[bundled][0] <= MODELS[recommended_model("cpu")][0]
 
 
 def test_unknown_memory_does_not_force_the_smallest_model(monkeypatch):
     """A platform that will not report RAM should not be punished for it."""
     _machine(monkeypatch, 8, 0.0)
-    assert recommended_model("cpu") == "ggml-small.en"
+    assert recommended_model("cpu") == "ggml-small.en-q8_0"
 
 
 def test_every_recommendation_is_a_model_we_can_actually_fetch(monkeypatch):
@@ -103,20 +103,45 @@ def test_every_recommendation_is_a_model_we_can_actually_fetch(monkeypatch):
 
 
 # ------------------------------------------------------------------- threads
-def test_threads_leave_the_machine_usable(monkeypatch):
-    """Saturating a laptop while dictating into it makes the desktop stutter."""
-    monkeypatch.setattr(backend_module.os, "cpu_count", lambda: 16)
+def _cpus(monkeypatch, logical, physical):
+    monkeypatch.setattr(backend_module.os, "cpu_count", lambda: logical)
     monkeypatch.delattr(backend_module.os, "sched_getaffinity", raising=False)
-    assert backend_module.usable_cores() == 7        # 16 logical -> 8 real -> 7
+    monkeypatch.setattr(backend_module, "_physical_cores", lambda _: physical)
 
-    monkeypatch.setattr(backend_module.os, "cpu_count", lambda: 4)
+
+def test_threads_match_the_physical_cores(monkeypatch):
+    """One thread per real core is where the encoder measured fastest."""
+    _cpus(monkeypatch, 16, 8)
+    assert backend_module.usable_cores() == 8
+
+    _cpus(monkeypatch, 12, 6)
+    assert backend_module.usable_cores() == 6
+
+    _cpus(monkeypatch, 4, 2)
     assert backend_module.usable_cores() == 2
 
-    monkeypatch.setattr(backend_module.os, "cpu_count", lambda: 2)
+    _cpus(monkeypatch, 2, 1)
     assert backend_module.usable_cores() == 2        # never below 2
 
-    monkeypatch.setattr(backend_module.os, "cpu_count", lambda: 128)
-    assert backend_module.usable_cores() == 8        # never a runaway count
+
+def test_threads_never_run_away_on_a_large_machine(monkeypatch):
+    """Oversubscription does not degrade gently: 12 threads on 6 cores was 20x."""
+    _cpus(monkeypatch, 128, 64)
+    assert backend_module.usable_cores() == 8
+
+
+def test_threads_respect_a_narrowed_affinity(monkeypatch):
+    """A cgroup or taskset limit outranks however many cores the box has."""
+    monkeypatch.setattr(backend_module.os, "sched_getaffinity", lambda _: {0, 1, 2})
+    monkeypatch.setattr(backend_module, "_physical_cores", lambda _: 8)
+    assert backend_module.usable_cores() == 3
+
+
+def test_smt_siblings_are_counted_out_where_the_topology_is_unreadable(monkeypatch):
+    """Off Linux there is no topology to read, so halving is the assumption."""
+    monkeypatch.setattr(backend_module.sys, "platform", "win32")
+    assert backend_module._physical_cores(16) == 8
+    assert backend_module._physical_cores(1) == 1    # never zero
 
 
 def test_threads_survive_a_platform_that_will_not_say(monkeypatch):
@@ -206,9 +231,9 @@ def test_a_downloaded_model_beats_the_bundled_one_without_a_config_reload(
     """pydantic resolves .env once at import, so the choice cannot live there."""
     bundled = Path(config.config_dir) / "bundled"
     (bundled / "models").mkdir(parents=True)
-    (bundled / "models" / "ggml-small.en.bin").write_text("")
+    (bundled / "models" / "ggml-small.en-q8_0.bin").write_text("")
     monkeypatch.setattr(backend_module, "bundled_dir", lambda: bundled)
-    assert local_backend.working_model() == "ggml-small.en"
+    assert local_backend.working_model() == "ggml-small.en-q8_0"
 
     downloaded = Path(config.config_dir) / "models"
     downloaded.mkdir(parents=True)
@@ -220,10 +245,10 @@ def test_a_downloaded_model_beats_the_bundled_one_without_a_config_reload(
 def test_the_configured_model_wins_among_several_downloads(local_backend, config):
     downloaded = Path(config.config_dir) / "models"
     downloaded.mkdir(parents=True)
-    for name in ("ggml-large-v3-turbo", "ggml-base.en", "ggml-small.en"):
+    for name in ("ggml-large-v3-turbo", "ggml-base.en-q8_0", "ggml-small.en-q8_0"):
         (downloaded / f"{name}.bin").write_text("")
-    config.model_name = "ggml-base.en"
-    assert local_backend.working_model() == "ggml-base.en"
+    config.model_name = "ggml-base.en-q8_0"
+    assert local_backend.working_model() == "ggml-base.en-q8_0"
 
 
 def test_linux_installs_the_cpu_tarball(local_backend, monkeypatch):
@@ -297,13 +322,13 @@ def test_inventory_marks_installed_current_and_recommended(
         config, local_backend, monkeypatch):
     _install_engine(local_backend, config)   # writes ggml-small.en (the fixture model)
     monkeypatch.setattr(backend_module, "recommended_model",
-                        lambda accelerator: "ggml-base.en")
+                        lambda accelerator: "ggml-base.en-q8_0")
     monkeypatch.setattr(backend_module, "detect_accelerator", lambda: "cpu")
 
     rows = {row["name"]: row for row in local_backend.model_inventory()}
 
     assert set(rows) == set(MODELS)
-    small = rows["ggml-small.en"]
+    small = rows["ggml-small.en-q8_0"]
     assert small["installed"] and small["current"] and not small["recommended"]
-    base = rows["ggml-base.en"]
+    base = rows["ggml-base.en-q8_0"]
     assert not base["installed"] and not base["current"] and base["recommended"]

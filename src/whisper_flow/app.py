@@ -131,6 +131,7 @@ class WhisperFlow:
             emit=self.system_manager.type_text,
             sample_rate=self.config.sample_rate,
             interval=self.config.live_interval,
+            prepare=self.audio_recorder.trim_frames,
         )
         live.start()
 

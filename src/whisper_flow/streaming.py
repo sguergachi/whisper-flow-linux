@@ -44,7 +44,8 @@ def _common_prefix(a: list[str], b: list[str]) -> int:
 class LiveTranscriber:
     """Runs transcription passes alongside recording and emits stable text."""
 
-    def __init__(self, transcribe, emit, sample_rate: int, interval: float = 0.9):
+    def __init__(self, transcribe, emit, sample_rate: int, interval: float = 0.9,
+                 prepare=None):
         """Initialize the live transcriber.
 
         Args:
@@ -52,12 +53,18 @@ class LiveTranscriber:
             emit: Callable taking the newly committed text to type
             sample_rate: Sample rate of the incoming frames
             interval: Minimum seconds between passes
+            prepare: Optional callable to condition frames before a pass runs,
+                used to strip silence. It must be deterministic on a given
+                prefix of audio: two passes over the same words have to agree
+                before either is typed, so a filter that decided differently
+                from one pass to the next would stop text committing at all.
 
         """
         self._transcribe = transcribe
         self._emit = emit
         self._sample_rate = sample_rate
         self._interval = interval
+        self._prepare = prepare
 
         self._pending = None  # latest frame snapshot awaiting a pass
         self._lock = threading.Lock()
@@ -127,6 +134,11 @@ class LiveTranscriber:
     def _run_pass(self, frames: list) -> str | None:
         path = None
         try:
+            if self._prepare:
+                try:
+                    frames = self._prepare(frames) or frames
+                except Exception as e:
+                    log(f"[LIVE] prepare failed, using raw audio: {e}")
             fd, path = tempfile.mkstemp(suffix=".wav", prefix="whisper-flow-live-")
             os.close(fd)
             with wave.open(path, "wb") as wf:

@@ -380,6 +380,9 @@ def test_the_live_flow_really_does_shorten_its_passes(monkeypatch):
         def record_push_to_talk(self, *a, **kw):
             return None                              # stop after the wiring
 
+        def trim_frames(self, frames):
+            return frames
+
     class Service:
         def transcribe_audio(self, path, max_retries=3, timeout=None):
             seen["max_retries"] = max_retries
@@ -389,7 +392,8 @@ def test_the_live_flow_really_does_shorten_its_passes(monkeypatch):
     captured = {}
 
     class FakeLive:
-        def __init__(self, transcribe, emit, sample_rate, interval):
+        def __init__(self, transcribe, emit, sample_rate, interval,
+                     prepare=None):
             captured["transcribe"] = transcribe
 
         def start(self): pass
@@ -423,6 +427,9 @@ def test_the_overlay_is_shown_only_once_capture_has_started(monkeypatch):
             if on_ready:
                 on_ready()
             return None
+
+        def trim_frames(self, frames):
+            return frames
 
     class FakeLive:
         def __init__(self, **kw): pass

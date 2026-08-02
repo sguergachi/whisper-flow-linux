@@ -46,16 +46,23 @@ can be downloaded and picked.
 | Machine | Model | Why |
 |---|---|---|
 | NVIDIA GPU | `large-v3-turbo` | Far more accurate, still faster than speech |
-| Desktop or workstation CPU | `small.en` | Keeps up given enough cores and RAM |
-| Typical laptop | `base.en` | Bundled; the safe default everywhere |
-| Thin, old or 4GB machine | `tiny.en` | Anything larger falls behind |
+| Desktop or workstation CPU | `small.en-q8_0` | Keeps up given enough cores and RAM |
+| Typical laptop | `base.en-q8_0` | Bundled; the safe default everywhere |
+| Thin, old or 4GB machine | `tiny.en-q8_0` | Anything larger falls behind |
+
+The CPU models are the 8-bit builds. On a six-core desktop those transcribe
+20–25% faster than the same model in full precision and download at half the
+size, for the same transcript on eight of nine test clips. Notably it is
+*only* the 8-bit ones worth having: the 5-bit builds are smaller again and
+measurably **slower**, because unpacking five-bit weights costs more time
+than the memory traffic it saves.
 
 **Integrated graphics are not used, and cannot be.** whisper.cpp publishes
 prebuilt binaries only for CPU and NVIDIA cuBLAS — no Vulkan, SYCL or
 OpenVINO on any platform — so on an Intel or AMD GPU there is no engine to
-point at. Those machines run on the CPU, with the model sized to it and the
-thread count held below the core count so the desktop stays responsive while
-you dictate into it.
+point at. Those machines run on the CPU, with the model sized to it and one
+thread per physical core — the count where the encoder measured fastest, and
+well short of the point where oversubscription collapses it.
 
 Nothing large is ever downloaded without being asked.
 

@@ -1,6 +1,7 @@
 """Keyboard hotkey listener using evdev with uinput proxy for Wayland."""
 
 import logging
+import os
 import queue
 import select
 import threading
@@ -34,6 +35,11 @@ BUS_VIRTUAL = 0x06  # uinput devices; see linux/input.h BUS_VIRTUAL
 # How often to look for keyboards that were not there at startup. Cheap: it
 # stats /dev/input and compares paths, and only rebuilds when the set differs.
 RESCAN_SECONDS = 3.0
+
+# Set WHISPER_FLOW_HOTKEY_DEBUG=1 to log every key this listener sees, with
+# the state it is matching against. Off by default because it records every
+# keystroke, which is not something to write to a journal unasked.
+DEBUG_KEYS = os.environ.get("WHISPER_FLOW_HOTKEY_DEBUG") == "1"
 
 
 class EvdevHotkeyListener:
@@ -286,6 +292,10 @@ class EvdevHotkeyListener:
         if value == 1:
             self._key_state.add(code)
             self._forward(event)
+            if DEBUG_KEYS:
+                from .logging import log as _log
+                _log(f"[HOTKEY-DEBUG] down code={code} state={sorted(self._key_state)} "
+                     f"bindings={{{', '.join(f'{n}:{sorted(k)}' for n, (k, *_) in self._bindings.items())}}}")
             self._check_bindings(rising=True)
             return
 

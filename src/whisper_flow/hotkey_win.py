@@ -147,6 +147,27 @@ class WinHotkeyListener:
                 log.exception("error polling keyboard state")
             time.sleep(self._poll_interval)
 
+    @staticmethod
+    def _spoil_start_menu_if_needed(keys) -> None:
+        """Stop letting go of a Super hotkey from opening the Start menu.
+
+        Windows opens Start when its key is released and nothing was pressed
+        while it was held. A push-to-talk combination ends with exactly that
+        release, so the menu appeared and the dictated text went into its
+        search box.
+
+        Done here, at the moment the combination fires, rather than only
+        before typing: a press with nothing to type still ends in a release.
+        """
+        if NAME_TO_VK["super"] not in keys:
+            return
+        try:
+            from . import system_win
+
+            system_win.spoil_start_menu()
+        except Exception as e:
+            log.debug("could not suppress the Start menu: %s", e)
+
     def _check_bindings(self, down: set, rising: bool):
         satisfied = [
             (name, keys) for name, (keys, _, _) in self._bindings.items()
@@ -161,6 +182,7 @@ class WinHotkeyListener:
                 # larger combination would fall through and fire a smaller one.
                 if name not in self._press_triggered and rising:
                     self._press_triggered.add(name)
+                    self._spoil_start_menu_if_needed(_keys)
                     if cb_press:
                         self._callbacks.put((name, "press", cb_press))
             elif name in self._press_triggered:

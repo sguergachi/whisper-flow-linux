@@ -99,3 +99,47 @@ def test_a_combination_only_arms_while_keys_are_going_down(listener):
     listener._check_bindings(down, rising=False)
     assert listener._callbacks.empty()
     assert fired == []
+
+
+# ------------------------------------------------------- the Start menu
+def test_a_super_hotkey_suppresses_the_start_menu(listener, monkeypatch):
+    """Releasing Super otherwise opens Start, and the dictation lands there."""
+    module = listener._module
+    calls = []
+    fake = type("M", (), {"spoil_start_menu": staticmethod(
+        lambda: calls.append(1))})
+    monkeypatch.setitem(sys.modules, "whisper_flow.system_win", fake)
+
+    listener.register_hotkey("transcribe", "super+alt", lambda: None)
+    down = {module.NAME_TO_VK["super"], module.NAME_TO_VK["alt"]}
+    listener._check_bindings(down, rising=True)
+    assert calls == [1]
+
+
+def test_a_hotkey_without_super_leaves_the_keyboard_alone(listener, monkeypatch):
+    module = listener._module
+    calls = []
+    fake = type("M", (), {"spoil_start_menu": staticmethod(
+        lambda: calls.append(1))})
+    monkeypatch.setitem(sys.modules, "whisper_flow.system_win", fake)
+
+    listener.register_hotkey("auto", "ctrl+alt+space", lambda: None)
+    down = {module.NAME_TO_VK[n] for n in ("ctrl", "alt", "space")}
+    listener._check_bindings(down, rising=True)
+    assert calls == []
+
+
+def test_suppression_failing_does_not_stop_the_hotkey(listener, monkeypatch):
+    module = listener._module
+    broken = type("M", (), {"spoil_start_menu": staticmethod(
+        lambda: (_ for _ in ()).throw(OSError("no user32")))})
+    monkeypatch.setitem(sys.modules, "whisper_flow.system_win", broken)
+
+    fired = []
+    listener.register_hotkey("transcribe", "super+alt",
+                             lambda: fired.append("press"))
+    down = {module.NAME_TO_VK["super"], module.NAME_TO_VK["alt"]}
+    listener._check_bindings(down, rising=True)
+    name, kind, cb = listener._callbacks.get_nowait()
+    cb()
+    assert fired == ["press"]

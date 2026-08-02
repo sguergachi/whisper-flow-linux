@@ -24,6 +24,10 @@ INJECTED_TAG = 0x5748464C
 
 VK_CONTROL, VK_MENU, VK_SHIFT, VK_LWIN, VK_RWIN = 0x11, 0x12, 0x10, 0x5B, 0x5C
 VK_V = 0x56
+# Reserved by Windows as a key that does nothing. Used to mark the
+# Windows key as having been combined with something, so releasing it
+# does not open the Start menu.
+VK_NONAME = 0xFC
 MODIFIERS = (VK_CONTROL, VK_MENU, VK_SHIFT, VK_LWIN, VK_RWIN)
 
 _user32 = ctypes.WinDLL("user32", use_last_error=True)
@@ -102,13 +106,36 @@ def _send(events: list) -> bool:
     return sent == len(events)
 
 
+def spoil_start_menu() -> None:
+    """Stop the Start menu opening when the user lets go of the Windows key.
+
+    Windows opens Start on a Windows-key release if no other key was pressed
+    while it was held. Push-to-talk on Super+Alt ends with exactly that
+    release, so letting go opened Start and the dictated text went into its
+    search box.
+
+    Pressing any key while Windows is still down marks the press as used, and
+    the release is then ignored. VK_NONAME is reserved as a no-op precisely
+    for this: it reaches no application and does nothing on its way past.
+    """
+    _send([
+        _key_event(VK_NONAME, 0, 0),
+        _key_event(VK_NONAME, 0, KEYEVENTF_KEYUP),
+    ])
+
+
 def release_modifiers() -> None:
     """Tell Windows no modifiers are held before injecting text.
 
     Live transcription types while the push-to-talk keys are physically down,
     and a held Alt or Ctrl would turn every character into a shortcut. Only
     releases are sent, never presses, so nothing can be left stuck.
+
+    The no-op key goes first, while Windows still believes its own key is
+    down. Sent afterwards it would be too late: the release below is what
+    arms the Start menu.
     """
+    spoil_start_menu()
     _send([_key_event(vk, 0, KEYEVENTF_KEYUP) for vk in MODIFIERS])
 
 

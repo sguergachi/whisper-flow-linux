@@ -81,22 +81,37 @@ def _selftest() -> int:
         # first build that passed this check still could not open a window,
         # because a missing GSettings schema aborts the process rather than
         # returning an error. Look one up, then actually build a window.
+        # No hardcoded schema name: GTK 4 renamed its own settings schemas
+        # under org.gtk.gtk4.*, so probing a GTK 3 name reports a missing
+        # bundle that is in fact present. Ask what the source holds instead
+        # - the bug being guarded against is a directory with no compiled
+        # schemas at all, which shows up as an empty list either way.
         schema_dir = os.environ.get("GSETTINGS_SCHEMA_DIR")
         source = Gio.SettingsSchemaSource.new_from_directory(
             schema_dir, None, True)
-        if source.lookup("org.gtk.Settings.FileChooser", True) is None:
+        listed = source.list_schemas(True)
+        schemas = sorted(set(listed[0]) | set(listed[1]))
+        gtk_schemas = [name for name in schemas if name.startswith("org.gtk.")]
+        if not gtk_schemas:
             raise RuntimeError(
-                f"no org.gtk.Settings.FileChooser schema in {schema_dir}; "
+                f"{schema_dir} has {len(schemas)} schemas and none from GTK; "
                 f"is gschemas.compiled bundled?")
-        report.append(f"schemas load from {schema_dir}")
+        report.append(
+            f"{len(schemas)} schemas from {schema_dir} "
+            f"(GTK: {', '.join(gtk_schemas[:3])})")
 
         if not Gtk.init_check():
             raise RuntimeError("Gtk.init_check() failed - no usable display")
         Adw.init()
-        window = Adw.ApplicationWindow(title="selftest", default_width=200)
+        # Adw.Window, not the Adw.ApplicationWindow the real windows use:
+        # binding one to an Adw.Application outside that application's
+        # startup signal earns a Gtk-CRITICAL, and a check that prints a
+        # warning every run is one whose warnings stop being read. Both
+        # realize the same native surface, which is what is under test.
+        window = Adw.Window(default_width=200)
         window.set_content(Gtk.Label(label="selftest"))
         window.realize()
-        report.append("Adw window realized")
+        report.append("Adw.Window realized")
         window.destroy()
     except Exception:
         import traceback

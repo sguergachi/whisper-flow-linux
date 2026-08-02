@@ -69,6 +69,10 @@ jobs:
       - name: Install
         shell: msys2 {0}
         run: |
+          # MSYS2's Python is PEP 668 externally managed. A venv with system
+          # site packages keeps pacman's python-gobject visible inside it.
+          python -m venv --system-site-packages .venv
+          source .venv/Scripts/activate
           python -m pip install --upgrade pip
           pip install "pyaudio>=0.2.14"
           pip install -e ".[dev]"
@@ -80,7 +84,9 @@ jobs:
         # and the overlay actually work against the real API - the gap that
         # let a broken clipboard ship.
         shell: msys2 {0}
-        run: pytest -q -p no:cacheprovider
+        run: |
+          source .venv/Scripts/activate
+          pytest -q -p no:cacheprovider
 
       - name: Confirm the Windows-only tests really ran
         # skipif on the wrong condition would make this job silently vacuous.
@@ -89,6 +95,7 @@ jobs:
         # run where all ten had in fact passed.
         shell: msys2 {0}
         run: |
+          source .venv/Scripts/activate
           out=$(pytest tests/test_windows_native.py -q -p no:cacheprovider --collect-only 2>&1)
           echo "$out"
           collected=$(echo "$out" | grep -oE '[0-9]+ tests? collected' | grep -oE '^[0-9]+' || true)
@@ -162,6 +169,10 @@ jobs:
       - name: Install
         shell: msys2 {0}
         run: |
+          # MSYS2's Python is PEP 668 externally managed. A venv with system
+          # site packages keeps pacman's python-gobject visible inside it.
+          python -m venv --system-site-packages .venv
+          source .venv/Scripts/activate
           python -m pip install --upgrade pip
           # pipwin-free: PyAudio publishes Windows wheels from 0.2.14.
           pip install "pyaudio>=0.2.14"
@@ -173,6 +184,7 @@ jobs:
         # build would fail the same way on a user's machine.
         shell: msys2 {0}
         run: |
+          source .venv/Scripts/activate
           python -c "import whisper_flow.system_win, whisper_flow.hotkey_win; print('windows modules OK')"
           python -c "import whisper_flow.hud_app, whisper_flow.blur_win; print('hud + blur OK')"
           python -c "import whisper_flow.blur_win as b; print('runner build', b.windows_build(), 'supported', b.is_supported())"
@@ -183,7 +195,9 @@ jobs:
         working-directory: packaging/windows
         # UCRT64's Python is a native Windows build: it wants the prefix in
         # Windows form (C:\msys64\ucrt64), not the MSYS form (/ucrt64).
-        run: GTK_PREFIX="$(cygpath -w /ucrt64)" pyinstaller --noconfirm --clean whisper-flow.spec
+        run: |
+          source "$GITHUB_WORKSPACE/.venv/Scripts/activate"
+          GTK_PREFIX="$(cygpath -w /ucrt64)" pyinstaller --noconfirm --clean whisper-flow.spec
 
       - name: Bundle the speech engine and a model
         # So the app transcribes the moment it is installed, with no network

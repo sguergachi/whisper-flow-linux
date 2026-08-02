@@ -124,10 +124,9 @@ def init_config(config_dir: ConfigDirOption = None):
     flow_app.config.ensure_config_files()
     typer.echo(f"✓ Configuration files initialized in {flow_app.config.config_dir}")
     typer.echo("\nNext steps:")
-    typer.echo("1. Set your OPENAI_API_KEY environment variable")
-    typer.echo("2. Run 'whisper-flow validate' to check your setup")
-    typer.echo("3. Run 'whisper-flow daemon' to start the background service")
-    typer.echo("4. Use the configured hotkeys for voice input")
+    typer.echo("1. Run 'whisper-flow validate' to check your setup")
+    typer.echo("2. Run 'whisper-flow daemon' to start the background service")
+    typer.echo("3. Use the configured hotkeys for voice input")
 
 
 @app.command()
@@ -189,16 +188,8 @@ def status(config_dir: ConfigDirOption = None):
     typer.echo("==================")
     typer.echo(f"Mode: {flow_app.mode}")
     typer.echo(f"Config Directory: {flow_app.config.config_dir}")
-
-    # OpenAI configuration
-    api_key_status = "Yes" if flow_app.config.openai_api_key else "No"
-    typer.echo(f"OpenAI Configured: {api_key_status}")
-    typer.echo()
-
-    # Model configuration
-    typer.echo("Models:")
-    typer.echo(f"  Transcription: {flow_app.config.transcription_model}")
-    typer.echo(f"  Completion: {flow_app.config.completion_model}")
+    typer.echo(f"Speech model: {flow_app.config.model_name}")
+    typer.echo(f"Whisper server: {flow_app.config.local_whisper_url or '(managed)'}")
     typer.echo()
 
     # Daemon configuration
@@ -240,30 +231,18 @@ def status(config_dir: ConfigDirOption = None):
             typer.echo(f"  {name}: ✗")
     typer.echo()
 
-    # Services
-    typer.echo("Services:")
-    transcription_available = "Yes" if flow_app.config.openai_api_key else "No"
-    completion_available = "Yes" if flow_app.config.openai_api_key else "No"
-    typer.echo(f"  Transcription Available: {transcription_available}")
-    typer.echo(f"  Completion Available: {completion_available}")
-    typer.echo()
-
     # Usage instructions
     typer.echo("Getting Started:")
-    if not flow_app.config.openai_api_key:
-        typer.echo("  1. Set OPENAI_API_KEY environment variable")
-        typer.echo("  2. Run 'whisper-flow validate' to verify setup")
-    else:
-        typer.echo("  1. Run 'whisper-flow daemon' to start background service")
-        typer.echo("  2. Use hotkeys for voice input:")
-        typer.echo(
-            f"     • {flow_app.config.hotkey_transcribe}: Push-to-talk transcription",
-        )
-        typer.echo(
-            f"     • {flow_app.config.hotkey_auto_transcribe}: Auto-stop transcription",
-        )
-        typer.echo(f"     • {flow_app.config.hotkey_command}: Command mode (with AI)")
-        typer.echo("  3. Press Escape to cancel any recording")
+    typer.echo("  1. Run 'whisper-flow daemon' to start background service")
+    typer.echo("  2. Use hotkeys for voice input:")
+    typer.echo(
+        f"     • {flow_app.config.hotkey_transcribe}: Push-to-talk transcription",
+    )
+    typer.echo(
+        f"     • {flow_app.config.hotkey_auto_transcribe}: Auto-stop transcription",
+    )
+    typer.echo(f"     • {flow_app.config.hotkey_command}: Command mode")
+    typer.echo("  3. Press Escape to cancel any recording")
 
 
 @app.command()

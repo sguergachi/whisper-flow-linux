@@ -14,7 +14,7 @@ def test_set_values_replaces_in_place_and_keeps_everything_else(tmp_path):
         "# my settings\n"
         "WHISPER_FLOW_MODEL_NAME=ggml-base.en\n"
         "\n"
-        "WHISPER_FLOW_OPENAI_API_KEY=sk-old  # rotated\n",
+        "WHISPER_FLOW_LOCAL_WHISPER_URL=http://127.0.0.1:8082  # managed\n",
         encoding="utf-8",
     )
 
@@ -24,7 +24,7 @@ def test_set_values_replaces_in_place_and_keeps_everything_else(tmp_path):
         "# my settings\n"
         "WHISPER_FLOW_MODEL_NAME=ggml-small.en\n"
         "\n"
-        "WHISPER_FLOW_OPENAI_API_KEY=sk-old  # rotated\n"
+        "WHISPER_FLOW_LOCAL_WHISPER_URL=http://127.0.0.1:8082  # managed\n"
     )
 
 

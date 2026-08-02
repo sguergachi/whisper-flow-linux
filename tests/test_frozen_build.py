@@ -16,7 +16,6 @@ SPEC = Path(__file__).resolve().parents[1] / "packaging/windows/whisper-flow.spe
 
 # Third-party modules the code imports lazily, and where it does it.
 LAZY_IMPORTS = {
-    "openai": "whisper_flow/completion.py and transcription.py",
     "pystray": "whisper_flow/daemon.py",
     "velopack": "whisper_flow/updater.py",
 }

@@ -42,8 +42,6 @@ class TestWhisperFlow:
             patch("whisper_flow.app.SystemManager") as mock_system_class,
             patch("whisper_flow.app.AudioRecorder") as mock_audio_class,
             patch("whisper_flow.app.TranscriptionService") as mock_transcription_class,
-            patch("whisper_flow.app.CompletionService") as mock_completion_class,
-            patch("whisper_flow.app.PromptManager") as mock_prompt_class,
         ):
             # Setup mocks
             mock_system = Mock()
@@ -56,14 +54,6 @@ class TestWhisperFlow:
             mock_transcription = Mock()
             mock_transcription.transcribe_audio.return_value = "Test transcript"
             mock_transcription_class.return_value = mock_transcription
-
-            mock_completion = Mock()
-            mock_completion_class.return_value = mock_completion
-
-            mock_prompt = Mock()
-            mock_prompt.choose_prompt.return_value = "Test prompt"
-            mock_prompt.should_use_completion.return_value = False
-            mock_prompt_class.return_value = mock_prompt
 
             # Create app and test
             app = WhisperFlow(mode="command")
@@ -90,8 +80,6 @@ class TestWhisperFlow:
             patch("whisper_flow.app.SystemManager") as mock_system_class,
             patch("whisper_flow.app.AudioRecorder") as mock_audio_class,
             patch("whisper_flow.app.TranscriptionService"),
-            patch("whisper_flow.app.CompletionService"),
-            patch("whisper_flow.app.PromptManager"),
         ):
             mock_system = Mock()
             mock_system_class.return_value = mock_system
@@ -114,8 +102,6 @@ class TestWhisperFlow:
             patch("whisper_flow.app.SystemManager") as mock_system_class,
             patch("whisper_flow.app.AudioRecorder") as mock_audio_class,
             patch("whisper_flow.app.TranscriptionService") as mock_transcription_class,
-            patch("whisper_flow.app.CompletionService"),
-            patch("whisper_flow.app.PromptManager"),
         ):
             mock_system = Mock()
             mock_system_class.return_value = mock_system
@@ -144,8 +130,6 @@ class TestWhisperFlow:
             patch("whisper_flow.app.SystemManager"),
             patch("whisper_flow.app.AudioRecorder"),
             patch("whisper_flow.app.TranscriptionService"),
-            patch("whisper_flow.app.CompletionService"),
-            patch("whisper_flow.app.PromptManager"),
         ):
             app = WhisperFlow()
 
@@ -166,8 +150,6 @@ class TestWhisperFlow:
             patch("whisper_flow.app.SystemManager") as mock_system_class,
             patch("whisper_flow.app.AudioRecorder"),
             patch("whisper_flow.app.TranscriptionService") as mock_transcription_class,
-            patch("whisper_flow.app.CompletionService"),
-            patch("whisper_flow.app.PromptManager"),
         ):
             mock_system = Mock()
             mock_system.paste_text.return_value = True
@@ -186,15 +168,18 @@ class TestWhisperFlow:
                 )
                 mock_system.paste_text.assert_called_once_with("Test transcript")
 
-    def test_process_recorded_audio_command_mode_with_completion(self, mock_config):
-        """Test processing recorded audio in command mode with completion."""
+    def test_command_mode_pastes_the_transcript_verbatim(self, mock_config):
+        """No mode rewrites the words: every one pastes what was heard.
+
+        Command mode used to send the transcript to a hosted model and paste
+        its answer. That backend is gone, so it must not silently paste
+        something other than the dictation.
+        """
         with (
             patch("whisper_flow.app.Config", return_value=mock_config),
             patch("whisper_flow.app.SystemManager") as mock_system_class,
             patch("whisper_flow.app.AudioRecorder"),
             patch("whisper_flow.app.TranscriptionService") as mock_transcription_class,
-            patch("whisper_flow.app.CompletionService") as mock_completion_class,
-            patch("whisper_flow.app.PromptManager") as mock_prompt_class,
         ):
             mock_system = Mock()
             mock_system.get_active_window_title.return_value = "Test Window"
@@ -203,23 +188,7 @@ class TestWhisperFlow:
             mock_transcription = Mock()
             mock_transcription.transcribe_audio.return_value = "Test transcript"
             mock_transcription_class.return_value = mock_transcription
-            mock_completion = Mock()
-            mock_completion.complete_text.return_value = "Test completion"
-            mock_completion_class.return_value = mock_completion
-            mock_prompt = Mock()
-            mock_prompt.get_system_message.return_value = "You are a helpful assistant."
-            mock_prompt.get_user_message.return_value = (
-                "Date: 2024-01-01\nTime: 12:00:00\nUser input: Test transcript"
-            )
-            mock_prompt.get_messages.return_value = [
-                {"role": "system", "content": "You are a helpful assistant."},
-                {
-                    "role": "user",
-                    "content": "Date: 2024-01-01\nTime: 12:00:00\nUser input: Test transcript",
-                },
-            ]
-            mock_prompt.should_use_completion.return_value = True
-            mock_prompt_class.return_value = mock_prompt
+
             app = WhisperFlow(mode="command")
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_file:
                 tmp_file.write(b"fake audio data")
@@ -229,18 +198,7 @@ class TestWhisperFlow:
                 mock_transcription.transcribe_audio.assert_called_once_with(
                     tmp_file.name,
                 )
-                mock_prompt.should_use_completion.assert_called_once()
-                mock_prompt.get_messages.assert_called_once_with("Test transcript")
-                mock_completion.complete_text.assert_called_once_with(
-                    [
-                        {"role": "system", "content": "You are a helpful assistant."},
-                        {
-                            "role": "user",
-                            "content": "Date: 2024-01-01\nTime: 12:00:00\nUser input: Test transcript",
-                        },
-                    ],
-                )
-                mock_system.paste_text.assert_called_once_with("Test completion")
+                mock_system.paste_text.assert_called_once_with("Test transcript")
 
     def test_process_recorded_audio_transcription_failure(self, mock_config):
         """Test processing recorded audio when transcription fails."""
@@ -249,8 +207,6 @@ class TestWhisperFlow:
             patch("whisper_flow.app.SystemManager"),
             patch("whisper_flow.app.AudioRecorder"),
             patch("whisper_flow.app.TranscriptionService") as mock_transcription_class,
-            patch("whisper_flow.app.CompletionService"),
-            patch("whisper_flow.app.PromptManager"),
         ):
             mock_transcription = Mock()
             mock_transcription.transcribe_audio.return_value = None
@@ -262,19 +218,15 @@ class TestWhisperFlow:
                 result = app._process_recorded_audio(tmp_file.name)
                 assert result is False
 
-    def test_validate_api_config_with_key(self, mock_config):
-        """An OpenAI key alone is a usable backend."""
-        mock_config.local_whisper_url = ""      # force the OpenAI branch
-        mock_config.openai_api_key = "test-key"
-        mock_config.transcription_model = "gpt-4o-mini"
+    def test_validate_api_config_with_a_server(self, mock_config):
+        """A whisper.cpp server is the only backend, and it is enough."""
+        mock_config.local_whisper_url = "http://127.0.0.1:8082"
 
         with (
             patch("whisper_flow.app.Config", return_value=mock_config),
             patch("whisper_flow.app.SystemManager"),
             patch("whisper_flow.app.AudioRecorder"),
             patch("whisper_flow.app.TranscriptionService"),
-            patch("whisper_flow.app.CompletionService"),
-            patch("whisper_flow.app.PromptManager"),
         ):
             app = WhisperFlow()
             results = app._validate_api_config()
@@ -282,20 +234,17 @@ class TestWhisperFlow:
             assert len(results) == 1
             assert results[0]["name"] == "Transcription backend"
             assert results[0]["status"] == "pass"
-            assert "OpenAI" in results[0]["message"]
+            assert "http://127.0.0.1:8082" in results[0]["message"]
 
-    def test_validate_api_config_without_key(self, mock_config):
-        """No local server and no key is the one real failure."""
+    def test_validate_api_config_without_a_server(self, mock_config):
+        """No server anywhere is the one real failure."""
         mock_config.local_whisper_url = ""
-        mock_config.openai_api_key = None
 
         with (
             patch("whisper_flow.app.Config", return_value=mock_config),
             patch("whisper_flow.app.SystemManager"),
             patch("whisper_flow.app.AudioRecorder"),
             patch("whisper_flow.app.TranscriptionService"),
-            patch("whisper_flow.app.CompletionService"),
-            patch("whisper_flow.app.PromptManager"),
         ):
             app = WhisperFlow()
             results = app._validate_api_config()
@@ -327,8 +276,6 @@ class TestWhisperFlow:
             patch("whisper_flow.app.SystemManager"),
             patch("whisper_flow.app.AudioRecorder") as mock_audio_class,
             patch("whisper_flow.app.TranscriptionService"),
-            patch("whisper_flow.app.CompletionService"),
-            patch("whisper_flow.app.PromptManager"),
         ):
             mock_audio = Mock()
             mock_audio.config = mock_config

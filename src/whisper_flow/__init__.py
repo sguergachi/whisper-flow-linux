@@ -1,7 +1,7 @@
-"""WhisperFlow - AI-powered voice-to-text with context-aware processing.
+"""WhisperFlow - voice-to-text, transcribed entirely on this machine.
 
 Names are resolved on first use rather than at import. Importing this package
-eagerly cost about 740ms, most of it the openai SDK and pyaudio, and every
+eagerly cost about 740ms, most of it pyaudio and the tray stack, and every
 one of those was paid by the overlay process - which is launched on the path
 that starts a recording, needs tkinter and nothing else, and is the thing the
 user is waiting to see. A frozen build on Windows pays considerably more than
@@ -23,9 +23,7 @@ from importlib import import_module
 # public name -> module it lives in
 _EXPORTS = {
     "AudioRecorder": ".audio",
-    "CompletionService": ".completion",
     "Config": ".config",
-    "PromptManager": ".prompts",
     "SystemManager": ".system",
     "TranscriptionService": ".transcription",
     "WhisperFlow": ".app",
@@ -38,9 +36,7 @@ _EXPORTS = {
 # to every static analyser, including the one that checks this file.
 __all__ = [
     "AudioRecorder",
-    "CompletionService",
     "Config",
-    "PromptManager",
     "SystemManager",
     "TranscriptionService",
     "WhisperFlow",

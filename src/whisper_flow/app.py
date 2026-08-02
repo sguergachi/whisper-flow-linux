@@ -5,10 +5,8 @@ from pathlib import Path
 
 from .audio import AudioRecorder
 from .boost import boost_wav
-from .completion import CompletionService
 from .config import Config
 from .logging import log, set_logging_enabled
-from .prompts import PromptManager
 from .streaming import LiveTranscriber
 from .system import SystemManager
 from .transcription import LIVE_TIMEOUT, TranscriptionService
@@ -35,8 +33,6 @@ class WhisperFlow:
         self.system_manager = SystemManager(self.config)
         self.audio_recorder = AudioRecorder(self.config, self.system_manager)
         self.transcription_service = TranscriptionService(self.config)
-        self.completion_service = CompletionService(self.config)
-        self.prompt_manager = PromptManager(self.config, self.system_manager)
 
     def _transcribe_allowing_for_a_whisper(self, audio_file: str) -> str | None:
         """Transcribe, and if nothing comes back, try again louder.
@@ -229,21 +225,10 @@ class WhisperFlow:
 
             log("Transcript completed")
 
-            # For transcribe and auto_transcribe modes, return transcript as-is
-            if self.mode in ["transcribe", "auto_transcribe"]:
-                final_result = transcript
-            # Use the new simplified prompt system
-            elif self.prompt_manager.should_use_completion():
-                log("Processing with AI...")
-                messages = self.prompt_manager.get_messages(transcript)
-
-                final_result = self.completion_service.complete_text(messages)
-
-                if not final_result:
-                    log("AI processing failed, using raw transcript")
-                    final_result = transcript
-            else:
-                final_result = transcript
+            # Every mode pastes the transcript as it was heard. The local
+            # whisper server is the only backend, and it transcribes; there
+            # is no cloud step to send the words to.
+            final_result = transcript
 
             log("Final result completed")
 
@@ -297,61 +282,43 @@ class WhisperFlow:
         return results
 
     def _validate_api_config(self) -> list[dict]:
-        """Check that some transcription backend is actually configured."""
-        tests = []
+        """Check that a transcription backend is actually configured."""
         local = (self.config.local_whisper_url or "").strip()
-        key = self.config.openai_api_key
 
         if local:
-            tests.append({
+            return [{
                 "name": "Transcription backend",
                 "status": "pass",
                 "message": f"Local whisper.cpp server at {local}",
-            })
-        elif key:
-            tests.append({
-                "name": "Transcription backend",
-                "status": "pass",
-                "message": f"OpenAI API ({self.config.transcription_model})",
-            })
-        else:
-            tests.append({
-                "name": "Transcription backend",
-                "status": "fail",
-                "message": ("Nothing configured. Set WHISPER_FLOW_LOCAL_WHISPER_URL "
-                            "to a whisper.cpp server, or WHISPER_FLOW_OPENAI_API_KEY."),
-            })
-        return tests
+            }]
+        return [{
+            "name": "Transcription backend",
+            "status": "fail",
+            "message": ("Nothing configured. Set WHISPER_FLOW_LOCAL_WHISPER_URL "
+                        "to a whisper.cpp server, or let the app manage one."),
+        }]
 
     def _validate_services(self) -> list[dict]:
         """Check the backend can actually be reached, not merely configured."""
-        tests = []
         local = (self.config.local_whisper_url or "").strip()
+        if not local:
+            return []
 
-        if local:
-            try:
-                import requests
-                # Any answer at all proves something is listening; the
-                # inference endpoint rejects a bare GET, which is still a
-                # reachable server.
-                requests.get(local, timeout=3)
-                reachable, detail = True, "responding"
-            except Exception as e:
-                reachable, detail = False, f"{type(e).__name__}: {e}"
-            tests.append({
-                "name": "Local whisper server",
-                "status": "pass" if reachable else "fail",
-                "message": (f"{local} {detail}" if reachable else
-                            f"Cannot reach {local} - is whisper-server running? ({detail})"),
-            })
-        elif self.config.openai_api_key:
-            tests.append({
-                "name": "OpenAI API",
-                "status": "pass",
-                "message": "Key present (not verified until first use)",
-            })
-
-        return tests
+        try:
+            import requests
+            # Any answer at all proves something is listening; the
+            # inference endpoint rejects a bare GET, which is still a
+            # reachable server.
+            requests.get(local, timeout=3)
+            reachable, detail = True, "responding"
+        except Exception as e:
+            reachable, detail = False, f"{type(e).__name__}: {e}"
+        return [{
+            "name": "Local whisper server",
+            "status": "pass" if reachable else "fail",
+            "message": (f"{local} {detail}" if reachable else
+                        f"Cannot reach {local} - is whisper-server running? ({detail})"),
+        }]
 
     def _validate_system_dependencies(self) -> list[dict]:
         """Check the tools needed to type text on this platform.

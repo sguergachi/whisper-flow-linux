@@ -25,9 +25,6 @@ def temp_config_dir():
 def mock_config():
     """Create a mock configuration object."""
     config = Mock()
-    config.openai_api_key = "test-api-key"
-    config.transcription_model = "gpt-4o-mini"
-    config.completion_model = "gpt-4o-mini"
     config.sample_rate = 16000
     config.frame_ms = 30
     config.vad_mode = 3
@@ -81,39 +78,6 @@ def mock_transcription_service():
     service = Mock()
     service.transcribe_audio.return_value = "This is a test transcript"
     return service
-
-
-@pytest.fixture
-def mock_completion_service():
-    """Create a mock completion service."""
-    service = Mock()
-    service.complete_text.return_value = "This is a test completion"
-    return service
-
-
-@pytest.fixture
-def mock_prompt_manager():
-    """Create a mock prompt manager."""
-    manager = Mock()
-    manager.get_system_message.return_value = "You are a helpful assistant."
-    manager.get_user_message.return_value = (
-        "Date: 2024-01-01\nTime: 12:00:00\nUser input: test transcript"
-    )
-    manager.get_messages.return_value = [
-        {"role": "system", "content": "You are a helpful assistant."},
-        {
-            "role": "user",
-            "content": "Date: 2024-01-01\nTime: 12:00:00\nUser input: test transcript",
-        },
-    ]
-    manager.should_use_completion.return_value = True
-    manager.get_prompt_info.return_value = {
-        "system": "single_template",
-        "system_message": "You are a helpful assistant.",
-        "variables": ["date", "time", "highlighted_text", "user_input"],
-        "description": "Single prompt template with context variables",
-    }
-    return manager
 
 
 @pytest.fixture

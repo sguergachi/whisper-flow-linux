@@ -12,9 +12,8 @@ It lives in the notification area — there is no main window.
 
 ## What you need
 
-* A transcription backend: either a local
-  [whisper.cpp](https://github.com/ggerganov/whisper.cpp) server, or an OpenAI
-  API key.
+* A [whisper.cpp](https://github.com/ggerganov/whisper.cpp) server. The
+  installer bundles one and manages it for you.
 * A microphone.
 
 ## Configuration
@@ -22,9 +21,8 @@ It lives in the notification area — there is no main window.
 `%LOCALAPPDATA%\whisper-flow\.env`:
 
 ```ini
-# A local server, or leave blank and set a key instead
+# Point at your own server, or leave blank for the managed one
 WHISPER_FLOW_LOCAL_WHISPER_URL=http://127.0.0.1:8082
-# WHISPER_FLOW_OPENAI_API_KEY=sk-...
 
 WHISPER_FLOW_HOTKEY_TRANSCRIBE=ctrl+alt
 WHISPER_FLOW_LIVE_TRANSCRIPTION=true

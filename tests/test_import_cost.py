@@ -2,10 +2,10 @@
 
 The HUD is launched on the path that starts a recording and is the thing the
 user waits to see. It needs tkinter (Windows) or GTK (Linux) and nothing
-else, but importing the package used to drag in the openai SDK, pyaudio,
-pystray and PIL first - about 740ms here, considerably more in a frozen
-build on Windows. These pin the package's import surface so it cannot
-quietly go back.
+else, but importing the package used to drag in pyaudio, pystray and PIL
+first - hundreds of milliseconds here, considerably more in a frozen build
+on Windows. These pin the package's import surface so it cannot quietly go
+back.
 """
 
 import subprocess
@@ -33,7 +33,7 @@ def _import_in_fresh_process(statement: str) -> set[str]:
     return set(out.stdout.split())
 
 
-EXPENSIVE = ("openai", "pyaudio", "pystray", "PIL")
+EXPENSIVE = ("pyaudio", "pystray", "PIL")
 
 
 def test_importing_the_package_does_not_drag_in_the_world():
@@ -74,24 +74,6 @@ def test_all_matches_what_is_actually_exported():
     import whisper_flow
 
     assert sorted(whisper_flow.__all__) == sorted(whisper_flow._EXPORTS)
-
-
-def test_the_daemon_does_not_import_the_openai_sdk():
-    """Dictation through a local server never uses it, and it cost ~540ms.
-
-    That half second is paid before the tray icon appears and before any
-    hotkey is registered, on every launch, by every user - including the
-    majority who never touch the hosted API.
-    """
-    loaded = _import_in_fresh_process("import whisper_flow.daemon")
-    assert "openai" not in loaded
-
-
-def test_the_openai_client_is_still_reachable_when_wanted():
-    """Lazy must not mean gone."""
-    from whisper_flow import completion
-
-    assert callable(completion._openai_client)
 
 
 def test_the_daemon_imports_without_a_display():

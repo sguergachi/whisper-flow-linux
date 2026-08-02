@@ -12,12 +12,12 @@ Hold a key, talk, and the words appear in whatever you were typing into.
 
 ## Features
 
-- 🎤 **Voice Transcription**: Real-time speech-to-text with OpenAI Whisper
-- 🤖 **AI Completion**: Context-aware text completion and commands
+- 🎤 **Voice Transcription**: Real-time speech-to-text, entirely on your
+  machine, through a local whisper.cpp server
 - 🔧 **System Tray**: Background daemon with tray icon and global hotkeys
 - ⌨️ **Global Hotkeys**: Push-to-talk and single-press voice activation
 - 📝 **Multiple Modes**: Transcribe, Auto-Transcribe, and Command modes
-- ⚙️ **Configurable**: Customizable prompts, models, and settings
+- ⚙️ **Configurable**: Customizable models and settings
 
 ## Windows 11
 
@@ -72,7 +72,8 @@ Nothing large is ever downloaded without being asked.
 
 - **Linux** (Ubuntu/Debian/Mint) with desktop environment
 - **Python 3.12** (required for system tray support)
-- **OpenAI API Key** (for transcription and completion)
+- **A [whisper.cpp](https://github.com/ggerganov/whisper.cpp) server** — the
+  app starts and manages one for you unless you point it at your own
 
 ### 1. Install System Dependencies
 
@@ -104,14 +105,13 @@ source .venv/bin/activate
 pip install -e .
 ```
 
-### 3. Configure API Key
+### 3. Point at a Whisper Server (optional)
+
+The app starts and manages a local whisper.cpp server on its own. To use one
+you already run instead:
 
 ```bash
-# Set your OpenAI API key
-export OPENAI_API_KEY="your-api-key-here"
-
-# Or add to your shell profile (~/.bashrc, ~/.zshrc, etc.)
-echo 'export OPENAI_API_KEY="your-api-key-here"' >> ~/.bashrc
+export WHISPER_FLOW_LOCAL_WHISPER_URL="http://127.0.0.1:8082"
 ```
 
 ### 4. Start the Daemon
@@ -217,8 +217,8 @@ whisper-flow/
 │   ├── daemon.py       # System tray daemon
 │   ├── cli.py          # Command-line interface
 │   ├── audio.py        # Audio recording
-│   ├── transcription.py # OpenAI Whisper integration
-│   ├── completion.py   # AI completion
+│   ├── transcription.py # whisper.cpp server client
+│   ├── backend.py      # Managed local whisper.cpp server
 │   └── config.py       # Configuration management
 ├── pyproject.toml      # Project configuration
 └── README.md          # This file
@@ -226,13 +226,9 @@ whisper-flow/
 
 ## Configuration
 
-Configuration files are stored in `~/.config/whisper-flow/`:
-
-- `config.yaml` - Main settings
-- `prompts.yaml` - Default prompts
-- `transcribe.yaml` - Transcription mode prompts
-- `auto_transcribe.yaml` - Auto-transcribe mode prompts
-- `command.yaml` - Command mode prompts
+Settings live in `~/.config/whisper-flow/.env`, and every one of them can be
+set from the environment instead. **Settings** in the tray menu opens a
+window onto all of them; `whisper-flow status` prints what is in effect.
 
 ## License
 

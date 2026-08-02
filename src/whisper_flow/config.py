@@ -82,12 +82,6 @@ class Config(BaseSettings):
         description="Configuration directory path",
     )
 
-    # API configuration
-    openai_api_key: str | None = Field(
-        default=None,
-        description="OpenAI API key",
-    )
-
     # Audio configuration
     #
     # The four legacy short names (VAD_MODE, MIC_DEVICE_INDEX, SILENCE_TIMEOUT,
@@ -137,25 +131,6 @@ class Config(BaseSettings):
         default=True,
         description="Drop silence either side of the speech before transcribing",
         env="WHISPER_FLOW_TRIM_SILENCE",
-    )
-
-    # AI model configuration
-    transcription_model: str = Field(
-        default="gpt-4o-mini-transcribe",
-        description="OpenAI model for transcription",
-        env="WHISPER_FLOW_TRANSCRIPTION_MODEL",
-    )
-    completion_model: str = Field(
-        default="gpt-4o-mini",
-        description="OpenAI model for completion",
-        env="WHISPER_FLOW_COMPLETION_MODEL",
-    )
-    temperature: float = Field(
-        default=0.4,
-        description="Temperature for completion",
-        ge=0.0,
-        le=2.0,
-        env="WHISPER_FLOW_TEMPERATURE",
     )
 
     # UI configuration
@@ -316,15 +291,6 @@ class Config(BaseSettings):
         env="WHISPER_FLOW_LOGGING_ENABLED",
     )
 
-    @field_validator("openai_api_key", mode="before")
-    @classmethod
-    def get_openai_api_key(cls, v):
-        """Get OpenAI API key from multiple possible environment variables."""
-        if v is not None:
-            return v
-        # Check standard OPENAI_API_KEY first, then our prefixed version
-        return os.getenv("OPENAI_API_KEY") or os.getenv("WHISPER_FLOW_OPENAI_API_KEY")
-
     @field_validator("config_dir", mode="before")
     @classmethod
     def expand_config_dir(cls, v):
@@ -337,6 +303,8 @@ class Config(BaseSettings):
         return path
 
     def ensure_config_files(self):
-        """Ensure configuration files exist with default content."""
-        # No longer need to create prompt configuration files
-        # The system now uses a single template approach
+        """Ensure configuration files exist with default content.
+
+        Creating the config directory is all there is to it: every setting
+        lives in the environment or the .env file, so nothing is written here.
+        """

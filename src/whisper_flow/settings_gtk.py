@@ -90,7 +90,6 @@ def _list_input_devices() -> list[tuple[int, str]]:
 # plain text row.
 _SPIN = {
     "local_server_port": (0, 1),
-    "temperature": (2, 0.05),
     "live_interval": (1, 0.1),
     "silence_timeout": (1, 0.5),
     "auto_stop_silence_duration": (1, 0.5),

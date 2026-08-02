@@ -88,7 +88,7 @@ def wav_duration(path: str) -> float:
 
 
 class TranscriptionService:
-    """Audio transcription service supporting OpenAI API and local whisper.cpp."""
+    """Audio transcription against a local whisper.cpp server."""
 
     def __init__(self, config: Config):
         """Initialize transcription service.
@@ -98,19 +98,10 @@ class TranscriptionService:
 
         """
         self.config = config
-        self.client = None
         self.local_url = None
 
         if config.local_whisper_url:
             self.local_url = config.local_whisper_url.rstrip("/")
-        elif config.openai_api_key:
-            try:
-                from openai import OpenAI  # ~540ms; only for the hosted API
-
-                self.client = OpenAI(api_key=config.openai_api_key)
-            except ImportError:
-                # Optional dependency: without it only the local server works.
-                log("[TRANSCRIBE] openai package not installed; cloud API unavailable")
 
     def transcribe_audio(self, audio_path: str, max_retries: int = 3,
                          timeout: float = FINAL_TIMEOUT) -> str | None:
@@ -130,10 +121,12 @@ class TranscriptionService:
 
         for attempt in range(max_retries):
             try:
-                if self.local_url:
-                    text = self._transcribe_local(audio_path, timeout)
-                else:
-                    text = self._transcribe_with_openai(audio_path)
+                if not self.local_url:
+                    raise RuntimeError(
+                        "No whisper server configured. Point WHISPER_FLOW_LOCAL_WHISPER_URL "
+                        "at one, or let the app manage one (it does by default).",
+                    )
+                text = self._transcribe_local(audio_path, timeout)
 
                 text = _normalize(text)
                 if text and text != "[BLANK_AUDIO]":
@@ -153,30 +146,6 @@ class TranscriptionService:
                 time.sleep(wait_time)
 
         return None
-
-    def _transcribe_with_openai(self, audio_path: str) -> str:
-        """Transcribe audio using OpenAI API.
-
-        Args:
-            audio_path: Path to the audio file
-
-        Returns:
-            Transcribed text
-
-        Raises:
-            RuntimeError: If API key is not configured or client is not initialized
-
-        """
-        if not self.client:
-            raise RuntimeError("OpenAI API key not configured")
-
-        with open(audio_path, "rb") as audio_file:
-            transcription = self.client.audio.transcriptions.create(
-                model=self.config.transcription_model,
-                file=audio_file,
-                response_format="text",
-            )
-            return transcription.strip()
 
     def _transcribe_local(self, audio_path: str,
                           timeout: float = FINAL_TIMEOUT) -> str:

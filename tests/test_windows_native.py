@@ -150,7 +150,7 @@ def test_importing_the_overlay_stays_cheap():
     """The overlay is what the user waits for; it must not pull in the app.
 
     A budget rather than a fixed number: a runner is slower and noisier than
-    a desktop, but importing the openai SDK and pyaudio would blow past this
+    a desktop, but importing pyaudio and the tray stack would blow past this
     by an order of magnitude.
     """
     code = (
@@ -169,7 +169,7 @@ def test_the_package_does_not_import_the_world():
     out = subprocess.run([sys.executable, "-c", code], capture_output=True,
                          text=True, check=True)
     loaded = set(out.stdout.strip().split(","))
-    assert not {"openai", "pyaudio", "pystray", "PIL"} & loaded
+    assert not {"pyaudio", "pystray", "PIL"} & loaded
 
 
 # ----------------------------------------------------------- struct layout

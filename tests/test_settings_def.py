@@ -27,7 +27,6 @@ _PROBE = {
     "pystray_backend": ("xorg", "xorg"),
     "local_server_port": ("18081", 18081),
     "notification_timeout": ("5000", 5000),
-    "temperature": ("1.25", 1.25),
     "live_interval": ("1.7", 1.7),
     "silence_timeout": ("2.5", 2.5),
     "auto_stop_silence_duration": ("3.5", 3.5),

@@ -43,7 +43,7 @@ exercised. 161 passed, 5 skipped, and 10 Windows-only tests collected.
 It **does** prove: the clipboard round-trips through Win32 (including a
 400-line report), `GetAsyncKeyState` polling works, `RtlGetVersion` returns
 a real build, the overlay process starts and stays up, and the package does
-not drag in the openai SDK.
+not drag in pyaudio, pystray or PIL.
 
 It **cannot** prove: anything needing a GPU, a microphone (the runner has no
 audio device, so recording itself is untested), or Windows 11 desktop

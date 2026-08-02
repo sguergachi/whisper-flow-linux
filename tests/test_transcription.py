@@ -17,9 +17,7 @@ from whisper_flow.transcription import (
 
 class FakeConfig:
     local_whisper_url = "http://127.0.0.1:8082"
-    openai_api_key = None
     fast_encoder = True
-    transcription_model = "unused"
 
 
 def _wav(path, seconds, rate=16000):

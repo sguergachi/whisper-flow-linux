@@ -81,9 +81,10 @@ jobs:
           # against the portaudio above.
           work=$(mktemp -d)
           pip download --no-deps --no-binary pyaudio "pyaudio>=0.2.14" -d "$work"
-          tar -C "$work" -xf "$work"/pyaudio-*.tar.gz
-          sed -i "s/'\\/MT'//g" "$work"/pyaudio-*/setup.py
-          pip install "$work"/pyaudio-*/
+          mkdir "$work/src"
+          tar -C "$work/src" --strip-components=1 -xf "$work"/[Pp]y[Aa]udio-*.tar.gz
+          sed -i "s/'\\/MT'//g" "$work/src/setup.py"
+          pip install "$work/src"
           pip install -e ".[dev]"
 
       - name: Test
@@ -191,9 +192,10 @@ jobs:
           # against the portaudio above.
           work=$(mktemp -d)
           pip download --no-deps --no-binary pyaudio "pyaudio>=0.2.14" -d "$work"
-          tar -C "$work" -xf "$work"/pyaudio-*.tar.gz
-          sed -i "s/'\\/MT'//g" "$work"/pyaudio-*/setup.py
-          pip install "$work"/pyaudio-*/
+          mkdir "$work/src"
+          tar -C "$work/src" --strip-components=1 -xf "$work"/[Pp]y[Aa]udio-*.tar.gz
+          sed -i "s/'\\/MT'//g" "$work/src/setup.py"
+          pip install "$work/src"
           pip install -e .
           pip install pyinstaller
 

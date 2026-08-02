@@ -17,7 +17,7 @@ from PIL import Image, ImageDraw, ImageFilter
 from . import __version__
 from . import updater
 from .app import WhisperFlow
-from .backend import LocalBackend, detect_accelerator, recommended_model
+from .backend import LocalBackend
 from .config import Config
 from .hotkey_manager import HotkeyManager, HotkeyMode
 from .hud import HUD
@@ -383,7 +383,6 @@ class WhisperFlowDaemon:
                 enabled=False,
             ),
             pystray.MenuItem("Settings", self.open_settings),
-            pystray.MenuItem("Speech model...", self.setup_speech_model),
             pystray.MenuItem("Test Configuration", self.test_configuration),
             pystray.MenuItem("Copy last error", self.copy_last_error),
             pystray.MenuItem("Copy log", self.copy_log),
@@ -831,25 +830,11 @@ class WhisperFlowDaemon:
                 manager._last_notified.pop(message, None)
         manager.notify(message)
 
-    def setup_speech_model(self, icon=None, item=None):
-        """Open the setup window, or download headlessly if there is none.
-
-        The tray callback has to return immediately or the icon stops
-        responding, so both paths hand off to another process or thread.
-        """
-        if self._open_setup_window():
-            return
-        self._download_model_headless()
-
-    def _open_setup_window(self) -> bool:
-        """Launch the one-button setup window as its own process."""
-        return self._open_tool_window("--setup", "whisper_flow.setup_gtk")
-
     def _open_tool_window(self, flag: str, module: str) -> bool:
-        """Launch one of the Tk tool windows (setup, settings) as a process.
+        """Launch the settings window as its own process.
 
-        They cannot share this process: pystray owns an event loop here and
-        Tk demands the main thread of wherever it runs. Returns False where
+        It cannot share this process: pystray owns an event loop here and
+        GTK demands the main thread of wherever it runs. Returns False where
         there is no window to show, so the caller can fall back.
         """
         if sys.platform != "win32" and not (
@@ -881,12 +866,12 @@ class WhisperFlowDaemon:
                 self._setup_process = None
                 return False
 
-        threading.Thread(target=self._after_setup_window, args=(process,),
-                         daemon=True, name="whisper-flow-setup-watch").start()
+        threading.Thread(target=self._after_tool_window, args=(process,),
+                         daemon=True, name="whisper-flow-window-watch").start()
         return True
 
-    def _after_setup_window(self, process=None) -> None:
-        """Adopt whatever the setup window installed, once it closes."""
+    def _after_tool_window(self, process=None) -> None:
+        """Adopt whatever the settings window installed, once it closes."""
         process = process or self._setup_process
         try:
             process.wait()
@@ -924,24 +909,6 @@ class WhisperFlowDaemon:
         self._use_backend_url(url)
         self.notify(f"Speech model ready ({model.replace('ggml-', '')})")
 
-    def _download_model_headless(self) -> None:
-        """Fall back for platforms with no setup window: just fetch it."""
-        def work():
-            accelerator = detect_accelerator()
-            model = recommended_model(accelerator)
-            if self.backend.install(model, force_download=True):
-                self.backend.stop()
-                url = self.backend.start(model)
-                if url:
-                    self.config.model_name = model
-                    self._backend_model = model
-                    self._use_backend_url(url)
-                    self.notify(f"Speech model ready ({accelerator})")
-            # install() and start() report their own failures.
-
-        threading.Thread(target=work, daemon=True,
-                         name="whisper-flow-model-setup").start()
-
     def _start_managed_backend(self) -> None:
         """Bring up the bundled server if one is configured and present.
 
@@ -955,11 +922,11 @@ class WhisperFlowDaemon:
             return          # pointed at something else already
         model = self.backend.working_model()
         if not model:
-            # Nothing can transcribe yet, so setup is the whole difference
-            # between a working app and a dead one. Open it straight away.
-            if not self._open_setup_window():
-                self.notify(
-                    "No speech model yet - use 'Set up speech model' in the tray")
+            # Nothing can transcribe yet, so this is the whole difference
+            # between a working app and a dead one. Open settings, where the
+            # model is chosen and downloaded, straight away.
+            if not self._open_settings_window():
+                self.notify("No speech model yet - open Settings in the tray")
             return
 
         url = self.backend.start(model)
@@ -969,10 +936,12 @@ class WhisperFlowDaemon:
         self._use_backend_url(url)
 
         # It already works, so the GPU model is an offer rather than a
-        # requirement. Ask once: downloading 1.6GB unprompted on a connection
-        # that might be metered is not a decision to make on someone's behalf.
+        # requirement. Mention it once: downloading 1.6GB unprompted on a
+        # connection that might be metered is not a decision to make on
+        # someone's behalf, and neither is taking over their screen with a
+        # window they did not ask for while the app is already working.
         if self.backend.setup_reason() == "gpu":
-            self._open_setup_window()
+            self.notify("A faster GPU speech model is available - see Settings")
 
     def copy_log(self, icon=None, item=None):
         """Put the recent log on the clipboard, whether or not anything failed.
@@ -1091,15 +1060,17 @@ class WhisperFlowDaemon:
     def open_settings(self, icon=None, item=None):
         """Open the settings window, as its own process.
 
-        Same process split as the setup window: pystray owns this process's
-        event loop and Tk insists on its own. The tray callback has to
-        return immediately or the icon stops responding, and spawning is all
-        this does.
+        It cannot run here: pystray owns this process's event loop and GTK
+        insists on its own. The tray callback has to return immediately or
+        the icon stops responding, and spawning is all this does.
         """
         log("[DAEMON] Settings menu item clicked")
-        # One GTK4 window on every platform.
-        if not self._open_tool_window("--settings", "whisper_flow.settings_gtk"):
+        if not self._open_settings_window():
             self.notify(f"Config directory: {self.config.config_dir}")
+
+    def _open_settings_window(self) -> bool:
+        """One GTK4 window on every platform."""
+        return self._open_tool_window("--settings", "whisper_flow.settings_gtk")
 
     def test_configuration(self, icon, item):
         """Run the checks, and put a pasteable report on the clipboard.

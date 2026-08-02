@@ -1,8 +1,8 @@
 # PyInstaller spec for the Windows build.
 #
 # One executable. It runs the tray daemon normally, the overlay when launched
-# with --hud (which hud.py does per recording), and the model setup window
-# with --setup. Shipping those as separate .exes only raised the question of
+# with --hud (which hud.py does per recording), and the settings window with
+# --settings. Shipping those as separate .exes only raised the question of
 # which one to run.
 #
 # The UI is GTK4 everywhere, so the GTK runtime has to ship too: typelibs,
@@ -160,7 +160,6 @@ hidden = collect_submodules("pydantic") + [
     "whisper_flow.system_win",
     "whisper_flow.blur_win",
     "whisper_flow.hud_app",
-    "whisper_flow.setup_gtk",
     "whisper_flow.settings_gtk",
     "pystray._win32",
     # Imported at the point of use rather than at module scope, to keep them

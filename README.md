@@ -132,8 +132,7 @@ You should see a microphone icon in your system tray. Right-click it to access t
 
 - **Right-click** the tray icon to access:
   - Settings — every option: speech model, hotkeys, dictation, notifications
-  - Speech model... — quick one-button model setup
-  - Test Configuration  
+  - Test Configuration
   - Exit
 
 ### Global Hotkeys

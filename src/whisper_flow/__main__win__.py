@@ -147,10 +147,6 @@ def main() -> int:
         from whisper_flow.hud_app import main as hud_main
         return hud_main()
 
-    if "--setup" in sys.argv:
-        from whisper_flow.setup_gtk import main as setup_main
-        return setup_main()
-
     if "--settings" in sys.argv:
         from whisper_flow.settings_gtk import main as settings_main
         return settings_main()

@@ -51,15 +51,20 @@ def test_widgets_load_the_running_config(window):
 def test_a_model_row_exists_per_known_model(window):
     from whisper_flow.backend import MODELS
 
-    labels = [
-        child.cget("text")
+    def labels(widget):
+        found = [widget.cget("text")] if isinstance(widget, tk.Label) else []
+        for child in widget.winfo_children():
+            found += labels(child)
+        return found
+
+    texts = [
+        text
         for row in window._models_frame.winfo_children()
-        for child in row.winfo_children()
-        if isinstance(child, tk.Label)
+        for text in labels(row)
     ]
     for name in MODELS:
-        assert any(label.startswith(name.replace("ggml-", ""))
-                   for label in labels), f"no row for {name}"
+        assert any(text.startswith(name.replace("ggml-", ""))
+                   for text in texts), f"no row for {name}"
 
 
 def test_saving_a_change_writes_the_env_file(window, tmp_path):

@@ -140,8 +140,8 @@ class TabBar(tk.Frame):
         super().__init__(parent, bg=bg)
         self._bg = bg
         self._font = font
-        bar = tk.Frame(self, bg=bg)
-        bar.pack(fill="x", padx=20, pady=(14, 0))
+        self._bar = tk.Frame(self, bg=bg)
+        self._bar.pack(fill="x", padx=20, pady=(14, 0))
         tk.Frame(self, bg=BORDER, height=1).pack(fill="x")
         self._container = tk.Frame(self, bg=bg)
         self._container.pack(fill="both", expand=True)

@@ -24,6 +24,13 @@ GTK_PREFIX = os.environ.get("GTK_PREFIX", r"C:\msys64\ucrt64")
 
 EXCLUDES = ["evdev", "pynput"]
 
+# The namespaces the UI names for itself. Everything they in turn depend on
+# comes along with the rest of the prefix; these are asserted because their
+# absence means the prefix is not a GTK 4 one at all. Kept in step with
+# --selftest, and with the test that reads this list.
+REQUIRED_NAMESPACES = ("Gtk-4.0", "Gdk-4.0", "Adw-1",
+                       "GLib-2.0", "GObject-2.0", "Gio-2.0")
+
 
 def gtk_runtime():
     """The pieces of the GTK4 runtime the frozen app cannot run without.
@@ -49,20 +56,24 @@ def gtk_runtime():
         for path in found:
             datas.append((path, dest))
 
-    # Typelibs: every namespace the UI touches, plus their dependencies as
-    # named by `g-ir-inspect` on a stock UCRT64 install.
+    # Every typelib in the prefix, rather than a hand-picked list.
     #
-    # Gdk-4.0 is a separate typelib from Gtk-4.0 and every one of the three
-    # GTK modules imports it; leaving it out shipped a build that resolved
-    # Gtk and then died on `from gi.repository import Gdk`. GModule-2.0 is
-    # named by Gio's typelib. Anything added here must also be added to the
-    # --selftest namespaces, which is what actually proves it at build time.
-    for ns in ("Adw-1", "Gtk-4.0", "Gdk-4.0", "Gsk-4.0", "Graphene-1.0",
-               "GdkPixbuf-2.0", "Pango-1.0", "PangoCairo-1.0", "cairo-1.0",
-               "HarfBuzz-0.0", "Gio-2.0", "GLib-2.0", "GObject-2.0",
-               "GModule-2.0"):
-        add(rf"lib\girepository-1.0\{ns}.typelib", "girepository-1.0",
-            required=True)
+    # The list was wrong twice. Gdk-4.0 was missing and shipped a build that
+    # resolved Gtk and then died on `from gi.repository import Gdk`; the next
+    # build died on freetype2-2.0, which nothing imports - HarfBuzz's typelib
+    # names it. A typelib's dependencies are not visible from the source that
+    # imports it, so this closure cannot be maintained by reading our own
+    # code, and each wrong guess costs a full Windows build to discover.
+    #
+    # They are inert data, a few MB against a 354MB bundle, and one that is
+    # never imported is never loaded. Ship them all; assert the ones the UI
+    # actually names, so a prefix without GTK 4 still fails here and loudly.
+    add(r"lib\girepository-1.0\*.typelib", "girepository-1.0", required=True)
+    have = {os.path.basename(path) for path, _ in datas}
+    absent = [ns for ns in REQUIRED_NAMESPACES if f"{ns}.typelib" not in have]
+    if absent:
+        raise SystemExit(
+            f"{GTK_PREFIX} has no typelib for: {', '.join(absent)}")
     add(r"share\glib-2.0\schemas\*.xml", "share/glib-2.0/schemas", required=True)
     # The symbolic icons the UI names, and the cursor/edit affordances.
     add(r"share\icons\Adwaita\symbolic\**\*.svg", "share/icons/Adwaita/symbolic",

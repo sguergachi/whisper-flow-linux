@@ -33,7 +33,7 @@ from gi.repository import Adw, Gdk, GLib, Gtk  # noqa: E402
 from . import envfile, restart, settings_def, wayland_blur  # noqa: E402
 from .backend import LocalBackend  # noqa: E402
 from .config import Config  # noqa: E402
-from .logging import log  # noqa: E402
+from .logging import log, set_logging_enabled  # noqa: E402
 
 WIDTH, HEIGHT = 760, 820
 CORNER_RADIUS = 12      # Adwaita's window corner radius
@@ -52,11 +52,57 @@ CSS = b"""
 .daemon-bad { color: #f87171; }
 """
 
-# Only loaded once compositor blur is confirmed: the window goes translucent
-# and the headerbar stops drawing its own background over the frost.
+# Only loaded once compositor blur is confirmed, so none of this can reach a
+# window that has no frost behind it to show.
+#
+# Frosting the window alone was not enough to see: libadwaita paints the
+# page, the viewport and every preferences card from its own named colours,
+# and those are opaque. They cover all but a few pixels of margin, so the
+# blur was real and invisible at the same time. Overriding the names frosts
+# what the eye actually sees, rather than chasing widget selectors that
+# change between libadwaita releases.
 CSS_BLUR = b"""
-window.blurred { background-color: rgba(23, 24, 30, 0.80); }
-window.blurred headerbar { background: transparent; box-shadow: none; }
+@define-color window_bg_color rgba(22, 23, 29, 0.66);
+@define-color view_bg_color rgba(22, 23, 29, 0.0);
+@define-color headerbar_bg_color rgba(22, 23, 29, 0.0);
+@define-color card_bg_color rgba(255, 255, 255, 0.055);
+@define-color popover_bg_color rgba(30, 31, 38, 0.94);
+@define-color dialog_bg_color rgba(24, 25, 31, 0.94);
+
+window.blurred,
+window.blurred > .background { background-color: rgba(22, 23, 29, 0.66); }
+
+/* Each layer between the window and the cards draws its own background.
+   Any one of them left opaque hides the frost under everything above it. */
+window.blurred headerbar,
+window.blurred .toolbar-view,
+window.blurred scrolledwindow,
+window.blurred viewport,
+window.blurred preferencespage,
+window.blurred preferencesgroup,
+window.blurred clamp { background-color: transparent; background-image: none; }
+window.blurred headerbar { box-shadow: none; border-color: transparent; }
+
+/* Glass, not a slab: a hairline of light and a barely-there fill, so the
+   card reads as sitting in the blur rather than on top of it. */
+window.blurred .boxed-list,
+window.blurred list.boxed-list,
+window.blurred listview.boxed-list {
+    background-color: rgba(255, 255, 255, 0.055);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    box-shadow: none;
+}
+window.blurred row,
+window.blurred row.activatable { background-color: transparent; }
+window.blurred row.activatable:hover {
+    background-color: rgba(255, 255, 255, 0.05);
+}
+
+/* The switcher is chrome, not content: let it float on the frost. */
+window.blurred viewswitcher button:not(:checked) { background-color: transparent; }
+window.blurred viewswitcher button:checked {
+    background-color: rgba(255, 255, 255, 0.10);
+}
 """
 
 
@@ -559,6 +605,16 @@ class SettingsWindow(Adw.ApplicationWindow):
 
 
 def main() -> int:
+    # This window runs as its own process and never turned logging on, so
+    # every log() in it went to the ring buffer and nowhere else - including
+    # the line saying whether backdrop blur was applied, and the one saying
+    # why it was not. Diagnosing "the blur is missing" meant re-running it by
+    # hand with the flag forced; the daemon's own setting answers it now.
+    try:
+        set_logging_enabled(Config().logging_enabled)
+    except Exception:
+        pass                    # a bad config must not cost us the window
+
     app = Adw.Application(application_id="dev.whisperflow.settings")
     app.connect(
         "activate", lambda app: SettingsWindow(application=app).present())

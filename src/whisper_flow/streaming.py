@@ -25,6 +25,11 @@ from .logging import log
 # latency and removes most mid-sentence punctuation artifacts.
 HOLD_BACK_WORDS = 1
 
+# The fastest a live pass will be repeated. Below this the gain in latency
+# is smaller than the extra load, and on a local server it would mean
+# transcribing the same audio continuously.
+MIN_PASS_INTERVAL = 0.35
+
 
 def _common_prefix(a: list[str], b: list[str]) -> int:
     """Number of leading words the two hypotheses agree on."""
@@ -102,9 +107,20 @@ class LiveTranscriber:
             if text is not None:
                 self._commit(text)
 
-            # Never queue up behind ourselves: if a pass took longer than the
-            # interval, the next snapshot simply replaces the stale one.
-            remaining = self._interval - (time.monotonic() - started)
+            # Pace to the machine rather than to a fixed number. A word is
+            # only typed once two passes agree on it, so latency is about
+            # twice the cadence - and waiting a flat 0.9s when a pass takes
+            # 0.25s spends most of that interval doing nothing.
+            #
+            # The cadence is the pass's own duration, floored so a very fast
+            # backend does not transcribe continuously, and capped by the
+            # configured interval so it can still be slowed deliberately.
+            # A machine where a pass takes longer than the cap simply runs
+            # back to back, exactly as before: this cannot overload anything
+            # that was previously keeping up.
+            elapsed = time.monotonic() - started
+            cadence = min(self._interval, max(MIN_PASS_INTERVAL, elapsed))
+            remaining = cadence - elapsed
             if remaining > 0:
                 time.sleep(remaining)
 

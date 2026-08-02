@@ -5,6 +5,8 @@ never type a word two passes have not agreed on, and never type anything
 after the final transcript has been emitted.
 """
 
+import pytest
+
 import sys
 import threading
 import time
@@ -162,3 +164,37 @@ def test_a_live_pass_uses_one_attempt_and_a_short_timeout():
     kwargs = app.transcription_service.transcribe_audio.call_args.kwargs
     assert kwargs["max_retries"] == 1
     assert kwargs["timeout"] == LIVE_TIMEOUT
+
+
+# -------------------------------------------------------------- pass pacing
+def test_pacing_follows_the_machine_rather_than_a_fixed_wait():
+    """Latency is about twice the cadence, so a flat wait costs latency on a
+    fast backend and cannot help a slow one."""
+    from whisper_flow.streaming import MIN_PASS_INTERVAL
+
+    def cadence(pass_seconds, configured=0.9):
+        return min(configured, max(MIN_PASS_INTERVAL, pass_seconds))
+
+    # A fast backend is repeated at the floor, not the configured interval.
+    assert cadence(0.10) == MIN_PASS_INTERVAL
+    assert cadence(0.25) == MIN_PASS_INTERVAL
+    # A mid-range one paces to itself.
+    assert cadence(0.60) == pytest.approx(0.60)
+    # A slow one is capped, so the sleep is zero and passes run back to back
+    # exactly as they did before - this cannot overload a struggling machine.
+    assert cadence(2.00) == pytest.approx(0.90)
+
+
+def test_the_floor_is_not_so_low_that_it_transcribes_continuously():
+    from whisper_flow.streaming import MIN_PASS_INTERVAL
+
+    assert 0.2 <= MIN_PASS_INTERVAL <= 0.5
+
+
+def test_a_slow_pass_is_never_made_to_wait_further():
+    """The sleep must be zero once a pass has already exceeded the cadence."""
+    from whisper_flow.streaming import MIN_PASS_INTERVAL
+
+    configured, elapsed = 0.9, 1.5
+    cadence = min(configured, max(MIN_PASS_INTERVAL, elapsed))
+    assert cadence - elapsed <= 0

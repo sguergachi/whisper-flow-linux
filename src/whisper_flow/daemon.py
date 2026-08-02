@@ -147,6 +147,7 @@ class WhisperFlowDaemon:
         # Managed speech engine, so a fresh install has something to talk to
         self.backend = LocalBackend(self.config, notify=self.notify)
         self._backend_model = None
+        self._pressed_at = None
         self._setup_process = None
         self._setup_lock = threading.Lock()
         self._last_failure = None
@@ -403,6 +404,9 @@ class WhisperFlowDaemon:
 
     def _handle_hotkey_press(self, mode: str):
         """Handle hotkey press with queuing support."""
+        # Stamped first, before any work, so the figure below is the whole
+        # delay the user feels and not a measurement of part of it.
+        self._pressed_at = time.monotonic()
         log(f"[DAEMON] Hotkey press received for mode: {mode}")
 
         if self.is_processing or self.is_recording:
@@ -563,7 +567,17 @@ class WhisperFlowDaemon:
         return True
 
     def _show_hud_now(self) -> None:
-        """Put the overlay up. Called when the microphone starts capturing."""
+        """Put the overlay up. Called when the microphone starts capturing.
+
+        Also reports the only latency figure that matters to the user: from
+        pressing the hotkey to being able to speak and be heard. Everything
+        else - the overlay, the icons, the imports - is a component of this
+        one number.
+        """
+        pressed = getattr(self, "_pressed_at", None)
+        if pressed is not None:
+            log(f"[DAEMON] ready to speak "
+                f"{(time.monotonic() - pressed) * 1000:.0f}ms after the hotkey")
         try:
             self.hud.show(level_file=getattr(self, "_level_file", None),
                           point=getattr(self, "_hud_point", None))

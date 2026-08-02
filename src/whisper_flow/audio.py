@@ -5,6 +5,7 @@ import contextlib
 import os
 import sys
 import tempfile
+import threading
 import time
 import warnings
 import wave
@@ -48,6 +49,11 @@ from .system import SystemManager
 # invents text when handed a fraction of a second of audio.
 MIN_RECORDING_SECONDS = 0.35
 
+# How long the capture stream is held open after a recording. Long enough
+# that a run of dictations pays to open the microphone once, short enough
+# that the in-use indicator does not simply stay lit.
+MIC_KEEP_WARM_SECONDS = 90.0
+
 
 class AudioRecorder:
     """Audio recording with Voice Activity Detection."""
@@ -73,6 +79,10 @@ class AudioRecorder:
         # problem cost the user their tray icon and hotkeys as well as their
         # microphone. _check_pyaudio reports it per recording instead.
         self.pa = None
+        self._warm_stream = None
+        self._warm_chunk = None
+        self._warm_timer = None
+        self._stream_lock = threading.Lock()
         if pyaudio is None:
             log("[AUDIO] pyaudio is not installed; recording is unavailable")
             return
@@ -81,6 +91,105 @@ class AudioRecorder:
                 self.pa = pyaudio.PyAudio()
         except Exception as e:
             log(f"[AUDIO] could not initialise the audio system: {e}")
+
+    def _input_device_index(self):
+        """Which input device to open, preferring WASAPI on Windows.
+
+        PortAudio enumerates MME first on Windows, and an open() that names
+        no device takes the default host API - so this was recording through
+        an interface from 1991, which is slow to open and adds latency of its
+        own. WASAPI is the modern path and the lowest one a user-mode
+        application can reach; below it is the audio engine and kernel
+        streaming, which need a driver.
+
+        A device set explicitly in config always wins.
+        """
+        if self.config.mic_device_index is not None:
+            return self.config.mic_device_index
+        if sys.platform != "win32" or self.pa is None:
+            return None
+        try:
+            for index in range(self.pa.get_host_api_count()):
+                api = self.pa.get_host_api_info_by_index(index)
+                if "wasapi" not in str(api.get("name", "")).lower():
+                    continue
+                device = api.get("defaultInputDevice", -1)
+                if device is not None and device >= 0:
+                    log(f"[AUDIO] using WASAPI input device {device}")
+                    return device
+        except Exception as e:
+            log(f"[AUDIO] could not pick a WASAPI device: {e}")
+        return None
+
+    def _open_input_stream(self, chunk: int):
+        """Open a capture stream, reusing a warm one when there is one.
+
+        Opening is the whole delay between pressing the hotkey and the
+        microphone being live. Keeping the stream around means a second
+        dictation starts immediately; it is released after
+        MIC_KEEP_WARM_SECONDS so the microphone-in-use indicator does not
+        stay lit, and so nothing else is kept out of the device.
+        """
+        with self._stream_lock:
+            warm = self._warm_stream
+            if warm is not None and self._warm_chunk == chunk:
+                self._warm_stream = None
+                try:
+                    if not warm.is_active():
+                        warm.start_stream()
+                    log("[AUDIO] reused a warm capture stream")
+                    return warm
+                except Exception as e:
+                    log(f"[AUDIO] warm stream unusable: {e}")
+                    self._close_stream(warm)
+
+        with suppress_alsa_warnings():
+            return self.pa.open(
+                format=pyaudio.paInt16,
+                channels=1,
+                rate=self.config.sample_rate,
+                input_device_index=self._input_device_index(),
+                input=True,
+                frames_per_buffer=chunk,
+            )
+
+    def _keep_stream_warm(self, stream, chunk: int) -> None:
+        """Hold a finished stream open briefly, then let the microphone go."""
+        if stream is None:
+            return
+        try:
+            stream.stop_stream()
+        except Exception:
+            self._close_stream(stream)
+            return
+
+        with self._stream_lock:
+            previous, self._warm_stream = self._warm_stream, stream
+            self._warm_chunk = chunk
+            if self._warm_timer is not None:
+                self._warm_timer.cancel()
+            self._warm_timer = threading.Timer(
+                MIC_KEEP_WARM_SECONDS, self._release_warm_stream)
+            self._warm_timer.daemon = True
+            self._warm_timer.start()
+        self._close_stream(previous)
+
+    def _release_warm_stream(self) -> None:
+        with self._stream_lock:
+            stream, self._warm_stream = self._warm_stream, None
+            self._warm_timer = None
+        if stream is not None:
+            log("[AUDIO] releasing the microphone after idle")
+            self._close_stream(stream)
+
+    @staticmethod
+    def _close_stream(stream) -> None:
+        if stream is None:
+            return
+        try:
+            stream.close()
+        except Exception:
+            pass
 
     def _read_audio_with_timeout(self, stream, chunk, timeout=0.1):
         """Read audio data (no timeout, PyAudio does not support timeout argument)."""
@@ -270,15 +379,7 @@ class AudioRecorder:
 
         try:
             opened_at = time.monotonic()
-            with suppress_alsa_warnings():
-                stream = self.pa.open(
-                    format=pyaudio.paInt16,
-                    channels=1,
-                    rate=self.config.sample_rate,
-                    input_device_index=self.config.mic_device_index,
-                    input=True,
-                    frames_per_buffer=chunk,
-                )
+            stream = self._open_input_stream(chunk)
 
             log(f"[AUDIO] capture stream open in "
                 f"{(time.monotonic() - opened_at) * 1000:.0f}ms")
@@ -319,7 +420,9 @@ class AudioRecorder:
                             log(f"[AUDIO] on_tick error: {e}")
 
             finally:
-                self._stop_stream_safely(stream)
+                # Keep it open briefly rather than closing: reopening is the
+                # whole delay between the hotkey and the microphone being live.
+                self._keep_stream_warm(stream, chunk)
 
             # Discard taps too short to contain speech - whisper hallucinates
             # text from a fraction of a second of audio.

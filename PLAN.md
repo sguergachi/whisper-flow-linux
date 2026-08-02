@@ -5,10 +5,23 @@ verified — not when written.
 
 ## Now
 
-- [ ] Verify on Windows: overlay now appears when the microphone is actually
-      capturing, so speaking the moment it appears is captured. The gap it
-      closes is `pa.open()`, ~55ms on Linux and reportedly much longer on
-      Windows WASAPI — the log now prints the real figure.
+- [ ] Verify on Windows: the overlay now appears when the microphone is
+      actually capturing, and the mic path should be much faster — PortAudio
+      was defaulting to MME, and the stream is now kept warm between
+      recordings. The log prints the real open time, so the figure stops
+      being a guess.
+
+## Why there is no "bare metal" below WASAPI
+
+WASAPI *is* the lowest layer a user-mode application can reach on Windows.
+Under it are the audio engine and kernel streaming (WDM-KS), which require a
+kernel-mode driver — not something an app can call. PortAudio does expose a
+WDM-KS host API, but it goes through the same stack and mainly bypasses the
+system mixer, which costs exclusive access to the device for a few ms.
+
+The latency was never WASAPI. It was that PortAudio enumerates MME first, so
+an `open()` naming no device took a 1991 interface, and that the stream was
+reopened for every single recording.
 
 - [ ] Verify the Velopack installer on a real Windows machine: that it
       installs, starts at login, and that "Check for updates" finds and

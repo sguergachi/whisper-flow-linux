@@ -356,6 +356,11 @@ class WhisperFlowDaemon:
             self.hotkey_manager.start()
             log("[DAEMON] Hotkeys setup complete")
 
+            # Have the overlay up and waiting before the first press, rather
+            # than starting it on the first recording - which would leave the
+            # first dictation of every session as slow as it always was.
+            self.hud.prewarm()
+
         except Exception as e:
             log(f"[DAEMON] Error setting up hotkeys: {e}")
             self.notify(f"Error setting up hotkeys: {e}")

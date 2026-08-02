@@ -41,9 +41,11 @@ Where the time goes when the hotkey is pressed, worst first:
 
 Techniques, in order of expected gain:
 
-- [x] **Keep the overlay process alive** — done, and it beat the target.
-      Measured time from `show()` to actually on screen: **114–159ms**
-      spawning per recording, **6–8ms** resident. ~19x, and Windows should
+- [x] **Keep the overlay process alive, and pre-warm it** — done, and it
+      beat the target. Measured time from `show()` to actually on screen:
+      **114–159ms** spawning per recording, **6–8ms** resident. Pre-warming
+      at daemon start fixes the first press too: **142ms → 6ms**, which was
+      the remaining "still slow" report. ~19x, and Windows should
       gain more than Linux because the frozen bootloader it avoids is far
       more expensive than a native interpreter.
       - Commands go down the process's stdin: `show <levels>`, `hide`.

@@ -178,12 +178,38 @@ class HUD:
         return [sys.executable,
                 os.path.join(os.path.dirname(os.path.abspath(__file__)), module)]
 
+    def prewarm(self) -> None:
+        """Start the resident overlay now, so the first press is fast too.
+
+        Without this it starts on the first recording, which means the first
+        press of a session still pays process startup - the very cost the
+        resident overlay exists to avoid. The daemon runs from login, so
+        doing it here means the overlay has been ready for a long time by
+        the time anyone dictates.
+
+        On a thread: starting a process is quick, but the overlay taking
+        longer to appear must not hold up the tray icon.
+        """
+        if not RESIDENT:
+            return
+
+        def work():
+            try:
+                with self._lock:
+                    if self._resident_process():
+                        log("[HUD] overlay ready")
+            except Exception as e:
+                log(f"[HUD] could not pre-start the overlay: {e}")
+
+        threading.Thread(target=work, daemon=True,
+                         name="whisper-flow-hud-prewarm").start()
+
     def _command(self, line: str) -> bool:
         """Send one order to a resident overlay. False if there is not one.
 
-        Starts it on first use rather than at daemon start, so a machine that
-        never dictates never pays for it, and a crash costs one slow press
-        rather than a permanently missing overlay.
+        Starts one if there is none - after a crash, or before prewarm has
+        finished - so a missing overlay costs one slow press rather than
+        being permanently absent.
         """
         for attempt in (1, 2):
             process = self._resident_process()

@@ -170,6 +170,36 @@ class BlurHandle:
         self.active = on
 
 
+def rounded_rect_rows(width: int, height: int, radius: float,
+                      inset: int = 0) -> list[tuple[int, int, int, int]]:
+    """Rows tracing a rounded rectangle, for an ordinary window's blur region.
+
+    Same idea as pill_rects but with a fixed corner radius rather than fully
+    rounded ends: outside the corner zone each row spans the full width,
+    inside it the edge follows a quarter circle.
+    """
+    import math
+
+    width -= 2 * inset
+    height -= 2 * inset
+    if width <= 0 or height <= 0:
+        return []
+    radius = min(radius, width / 2.0, height / 2.0)
+    rows = []
+    for y in range(height):
+        dy = min(y + 0.5, height - y - 0.5)   # distance to the nearest edge
+        if dy >= radius:
+            rows.append((inset, y + inset, width, 1))
+            continue
+        d = radius - dy
+        dx = radius - math.sqrt(max(0.0, radius * radius - d * d))
+        x0 = int(math.ceil(dx))
+        w = width - 2 * x0
+        if w > 0:
+            rows.append((x0 + inset, y + inset, w, 1))
+    return rows
+
+
 def pill_rects(width: int, height: int, exponent: float,
                inset: int = 0, cap: float = 1.12) -> list[tuple[int, int, int, int]]:
     """Rows tracing the capsule the HUD draws, as wl_region only takes rects.
@@ -206,6 +236,29 @@ def pill_rects(width: int, height: int, exponent: float,
 def enable_blur(wl_display: int, wl_surface: int,
                 width: int, height: int, exponent: float,
                 inset: int = 0, active: bool = True) -> BlurHandle | None:
+    """Ask the compositor to blur behind a pill-shaped surface."""
+    return _enable_blur_impl(
+        wl_display, wl_surface, pill_rects(width, height, exponent, inset),
+        active)
+
+
+def enable_window_blur(wl_display: int, wl_surface: int,
+                       width: int, height: int, radius: float,
+                       inset: int = 0, active: bool = True) -> BlurHandle | None:
+    """Ask the compositor to blur behind a rounded-rectangle window.
+
+    Same contract as enable_blur, with a region matching the window's
+    rounded corners instead of the HUD's pill. The window must not be
+    resized afterwards - the region is in fixed surface-local coordinates.
+    """
+    return _enable_blur_impl(
+        wl_display, wl_surface,
+        rounded_rect_rows(width, height, radius, inset), active)
+
+
+def _enable_blur_impl(wl_display: int, wl_surface: int,
+                      rows: list[tuple[int, int, int, int]],
+                      active: bool) -> BlurHandle | None:
     """Ask the compositor to blur behind wl_surface.
 
     A region must be supplied and it must be non-empty: the protocol starts
@@ -216,15 +269,13 @@ def enable_blur(wl_display: int, wl_surface: int,
     Args:
         wl_display: Pointer to the struct wl_display GTK is already using
         wl_surface: Pointer to this window's struct wl_surface
-        width: Surface width in surface-local units
-        height: Surface height in surface-local units
-        exponent: Superellipse exponent, matching the drawn pill
+        rows: Rectangles (x, y, w, h) tracing the shape to blur
 
     Returns:
         A handle to retain, or None if the compositor lacks the protocol.
 
     """
-    if not wl_display or not wl_surface:
+    if not wl_display or not wl_surface or not rows:
         return None
 
     wl = _wl()
@@ -334,7 +385,7 @@ def enable_blur(wl_display: int, wl_surface: int,
     if empty_region:
         wl.wl_proxy_set_queue(ctypes.c_void_p(empty_region), ctypes.c_void_p(queue))
 
-    for x, y, w, h in pill_rects(width, height, exponent, inset):
+    for x, y, w, h in rows:
         wl.wl_proxy_marshal_flags(
             ctypes.c_void_p(region), WL_REGION_ADD,
             None, ctypes.c_uint32(cver), ctypes.c_uint32(0),

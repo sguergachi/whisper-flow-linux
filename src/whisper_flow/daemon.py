@@ -1083,8 +1083,18 @@ class WhisperFlowDaemon:
         this does.
         """
         log("[DAEMON] Settings menu item clicked")
-        if not self._open_tool_window("--settings", "whisper_flow.settings_ui"):
-            self.notify(f"Config directory: {self.config.config_dir}")
+        # GTK4+libadwaita on Linux, tkinter on Windows - the same split as
+        # the HUD. A Linux machine without GTK4 falls back to tkinter too:
+        # the window process exits at once and the next module is tried.
+        if sys.platform == "win32":
+            modules = [("--settings", "whisper_flow.settings_ui")]
+        else:
+            modules = [("--settings-gtk", "whisper_flow.settings_gtk"),
+                       ("--settings", "whisper_flow.settings_ui")]
+        for flag, module in modules:
+            if self._open_tool_window(flag, module):
+                return
+        self.notify(f"Config directory: {self.config.config_dir}")
 
     def test_configuration(self, icon, item):
         """Run the checks, and put a pasteable report on the clipboard.

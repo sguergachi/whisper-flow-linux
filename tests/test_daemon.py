@@ -797,3 +797,89 @@ class TestWhisperFlowDaemon:
             assert health["is_running"] is True
             assert health["listener_alive"] is True
             assert health["active_bindings"] == 3
+
+
+def _stub_daemon(temp_config_dir):
+    """A daemon with the configuration, apps and hotkeys mocked out."""
+    mock_config = Mock()
+    mock_config.hotkey_transcribe = "ctrl+cmd"
+    mock_config.hotkey_auto_transcribe = "ctrl+cmd+space"
+    mock_config.hotkey_command = "ctrl+cmd+alt"
+    mock_config.max_recording_duration = 300.0
+    mock_config.watchdog_interval = 2.0
+    mock_config.processing_lock_timeout = 5.0
+    mock_config.queue_request_timeout = 30.0
+    mock_config.logging_enabled = False
+    mock_config.notifications_enabled = True
+    with (
+        patch("whisper_flow.daemon.Config", return_value=mock_config),
+        patch("whisper_flow.daemon.WhisperFlow"),
+        patch("whisper_flow.daemon.HotkeyManager"),
+    ):
+        return WhisperFlowDaemon(temp_config_dir)
+
+
+class TestDaemonStability:
+    """Guards on the failure paths that used to wedge the daemon."""
+
+    def test_start_recording_rolls_back_state_when_startup_fails(self, temp_config_dir):
+        """A failed start must not leave the daemon 'recording' forever.
+
+        is_recording outlived the failure before: no thread existed to clear
+        it, the watchdog ignores a recording with no thread, and every later
+        press was dropped as "busy" for the rest of the daemon's life.
+        """
+        daemon = _stub_daemon(temp_config_dir)
+        with patch(
+            "whisper_flow.daemon.tempfile.mkstemp",
+            side_effect=OSError("disk full"),
+        ):
+            with pytest.raises(OSError):
+                daemon.start_recording("transcribe")
+
+        assert daemon.is_recording is False
+        assert daemon.current_mode is None
+        assert daemon.recording_thread is None
+
+    def test_process_mode_releases_everything_when_start_fails(self, temp_config_dir):
+        """The processing lock must be free for the next press afterwards."""
+        daemon = _stub_daemon(temp_config_dir)
+        with patch.object(
+            daemon, "start_recording", side_effect=RuntimeError("boom"),
+        ):
+            daemon._process_mode("transcribe")
+
+        assert daemon.is_processing is False
+        assert daemon.processing_lock.acquire(blocking=False)
+        daemon.processing_lock.release()
+
+    def test_stale_queued_request_does_not_block_the_one_behind_it(self, temp_config_dir):
+        """Dropping an expired request must not strand a fresh one queued later."""
+        daemon = _stub_daemon(temp_config_dir)
+        stale = time.time() - (daemon.config.queue_request_timeout + 5)
+        daemon.request_queue.put(("auto_transcribe", stale))
+        daemon.request_queue.put(("auto_transcribe", time.time()))
+
+        seen = []
+        with patch.object(daemon, "_process_mode", side_effect=seen.append):
+            daemon._process_next_in_queue()
+
+        assert seen == ["auto_transcribe"]
+        assert daemon.request_queue.empty()
+
+    def test_notify_falls_back_when_the_tray_cannot_toast(self, temp_config_dir):
+        """A tray backend without notifications must not swallow the message.
+
+        The attempt consumes the rate-limit stamp, so the fallback would be
+        suppressed as a repeat unless the stamp is handed back first.
+        """
+        daemon = _stub_daemon(temp_config_dir)
+        manager = daemon.transcribe_app.system_manager
+        manager.should_notify.return_value = True
+        daemon.tray_icon = Mock()
+        daemon.tray_icon.notify.side_effect = AttributeError("no toasts here")
+
+        daemon.notify("hello")
+
+        manager._last_notified.pop.assert_called_once_with("hello", None)
+        manager.notify.assert_called_once_with("hello")

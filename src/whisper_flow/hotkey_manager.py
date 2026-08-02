@@ -205,6 +205,7 @@ class HotkeyManager:
         from .hotkey_win import WinHotkeyListener
 
         self._evdev_listener = WinHotkeyListener()
+        self._evdev_listener.escape_callback = self._handle_escape_key
         for name, binding in self.active_bindings.items():
             key_str = "+".join(sorted(binding.keys))
             release_cb = (binding.callback_release
@@ -220,6 +221,7 @@ class HotkeyManager:
         from .hotkey_evdev import EvdevHotkeyListener
 
         self._evdev_listener = EvdevHotkeyListener()
+        self._evdev_listener.escape_callback = self._handle_escape_key
 
         for name, binding in self.active_bindings.items():
             # Build key string from the parsed set (which is normalized)
@@ -360,18 +362,21 @@ class HotkeyManager:
 
             log(f"[HOTKEY] Key PRESS: {key_name}")
 
+            # Escape first, before the processing gate: it is the cancel key,
+            # so it has to work precisely while a recording is running - which
+            # is exactly when the gate below drops everything else. Behind the
+            # gate it was unreachable, and a recording could never be cancelled.
+            if key_name in ["esc", "escape"]:
+                log("[HOTKEY] Escape key detected")
+                self._handle_escape_key()
+                return
+
             # Check if system is processing - ignore keys if so
             if self.processing_callback:
                 is_processing = self.processing_callback()
                 if is_processing:
                     log(f"[HOTKEY] Ignoring key {key_name} - system is processing")
                     return
-
-            # Handle special keys (escape, etc.)
-            if key_name in ["esc", "escape"]:
-                log("[HOTKEY] Escape key detected")
-                self._handle_escape_key()
-                return
 
             # Check if this key is part of any registered hotkey combination
             is_hotkey_key = False
@@ -632,30 +637,7 @@ class HotkeyManager:
                     self.current_push_to_talk = None
 
                 # Stuck key detection: remove keys held longer than the timeout
-                stuck_keys = []
-                for key_name, press_time in list(self.key_press_times.items()):
-                    held_duration = current_time - press_time
-                    if held_duration > self.stuck_key_timeout:
-                        stuck_keys.append((key_name, held_duration))
-
-                if stuck_keys:
-                    log(
-                        f"[HOTKEY] Stuck key detection: keys held too long: {[(k, f'{d:.1f}s') for k, d in stuck_keys]}",
-                    )
-                    for key_name, _ in stuck_keys:
-                        self.pressed_keys.discard(key_name)
-                        self.key_press_times.pop(key_name, None)
-                        self.last_key_times.pop(key_name, None)
-                    log(
-                        f"[HOTKEY] Stuck keys removed. pressed_keys now: {self.pressed_keys}",
-                    )
-                    # If pressed_keys is now empty, clear the active state
-                    if not self.pressed_keys:
-                        log(
-                            "[HOTKEY] Stuck key recovery: all keys cleared, resetting active state",
-                        )
-                        self.active_combination = None
-                        self.current_push_to_talk = None
+                self._evict_stuck_keys(current_time)
 
                 # Check for inconsistent state: active_combination set but not all combo keys are pressed
                 if self.active_combination and self.pressed_keys:
@@ -682,6 +664,44 @@ class HotkeyManager:
             except Exception as e:
                 log(f"[HOTKEY] Heartbeat error: {e}")
                 time.sleep(self.heartbeat_interval)
+
+    def _evict_stuck_keys(self, current_time: float) -> None:
+        """Drop keys that have looked held for longer than the stuck timeout.
+
+        Not while a push-to-talk combination is active. Holding the hotkey
+        for a whole sentence is the normal case, and it crosses the timeout
+        at fifteen seconds; evicting those keys then lost the release that
+        ends the recording, so letting go did nothing and the microphone ran
+        on to the maximum-duration watchdog. A genuinely stuck release while
+        recording is still bounded by that same watchdog.
+        """
+        if self.current_push_to_talk:
+            return
+
+        stuck_keys = []
+        for key_name, press_time in list(self.key_press_times.items()):
+            held_duration = current_time - press_time
+            if held_duration > self.stuck_key_timeout:
+                stuck_keys.append((key_name, held_duration))
+
+        if stuck_keys:
+            log(
+                f"[HOTKEY] Stuck key detection: keys held too long: {[(k, f'{d:.1f}s') for k, d in stuck_keys]}",
+            )
+            for key_name, _ in stuck_keys:
+                self.pressed_keys.discard(key_name)
+                self.key_press_times.pop(key_name, None)
+                self.last_key_times.pop(key_name, None)
+            log(
+                f"[HOTKEY] Stuck keys removed. pressed_keys now: {self.pressed_keys}",
+            )
+            # If pressed_keys is now empty, clear the active state
+            if not self.pressed_keys:
+                log(
+                    "[HOTKEY] Stuck key recovery: all keys cleared, resetting active state",
+                )
+                self.active_combination = None
+                self.current_push_to_talk = None
 
     def _restart_listener(self):
         """Restart the keyboard listener if it died, using the same backend."""

@@ -8,6 +8,7 @@ import tempfile
 import time
 
 from .config import Config
+from .logging import log
 
 IS_WINDOWS = sys.platform == "win32"
 if IS_WINDOWS:  # pragma: no cover - platform dependent
@@ -99,14 +100,12 @@ class SystemManager:
         if not self._ydotool_available():
             return False
         try:
-            import subprocess as _sp
-
             # Release all modifiers to clear any stuck state
             clear_codes = [f"{c}:0" for c in self.MODIFIER_CODES]
-            _sp.run(["ydotool", "key", *clear_codes], check=False)
+            subprocess.run(["ydotool", "key", *clear_codes], check=False)
 
             # Ctrl+V with explicit down/up sequence
-            result = _sp.run(
+            result = subprocess.run(
                 ["ydotool", "key", "29:1", "47:1", "47:0", "29:0"],
                 capture_output=True,
             )
@@ -114,7 +113,7 @@ class SystemManager:
                 return False
 
             # Release Ctrl again (safety net)
-            _sp.run(["ydotool", "key", "29:0", "97:0"], check=False)
+            subprocess.run(["ydotool", "key", "29:0", "97:0"], check=False)
             return True
         except Exception:
             return False
@@ -133,32 +132,19 @@ class SystemManager:
             return False
 
     def _wtype_type(self, text: str) -> bool:
-        import sys as _sys
-        _sys.stdout.write(f"[PASTE] _wtype_type called with text={text!r}\n")
-        _sys.stdout.flush()
+        """Type text directly using wtype (Wayland-native keyboard simulator)."""
         if not shutil.which("wtype"):
-            _sys.stdout.write("[PASTE] wtype not found\n")
-            _sys.stdout.flush()
             return False
         try:
             result = subprocess.run(
                 ["wtype", text],
                 capture_output=True,
             )
-            _sys.stdout.write(f"[PASTE] wtype type rc={result.returncode}\n")
-            _sys.stdout.flush()
+            if result.returncode != 0:
+                log(f"[PASTE] wtype type failed: {result.stderr.decode(errors='replace')}")
             return result.returncode == 0
         except Exception as e:
-            _sys.stdout.write(f"[PASTE] _wtype_type exception: {e}\n")
-            _sys.stdout.flush()
-            return False
-        try:
-            result = subprocess.run(
-                ["wtype", text],
-                capture_output=True,
-            )
-            return result.returncode == 0
-        except Exception:
+            log(f"[PASTE] wtype type error: {e}")
             return False
 
     def save_active_window(self) -> None:
@@ -178,9 +164,7 @@ class SystemManager:
                 capture_output=True, text=True, timeout=5,
             )
             if result.returncode != 0:
-                import sys as _sys
-                _sys.stdout.write(f"[PASTE] kdotool getactivewindow stderr: {result.stderr}\n")
-                _sys.stdout.flush()
+                log(f"[PASTE] kdotool getactivewindow failed: {result.stderr}")
                 return None
             uuid = result.stdout.strip()
             return uuid if uuid else None
@@ -228,9 +212,7 @@ class SystemManager:
                 capture_output=True, text=True, timeout=5,
             )
             if result.returncode != 0:
-                import sys as _sys
-                _sys.stdout.write(f"[PASTE] kdotool activate stderr: {result.stderr}\n")
-                _sys.stdout.flush()
+                log(f"[PASTE] kdotool activate failed: {result.stderr}")
                 return False
             return True
         except Exception:
@@ -247,9 +229,7 @@ class SystemManager:
 
         """
         try:
-            import sys as _sys
-            _sys.stdout.write(f"[PASTE] Text to paste ({len(text)} chars): {text[:80]}...\n")
-            _sys.stdout.flush()
+            log(f"[PASTE] Text to paste ({len(text)} chars): {text[:80]}...")
 
             if IS_WINDOWS:
                 sanitized = text.replace("\n", " ")
@@ -259,51 +239,24 @@ class SystemManager:
                         and system_win.send_paste())
 
             if self._is_wayland():
-                import sys as _sys
-                _sys.stdout.write("[PASTE] Wayland path entered\n")
-                _sys.stdout.flush()
                 target_window = self._saved_window or self._get_active_window()
 
                 if target_window and self._kdotool_available():
-                    _sys.stdout.write(f"[PASTE] Activating window: {target_window}\n")
-                    _sys.stdout.flush()
                     self._activate_window(target_window)
 
                 sanitized = text.replace('\n', ' ')
-                _sys.stdout.write(f"[PASTE] Sanitized text: {sanitized!r}\n")
-                _sys.stdout.flush()
 
-                _sys.stdout.write("[PASTE] Trying _ydotool_type\n")
-                _sys.stdout.flush()
                 if self._ydotool_type(sanitized):
-                    _sys.stdout.write("[PASTE] _ydotool_type succeeded\n")
-                    _sys.stdout.flush()
                     return True
 
-                _sys.stdout.write("[PASTE] _ydotool_type failed, trying _wtype_type\n")
-                _sys.stdout.flush()
                 if self._wtype_type(sanitized):
-                    _sys.stdout.write("[PASTE] _wtype_type succeeded\n")
-                    _sys.stdout.flush()
                     return True
 
-                _sys.stdout.write("[PASTE] Direct type failed, copying to clipboard\n")
-                _sys.stdout.flush()
+                log("[PASTE] direct typing failed, falling back to the clipboard")
                 if not self.copy_to_clipboard(sanitized):
-                    _sys.stdout.write("[PASTE] copy_to_clipboard failed\n")
-                    _sys.stdout.flush()
                     return False
 
-                _sys.stdout.write("[PASTE] Clipboard copy succeeded, sending paste keystroke\n")
-                _sys.stdout.flush()
-                if not self._send_paste_keystroke():
-                    _sys.stdout.write("[PASTE] _send_paste_keystroke failed\n")
-                    _sys.stdout.flush()
-                    return False
-
-                _sys.stdout.write("[PASTE] Paste keystroke succeeded\n")
-                _sys.stdout.flush()
-                return True
+                return self._send_paste_keystroke()
 
             if shutil.which("xdotool"):
                 subprocess.run(
@@ -314,8 +267,7 @@ class SystemManager:
 
             return False
         except Exception as e:
-            _sys.stdout.write(f"Error pasting text: {e}\n")
-            _sys.stdout.flush()
+            log(f"Error pasting text: {e}")
             return False
 
     def type_text(self, text: str) -> bool:
@@ -343,20 +295,9 @@ class SystemManager:
         return False
 
     def _send_paste_keystroke(self) -> bool:
-        import sys as _sys
-        _sys.stdout.write("[PASTE] _send_paste_keystroke called\n")
-        _sys.stdout.flush()
         if self._wtype_paste():
-            _sys.stdout.write("[PASTE] _wtype_paste succeeded\n")
-            _sys.stdout.flush()
             return True
-        if self._ydotool_paste():
-            _sys.stdout.write("[PASTE] _ydotool_paste succeeded\n")
-            _sys.stdout.flush()
-            return True
-        _sys.stdout.write("[PASTE] _send_paste_keystroke failed\n")
-        _sys.stdout.flush()
-        return False
+        return self._ydotool_paste()
 
     def copy_to_clipboard(self, text: str) -> bool:
         """Copy text to the system clipboard.
@@ -484,9 +425,6 @@ class SystemManager:
             pass
 
     def _ydotool_type(self, text: str) -> bool:
-        import sys as _sys
-        _sys.stdout.write(f"[PASTE] _ydotool_type called with text={text!r}\n")
-        _sys.stdout.flush()
         self._release_modifiers()
         with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
             f.write(text)
@@ -498,19 +436,15 @@ class SystemManager:
                 capture_output=True,
                 timeout=15,
             )
-            _sys.stdout.write(f"[PASTE] ydotool type rc={result.returncode}\n")
-            _sys.stdout.flush()
             if result.returncode != 0:
-                _sys.stdout.write(f"[PASTE] ydotool type stderr: {result.stderr.decode() if isinstance(result.stderr, bytes) else result.stderr}\n")
-                _sys.stdout.flush()
+                log(f"[PASTE] ydotool type failed: "
+                    f"{result.stderr.decode(errors='replace')}")
             return result.returncode == 0
         except subprocess.TimeoutExpired:
-            _sys.stdout.write("[PASTE] ydotool type timeout\n")
-            _sys.stdout.flush()
+            log("[PASTE] ydotool type timed out")
             return False
         except Exception as e:
-            _sys.stdout.write(f"[PASTE] ydotool type exception: {e}\n")
-            _sys.stdout.flush()
+            log(f"[PASTE] ydotool type error: {e}")
             return False
         finally:
             try:

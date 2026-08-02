@@ -14,7 +14,7 @@ block_cipher = None
 EXCLUDES = [
     "evdev", "gi", "gi.repository", "pynput", "cairo",
     "whisper_flow.hotkey_evdev", "whisper_flow.hud_app",
-    "whisper_flow.wayland_blur", "whisper_flow.hotkey_kde",
+    "whisper_flow.wayland_blur",
 ]
 
 hidden = collect_submodules("pydantic") + [

@@ -67,6 +67,10 @@ class EvdevHotkeyListener:
         self._active_hotkey = None
         self._press_triggered = set()  # hotkeys whose press callback was already fired
         self._muted = set()  # codes whose auto-repeat is suppressed while held
+        # Cancel is not a binding: bindings resolve most-specific-wins, so a
+        # lone Escape could never fire while a push-to-talk combination is
+        # held - which is the whole point of a cancel key. Set by the manager.
+        self.escape_callback = None
 
     def register_hotkey(self, name, key_string, callback_press, callback_release=None,
                         release_modifiers=False):
@@ -304,6 +308,8 @@ class EvdevHotkeyListener:
         if value == 1:
             self._key_state.add(code)
             self._forward(event)
+            if code == ecodes.KEY_ESC and self.escape_callback:
+                self._callbacks.put(("escape", "press", self.escape_callback))
             if DEBUG_KEYS and code in self._binding_codes:
                 from .logging import log as _log
                 _log(f"[HOTKEY-DEBUG] hotkey key down code={code} "

@@ -304,3 +304,20 @@ def test_debug_logging_is_off_unless_asked_for():
     from whisper_flow import hotkey_evdev
 
     assert hotkey_evdev.DEBUG_KEYS is False
+
+
+def test_escape_fires_even_during_a_held_combination(listener):
+    """Escape cancels a recording, so it cannot be subject to
+    most-specific-wins: held push-to-talk keys would always outrank it."""
+    listener.escape_callback = lambda: None
+    listener.register_hotkey("transcribe", "cmd+alt", lambda: None)
+
+    listener._handle_key(FakeEvent(ecodes.KEY_LEFTMETA, 1))
+    listener._handle_key(FakeEvent(ecodes.KEY_LEFTALT, 1))
+    listener._handle_key(FakeEvent(ecodes.KEY_ESC, 1))
+
+    first = listener._callbacks.get_nowait()
+    second = listener._callbacks.get_nowait()
+    assert [first[0], second[0]] == ["transcribe", "escape"]
+    # The real key event is still forwarded, like any other.
+    assert (ecodes.KEY_ESC, 1) in listener.forwarded

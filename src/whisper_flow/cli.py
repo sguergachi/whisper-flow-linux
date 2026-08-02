@@ -61,21 +61,24 @@ def set_device(
     flow_app = WhisperFlow(config_dir)
     try:
         import pyaudio
-
-        pa = pyaudio.PyAudio()
-        info = pa.get_host_api_info_by_index(0)
-        num_devices = info.get("deviceCount")
-        if device_index < 0 or device_index >= num_devices:
-            typer.echo("Invalid device index. Use 'whisper-flow list-devices' to see available devices.")
-            raise typer.Exit(1)
-        dev = pa.get_device_info_by_host_api_device_index(0, device_index)
-        if dev.get("maxInputChannels", 0) == 0:
-            typer.echo(f"Device [{device_index}] is not an input device.")
-            raise typer.Exit(1)
-        pa.terminate()
     except ImportError:
         typer.echo("PyAudio not available")
         raise typer.Exit(1)
+
+    pa = pyaudio.PyAudio()
+    try:
+        # Global PortAudio indices, matching what the recorder passes to
+        # pa.open() - numbering them per host API stored a value that named
+        # a different device, or none at all.
+        if device_index < 0 or device_index >= pa.get_device_count():
+            typer.echo("Invalid device index. Use 'whisper-flow list-devices' to see available devices.")
+            raise typer.Exit(1)
+        dev = pa.get_device_info_by_index(device_index)
+        if dev.get("maxInputChannels", 0) == 0:
+            typer.echo(f"Device [{device_index}] is not an input device.")
+            raise typer.Exit(1)
+    finally:
+        pa.terminate()
 
     # Save to env file for persistence
     env_file = flow_app.config.config_dir / ".env"
@@ -100,14 +103,16 @@ def list_devices(config_dir: ConfigDirOption = None):
     flow_app = WhisperFlow(config_dir)
     try:
         import pyaudio
+    except ImportError:
+        typer.echo("PyAudio not available")
+        return
 
-        pa = pyaudio.PyAudio()
-        info = pa.get_host_api_info_by_index(0)
-        num_devices = info.get("deviceCount")
+    pa = pyaudio.PyAudio()
+    try:
         typer.echo("Available audio input devices:")
         typer.echo("─" * 50)
-        for i in range(num_devices):
-            dev = pa.get_device_info_by_host_api_device_index(0, i)
+        for i in range(pa.get_device_count()):
+            dev = pa.get_device_info_by_index(i)
             if dev.get("maxInputChannels", 0) > 0:
                 name = dev.get("name", "Unknown")
                 channels = dev.get("maxInputChannels", 0)
@@ -115,9 +120,8 @@ def list_devices(config_dir: ConfigDirOption = None):
                 sel = "  ← current" if i == flow_app.config.mic_device_index else ""
                 typer.echo(f"  [{i}] {name}{sel}")
                 typer.echo(f"       Channels: {channels}, Sample Rate: {int(rate)} Hz")
+    finally:
         pa.terminate()
-    except ImportError:
-        typer.echo("PyAudio not available")
 
 
 @app.command("init-config")

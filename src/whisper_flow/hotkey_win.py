@@ -68,6 +68,10 @@ class WinHotkeyListener:
         self._dispatch_thread = None
         self._running = False
         self._poll_interval = poll_interval
+        # Cancel is not a binding: bindings resolve most-specific-wins, so a
+        # lone Escape could never fire while a push-to-talk combination is
+        # held - which is the whole point of a cancel key. Set by the manager.
+        self.escape_callback = None
         self._user32 = ctypes.WinDLL("user32", use_last_error=True)
         self._user32.GetAsyncKeyState.restype = ctypes.c_short
         self._user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
@@ -135,7 +139,9 @@ class WinHotkeyListener:
     def _poll_loop(self):
         watched = self._watched          # fixed once; bindings do not change
         get = self._user32.GetAsyncKeyState
+        esc = NAME_TO_VK["esc"]
         previous = set()
+        esc_was_down = False
         while self._running:
             try:
                 down = {VK_ALIASES.get(vk, vk)
@@ -143,6 +149,12 @@ class WinHotkeyListener:
                 if down != previous:
                     self._check_bindings(down, rising=len(down) > len(previous))
                     previous = down
+                # Escape is tracked beside the bindings, not among them: it
+                # must fire even while a push-to-talk combination is held.
+                esc_down = bool(get(esc) & HELD_MASK)
+                if esc_down and not esc_was_down and self.escape_callback:
+                    self._callbacks.put(("escape", "press", self.escape_callback))
+                esc_was_down = esc_down
             except Exception:
                 log.exception("error polling keyboard state")
             time.sleep(self._poll_interval)

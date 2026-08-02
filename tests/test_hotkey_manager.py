@@ -448,3 +448,57 @@ class TestHotkeyManager:
         assert len(manager.pressed_keys) == 0
         assert manager.active_combination is None
         assert manager.current_push_to_talk is None
+
+    def test_escape_fires_while_processing(self):
+        """Escape is the cancel key: it must work while a recording runs.
+
+        The processing gate drops every other key while the system is busy,
+        and escape used to sit behind it - so the one key whose whole job is
+        to interrupt a busy system could never fire.
+        """
+        manager = HotkeyManager()
+        manager.register_processing_callback(lambda: True)
+        fired = []
+        manager._handle_escape_key = lambda: fired.append(True)
+
+        class MockKey:
+            name = "esc"
+
+        manager._on_key_press(MockKey())
+
+        assert fired == [True]
+        # And it is not treated as part of any combination.
+        assert manager.pressed_keys == set()
+        assert manager.active_combination is None
+
+    def test_stuck_keys_not_evicted_during_push_to_talk(self):
+        """A held push-to-talk combination is held on purpose, not stuck.
+
+        Evicting it at the timeout lost the release that ends the recording:
+        letting go after a long sentence did nothing, and the microphone ran
+        on to the maximum-duration watchdog.
+        """
+        manager = HotkeyManager()
+        manager.current_push_to_talk = "transcribe"
+        manager.active_combination = "transcribe"
+        manager.pressed_keys = {"cmd", "alt"}
+        manager.key_press_times = {"cmd": 0.0, "alt": 0.0}
+
+        manager._evict_stuck_keys(manager.stuck_key_timeout + 100)
+
+        assert manager.pressed_keys == {"cmd", "alt"}
+        assert manager.current_push_to_talk == "transcribe"
+        assert manager.active_combination == "transcribe"
+
+    def test_stuck_keys_evicted_when_idle(self):
+        """With no push-to-talk active, a key held past the timeout is stuck."""
+        manager = HotkeyManager()
+        manager.pressed_keys = {"cmd"}
+        manager.key_press_times = {"cmd": 0.0}
+        manager.last_key_times = {"cmd": 0.0}
+        manager.active_combination = "transcribe"
+
+        manager._evict_stuck_keys(manager.stuck_key_timeout + 100)
+
+        assert manager.pressed_keys == set()
+        assert manager.active_combination is None

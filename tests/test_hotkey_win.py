@@ -101,6 +101,35 @@ def test_a_combination_only_arms_while_keys_are_going_down(listener):
     assert fired == []
 
 
+def test_escape_fires_even_during_a_held_combination(listener):
+    """Cancel must work while push-to-talk keys are held.
+
+    Bindings resolve most-specific-wins, so a lone Escape could never win
+    against a held combination; it is tracked beside the bindings instead.
+    """
+    import threading
+    import time
+
+    module = listener._module
+    listener.escape_callback = lambda: None
+    listener.register_hotkey("transcribe", "super+alt", lambda: None)
+    listener._held_set.update({module.NAME_TO_VK["super"],
+                               module.NAME_TO_VK["alt"],
+                               module.NAME_TO_VK["esc"]})
+
+    listener._running = True
+    thread = threading.Thread(target=listener._poll_loop, daemon=True)
+    thread.start()
+    time.sleep(0.1)
+    listener._running = False
+    thread.join(timeout=2)
+
+    names = []
+    while not listener._callbacks.empty():
+        names.append(listener._callbacks.get_nowait()[0])
+    assert "escape" in names
+
+
 
 def _fake_system_win(monkeypatch, spoil):
     """Replace whisper_flow.system_win for `from . import system_win`.

@@ -537,23 +537,27 @@ class WhisperFlowDaemon:
     def _process_next_in_queue(self):
         """Process next item in queue if any."""
         try:
-            if not self.request_queue.empty():
+            while True:
+                if self.request_queue.empty():
+                    log("[DAEMON] No queued requests to process")
+                    return
                 mode, timestamp = self.request_queue.get_nowait()
                 log(
                     f"[DAEMON] Processing queued request: {mode} (queued at {timestamp})",
                 )
 
-                # Check if request is too old (older than configured timeout)
+                # Check if request is too old (older than configured timeout).
+                # A stale one must not stop the drain: the request behind it
+                # may still be fresh, and returning here stranded it forever.
                 if time.time() - timestamp > self.config.queue_request_timeout:
                     log(
                         f"[DAEMON] Dropping old queued request for {mode} (age: {time.time() - timestamp:.1f}s)",
                     )
-                    return
+                    continue
 
                 log(f"[DAEMON] Processing queued mode: {mode}")
                 self._process_mode(mode)
-            else:
-                log("[DAEMON] No queued requests to process")
+                return
         except queue.Empty:
             log("[DAEMON] Queue is empty")
         except Exception as e:
@@ -582,46 +586,54 @@ class WhisperFlowDaemon:
         self.stop_recording_event = threading.Event()
         self.recording_start_time = time.time()
 
-        # Save the currently active window UUID for focus restoration at paste time
-        self._mark_ptl("dispatch")
-        app = self._get_app_for_mode(mode)
-        saved_window = None
         try:
-            app.system_manager.save_active_window()
-            saved_window = app.system_manager._saved_window
-            log(f"[DAEMON] Saved active window for mode: {mode} -> {saved_window}")
-        except Exception as e:
-            log(f"[DAEMON] Failed to save active window: {e}")
+            # Save the currently active window UUID for focus restoration at paste time
+            self._mark_ptl("dispatch")
+            app = self._get_app_for_mode(mode)
+            saved_window = None
+            try:
+                app.system_manager.save_active_window()
+                saved_window = app.system_manager._saved_window
+                log(f"[DAEMON] Saved active window for mode: {mode} -> {saved_window}")
+            except Exception as e:
+                log(f"[DAEMON] Failed to save active window: {e}")
 
-        self._mark_ptl("save window")
+            self._mark_ptl("save window")
 
-        # Create level file for HUD waveform
-        fd, self._level_file = tempfile.mkstemp(suffix=".levels", prefix="whisper-flow-")
-        os.close(fd)
+            # Create level file for HUD waveform
+            fd, self._level_file = tempfile.mkstemp(suffix=".levels", prefix="whisper-flow-")
+            os.close(fd)
 
-        # The overlay is shown from the recording thread, once the microphone
-        # is actually capturing - see _record_audio_thread. Showing it here
-        # meant it appeared while the capture stream was still opening, and
-        # anything said in that gap was never recorded. The user treats the
-        # overlay as "speak now", so it has to be true.
-        try:
-            self._hud_point = app.system_manager.active_window_center()
+            # The overlay is shown from the recording thread, once the microphone
+            # is actually capturing - see _record_audio_thread. Showing it here
+            # meant it appeared while the capture stream was still opening, and
+            # anything said in that gap was never recorded. The user treats the
+            # overlay as "speak now", so it has to be true.
+            try:
+                self._hud_point = app.system_manager.active_window_center()
+            except Exception:
+                self._hud_point = None
+            self._mark_ptl("window centre")
+
+            # Update tray icon to recording state
+            if self.tray_icon:
+                self.tray_icon.icon = self.create_recording_icon()
+
+            # Start recording thread
+            self.recording_thread = threading.Thread(
+                target=self._record_audio_thread,
+                args=(mode,),
+                daemon=True,
+                name=f"WhisperFlow-Recording-{mode}",
+            )
+            self.recording_thread.start()
         except Exception:
-            self._hud_point = None
-        self._mark_ptl("window centre")
-
-        # Update tray icon to recording state
-        if self.tray_icon:
-            self.tray_icon.icon = self.create_recording_icon()
-
-        # Start recording thread
-        self.recording_thread = threading.Thread(
-            target=self._record_audio_thread,
-            args=(mode,),
-            daemon=True,
-            name=f"WhisperFlow-Recording-{mode}",
-        )
-        self.recording_thread.start()
+            # Roll back rather than leave is_recording set with no thread to
+            # clear it: the watchdog ignores a recording with no thread, so
+            # every later press would be dropped as "busy" for the rest of
+            # the daemon's life.
+            self._stop_recording()
+            raise
         self._mark_ptl("thread start")
         log(f"[DAEMON] Recording thread started for mode: {mode}")
         return True
@@ -812,7 +824,11 @@ class WhisperFlowDaemon:
                     self.tray_icon.notify(message, "Whisper-Flow")
                 return
             except Exception:
-                pass  # not every tray backend implements it
+                # Not every tray backend implements notifications. Falling
+                # through as-is would lose the message entirely: the attempt
+                # above already consumed the rate-limit stamp, so the fallback
+                # would be suppressed as a repeat. Hand the stamp back first.
+                manager._last_notified.pop(message, None)
         manager.notify(message)
 
     def setup_speech_model(self, icon=None, item=None):
@@ -1106,8 +1122,6 @@ class WhisperFlowDaemon:
 
     def _diagnostic_report(self, results: dict, counts: dict) -> str:
         """A plain-text report of the checks, plus what it is running on."""
-        import platform
-
         lines = [
             f"whisper-flow diagnostics - {counts['pass']} passed, "
             f"{counts['fail']} failed, {counts['warn']} warnings",

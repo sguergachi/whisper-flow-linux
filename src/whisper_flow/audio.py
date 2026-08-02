@@ -1,6 +1,5 @@
 """Audio recording functionality for whisper-flow."""
 
-import collections
 import contextlib
 import os
 import sys
@@ -238,14 +237,21 @@ class AudioRecorder:
             self._warm_chunk = chunk
             if self._warm_timer is not None:
                 self._warm_timer.cancel()
+            # The timer carries the stream it was scheduled for. Cancelling a
+            # timer that has already begun firing does nothing, and without
+            # the identity check that stale firing would close the stream a
+            # newer recording just stored here, and clobber the new timer's
+            # bookkeeping with it.
             self._warm_timer = threading.Timer(
-                MIC_KEEP_WARM_SECONDS, self._release_warm_stream)
+                MIC_KEEP_WARM_SECONDS, self._release_warm_stream, args=(stream,))
             self._warm_timer.daemon = True
             self._warm_timer.start()
         self._close_stream(previous)
 
-    def _release_warm_stream(self) -> None:
+    def _release_warm_stream(self, expected=None) -> None:
         with self._stream_lock:
+            if expected is not None and self._warm_stream is not expected:
+                return  # a newer recording has already taken the warm slot
             stream, self._warm_stream = self._warm_stream, None
             self._warm_timer = None
         if stream is not None:
@@ -267,116 +273,6 @@ class AudioRecorder:
             return stream.read(chunk, exception_on_overflow=False)
         except Exception as e:
             log(f"Audio read error: {e}")
-            return None
-
-    def _stop_stream_safely(self, stream):
-        """Safely stop and close audio stream with timeout protection.
-
-        Args:
-            stream: PyAudio stream to stop
-
-        """
-        try:
-            # Set a timeout for stream operations
-            stream.stop_stream()
-            stream.close()
-        except Exception as e:
-            log(f"Error stopping audio stream: {e}")
-            # Force close if normal stop fails
-            try:
-                stream.close()
-            except Exception:
-                pass
-
-    def record_with_vad(self, stop_event=None, level_file: str | None = None) -> str | None:
-        """Record audio with Voice Activity Detection.
-
-        Args:
-            stop_event: Threading event to stop recording
-            level_file: Path to write audio levels for HUD visualization
-
-        Returns:
-            Path to the recorded audio file, or None if cancelled
-
-        """
-        if not self._check_pyaudio():
-            return None
-
-        # Create temporary file
-        fd, output_path = tempfile.mkstemp(suffix=".wav")
-        os.close(fd)
-
-        frame_len = int(self.config.sample_rate * self.config.frame_ms / 1000)
-        chunk = frame_len
-
-        try:
-            with suppress_alsa_warnings():
-                stream = self.pa.open(
-                    format=pyaudio.paInt16,
-                    channels=1,
-                    rate=self.config.sample_rate,
-                    input_device_index=self.config.mic_device_index,
-                    input=True,
-                    frames_per_buffer=chunk,
-                )
-
-            ring_buffer = collections.deque(maxlen=20)
-            recording = False
-            frames = []
-            last_voice_time = time.time()
-
-            # Stop flag; the daemon signals termination through stop_event.
-            stop_flag = {"stop": False}
-
-            try:
-                while not stop_flag["stop"]:
-                    # Check if stop event is set (for daemon control)
-                    if stop_event and stop_event.is_set():
-                        stop_flag["stop"] = True
-                        break
-
-                    # Read audio with timeout to prevent blocking
-                    buf = self._read_audio_with_timeout(stream, chunk)
-                    if buf is None:
-                        # Audio read failed, try to continue but log warning
-                        log("Warning: Audio read error, continuing...")
-                        continue
-
-                    self._write_level(level_file, buf)
-
-                    voiced = self.vad.is_speech(buf, self.config.sample_rate)
-                    ring_buffer.append(buf)
-
-                    if voiced:
-                        if not recording:
-                            # Start recording, include buffered audio
-                            frames.extend(ring_buffer)
-                            recording = True
-                        frames.append(buf)
-                        last_voice_time = time.time()
-                    elif recording and (
-                        time.time() - last_voice_time > self.config.silence_timeout
-                    ):
-                        # Stop recording after silence timeout
-                        stop_flag["stop"] = True
-                        break
-
-            finally:
-                self._stop_stream_safely(stream)
-
-            # Save the recorded audio
-            if frames:
-                self._save_wav_file(output_path, frames)
-                return output_path
-            os.unlink(output_path)
-            return None
-
-        except Exception as e:
-            log(f"Recording error: {e}")
-            try:
-                os.unlink(output_path)
-            except Exception:
-                pass
             return None
 
     @staticmethod
@@ -584,15 +480,7 @@ class AudioRecorder:
         chunk = frame_len
 
         try:
-            with suppress_alsa_warnings():
-                stream = self.pa.open(
-                    format=pyaudio.paInt16,
-                    channels=1,
-                    rate=self.config.sample_rate,
-                    input_device_index=self.config.mic_device_index,
-                    input=True,
-                    frames_per_buffer=chunk,
-                )
+            stream = self._open_input_stream(chunk)
 
             frames = []
             last_voice_time = time.time()
@@ -635,7 +523,9 @@ class AudioRecorder:
                         break
 
             finally:
-                self._stop_stream_safely(stream)
+                # Same lifecycle as push-to-talk: hold the stream warm briefly
+                # rather than paying to reopen the microphone next time.
+                self._keep_stream_warm(stream, chunk)
 
             # Save the recorded audio
             if frames and recording_started:

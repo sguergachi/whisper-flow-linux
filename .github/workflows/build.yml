@@ -88,6 +88,8 @@ jobs:
           tar -C "$work/src" --strip-components=1 -xf "$work"/[Pp]y[Aa]udio-*.tar.gz
           sed -i "s|[\"']/MT[\"']||g" "$work/src/setup.py"
           pip install "$work/src"
+          # velopack has no MSYS2 wheels and its tests are fully mocked.
+          sed -i "/velopack/d" pyproject.toml
           pip install -e ".[dev]"
 
       - name: Test
@@ -202,7 +204,19 @@ jobs:
           tar -C "$work/src" --strip-components=1 -xf "$work"/[Pp]y[Aa]udio-*.tar.gz
           sed -i "s|[\"']/MT[\"']||g" "$work/src/setup.py"
           pip install "$work/src"
+          sed -i "/velopack/d" pyproject.toml
           pip install -e .
+          # velopack ships a stable-ABI extension: the win_amd64 wheel loads
+          # on MSYS2's CPython too; only pip's tag check disagrees.
+          vpdir=$(mktemp -d)
+          pip download --only-binary :all: --platform win_amd64 \
+              --python-version 312 --no-deps velopack -d "$vpdir"
+          python - "$vpdir" <<'PY'
+import glob, site, sys, zipfile
+wheel = glob.glob(sys.argv[1] + "/*.whl")[0]
+zipfile.ZipFile(wheel).extractall(site.getsitepackages()[0])
+print("velopack force-installed from", wheel)
+PY
           pip install pyinstaller
 
       - name: Confirm the package imports without the Linux modules

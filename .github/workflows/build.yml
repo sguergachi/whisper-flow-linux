@@ -67,6 +67,8 @@ jobs:
             mingw-w64-ucrt-x86_64-adwaita-icon-theme
             mingw-w64-ucrt-x86_64-portaudio
             mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-python-numpy
+            mingw-w64-ucrt-x86_64-python-pillow
 
       - name: Install
         shell: msys2 {0}
@@ -182,6 +184,8 @@ jobs:
             mingw-w64-ucrt-x86_64-adwaita-icon-theme
             mingw-w64-ucrt-x86_64-portaudio
             mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-python-numpy
+            mingw-w64-ucrt-x86_64-python-pillow
 
       - name: Install
         shell: msys2 {0}
@@ -212,7 +216,6 @@ jobs:
           pip download --only-binary :all: --platform win_amd64 \
               --python-version 312 --no-deps velopack -d "$vpdir"
           python -c "import glob,site,sys,zipfile; w=glob.glob(sys.argv[1]+'/*.whl')[0]; zipfile.ZipFile(w).extractall(site.getsitepackages()[0]); print('velopack from', w)" "$vpdir"
-          pip install pyinstaller
 
       - name: Confirm the package imports without the Linux modules
         # The whole point of the platform split. If this fails, the frozen

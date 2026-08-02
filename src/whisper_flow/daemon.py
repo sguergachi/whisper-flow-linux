@@ -13,7 +13,6 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 
-import pystray
 from PIL import Image, ImageDraw, ImageFilter
 
 from . import __version__
@@ -32,6 +31,19 @@ ICON_SIZE = 64
 ICON_SUPERSAMPLE = 8  # draw large, downscale: PIL has no antialiased primitives
 ICON_IDLE = (245, 245, 247, 255)
 ICON_RECORDING = (255, 69, 74, 255)
+
+
+def _pystray():
+    """Import pystray at the point of use.
+
+    It resolves its backend during import, and the X11 backend raises if
+    there is no display - so merely importing this module required one, and
+    a bare `import whisper_flow.daemon` failed on any headless machine. It
+    also costs ~126ms that a run which never reaches the tray need not pay.
+    """
+    import pystray
+
+    return pystray
 
 
 def _render_mic_icon(color: tuple[int, int, int, int]) -> Image.Image:
@@ -107,6 +119,39 @@ def prerender_icons() -> None:
     """Draw both icons before they are needed, off the recording path."""
     for color in (ICON_IDLE, ICON_RECORDING):
         _cached_icon(color)
+
+
+class PressToListen:
+    """Timing of the path from hotkey press to the microphone capturing.
+
+    PTL - press-to-listen - is the one latency the user feels: everything
+    optimised so far, the overlay, the tray icons, the imports, the audio
+    device, is a component of it. Recording the stages rather than only the
+    total means the next thing worth optimising names itself instead of
+    being guessed at.
+
+    Cheap enough to leave on: a monotonic clock read per stage.
+    """
+
+    def __init__(self):
+        self.started = time.monotonic()
+        self._last = self.started
+        self._stages: list[tuple[str, float]] = []
+        self.reported = False
+
+    def mark(self, stage: str) -> None:
+        now = time.monotonic()
+        self._stages.append((stage, (now - self._last) * 1000))
+        self._last = now
+
+    def report(self) -> None:
+        """Log the total and where it went. Only ever once per press."""
+        if self.reported:
+            return
+        self.reported = True
+        total = (time.monotonic() - self.started) * 1000
+        breakdown = ", ".join(f"{name} {ms:.0f}" for name, ms in self._stages)
+        log(f"[PTL] {total:.0f}ms press-to-listen ({breakdown})")
 
 
 class WhisperFlowDaemon:
@@ -311,6 +356,7 @@ class WhisperFlowDaemon:
 
     def setup_tray_menu(self):
         """Setup the system tray menu."""
+        pystray = _pystray()
         return pystray.Menu(
             pystray.MenuItem("WhisperFlow Daemon", None, enabled=False),
             pystray.MenuItem(
@@ -406,7 +452,7 @@ class WhisperFlowDaemon:
         """Handle hotkey press with queuing support."""
         # Stamped first, before any work, so the figure below is the whole
         # delay the user feels and not a measurement of part of it.
-        self._pressed_at = time.monotonic()
+        self._ptl = PressToListen()
         log(f"[DAEMON] Hotkey press received for mode: {mode}")
 
         if self.is_processing or self.is_recording:
@@ -528,6 +574,7 @@ class WhisperFlowDaemon:
         self.recording_start_time = time.time()
 
         # Save the currently active window UUID for focus restoration at paste time
+        self._mark_ptl("dispatch")
         app = self._get_app_for_mode(mode)
         saved_window = None
         try:
@@ -536,6 +583,8 @@ class WhisperFlowDaemon:
             log(f"[DAEMON] Saved active window for mode: {mode} -> {saved_window}")
         except Exception as e:
             log(f"[DAEMON] Failed to save active window: {e}")
+
+        self._mark_ptl("save window")
 
         # Create level file for HUD waveform
         fd, self._level_file = tempfile.mkstemp(suffix=".levels", prefix="whisper-flow-")
@@ -550,6 +599,7 @@ class WhisperFlowDaemon:
             self._hud_point = app.system_manager.active_window_center()
         except Exception:
             self._hud_point = None
+        self._mark_ptl("window centre")
 
         # Update tray icon to recording state
         if self.tray_icon:
@@ -563,26 +613,34 @@ class WhisperFlowDaemon:
             name=f"WhisperFlow-Recording-{mode}",
         )
         self.recording_thread.start()
+        self._mark_ptl("thread start")
         log(f"[DAEMON] Recording thread started for mode: {mode}")
         return True
+
+    def _mark_ptl(self, stage: str) -> None:
+        """Record a stage of the press-to-listen path, if one is in flight."""
+        ptl = getattr(self, "_ptl", None)
+        if ptl is not None and not ptl.reported:
+            ptl.mark(stage)
 
     def _show_hud_now(self) -> None:
         """Put the overlay up. Called when the microphone starts capturing.
 
-        Also reports the only latency figure that matters to the user: from
-        pressing the hotkey to being able to speak and be heard. Everything
-        else - the overlay, the icons, the imports - is a component of this
-        one number.
+        This is the end of the PTL window: the microphone is live, so the
+        overlay can honestly say "speak now".
         """
-        pressed = getattr(self, "_pressed_at", None)
-        if pressed is not None:
-            log(f"[DAEMON] ready to speak "
-                f"{(time.monotonic() - pressed) * 1000:.0f}ms after the hotkey")
+        ptl = getattr(self, "_ptl", None)
+        if ptl is not None:
+            ptl.mark("mic open")
         try:
             self.hud.show(level_file=getattr(self, "_level_file", None),
                           point=getattr(self, "_hud_point", None))
         except Exception as e:
             log(f"[DAEMON] could not show the overlay: {e}")
+        finally:
+            if ptl is not None:
+                ptl.mark("overlay")
+                ptl.report()
 
     def _stop_recording_if_active(self, mode: str):
         """Stop recording if the specified mode is currently active."""
@@ -1272,7 +1330,7 @@ Use 'whisper-flow stop' to exit daemon
                 # Foreground mode: try tray, fallback to notification mode
                 log("[DAEMON] Running in foreground mode")
                 try:
-                    self.tray_icon = pystray.Icon(
+                    self.tray_icon = _pystray().Icon(
                         "whisper-flow",
                         self.create_tray_icon(),
                         "WhisperFlow Daemon",
@@ -1287,7 +1345,7 @@ Use 'whisper-flow stop' to exit daemon
                 # Background mode: try tray, fallback to headless
                 log("[DAEMON] Running in background mode")
                 try:
-                    self.tray_icon = pystray.Icon(
+                    self.tray_icon = _pystray().Icon(
                         "whisper-flow",
                         self.create_tray_icon(),
                         "WhisperFlow Daemon",

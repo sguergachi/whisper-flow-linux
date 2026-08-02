@@ -13,14 +13,23 @@ import sys
 
 
 def _import_in_fresh_process(statement: str) -> set[str]:
-    """Module names loaded after running `statement` in a new interpreter."""
+    """Module names loaded after running `statement` in a new interpreter.
+
+    Surfaces the child's stderr on failure. It used to use check=True, which
+    raised CalledProcessError and threw the traceback away - so a CI failure
+    said only "exit status 1" and the reason had to be guessed at.
+    """
     code = (
         "import sys\n"
         f"{statement}\n"
         "print('\\n'.join(sorted(sys.modules)))\n"
     )
     out = subprocess.run([sys.executable, "-c", code], capture_output=True,
-                         text=True, check=True)
+                         text=True, check=False)
+    assert out.returncode == 0, (
+        f"`{statement}` failed in a fresh interpreter "
+        f"(exit {out.returncode}):\n{out.stderr.strip()}"
+    )
     return set(out.stdout.split())
 
 
@@ -83,3 +92,25 @@ def test_the_openai_client_is_still_reachable_when_wanted():
     from whisper_flow import completion
 
     assert callable(completion._openai_client)
+
+
+def test_the_daemon_imports_without_a_display():
+    """pystray resolves its backend during import and raises with no display.
+
+    So `import whisper_flow.daemon` needed a screen, which broke it on any
+    headless machine and in CI - and cost ~126ms that a run never reaching
+    the tray does not need.
+    """
+    import os
+
+    code = "import whisper_flow.daemon; print('ok')"
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("DISPLAY", "WAYLAND_DISPLAY")}
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True,
+                         text=True, env=env, check=False)
+    assert out.returncode == 0, out.stderr.strip()
+
+
+def test_the_tray_library_is_not_loaded_just_by_importing():
+    loaded = _import_in_fresh_process("import whisper_flow.daemon")
+    assert "pystray" not in loaded

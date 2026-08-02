@@ -270,22 +270,22 @@ def test_a_helper_that_will_not_take_the_text_is_a_failure(monkeypatch):
     assert SystemManager._pipe_to_clipboard(["wl-copy"], "text") is False
 
 
-def test_the_press_to_ready_latency_is_reported(daemon):
-    """The one number the user feels: hotkey to being able to speak."""
-    import time as _time
+def test_the_press_to_listen_latency_is_reported(daemon):
+    """PTL: the one number the user feels, hotkey to being able to speak."""
+    from whisper_flow import logging as wf
+    from whisper_flow.daemon import PressToListen
 
     _clipboard(daemon)
-    daemon._pressed_at = _time.monotonic() - 0.25
+    daemon._ptl = PressToListen()
     daemon._show_hud_now()
 
-    from whisper_flow import logging as wf
-
-    assert "ready to speak" in wf.recent_log()
+    assert "[PTL]" in wf.recent_log()
+    assert "mic open" in wf.recent_log()
 
 
 def test_showing_the_overlay_survives_never_having_been_pressed(daemon):
     """Reload and other paths can show it without a press behind them."""
     _clipboard(daemon)
-    daemon._pressed_at = None
+    daemon._ptl = None
     daemon._show_hud_now()          # must not raise
     daemon.hud.show.assert_called()

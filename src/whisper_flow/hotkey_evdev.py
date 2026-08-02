@@ -36,9 +36,13 @@ BUS_VIRTUAL = 0x06  # uinput devices; see linux/input.h BUS_VIRTUAL
 # stats /dev/input and compares paths, and only rebuilds when the set differs.
 RESCAN_SECONDS = 3.0
 
-# Set WHISPER_FLOW_HOTKEY_DEBUG=1 to log every key this listener sees, with
-# the state it is matching against. Off by default because it records every
-# keystroke, which is not something to write to a journal unasked.
+# Set WHISPER_FLOW_HOTKEY_DEBUG=1 to log the keys a hotkey is built from, and
+# the state they are matched against, when one is pressed.
+#
+# Only keys that appear in a binding - the modifiers and space - are ever
+# named. Logging every key would make this a keylogger writing into the
+# journal, which is not a thing to leave running on someone's machine while
+# they are away from it.
 DEBUG_KEYS = os.environ.get("WHISPER_FLOW_HOTKEY_DEBUG") == "1"
 
 
@@ -77,6 +81,14 @@ class EvdevHotkeyListener:
         """
         keys = self._parse_key_string(key_string)
         self._bindings[name] = (keys, callback_press, callback_release, release_modifiers)
+
+    @property
+    def _binding_codes(self) -> set:
+        """Every key code that appears in some binding. Nothing else is named."""
+        codes = set()
+        for keys, *_ in self._bindings.values():
+            codes |= set(keys)
+        return codes
 
     def _parse_key_string(self, key_string):
         codes = set()
@@ -292,10 +304,11 @@ class EvdevHotkeyListener:
         if value == 1:
             self._key_state.add(code)
             self._forward(event)
-            if DEBUG_KEYS:
+            if DEBUG_KEYS and code in self._binding_codes:
                 from .logging import log as _log
-                _log(f"[HOTKEY-DEBUG] down code={code} state={sorted(self._key_state)} "
-                     f"bindings={{{', '.join(f'{n}:{sorted(k)}' for n, (k, *_) in self._bindings.items())}}}")
+                _log(f"[HOTKEY-DEBUG] hotkey key down code={code} "
+                     f"state={sorted(self._key_state)} "
+                     f"want={{{', '.join(f'{n}:{sorted(k)}' for n, (k, *_) in self._bindings.items())}}}")
             self._check_bindings(rising=True)
             return
 

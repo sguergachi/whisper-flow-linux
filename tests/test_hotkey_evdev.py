@@ -284,3 +284,23 @@ def test_full_teardown_does_drop_the_proxy(monkeypatch):
     listener._release_devices()
     proxy.close.assert_called_once()
     assert listener._uinput is None
+
+
+def test_debug_logging_only_ever_names_hotkey_keys(monkeypatch):
+    """It must not become a keylogger writing into the journal."""
+    from whisper_flow import hotkey_evdev
+
+    listener = hotkey_evdev.EvdevHotkeyListener()
+    listener._uinput = Mock()
+    listener.register_hotkey("transcribe", "super+alt", lambda: None)
+
+    codes = listener._binding_codes
+    assert codes == {ecodes.KEY_LEFTMETA, ecodes.KEY_LEFTALT}
+    for ordinary in (ecodes.KEY_A, ecodes.KEY_P, ecodes.KEY_1, ecodes.KEY_ENTER):
+        assert ordinary not in codes
+
+
+def test_debug_logging_is_off_unless_asked_for():
+    from whisper_flow import hotkey_evdev
+
+    assert hotkey_evdev.DEBUG_KEYS is False

@@ -38,9 +38,14 @@ class CompletionService:
 
         """
         self.config = config
-        self.client = (
-            _openai_client(config.openai_api_key) if config.openai_api_key else None
-        )
+        self.client = None
+        if config.openai_api_key:
+            try:
+                self.client = _openai_client(config.openai_api_key)
+            except ImportError:
+                # The SDK is optional everywhere but here; a key without the
+                # package means the same as no key until something asks.
+                log("[COMPLETION] openai package not installed; completion unavailable")
 
     def complete_text(
         self,

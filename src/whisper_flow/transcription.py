@@ -104,9 +104,13 @@ class TranscriptionService:
         if config.local_whisper_url:
             self.local_url = config.local_whisper_url.rstrip("/")
         elif config.openai_api_key:
-            from openai import OpenAI  # ~540ms; only for the hosted API
+            try:
+                from openai import OpenAI  # ~540ms; only for the hosted API
 
-            self.client = OpenAI(api_key=config.openai_api_key)
+                self.client = OpenAI(api_key=config.openai_api_key)
+            except ImportError:
+                # Optional dependency: without it only the local server works.
+                log("[TRANSCRIBE] openai package not installed; cloud API unavailable")
 
     def transcribe_audio(self, audio_path: str, max_retries: int = 3,
                          timeout: float = FINAL_TIMEOUT) -> str | None:

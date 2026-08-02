@@ -87,11 +87,14 @@ Measured and deliberately **not** changed:
 
 Where the time goes when the hotkey is pressed, worst first:
 
-0. ~~Drawing the tray icon~~ — fixed. `_render_mic_icon` supersamples to
-   512px and runs a 41-pixel MaxFilter: **~615ms**, and it ran on every
-   recording start *and* stop, ahead of opening the microphone. Roughly 1.2s
-   per dictation spent drawing a picture of a microphone. Both colours are
-   constants, so they are drawn once at startup now.
+0. ~~Drawing the tray icon~~ — fixed twice. It ran on every recording start
+   *and* stop, ahead of opening the microphone: ~1.2s per dictation spent
+   drawing a picture of a microphone. Both colours are constants, so they are
+   drawn once at startup now. Then the render itself: the halo was grown at
+   the supersampled size, a 41-pixel kernel over 512x512, which was **609ms
+   of the 615ms**. Growing it after downscaling costs 0.3ms and is visually
+   identical (mean difference 1.17/255). Both icons now render in **10ms**,
+   so the tray appears at login instead of 1.2s later.
 
 1. **Process startup.** Every recording spawns `whisper-flow.exe --hud`. In a
    PyInstaller onedir build that re-runs the bootloader, initialises a fresh

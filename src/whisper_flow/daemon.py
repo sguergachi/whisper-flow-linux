@@ -31,6 +31,8 @@ ICON_SIZE = 64
 ICON_SUPERSAMPLE = 8  # draw large, downscale: PIL has no antialiased primitives
 ICON_IDLE = (245, 245, 247, 255)
 ICON_RECORDING = (255, 69, 74, 255)
+# Width of the dark halo, in final icon pixels. Odd, as MaxFilter requires.
+HALO_PIXELS = 5
 
 
 def _pystray():
@@ -83,14 +85,20 @@ def _render_mic_icon(color: tuple[int, int, int, int]) -> Image.Image:
     draw.line([cx, cradle_cy + cradle_r, cx, 54 * u], fill=color, width=stroke)
     draw.line([cx - 9 * u, 54 * u, cx + 9 * u, 54 * u], fill=color, width=stroke)
 
+    # Downscale first, then grow the halo. Growing it at the supersampled
+    # size meant a 41-pixel kernel over 512x512 - 609ms of the 615ms this
+    # function took, for a halo that is five pixels wide once it has been
+    # reduced to 64. The same operation at the final size is 0.3ms, and the
+    # supersampling still does its job on the glyph itself, which is the
+    # only part that needed it.
+    image = image.resize((ICON_SIZE, ICON_SIZE), Image.LANCZOS)
+
     # A dark halo grown from the glyph's own alpha, so a light icon still reads
     # against a light panel without needing to know the tray's theme.
-    halo_alpha = image.getchannel("A").filter(ImageFilter.MaxFilter(int(5 * u) | 1))
-    halo = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+    halo_alpha = image.getchannel("A").filter(ImageFilter.MaxFilter(HALO_PIXELS))
+    halo = Image.new("RGBA", (ICON_SIZE, ICON_SIZE), (0, 0, 0, 0))
     halo.putalpha(halo_alpha.point(lambda v: v * 100 // 255))
-    image = Image.alpha_composite(halo, image)
-
-    return image.resize((ICON_SIZE, ICON_SIZE), Image.LANCZOS)
+    return Image.alpha_composite(halo, image)
 
 
 _icon_cache: dict[tuple, Image.Image] = {}

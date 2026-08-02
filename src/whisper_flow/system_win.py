@@ -43,12 +43,43 @@ class KEYBDINPUT(ctypes.Structure):
     ]
 
 
+class MOUSEINPUT(ctypes.Structure):
+    """Never sent, but it is the largest member and therefore sets the size."""
+
+    _fields_ = [
+        ("dx", wintypes.LONG),
+        ("dy", wintypes.LONG),
+        ("mouseData", wintypes.DWORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ctypes.c_size_t),
+    ]
+
+
+class HARDWAREINPUT(ctypes.Structure):
+    _fields_ = [
+        ("uMsg", wintypes.DWORD),
+        ("wParamL", wintypes.WORD),
+        ("wParamH", wintypes.WORD),
+    ]
+
+
 class _INPUTunion(ctypes.Union):
-    _fields_ = [("ki", KEYBDINPUT), ("padding", ctypes.c_ubyte * 24)]
+    # Spelled out rather than padded to a guessed width. It used to be
+    # `c_ubyte * 24`, which is the size of this union on 32-bit Windows; on
+    # x64 MOUSEINPUT is 32 bytes, so INPUT is 40 and not the 32 that padding
+    # produced. SendInput is handed sizeof(INPUT) as cbSize and rejects a
+    # value that is not exactly right, so every call failed with
+    # ERROR_INVALID_PARAMETER and no dictated text was ever typed.
+    _fields_ = [("mi", MOUSEINPUT), ("ki", KEYBDINPUT), ("hi", HARDWAREINPUT)]
 
 
 class INPUT(ctypes.Structure):
     _fields_ = [("type", wintypes.DWORD), ("union", _INPUTunion)]
+
+
+_user32.SendInput.restype = wintypes.UINT
+_user32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int]
 
 
 _TAG = INJECTED_TAG

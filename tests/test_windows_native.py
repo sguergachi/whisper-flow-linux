@@ -171,3 +171,38 @@ def test_the_package_does_not_import_the_world():
                          text=True, check=True)
     loaded = set(out.stdout.strip().split(","))
     assert not {"openai", "pyaudio", "pystray", "PIL"} & loaded
+
+
+# ----------------------------------------------------------- struct layout
+def test_the_input_struct_matches_what_sendinput_expects():
+    """40 bytes on x64. Passing 32 made every SendInput fail with error 87,
+    so no dictated text was typed and the only symptom was silence.
+    """
+    import ctypes
+
+    from whisper_flow import system_win
+
+    expected = 40 if ctypes.sizeof(ctypes.c_void_p) == 8 else 28
+    assert ctypes.sizeof(system_win.INPUT) == expected
+
+
+def test_sendinput_accepts_our_events():
+    """Send a character no one will notice, and check Windows took it.
+
+    A rejected batch returns fewer than it was given and sets the error, so
+    this fails loudly rather than typing nothing in silence.
+    """
+    import ctypes
+
+    from whisper_flow import system_win
+
+    events = [system_win._key_event(0, ord("a"), system_win.KEYEVENTF_UNICODE),
+              system_win._key_event(0, ord("a"),
+                                    system_win.KEYEVENTF_UNICODE
+                                    | system_win.KEYEVENTF_KEYUP)]
+    array = (system_win.INPUT * len(events))(*events)
+    sent = system_win._user32.SendInput(len(events), array,
+                                        ctypes.sizeof(system_win.INPUT))
+    assert sent == len(events), (
+        f"SendInput accepted {sent}/{len(events)}; "
+        f"error {ctypes.get_last_error()}")

@@ -92,3 +92,28 @@ def test_utf16_round_trips_through_the_fallback(system_win, monkeypatch):
     text = "❌ Recording failed → check the microphone"
     system_win._copy_via_clip_exe(text)
     assert sent["input"].decode("utf-16") == text
+
+
+# ------------------------------------------------------------ struct layout
+def test_the_union_is_not_padded_to_a_guessed_width(system_win):
+    """The exact byte counts only mean anything on Windows - wintypes.DWORD
+    is 8 bytes here and 4 there - so this asserts the relationship that
+    caused the bug instead: the union must be at least as large as its
+    largest member. It was padded to 24, the 32-bit width, while MOUSEINPUT
+    on x64 is 32, so SendInput was handed a cbSize 8 bytes short and
+    rejected every call with ERROR_INVALID_PARAMETER.
+    """
+    import ctypes
+
+    assert ctypes.sizeof(system_win._INPUTunion) >= ctypes.sizeof(
+        system_win.MOUSEINPUT)
+    assert ctypes.sizeof(system_win._INPUTunion) >= ctypes.sizeof(
+        system_win.KEYBDINPUT)
+    assert ctypes.sizeof(system_win.INPUT) > ctypes.sizeof(system_win._INPUTunion)
+
+
+def test_a_key_event_carries_the_tag_as_a_number(system_win):
+    """dwExtraInfo is ULONG_PTR - an integer, not a pointer to one."""
+    event = system_win._key_event(0, 65, system_win.KEYEVENTF_UNICODE)
+    assert event.union.ki.dwExtraInfo == system_win.INJECTED_TAG
+    assert event.union.ki.wScan == 65

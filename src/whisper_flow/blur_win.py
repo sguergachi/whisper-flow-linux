@@ -32,6 +32,7 @@ DWMWA_BORDER_COLOR = 34
 DWMWA_SYSTEMBACKDROP_TYPE = 38
 
 # DWM_SYSTEMBACKDROP_TYPE
+DWMSBT_MAINWINDOW = 2        # mica; wallpaper tint, for long-lived windows
 DWMSBT_TRANSIENTWINDOW = 3   # acrylic; the flyout/transient variant
 
 # DWM_WINDOW_CORNER_PREFERENCE
@@ -42,6 +43,46 @@ DWMWCP_ROUNDSMALL = 3
 # DwmEnableBlurBehindWindow, which is what makes the alpha channel real.
 DWM_BB_ENABLE = 0x1
 DWM_BB_BLURREGION = 0x2
+
+
+# SetWindowCompositionAttribute. Undocumented, and the only call that blurs
+# the client area of a plain Win32 window with a tint we control - which is
+# what "acrylic" looks like. DWMWA_SYSTEMBACKDROP_TYPE is the documented
+# route and it draws into the window frame, which a toolkit that owns its
+# own client area never shows.
+WCA_ACCENT_POLICY = 19
+ACCENT_ENABLE_BLURBEHIND = 3
+ACCENT_ENABLE_ACRYLICBLURBEHIND = 4
+# 0xAABBGGRR. The alpha is the frost: acrylic blurs what is behind and then
+# lays this over it, so this single number is the whole tint and nothing
+# else needs to add one.
+ACCENT_TINT_DARK = 0x99181614
+
+
+class _ACCENTPOLICY(ctypes.Structure):
+    _fields_ = [
+        ("AccentState", ctypes.c_int),
+        ("AccentFlags", ctypes.c_int),
+        ("GradientColor", ctypes.c_uint),
+        ("AnimationId", ctypes.c_int),
+    ]
+
+
+class _WINCOMPATTRDATA(ctypes.Structure):
+    _fields_ = [
+        ("Attribute", ctypes.c_int),
+        ("Data", ctypes.c_void_p),
+        ("SizeOfData", ctypes.c_size_t),
+    ]
+
+
+class _MARGINS(ctypes.Structure):
+    _fields_ = [
+        ("cxLeftWidth", ctypes.c_int),
+        ("cxRightWidth", ctypes.c_int),
+        ("cyTopHeight", ctypes.c_int),
+        ("cyBottomHeight", ctypes.c_int),
+    ]
 
 
 class _DWM_BLURBEHIND(ctypes.Structure):
@@ -186,6 +227,14 @@ def apply_window_style(hwnd: int) -> str | None:
     # rounded rectangle behind it is the exact thing being removed.
     _set_attribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND)
 
+    # No acrylic here, and the reason is worth keeping. Accent acrylic does
+    # blur the client area - the settings window uses it - but a window
+    # region does not clip it: SetWindowRgn succeeded, GetWindowRgnBox
+    # confirmed the capsule, and the material still filled the rectangle,
+    # leaving the pill on a black slab. That was first found under battery
+    # saver, when everything looked broken, so it was re-tested properly
+    # afterwards and held. Shaping a material needs WinUI's
+    # SystemBackdropElement; see docs/windows-hud-blur.md.
     if _enable_per_pixel_alpha(hwnd):
         return "per-pixel-alpha"
 
@@ -195,6 +244,116 @@ def apply_window_style(hwnd: int) -> str | None:
         return None
     _set_attribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND)
     return "dwm-acrylic"
+
+
+def _apply_accent_acrylic(hwnd: int, tint: int = ACCENT_TINT_DARK) -> bool:
+    """Acrylic in the client area: blur, then this tint over it.
+
+    Undocumented, and taken on purpose. The documented backdrop paints into
+    the window frame, which never shows through a toolkit that draws its own
+    client area - it applied cleanly and looked like nothing at all. This
+    one blurs the pixels the window actually covers.
+
+    The blur was tested once before and came back a black rectangle. That
+    was battery saver, which drops every material to a solid colour, and had
+    nothing to do with the call.
+    """
+    try:
+        user32 = ctypes.WinDLL("user32")
+        set_attribute = user32.SetWindowCompositionAttribute
+        set_attribute.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        set_attribute.restype = ctypes.c_bool
+    except (AttributeError, OSError):
+        return False
+    for state in (ACCENT_ENABLE_ACRYLICBLURBEHIND, ACCENT_ENABLE_BLURBEHIND):
+        policy = _ACCENTPOLICY(state, 2, tint, 0)
+        data = _WINCOMPATTRDATA(
+            WCA_ACCENT_POLICY,
+            ctypes.cast(ctypes.byref(policy), ctypes.c_void_p),
+            ctypes.sizeof(policy))
+        try:
+            if set_attribute(ctypes.c_void_p(hwnd), ctypes.byref(data)):
+                return True
+        except Exception:
+            return False
+    return False
+
+
+def surface_handle(surface_pointer: int) -> int | None:
+    """The HWND behind a GdkSurface, given the surface's GObject address."""
+    for name in ("libgtk-4-1.dll", "libgtk-4.so.1"):
+        try:
+            lib = ctypes.CDLL(name)
+            get = lib.gdk_win32_surface_get_handle
+            get.restype = ctypes.c_void_p
+            get.argtypes = [ctypes.c_void_p]
+            hwnd = get(ctypes.c_void_p(surface_pointer))
+            if hwnd:
+                return hwnd
+        except (OSError, AttributeError):
+            continue
+    return None
+
+
+def apply_backdrop(hwnd: int, transient: bool = True) -> str | None:
+    """Put a DWM material behind an ordinary rectangular window.
+
+    This is the case the system backdrop was built for, and the reason the
+    pill could not use it: the backdrop fills the window's rectangle, which
+    is wrong for a capsule and exactly right for a settings window.
+
+    It shows through whatever the toolkit leaves transparent. GTK's own
+    translucent CSS is enough - the same frosted surfaces the Wayland path
+    uses - so the caller pairs this with the blur stylesheet and nothing
+    else is needed.
+
+    Do not combine with the per-pixel alpha in apply_window_style: enabling
+    the alpha channel tells DWM to discard the backdrop it would otherwise
+    composite, and the window ends up with neither.
+
+    Args:
+        hwnd: Native window handle.
+        transient: Acrylic, which blurs what is behind the window. False
+            selects Mica, which tints from the wallpaper and does not blur -
+            calmer, and Microsoft's guidance for a long-lived window.
+
+    Returns:
+        What was applied, or None where the build cannot.
+
+    """
+    if not hwnd or not is_supported():
+        return None
+    _set_attribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, 1)
+
+    # Extend the frame across the whole window. Anything DWM draws goes into
+    # the frame, not the client area, so without this it is applied, reported
+    # as applied, and invisible. Margins of -1 is the "sheet of glass" case.
+    try:
+        dwm = ctypes.WinDLL("dwmapi")
+        dwm.DwmExtendFrameIntoClientArea.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(_MARGINS)]
+        dwm.DwmExtendFrameIntoClientArea.restype = ctypes.c_long
+        margins = _MARGINS(-1, -1, -1, -1)
+        dwm.DwmExtendFrameIntoClientArea(
+            ctypes.c_void_p(hwnd), ctypes.byref(margins))
+    except Exception:
+        pass
+
+    # Real acrylic first: blur plus tint, in the client area, with the tint
+    # under our control. The documented backdrop below is a fallback - it
+    # renders into the frame, which reads as flat through a toolkit that
+    # paints its own client area.
+    if transient and _apply_accent_acrylic(hwnd):
+        _set_attribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND)
+        return "accent-acrylic"
+
+    kind = DWMSBT_TRANSIENTWINDOW if transient else DWMSBT_MAINWINDOW
+    if not _set_attribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, kind):
+        return None
+    # Rounded by the compositor, matching Adwaita's own corner radius closely
+    # enough that the frosted backdrop does not show past the window's edge.
+    _set_attribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND)
+    return "acrylic" if transient else "mica"
 
 
 def set_shape(hwnd: int, points) -> bool:

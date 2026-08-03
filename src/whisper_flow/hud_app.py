@@ -876,9 +876,9 @@ class HudWindow(Gtk.Window):
         cr.scale(scale, scale)
         cr.translate(-w / 2.0, -h / 2.0)
 
-        # On Wayland the compositor blurs what is behind the surface and this
-        # tint sits over the frost. On Windows nothing blurs, so it is the
-        # whole material and MATERIAL_ALPHA is 1.
+        # On Wayland the compositor blurs behind the surface and this tint
+        # sits over the frost. On Windows nothing blurs inside a shape, so it
+        # is the whole material and MATERIAL_ALPHA is 1.
         inner = STROKE_W / 2
         _squircle(cr, inner, inner, w - 2 * inner, h - 2 * inner)
         cr.set_source_rgba(*MATERIAL_RGB, MATERIAL_ALPHA * a)

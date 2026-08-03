@@ -26,8 +26,22 @@ DWMWA_SYSTEMBACKDROP_TYPE = 38
 DWMSBT_TRANSIENTWINDOW = 3   # acrylic; the flyout/transient variant
 
 # DWM_WINDOW_CORNER_PREFERENCE
+DWMWCP_DONOTROUND = 1        # we cut our own shape; DWM must not add corners
 DWMWCP_ROUND = 2             # the full radius, as used by system flyouts
 DWMWCP_ROUNDSMALL = 3
+
+# DwmEnableBlurBehindWindow, which is what makes the alpha channel real.
+DWM_BB_ENABLE = 0x1
+DWM_BB_BLURREGION = 0x2
+
+
+class _DWM_BLURBEHIND(ctypes.Structure):
+    _fields_ = [
+        ("dwFlags", ctypes.c_uint),
+        ("fEnable", ctypes.c_int),
+        ("hRgnBlur", ctypes.c_void_p),
+        ("fTransitionOnMaximized", ctypes.c_int),
+    ]
 
 # Build 22621 is 22H2, the first with DWMWA_SYSTEMBACKDROP_TYPE. 22000 is
 # 21H2, which only had the undocumented DWMWA_MICA_EFFECT.
@@ -85,8 +99,63 @@ def _set_attribute(hwnd: int, attribute: int, value: int) -> bool:
         return False
 
 
+def _enable_per_pixel_alpha(hwnd: int) -> bool:
+    """Make the window's alpha channel mean something.
+
+    An ordinary window is composited as opaque: whatever cairo puts in the
+    alpha channel is thrown away, and a pixel drawn fully transparent comes
+    out as whatever the backdrop layer beneath it happened to be - grey with
+    the system backdrop, black with the accent policy. Enabling blur-behind
+    over an empty region asks DWM to honour the channel instead. It is the
+    long-standing way to do this and, since Windows 8 removed Aero, it no
+    longer blurs anything: enabling the alpha is all it now does, which is
+    exactly what is wanted here.
+
+    The region is empty, not the pill: an empty one means "no blur anywhere",
+    and the whole window keeps its per-pixel alpha.
+    """
+    try:
+        gdi32 = ctypes.WinDLL("gdi32")
+        dwm = ctypes.WinDLL("dwmapi")
+        gdi32.CreateRectRgn.argtypes = [ctypes.c_int] * 4
+        gdi32.CreateRectRgn.restype = ctypes.c_void_p
+        dwm.DwmEnableBlurBehindWindow.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p]
+        dwm.DwmEnableBlurBehindWindow.restype = ctypes.c_long
+
+        empty = gdi32.CreateRectRgn(0, 0, -1, -1)
+        blur = _DWM_BLURBEHIND(
+            DWM_BB_ENABLE | DWM_BB_BLURREGION, 1, empty, 0)
+        ok = dwm.DwmEnableBlurBehindWindow(
+            ctypes.c_void_p(hwnd), ctypes.byref(blur)) == 0
+        if empty:
+            gdi32.DeleteObject.argtypes = [ctypes.c_void_p]
+            gdi32.DeleteObject(ctypes.c_void_p(empty))
+        return ok
+    except Exception:
+        return False
+
+
 def apply_window_style(hwnd: int) -> str | None:
-    """Give the window an acrylic backdrop, rounded corners and no border.
+    """Give the window a blurred backdrop, no corners of its own, no border.
+
+    Every backdrop DWM will draw is a rectangle. DWMWA_SYSTEMBACKDROP_TYPE
+    paints across the window's whole rect and ignores the window region -
+    the region was applied, GetWindowRgnBox confirmed the capsule, and the
+    grey slab was still there. The undocumented accent policy behaves the
+    same way; it changed the slab's colour and nothing else. A compositor
+    blur here is a rectangle or it is not there at all.
+
+    So the backdrop goes and the alpha channel does the work. The corners
+    outside the pill are transparent because nothing is drawn there, with
+    cairo's antialiasing intact rather than a region's hard cut. What the
+    pill loses is the frost behind it; what it gains is being a pill. Its
+    own material, sheen, inner shadow and outline are all still drawn.
+
+    The name of what was applied comes back so the caller knows whether it
+    still needs the window region: only when the alpha could not be enabled,
+    because then transparent pixels are opaque again and cutting the shape
+    out of the window is the one remaining way to be rid of them.
 
     Args:
         hwnd: Native window handle.
@@ -99,19 +168,119 @@ def apply_window_style(hwnd: int) -> str | None:
     if not hwnd or not is_supported():
         return None
 
-    # Dark first: the acrylic tints towards the theme, and asking afterwards
-    # leaves the first composited frame light.
+    # Dark first: anything DWM tints, it tints towards the theme, and asking
+    # afterwards leaves the first composited frame light.
     _set_attribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, 1)
-
-    if not _set_attribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, DWMSBT_TRANSIENTWINDOW):
-        return None
-
-    # Rounded by the compositor, so the corners are antialiased. The Windows 10
-    # route was a window region, which is a hard-edged mask.
-    _set_attribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND)
     # Suppress DWM's own border; the overlay draws its own outline.
     _set_attribute(hwnd, DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE)
+    # No corner radius of DWM's. The pill's shape is what cairo draws, and a
+    # rounded rectangle behind it is the exact thing being removed.
+    _set_attribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND)
+
+    if _enable_per_pixel_alpha(hwnd):
+        return "per-pixel-alpha"
+
+    # Nothing honours the alpha channel here. A frosted rectangle beats a
+    # black one, and the caller cuts the window down to the pill instead.
+    if not _set_attribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, DWMSBT_TRANSIENTWINDOW):
+        return None
+    _set_attribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND)
     return "dwm-acrylic"
+
+
+def capture_backdrop(x: int, y: int, w: int, h: int, shrink: int = 8):
+    """Grab the screen under the pill, already blurred by being shrunk.
+
+    Windows has no way to blur inside a shape. Every backdrop it offers -
+    the system backdrop, the accent policy - is drawn across the window's
+    whole rectangle and ignores the window region, so a frosted capsule is
+    not something the compositor will do. The frost has to be painted, which
+    means having a picture of what is behind the pill.
+
+    The blur is the shrink. StretchBlt in HALFTONE mode averages the pixels
+    it drops, which is a box filter; scaling that back up with a smooth
+    filter is a cheap, close approximation of a gaussian, and it costs one
+    BitBlt of a few hundred pixels rather than a convolution per frame. No
+    numpy, no per-frame work at all: this is called once, when the pill is
+    about to appear.
+
+    Must be called while the pill is hidden, or it captures itself.
+
+    Args:
+        x, y: Top-left of the region, in physical screen pixels.
+        w, h: Its size, also physical.
+        shrink: How many times smaller to sample. Bigger blurs harder.
+
+    Returns:
+        (pixels, width, height) as 32-bit BGRA rows, or None if the screen
+        could not be read.
+
+    """
+    if w <= 0 or h <= 0:
+        return None
+    sw, sh = max(1, w // shrink), max(1, h // shrink)
+    user32 = ctypes.WinDLL("user32")
+    gdi32 = ctypes.WinDLL("gdi32")
+    for fn, restype in (
+            (user32.GetDC, ctypes.c_void_p),
+            (gdi32.CreateCompatibleDC, ctypes.c_void_p),
+            (gdi32.CreateCompatibleBitmap, ctypes.c_void_p),
+            (gdi32.SelectObject, ctypes.c_void_p)):
+        fn.restype = restype
+    screen = memory = bitmap = None
+    try:
+        screen = user32.GetDC(None)
+        if not screen:
+            return None
+        memory = gdi32.CreateCompatibleDC(ctypes.c_void_p(screen))
+        bitmap = gdi32.CreateCompatibleBitmap(ctypes.c_void_p(screen), sw, sh)
+        if not memory or not bitmap:
+            return None
+        gdi32.SelectObject(ctypes.c_void_p(memory), ctypes.c_void_p(bitmap))
+        HALFTONE, SRCCOPY = 4, 0x00CC0020
+        gdi32.SetStretchBltMode(ctypes.c_void_p(memory), HALFTONE)
+        gdi32.SetBrushOrgEx(ctypes.c_void_p(memory), 0, 0, None)
+        if not gdi32.StretchBlt(
+                ctypes.c_void_p(memory), 0, 0, sw, sh,
+                ctypes.c_void_p(screen), x, y, w, h, SRCCOPY):
+            return None
+
+        class _BITMAPINFOHEADER(ctypes.Structure):
+            _fields_ = [
+                ("biSize", ctypes.c_uint32), ("biWidth", ctypes.c_int32),
+                ("biHeight", ctypes.c_int32), ("biPlanes", ctypes.c_uint16),
+                ("biBitCount", ctypes.c_uint16),
+                ("biCompression", ctypes.c_uint32),
+                ("biSizeImage", ctypes.c_uint32),
+                ("biXPelsPerMeter", ctypes.c_int32),
+                ("biYPelsPerMeter", ctypes.c_int32),
+                ("biClrUsed", ctypes.c_uint32),
+                ("biClrImportant", ctypes.c_uint32),
+            ]
+
+        header = _BITMAPINFOHEADER()
+        header.biSize = ctypes.sizeof(header)
+        header.biWidth = sw
+        header.biHeight = -sh          # negative: top-down, as cairo wants
+        header.biPlanes = 1
+        header.biBitCount = 32
+        header.biCompression = 0       # BI_RGB
+        buffer = ctypes.create_string_buffer(sw * sh * 4)
+        DIB_RGB_COLORS = 0
+        if not gdi32.GetDIBits(
+                ctypes.c_void_p(memory), ctypes.c_void_p(bitmap), 0, sh,
+                buffer, ctypes.byref(header), DIB_RGB_COLORS):
+            return None
+        return bytearray(buffer.raw), sw, sh
+    except Exception:
+        return None
+    finally:
+        if bitmap:
+            gdi32.DeleteObject(ctypes.c_void_p(bitmap))
+        if memory:
+            gdi32.DeleteDC(ctypes.c_void_p(memory))
+        if screen:
+            user32.ReleaseDC(None, ctypes.c_void_p(screen))
 
 
 def set_shape(hwnd: int, points) -> bool:

@@ -299,6 +299,13 @@ class HudWindow(Gtk.Window):
         # hotkey and seeing anything.
         self._resident = resident
         self._hwnd = None
+        # What Windows composition gave us; decides whether the window still
+        # has to be cut to shape. See blur_win.apply_window_style.
+        self._style = None
+        # The blurred picture of whatever is behind the pill, and its size.
+        # Windows only: on Wayland the compositor supplies the real thing.
+        self._backdrop = None
+        self._backdrop_size = (0, 0)
         # Gtk.Window.close() only emits close-request; on a layer-shell surface
         # that does not end the main loop, so the process would linger with the
         # pill still on screen. Always tear down through this instead.
@@ -550,10 +557,11 @@ class HudWindow(Gtk.Window):
                 return
             self._raise_win32()
             self._apply_position()
-            self._apply_shape_win32()
             if not os.environ.get("WHISPER_FLOW_HUD_NO_BLUR"):
-                style = _win_blur.apply_window_style(self._hwnd)
-                print(f"[HUD] window style: {style or 'not applied'}", flush=True)
+                self._style = _win_blur.apply_window_style(self._hwnd)
+                print(f"[HUD] window style: {self._style or 'not applied'}",
+                      flush=True)
+            self._apply_shape_win32()
         except Exception as e:
             print(f"[HUD] Windows window setup failed: {e}", flush=True)
 
@@ -567,14 +575,20 @@ class HudWindow(Gtk.Window):
     SHAPE_BLEED = 1
 
     def _apply_shape_win32(self):
-        """Cut the window down to the pill, so the rest is really transparent.
+        """Cut the window down to the pill, when nothing honours the alpha.
+
+        A last resort, not the normal path. The region's edge has no
+        antialiasing, so it replaces the pill's soft rim with a staircase;
+        with per-pixel alpha working, the transparent corners cost nothing
+        and the rim survives. This is what is left when the alpha channel is
+        being thrown away and every transparent pixel comes out opaque.
 
         Measured from the window rather than computed from WIDTH and HEIGHT:
         GTK owns the surface size and applies the display scale itself, and a
         region built from what we assumed the size was would be wrong on
         every display that is not at 100%.
         """
-        if not self._hwnd:
+        if not self._hwnd or self._style == "per-pixel-alpha":
             return
         try:
             rect = (ctypes.c_long * 4)()
@@ -592,6 +606,62 @@ class HudWindow(Gtk.Window):
                   flush=True)
         except Exception as e:
             print(f"[HUD] could not shape the window: {e}", flush=True)
+
+    def _refresh_backdrop(self):
+        """Re-photograph the screen after a drag, hiding the pill to do it.
+
+        The capture has to be of the screen without the pill in it, and the
+        pill is on screen by the time a drag ends. Hidden, captured and shown
+        again inside one main-loop turn, so no frame is drawn in between and
+        nothing flickers.
+        """
+        if not IS_WINDOWS or self._backdrop is None:
+            return
+
+        def work():
+            self.hide()
+            self._capture_backdrop()
+            self.present()
+            self._raise_win32()
+            return GLib.SOURCE_REMOVE
+
+        GLib.idle_add(work)
+
+    def _capture_backdrop(self):
+        """Photograph what the pill is about to cover, blurred.
+
+        Called while the pill is hidden and just before it is shown, because
+        the capture is of the screen and would otherwise include the pill.
+        Once per appearance, not per frame: the pill is on screen for a few
+        seconds over a background that is almost always still, and the cost
+        of being wrong about that is a backdrop that lags, not one that
+        breaks.
+        """
+        if not IS_WINDOWS or os.environ.get("WHISPER_FLOW_HUD_NO_BLUR"):
+            return
+        self._backdrop = None
+        try:
+            scale = self._monitor_scale()
+            local = self._pos if self._pos is not None else self._default_pos()
+            g = self._monitor.get_geometry() if self._monitor else None
+            x = int(((g.x if g else 0) + local[0]) * scale)
+            y = int(((g.y if g else 0) + local[1]) * scale)
+            shot = _win_blur.capture_backdrop(
+                x, y, int(WIDTH * scale), int(HEIGHT * scale))
+            if not shot:
+                return
+            pixels, sw, sh = shot
+            # RGB24 rather than ARGB32: the desktop has no alpha, and the
+            # high byte of each pixel is whatever GDI left there. Read as
+            # ARGB32 it would be a garbage alpha channel.
+            stride = cairo.ImageSurface.format_stride_for_width(
+                cairo.FORMAT_RGB24, sw)
+            self._backdrop = cairo.ImageSurface.create_for_data(
+                pixels, cairo.FORMAT_RGB24, sw, sh, stride)
+            self._backdrop_size = (sw, sh)
+        except Exception as e:
+            print(f"[HUD] could not capture the backdrop: {e}", flush=True)
+            self._backdrop = None
 
     def _monitor_scale(self) -> float:
         """Logical-to-physical factor for the output the pill is on.
@@ -672,6 +742,9 @@ class HudWindow(Gtk.Window):
         self._fade_out_t0 = None
         self._quitting = False
         self._apply_position()
+        # Before present(), while the screen under the pill is still the
+        # screen and not the pill.
+        self._capture_backdrop()
         self.present()
         print(f"[HUD] visible {time.time():.6f}", flush=True)
 
@@ -758,6 +831,9 @@ class HudWindow(Gtk.Window):
             return
         _save_position(self._connector, *self._pos)
         print(f"[HUD] position saved for {self._connector}: {self._pos}", flush=True)
+        # The pill is over different screen now, so the frost it is carrying
+        # is a picture of where it used to be.
+        self._refresh_backdrop()
 
     def _on_enter(self, *_):
         self.want_hover = True
@@ -853,9 +929,26 @@ class HudWindow(Gtk.Window):
         cr.scale(scale, scale)
         cr.translate(-w / 2.0, -h / 2.0)
 
-        # A light tint only - the compositor blur behind the pill supplies the
-        # frost, and a heavy fill would just mute it into flat grey.
+        # The frost. On Wayland the compositor blurs what is behind the
+        # surface; on Windows nothing will, so this is the picture taken
+        # just before the pill appeared, scaled back up. Painted first and
+        # clipped to the pill, with the tint going over it.
         inner = STROKE_W / 2
+        if self._backdrop is not None:
+            sw, sh = self._backdrop_size
+            cr.save()
+            _squircle(cr, inner, inner, w - 2 * inner, h - 2 * inner)
+            cr.clip()
+            cr.scale(w / sw, h / sh)
+            cr.set_source_surface(self._backdrop, 0, 0)
+            # Bilinear on the way up is what turns the shrunken image back
+            # into a smooth blur instead of visible blocks.
+            cr.get_source().set_filter(cairo.FILTER_BILINEAR)
+            cr.paint_with_alpha(a)
+            cr.restore()
+
+        # A light tint only - the blur behind the pill supplies the frost,
+        # and a heavy fill would just mute it into flat grey.
         _squircle(cr, inner, inner, w - 2 * inner, h - 2 * inner)
         cr.set_source_rgba(*MATERIAL_RGB, MATERIAL_ALPHA * a)
         cr.fill_preserve()
@@ -1004,6 +1097,8 @@ def main() -> int:
         threading.Thread(target=_command_loop, args=(win,), daemon=True,
                          name="whisper-flow-hud-commands").start()
     else:
+        # Same order as begin_show: photograph the screen before covering it.
+        win._capture_backdrop()
         win.present()
     _mark("present() returned")
     loop.run()

@@ -1,16 +1,25 @@
-"""Window composition on Windows 11: acrylic backdrop, rounded corners, border.
+"""Window composition on Windows 11: transparency, corners, border.
 
-Windows 11 22H2 exposes all three through DwmSetWindowAttribute, so this is
-the documented path with no undocumented ordinals and no per-build branching.
+Not blur. The pill is a capsule, and Windows will not blur inside a shape:
 
-Earlier builds are refused rather than worked around. Windows 10 could get a
-similar effect through SetWindowCompositionAttribute, but that is undocumented,
-looks visibly different, and having one supported target is worth more than
-covering a build nobody here runs.
+  * DWMWA_SYSTEMBACKDROP_TYPE paints the window's whole rectangle and
+    ignores its region. The region was applied and GetWindowRgnBox confirmed
+    the capsule; the grey slab stayed.
+  * The undocumented accent policy does the same, only black.
+  * The Visual Layer will honour a clip, and neither of its brushes can
+    sample the desktop from a plain Win32 window: CreateHostBackdropBrush
+    renders black outside UWP, and CreateBackdropBrush sees only its own
+    composition tree. A solid colour brush in that same tree drew a perfect
+    capsule, so the plumbing was right and the sampling is simply absent.
 
-The window must stay layered with a uniform alpha below 1. DWM blurs the
-backdrop and composites the window over it, so an opaque window hides the
-effect completely - the alpha is what lets the acrylic through.
+So the pill is opaque, and what this module still does is make the pixels
+*outside* it disappear: DwmEnableBlurBehindWindow over an empty region,
+which has not blurred anything since Windows 8 removed Aero and now only
+asks DWM to honour the alpha channel. A window region is kept as the
+fallback for when even that fails.
+
+Earlier builds are refused rather than worked around. Having one supported
+target is worth more than covering a build nobody here runs.
 """
 
 import ctypes
@@ -186,101 +195,6 @@ def apply_window_style(hwnd: int) -> str | None:
         return None
     _set_attribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND)
     return "dwm-acrylic"
-
-
-def capture_backdrop(x: int, y: int, w: int, h: int, shrink: int = 8):
-    """Grab the screen under the pill, already blurred by being shrunk.
-
-    Windows has no way to blur inside a shape. Every backdrop it offers -
-    the system backdrop, the accent policy - is drawn across the window's
-    whole rectangle and ignores the window region, so a frosted capsule is
-    not something the compositor will do. The frost has to be painted, which
-    means having a picture of what is behind the pill.
-
-    The blur is the shrink. StretchBlt in HALFTONE mode averages the pixels
-    it drops, which is a box filter; scaling that back up with a smooth
-    filter is a cheap, close approximation of a gaussian, and it costs one
-    BitBlt of a few hundred pixels rather than a convolution per frame. No
-    numpy, no per-frame work at all: this is called once, when the pill is
-    about to appear.
-
-    Must be called while the pill is hidden, or it captures itself.
-
-    Args:
-        x, y: Top-left of the region, in physical screen pixels.
-        w, h: Its size, also physical.
-        shrink: How many times smaller to sample. Bigger blurs harder.
-
-    Returns:
-        (pixels, width, height) as 32-bit BGRA rows, or None if the screen
-        could not be read.
-
-    """
-    if w <= 0 or h <= 0:
-        return None
-    sw, sh = max(1, w // shrink), max(1, h // shrink)
-    user32 = ctypes.WinDLL("user32")
-    gdi32 = ctypes.WinDLL("gdi32")
-    for fn, restype in (
-            (user32.GetDC, ctypes.c_void_p),
-            (gdi32.CreateCompatibleDC, ctypes.c_void_p),
-            (gdi32.CreateCompatibleBitmap, ctypes.c_void_p),
-            (gdi32.SelectObject, ctypes.c_void_p)):
-        fn.restype = restype
-    screen = memory = bitmap = None
-    try:
-        screen = user32.GetDC(None)
-        if not screen:
-            return None
-        memory = gdi32.CreateCompatibleDC(ctypes.c_void_p(screen))
-        bitmap = gdi32.CreateCompatibleBitmap(ctypes.c_void_p(screen), sw, sh)
-        if not memory or not bitmap:
-            return None
-        gdi32.SelectObject(ctypes.c_void_p(memory), ctypes.c_void_p(bitmap))
-        HALFTONE, SRCCOPY = 4, 0x00CC0020
-        gdi32.SetStretchBltMode(ctypes.c_void_p(memory), HALFTONE)
-        gdi32.SetBrushOrgEx(ctypes.c_void_p(memory), 0, 0, None)
-        if not gdi32.StretchBlt(
-                ctypes.c_void_p(memory), 0, 0, sw, sh,
-                ctypes.c_void_p(screen), x, y, w, h, SRCCOPY):
-            return None
-
-        class _BITMAPINFOHEADER(ctypes.Structure):
-            _fields_ = [
-                ("biSize", ctypes.c_uint32), ("biWidth", ctypes.c_int32),
-                ("biHeight", ctypes.c_int32), ("biPlanes", ctypes.c_uint16),
-                ("biBitCount", ctypes.c_uint16),
-                ("biCompression", ctypes.c_uint32),
-                ("biSizeImage", ctypes.c_uint32),
-                ("biXPelsPerMeter", ctypes.c_int32),
-                ("biYPelsPerMeter", ctypes.c_int32),
-                ("biClrUsed", ctypes.c_uint32),
-                ("biClrImportant", ctypes.c_uint32),
-            ]
-
-        header = _BITMAPINFOHEADER()
-        header.biSize = ctypes.sizeof(header)
-        header.biWidth = sw
-        header.biHeight = -sh          # negative: top-down, as cairo wants
-        header.biPlanes = 1
-        header.biBitCount = 32
-        header.biCompression = 0       # BI_RGB
-        buffer = ctypes.create_string_buffer(sw * sh * 4)
-        DIB_RGB_COLORS = 0
-        if not gdi32.GetDIBits(
-                ctypes.c_void_p(memory), ctypes.c_void_p(bitmap), 0, sh,
-                buffer, ctypes.byref(header), DIB_RGB_COLORS):
-            return None
-        return bytearray(buffer.raw), sw, sh
-    except Exception:
-        return None
-    finally:
-        if bitmap:
-            gdi32.DeleteObject(ctypes.c_void_p(bitmap))
-        if memory:
-            gdi32.DeleteDC(ctypes.c_void_p(memory))
-        if screen:
-            user32.ReleaseDC(None, ctypes.c_void_p(screen))
 
 
 def set_shape(hwnd: int, points) -> bool:

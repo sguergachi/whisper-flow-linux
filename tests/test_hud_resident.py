@@ -153,6 +153,54 @@ def test_the_overlay_opens_the_display_itself():
         "GTK has to be initialised before the window is constructed")
 
 
+def _hud_app_source() -> str:
+    from pathlib import Path
+    return (Path(__file__).resolve().parents[1]
+            / "src/whisper_flow/hud_app.py").read_text(encoding="utf-8")
+
+
+def test_the_overlay_is_placed_in_physical_pixels():
+    """GDK measures in logical units; SetWindowPos takes physical pixels.
+
+    Nothing converted between them, so on a 2x display the pill went to half
+    its intended offset - the upper-left quadrant rather than bottom-centre.
+    It was on screen the whole time, nowhere near where anyone was looking.
+    """
+    source = _hud_app_source()
+    assert "_monitor_scale" in source, (
+        "the overlay needs the monitor's logical-to-physical factor")
+    branch = source.split("def _apply_position(", 1)[1].split("\n    def ", 1)[0]
+    assert "_monitor_scale()" in branch, (
+        "the Win32 branch of _apply_position must scale GDK's logical "
+        "coordinates to physical pixels before calling SetWindowPos")
+
+
+def test_the_overlay_is_placed_after_it_is_mapped():
+    """GTK places the window itself when it maps it, and maps after realize.
+
+    Positioning at realize alone was silently undone every time.
+    """
+    source = _hud_app_source()
+    assert '"map"' in source and "_on_map" in source, (
+        "the overlay must re-apply its position on map; a position set at "
+        "realize is overwritten by GTK's own placement")
+
+
+def test_a_parked_overlay_keeps_following_the_level_file():
+    """The timer must survive the recording that ends, or later ones are dead.
+
+    _read_levels returned False when the daemon deleted the level file, which
+    removes the GLib source for good. A resident overlay parks and is shown
+    again, and every later recording drew a waveform frozen where the last
+    one ended.
+    """
+    source = _hud_app_source()
+    body = source.split("def _read_levels(", 1)[1].split("\n    def ", 1)[0]
+    assert "return self._resident" in body, (
+        "a resident overlay must keep its level timer when the file goes "
+        "away; returning False removes the source permanently")
+
+
 # ------------------------------------------------------- the overlay's states
 _GTK_CHILD = """
 import sys

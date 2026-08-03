@@ -38,6 +38,20 @@ from .logging import log, set_logging_enabled  # noqa: E402
 WIDTH, HEIGHT = 760, 820
 CORNER_RADIUS = 12      # Adwaita's window corner radius
 
+# Every icon this window names, in one place so the frozen build can check
+# that the bundled theme actually has them. An icon GTK cannot find is not an
+# error it reports - it silently draws the broken-image glyph, which is what
+# the view switcher showed for three of its four tabs while the fourth, which
+# happens to be in the set GTK compiles into libgtk, looked perfectly fine.
+SECTION_ICONS = {
+    "Speech": "audio-speakers-symbolic",
+    "Hotkeys": "input-keyboard-symbolic",
+    "Dictation": "audio-input-microphone-symbolic",
+    "General": "emblem-system-symbolic",
+}
+STATUS_ICONS = ("emblem-ok-symbolic", "dialog-warning-symbolic")
+ICON_NAMES = tuple(SECTION_ICONS.values()) + STATUS_ICONS
+
 CSS = b"""
 .model-pill {
     border-radius: 999px;
@@ -278,17 +292,11 @@ class SettingsWindow(Adw.ApplicationWindow):
             "Dictation": self._build_plain_page,
             "General": self._build_general_page,
         }
-        icons = {
-            "Speech": "audio-speakers-symbolic",
-            "Hotkeys": "input-keyboard-symbolic",
-            "Dictation": "audio-input-microphone-symbolic",
-            "General": "emblem-system-symbolic",
-        }
         for section in settings_def.SECTIONS:
             page = builders[section](section)
             # Without an icon the view switcher draws the broken-image glyph.
             self._stack.add_titled_with_icon(
-                page, section.lower(), section, icons[section])
+                page, section.lower(), section, SECTION_ICONS[section])
 
     def _add_field_groups(self, page, section: str, lead_rows=None):
         """Render a section as titled groups, expert rows behind an expander.

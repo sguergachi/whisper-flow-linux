@@ -373,7 +373,23 @@ class HudWindow(Gtk.Window):
             for sig in (signal.SIGTERM, signal.SIGINT):
                 _unix_signal_add(sig, self._on_signal)
         self.connect("realize", self._on_realize)
+        if IS_WINDOWS:
+            # Position again once the window is on screen. Placing it at
+            # realize is too early: GTK sets the surface's own position as
+            # part of the map that follows, which overwrote ours - so the
+            # pill appeared at Windows' default cascade spot in the top-left
+            # corner rather than bottom-centre, on every recording. It was
+            # never invisible, only never where anyone was looking.
+            self.connect("map", self._on_map)
         _mark("window constructed")
+
+    def _on_map(self, *_):
+        """Re-apply the position after GTK has placed the window itself."""
+        GLib.idle_add(self._reposition)
+
+    def _reposition(self):
+        self._apply_position()
+        return GLib.SOURCE_REMOVE
 
     def _pick_monitor(self, hint: str | None):
         """Choose the output to show on.
@@ -494,6 +510,33 @@ class HudWindow(Gtk.Window):
         except Exception as e:
             print(f"[HUD] Windows window setup failed: {e}", flush=True)
 
+    def _monitor_scale(self) -> float:
+        """Logical-to-physical factor for the output the pill is on.
+
+        GDK measures in logical units and SetWindowPos takes physical pixels,
+        so every coordinate has to cross that boundary. Nothing converted, so
+        on a 2x display the pill went to half its intended offset - the
+        upper-left quadrant instead of bottom-centre, which read as the
+        overlay simply not appearing.
+
+        get_scale() before get_scale_factor(): the latter is an integer and
+        reports 1 at 125% and 150%, where the real factor is fractional and
+        the error is smaller but just as wrong.
+        """
+        if self._monitor is None:
+            return 1.0
+        for name in ("get_scale", "get_scale_factor"):
+            getter = getattr(self._monitor, name, None)
+            if getter is None:
+                continue
+            try:
+                scale = float(getter())
+            except Exception:
+                continue
+            if scale > 0:
+                return scale
+        return 1.0
+
     def _apply_position_win32(self, x: int, y: int):
         if not self._hwnd:
             return
@@ -577,11 +620,15 @@ class HudWindow(Gtk.Window):
     def _apply_position(self):
         """Anchor bottom-centre by default, or top-left at a dragged position."""
         if LayerShell is None:
-            # Win32 coordinates are absolute; layer-shell margins were local.
+            # Win32 coordinates are absolute and physical; layer-shell margins
+            # were local, and everything above this line is in GDK's logical
+            # units. This is the one place the two meet.
             local = self._pos if self._pos is not None else self._default_pos()
             g = self._monitor.get_geometry() if self._monitor else None
+            scale = self._monitor_scale()
             self._apply_position_win32(
-                (g.x if g else 0) + local[0], (g.y if g else 0) + local[1])
+                ((g.x if g else 0) + local[0]) * scale,
+                ((g.y if g else 0) + local[1]) * scale)
             return
         if self._pos is None:
             LayerShell.set_anchor(self, LayerShell.Edge.LEFT, False)
@@ -667,8 +714,15 @@ class HudWindow(Gtk.Window):
         # because whoever spawned us failed to take us down.
         if not os.path.exists(self.level_file):
             print("[HUD] level file gone, closing", flush=True)
+            # Stop following it before quitting, or the next tick reports it
+            # missing all over again.
+            self.level_file = ""
             self.quit()
-            return False
+            # A resident overlay parks rather than exits, and it needs this
+            # timer for the next recording. Removing the source left every
+            # later recording with a waveform frozen where the last one
+            # ended, and nothing watching for an orphaned overlay either.
+            return self._resident
         if not self._check_lifetime():
             return False
 

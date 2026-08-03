@@ -99,6 +99,35 @@ def _selftest_overlay() -> str:
     return "overlay window drew a frame"
 
 
+def _selftest_icons() -> str:
+    """Confirm the bundled theme holds every icon the UI names.
+
+    GTK does not report a missing icon; it draws the broken-image glyph and
+    carries on, so this only ever surfaces as someone looking at the window.
+    The bundle shipped 653 SVGs and no index.theme, flattened out of the
+    subdirectories the theme declares - which is a theme GTK cannot read at
+    all. What still rendered came from libgtk's own compiled-in set, and made
+    the bundle look half-working rather than unused.
+    """
+    from gi.repository import Gdk, Gtk
+
+    from whisper_flow.settings_gtk import ICON_NAMES
+
+    theme = Gtk.IconTheme.get_for_display(Gdk.Display.get_default())
+    theme.add_resource_path("/org/gnome/Adwaita/icons")
+    missing = [name for name in ICON_NAMES if not theme.has_icon(name)]
+    if missing:
+        try:
+            where = list(theme.get_search_path() or [])
+        except Exception as e:          # never let the diagnosis fail first
+            where = f"(search path unavailable: {e})"
+        raise RuntimeError(
+            f"the icon theme is missing {', '.join(missing)} - is "
+            f"index.theme bundled, and the symbolic tree unflattened? "
+            f"search path: {where}")
+    return f"icon theme resolves all {len(ICON_NAMES)} icons the UI names"
+
+
 def _selftest_settings() -> str:
     """Build the real settings window, inside an application as it runs.
 
@@ -204,6 +233,7 @@ def _selftest() -> int:
         # broken, which is how this check stayed green through the whole
         # thing. Build the windows the app actually shows, the way it shows
         # them, and let them fail here rather than on someone's desktop.
+        report.append(_selftest_icons())
         report.append(_selftest_overlay())
         report.append(_selftest_settings())
     except Exception:

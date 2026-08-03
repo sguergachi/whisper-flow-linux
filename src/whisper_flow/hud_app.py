@@ -75,21 +75,36 @@ else:
     enable_blur = _load_sibling("wayland_blur").enable_blur
 _mark("imports done")
 
-WIDTH = 268
-HEIGHT = 54
+# The pill was drawn at 268x54, and every measurement below is in terms of
+# that. A different height scales all of them together rather than squashing
+# the same contents into a shorter box - bars, dot and margins keep their
+# proportions and the silhouette stays the shape it was designed as.
+#
+# Windows is smaller on purpose. There the pill's outline is whatever DWM
+# rounds the window to, because a region will not clip the acrylic behind
+# it, and DWM offers one radius: 8 logical pixels, take it or leave it. On a
+# 54-tall pill that reads as a barely-softened rectangle. The only way to
+# make it look round is to make the pill smaller against that fixed 8, so it
+# is, and the two platforms end up different sizes - the price of having a
+# material behind it at all. Wayland keeps the full size and the squircle.
+BASE_WIDTH, BASE_HEIGHT = 268, 54
+DEFAULT_HEIGHT = 38 if IS_WINDOWS else BASE_HEIGHT
+HEIGHT = int(os.environ.get("WHISPER_FLOW_HUD_HEIGHT", str(DEFAULT_HEIGHT)))
+SIZE_SCALE = HEIGHT / BASE_HEIGHT
+WIDTH = round(BASE_WIDTH * SIZE_SCALE)
 RADIUS = HEIGHT / 2
 BOTTOM_MARGIN = int(os.environ.get("WHISPER_FLOW_HUD_BOTTOM_MARGIN", "28"))
 
-DOT_X = 27
-DOT_R = 4.5
-WAVE_L = 48
-WAVE_R = WIDTH - 24
-BARS = 30
-BAR_W = 2.6
-BAR_MAX = 15.0
-BAR_OUTLINE = 0.9    # dark ring hugging each bar
-BAR_SHADOW_DX = 0.9  # cast shadow offset, down and to the right
-BAR_SHADOW_DY = 1.4
+DOT_X = 27 * SIZE_SCALE
+DOT_R = 4.5 * SIZE_SCALE
+WAVE_L = 48 * SIZE_SCALE
+WAVE_R = WIDTH - 24 * SIZE_SCALE
+BARS = 30                       # a count, not a measurement
+BAR_W = 2.6 * SIZE_SCALE
+BAR_MAX = 15.0 * SIZE_SCALE
+BAR_OUTLINE = 0.9 * SIZE_SCALE   # dark ring hugging each bar
+BAR_SHADOW_DX = 0.9 * SIZE_SCALE  # cast shadow offset, down and to the right
+BAR_SHADOW_DY = 1.4 * SIZE_SCALE
 
 STROKE_W = 1.0              # outline width in surface-local units
 STROKE_RGB = (0.42, 0.43, 0.47)
@@ -112,16 +127,18 @@ CAP_EXT = 1.12   # cap reaches this many half-heights along the edge
 MATERIAL_RGB = (0.03, 0.03, 0.04)
 MATERIAL_ALPHA = 0.80
 if IS_WINDOWS:
-    # Opaque, because there is nothing behind it worth seeing. Windows has
-    # no shaped backdrop blur: the system backdrop and the accent policy
-    # both paint the window's whole rectangle and ignore its region, and of
-    # the two Visual Layer brushes that would honour a clip, the host one
-    # renders black on a plain Win32 window and the other samples only its
-    # own composition tree. A solid colour brush in that same tree drew
-    # fine, so it is the sampling that is missing, not the plumbing.
-    # Translucency without a blur behind it just shows the raw desktop
-    # through the pill, which reads as a bug rather than as glass.
+    # Opaque when there is nothing behind the pill to show. Translucency
+    # over a raw desktop is not glass, it just looks like a bug. This is
+    # the fallback for when acrylic could not be applied - with it, the
+    # tint below is used instead.
     MATERIAL_ALPHA = 1.0
+# Over acrylic instead. Barely a tint: the material is already blurred and
+# tinted, and anything heavier turns it back into the flat slab it replaced.
+ACRYLIC_TINT_ALPHA = 0.12
+# What DWM rounds a window to, in logical pixels. With acrylic behind the
+# pill this is its silhouette - a region cannot clip a material, so DWM's
+# rounding is the only shape on offer.
+DWM_CORNER_RADIUS = 8
 # Rim masking the blur region's edge. Only just wider than the inset: it is
 # darker than the glass, so every extra pixel reads as a heavy border.
 EDGE_COVER = BLUR_INSET + 0.5
@@ -597,7 +614,10 @@ class HudWindow(Gtk.Window):
         region built from what we assumed the size was would be wrong on
         every display that is not at 100%.
         """
-        if not self._hwnd or self._style == "per-pixel-alpha":
+        # Not with a material: a region does not clip one, so cutting the
+        # window would leave the acrylic rectangular and the content capsule
+        # shaped - the two disagreeing is worse than either alone.
+        if not self._hwnd or self._style in ("per-pixel-alpha", "accent-acrylic"):
             return
         try:
             rect = (ctypes.c_long * 4)()
@@ -776,7 +796,7 @@ class HudWindow(Gtk.Window):
             # A tap. Only the close affordance dismisses; anywhere else would
             # make the pill vanish whenever a drag came up a pixel short.
             sx, sy = self._drag_start_xy
-            if sx >= WIDTH - 34:
+            if sx >= WIDTH - 34 * SIZE_SCALE:
                 self.quit()
             return
         _save_position(self._connector, *self._pos)
@@ -851,6 +871,23 @@ class HudWindow(Gtk.Window):
             self.targets.append(min(1.0, (v / self.peak) ** LEVEL_GAMMA))
         return True
 
+    def _outline(self, cr, x, y, w, h):
+        """The pill's silhouette, which is not the same shape on Windows.
+
+        With acrylic behind it the shape is not ours to choose: a window
+        region does not clip a material, so whatever DWM rounds the window
+        to is what the pill is - a rounded rectangle at the system radius.
+        Drawing the capsule over that would put our outline inside the
+        material's own edge, with frost showing past it at both ends.
+
+        Everywhere else, the squircle: continuous curvature into the caps,
+        which is the shape this overlay is meant to have.
+        """
+        if self._style == "accent-acrylic":
+            _round_rect(cr, x, y, w, h, DWM_CORNER_RADIUS)
+        else:
+            _squircle(cr, x, y, w, h)
+
     def _draw(self, area, cr, w, h):
         if not getattr(self, "_drew", False):
             self._drew = True
@@ -877,11 +914,14 @@ class HudWindow(Gtk.Window):
         cr.translate(-w / 2.0, -h / 2.0)
 
         # On Wayland the compositor blurs behind the surface and this tint
-        # sits over the frost. On Windows nothing blurs inside a shape, so it
-        # is the whole material and MATERIAL_ALPHA is 1.
+        # sits over the frost. On Windows it depends what the window got:
+        # acrylic arrives already blurred and tinted, so the full material
+        # over the top would flatten it back into the slab it replaced.
         inner = STROKE_W / 2
-        _squircle(cr, inner, inner, w - 2 * inner, h - 2 * inner)
-        cr.set_source_rgba(*MATERIAL_RGB, MATERIAL_ALPHA * a)
+        material = (ACRYLIC_TINT_ALPHA if self._style == "accent-acrylic"
+                    else MATERIAL_ALPHA)
+        self._outline(cr, inner, inner, w - 2 * inner, h - 2 * inner)
+        cr.set_source_rgba(*MATERIAL_RGB, material * a)
         cr.fill_preserve()
 
         sheen = cairo.LinearGradient(0, 0, 0, h)
@@ -894,13 +934,13 @@ class HudWindow(Gtk.Window):
         # Everything from here to the border is clipped to the pill, so strokes
         # centred on the outline only paint inwards.
         cr.save()
-        _squircle(cr, 0, 0, w, h)
+        self._outline(cr, 0, 0, w, h)
         cr.clip()
 
         # Opaque rim covering the blur region's staircase. The region is built
         # from rectangles and cannot be antialiased, so its curved ends are
         # ragged; this hides that boundary rather than leaving it on show.
-        _squircle(cr, 0, 0, w, h)
+        self._outline(cr, 0, 0, w, h)
         cr.set_line_width(2 * EDGE_COVER)
         cr.set_source_rgba(*MATERIAL_RGB, EDGE_COVER_ALPHA * a)
         cr.stroke()
@@ -911,7 +951,7 @@ class HudWindow(Gtk.Window):
         for i in range(INNER_SHADOW_STEPS):
             frac = i / max(1, INNER_SHADOW_STEPS - 1)
             reach = INNER_SHADOW_SPREAD + INNER_SHADOW_BLUR * frac
-            _squircle(cr, 0, 0, w, h)
+            self._outline(cr, 0, 0, w, h)
             cr.set_line_width(2 * reach)
             cr.set_source_rgba(*INNER_SHADOW_RGB, band * a)
             cr.stroke()
@@ -957,13 +997,13 @@ class HudWindow(Gtk.Window):
         # Outline last, so nothing can paint over it. Solid and fully opaque:
         # a translucent hairline picks up whatever is behind the glass and
         # reads as a ragged edge rather than a clean one.
-        _squircle(cr, inner, inner, w - 2 * inner, h - 2 * inner)
+        self._outline(cr, inner, inner, w - 2 * inner, h - 2 * inner)
         cr.set_line_width(STROKE_W)
         cr.set_source_rgba(*STROKE_RGB, a)
         cr.stroke()
 
         if self.hover > 0.01:
-            cx, r = w - 21, 4.0
+            cx, r = w - 21 * SIZE_SCALE, 4.0 * SIZE_SCALE
             cr.set_source_rgba(1, 1, 1, 0.75 * self.hover * a)
             cr.set_line_width(1.4)
             cr.move_to(cx - r, mid - r)

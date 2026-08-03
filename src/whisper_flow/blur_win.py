@@ -24,6 +24,7 @@ target is worth more than covering a build nobody here runs.
 
 import ctypes
 import ctypes.wintypes as wintypes
+import os
 
 # DwmSetWindowAttribute attributes, all Windows 11.
 DWMWA_USE_IMMERSIVE_DARK_MODE = 20
@@ -227,14 +228,33 @@ def apply_window_style(hwnd: int) -> str | None:
     # rounded rectangle behind it is the exact thing being removed.
     _set_attribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND)
 
-    # No acrylic here, and the reason is worth keeping. Accent acrylic does
-    # blur the client area - the settings window uses it - but a window
-    # region does not clip it: SetWindowRgn succeeded, GetWindowRgnBox
-    # confirmed the capsule, and the material still filled the rectangle,
-    # leaving the pill on a black slab. That was first found under battery
-    # saver, when everything looked broken, so it was re-tested properly
-    # afterwards and held. Shaping a material needs WinUI's
-    # SystemBackdropElement; see docs/windows-hud-blur.md.
+    # Acrylic, at the price of the capsule.
+    #
+    # A window region does not clip a material - SetWindowRgn succeeded,
+    # GetWindowRgnBox confirmed the capsule, and the acrylic still filled
+    # the rectangle. So the shape has to be one DWM will round by itself,
+    # which is a rounded rectangle at the system radius, not a pill. That is
+    # the trade: real blur in a slightly squarer silhouette, against a true
+    # capsule with no material behind it.
+    #
+    # WHISPER_FLOW_HUD_OPAQUE=1 takes the capsule back.
+    if not os.environ.get("WHISPER_FLOW_HUD_OPAQUE"):
+        try:
+            dwm = ctypes.WinDLL("dwmapi")
+            dwm.DwmExtendFrameIntoClientArea.argtypes = [
+                ctypes.c_void_p, ctypes.POINTER(_MARGINS)]
+            dwm.DwmExtendFrameIntoClientArea.restype = ctypes.c_long
+            margins = _MARGINS(-1, -1, -1, -1)
+            dwm.DwmExtendFrameIntoClientArea(
+                ctypes.c_void_p(hwnd), ctypes.byref(margins))
+        except Exception:
+            pass
+        if _apply_accent_acrylic(hwnd):
+            # DWM rounds the window, and that rounding is now the pill's
+            # outline - there is nothing else shaping it.
+            _set_attribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND)
+            return "accent-acrylic"
+
     if _enable_per_pixel_alpha(hwnd):
         return "per-pixel-alpha"
 

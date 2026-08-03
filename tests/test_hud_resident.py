@@ -186,6 +186,26 @@ def test_the_overlay_is_placed_after_it_is_mapped():
         "realize is overwritten by GTK's own placement")
 
 
+def test_the_pill_keeps_its_proportions_at_any_height():
+    """Windows draws a smaller pill, and it must be the same pill.
+
+    Its outline there is whatever DWM rounds the window to - a region will
+    not clip the acrylic behind it - and DWM has one radius. Making that
+    read as round means making the pill smaller, which is only acceptable
+    if everything scales together rather than the contents being squashed
+    into a shorter box.
+    """
+    source = _hud_app_source()
+    assert "SIZE_SCALE" in source, (
+        "the pill's measurements must derive from one scale factor")
+    for name in ("WIDTH = ", "DOT_X", "WAVE_L", "BAR_MAX", "BAR_W"):
+        line = next((line for line in source.splitlines()
+                     if line.startswith(name)), "")
+        assert "SIZE_SCALE" in line, (
+            f"{name.strip()} does not scale with the pill; a shorter pill "
+            f"would keep this measurement and lose the proportions")
+
+
 def test_the_window_is_cut_down_to_the_pill():
     """A toplevel is a rectangle, and DWM paints its backdrop across all of it.
 

@@ -1,12 +1,20 @@
-# A blurred pill on Windows
+# Blur on Windows
 
 The overlay's glass comes free on Wayland: the compositor blurs what is
 behind the surface and the pill tints it. Windows gives nothing away, and
-finding the arrangement that works took an entire session of dead ends. This
-is that arrangement, and the dead ends, so neither has to be found twice.
+finding the arrangements that work took an entire session of dead ends.
 
-The pill is currently **opaque** on Windows. Everything below is what a
-WinUI 3 overlay would need, proven in a throwaway spike, not yet built.
+What ships today, both through `SetWindowCompositionAttribute`:
+
+  * **The settings window** has real acrylic. It is a rectangle, which is the
+    shape Windows will put a material behind, so it gets the full effect.
+  * **The pill** has acrylic in a rounded rectangle rather than a capsule,
+    and is smaller on Windows than on Wayland to make that fixed radius read
+    as round. A window region does not clip a material - that is the whole
+    constraint, and everything below follows from it.
+
+A true capsule with blur needs WinUI 3, which is the rest of this document:
+proven in a throwaway spike, not built.
 
 ## The setting that wasted the day
 
@@ -104,8 +112,8 @@ was tried both ways; the material needs the framework package.
 
 | Approach | Result |
 | --- | --- |
-| `DWMWA_SYSTEMBACKDROP_TYPE` | Paints the window's whole rectangle. Ignores `SetWindowRgn` entirely - the region was applied, `GetWindowRgnBox` confirmed the capsule, and the slab stayed. |
-| `SetWindowCompositionAttribute` accent policy | Same rectangle, different colour. |
+| `DWMWA_SYSTEMBACKDROP_TYPE` | Draws into the window *frame*, so a toolkit that paints its own client area never shows it: applied cleanly, reported success, looked like nothing. Needs `DwmExtendFrameIntoClientArea` with margins of -1 first. Even then it ignores `SetWindowRgn` - the region was applied, `GetWindowRgnBox` confirmed the capsule, and the slab stayed. |
+| `SetWindowCompositionAttribute` accent policy | **This is what works.** Blurs the client area with a tint we control. Undocumented, and the only call that does this to a plain Win32 window. Also ignores the window region, which is why the pill is a rounded rectangle and not a capsule. |
 | `DwmEnableBlurBehindWindow` | Has not blurred anything since Windows 8 removed Aero. Still useful for one thing: over an *empty* region it makes DWM honour the window's alpha channel, which is how the GTK overlay gets transparent corners today. |
 | `CreateHostBackdropBrush` | Renders black on a plain Win32 window. Effectively UWP-only. |
 | `CreateBackdropBrush` | Samples only its own composition tree, which for a window holding nothing else is nothing. |

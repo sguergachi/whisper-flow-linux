@@ -28,7 +28,7 @@ import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw, Gdk, GLib, Gtk, Pango  # noqa: E402
+from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
 
 from . import envfile, restart, settings_def, wayland_blur  # noqa: E402
 from .backend import LocalBackend  # noqa: E402
@@ -37,10 +37,6 @@ from .logging import log, set_logging_enabled  # noqa: E402
 
 WIDTH, HEIGHT = 760, 820
 CORNER_RADIUS = 12      # Adwaita's window corner radius
-# What AdwPreferencesPage clamps its own content to. The action bar uses the
-# same number so Save sits on the right edge of the cards above it instead of
-# out in the window margin, lined up with nothing.
-CONTENT_WIDTH = 600
 
 CSS = b"""
 .model-pill {
@@ -52,7 +48,6 @@ CSS = b"""
 .pill-recommended { background: #1b2c4a; color: #9ec2fc; }
 .pill-current { background: #16301f; color: #4ade80; }
 .model-progress { min-width: 110px; }
-.save-bar { border-top: 1px solid rgba(255, 255, 255, 0.08); }
 .daemon-ok { color: #4ade80; }
 .daemon-bad { color: #f87171; }
 """
@@ -109,9 +104,10 @@ window.blurred viewswitcher button:checked {
     background-color: rgba(255, 255, 255, 0.10);
 }
 
-/* One hairline separating the action bar from the page it commits, and no
-   filled strip: the frost should run unbroken to the bottom edge. */
-window.blurred .save-bar { background-color: transparent; }
+/* The unsaved-changes banner, on the frost rather than on a filled strip. */
+window.blurred banner > revealer > widget {
+    background-color: rgba(255, 255, 255, 0.09);
+}
 """
 
 
@@ -227,49 +223,33 @@ class SettingsWindow(Adw.ApplicationWindow):
 
         toolbar.set_content(self._stack)
 
-        # Save lives on its own bar at the foot of the window, not packed
-        # into the header beside the view switcher. There it sat immediately
-        # to the right of the last tab, at the same size, on the same strip -
-        # so it read as a fifth tab rather than the action that commits the
-        # page. Navigation along the top, the action along the bottom.
+        # No permanent bar for Save at all.
         #
-        # Clamped to the same column as the cards. Left to span the window it
-        # pinned the button to the far corner and the hint to the far edge,
-        # aligned with nothing and hard against the rounded corner, with the
-        # width of the window between them.
-        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-        # AdwPreferencesPage insets its content inside the same clamp; without
-        # matching it the button overhangs the right edge of the cards by
-        # about ten pixels, which is exactly the sort of near-miss that reads
-        # as sloppy without being obvious enough to name.
-        row.set_margin_start(10)
-        row.set_margin_end(10)
+        # A footer meant a rule across the window with a mostly empty strip
+        # under it and one small button adrift at the right end - furniture
+        # that was there on every page, most of the time with nothing to do,
+        # and a separator inset from both edges so it spanned neither the
+        # window nor the content column. The header was no better: beside the
+        # view switcher the button read as a fifth tab.
+        #
+        # So it appears where it is relevant and not before: a banner under
+        # the header, the moment there is something to save, saying what is
+        # pending and offering the one action. Nothing changed means nothing
+        # on screen, and the page runs clean to the bottom edge.
+        self._banner = Adw.Banner()
+        self._banner.set_button_label("Save")
+        self._banner.connect("button-clicked", lambda *_: self._on_save())
+        self._banner.set_revealed(False)
+        toolbar.add_top_bar(self._banner)
 
-        self._save_hint = Gtk.Label(xalign=0.0)
-        self._save_hint.add_css_class("dim-label")
-        self._save_hint.set_hexpand(True)
-        self._save_hint.set_ellipsize(Pango.EllipsizeMode.END)
-        row.append(self._save_hint)
-
-        # No suggested-action here: _refresh_dirty owns that class, and adding
-        # it up front means the window flashes an accented button for the
-        # frame before the first check runs.
-        self.save_button = Gtk.Button(label="Save")
-        self.save_button.add_css_class("pill")
-        self.save_button.connect("clicked", lambda *_: self._on_save())
-        row.append(self.save_button)
-
-        clamp = Adw.Clamp(maximum_size=CONTENT_WIDTH)
-        clamp.set_child(row)
-        actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
-        actions.add_css_class("save-bar")
-        actions.append(clamp)
-        clamp.set_hexpand(True)
-        actions.set_margin_start(12)
-        actions.set_margin_end(12)
-        actions.set_margin_top(12)
-        actions.set_margin_bottom(16)
-        toolbar.add_bottom_bar(actions)
+        # Ctrl+S regardless, because the banner is only reachable by mouse
+        # and this is a window people close by keyboard.
+        save_action = Gio.SimpleAction.new("save", None)
+        save_action.connect("activate", lambda *_: self._on_save())
+        self.add_action(save_action)
+        app = self.get_application()
+        if app is not None:
+            app.set_accels_for_action("win.save", ["<Control>s"])
 
         builders = {
             "Speech": self._build_speech_page,
@@ -522,21 +502,15 @@ class SettingsWindow(Adw.ApplicationWindow):
         except Exception:
             return True         # a half-built row must not stop the timer
 
-        # The accent goes on only when pressing it would do something. An
-        # insensitive suggested-action button renders as a muddy blue-grey
-        # slab with grey text on it, which reads as broken rather than as
-        # "nothing to save" - and it is the one control on the page, sitting
-        # by itself, so there is nothing around it to read it against.
-        dirty = bool(changed)
-        self.save_button.set_sensitive(dirty)
-        if dirty:
-            self.save_button.add_css_class("suggested-action")
-        else:
-            self.save_button.remove_css_class("suggested-action")
-        self._save_hint.set_text(
-            f"{len(changed)} unsaved change"
-            f"{'s' if len(changed) != 1 else ''} - applies on restart"
-            if changed else "")
+        # The banner is the whole state: revealed means there is something to
+        # save and says what, hidden means there is not and takes its own
+        # space back with it. No disabled control to explain, and no strip of
+        # empty furniture on a page where nothing has been touched.
+        if changed:
+            self._banner.set_title(
+                f"{len(changed)} unsaved change"
+                f"{'s' if len(changed) != 1 else ''} - applies on restart")
+        self._banner.set_revealed(bool(changed))
         return True
 
     def _values(self) -> dict:

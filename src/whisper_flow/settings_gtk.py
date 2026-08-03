@@ -37,6 +37,10 @@ from .logging import log, set_logging_enabled  # noqa: E402
 
 WIDTH, HEIGHT = 760, 820
 CORNER_RADIUS = 12      # Adwaita's window corner radius
+# What AdwPreferencesPage clamps its own content to. The action bar uses the
+# same number so Save sits on the right edge of the cards above it instead of
+# out in the window margin, lined up with nothing.
+CONTENT_WIDTH = 600
 
 CSS = b"""
 .model-pill {
@@ -48,6 +52,7 @@ CSS = b"""
 .pill-recommended { background: #1b2c4a; color: #9ec2fc; }
 .pill-current { background: #16301f; color: #4ade80; }
 .model-progress { min-width: 110px; }
+.save-bar { border-top: 1px solid rgba(255, 255, 255, 0.08); }
 .daemon-ok { color: #4ade80; }
 .daemon-bad { color: #f87171; }
 """
@@ -106,10 +111,7 @@ window.blurred viewswitcher button:checked {
 
 /* One hairline separating the action bar from the page it commits, and no
    filled strip: the frost should run unbroken to the bottom edge. */
-window.blurred .action-bar {
-    background-color: transparent;
-    border-top: 1px solid rgba(255, 255, 255, 0.07);
-}
+window.blurred .save-bar { background-color: transparent; }
 """
 
 
@@ -198,6 +200,8 @@ class SettingsWindow(Adw.ApplicationWindow):
 
         self._build()
         self._load()
+        self._refresh_dirty()
+        GLib.timeout_add(400, self._refresh_dirty)
         self.connect("realize", self._on_realize)
 
     # ---------------------------------------------------------------- layout
@@ -228,25 +232,41 @@ class SettingsWindow(Adw.ApplicationWindow):
         # to the right of the last tab, at the same size, on the same strip -
         # so it read as a fifth tab rather than the action that commits the
         # page. Navigation along the top, the action along the bottom.
-        actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        actions.add_css_class("action-bar")
-        actions.set_margin_start(12)
-        actions.set_margin_end(12)
-        actions.set_margin_top(8)
-        actions.set_margin_bottom(8)
+        #
+        # Clamped to the same column as the cards. Left to span the window it
+        # pinned the button to the far corner and the hint to the far edge,
+        # aligned with nothing and hard against the rounded corner, with the
+        # width of the window between them.
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        # AdwPreferencesPage insets its content inside the same clamp; without
+        # matching it the button overhangs the right edge of the cards by
+        # about ten pixels, which is exactly the sort of near-miss that reads
+        # as sloppy without being obvious enough to name.
+        row.set_margin_start(10)
+        row.set_margin_end(10)
 
         self._save_hint = Gtk.Label(xalign=0.0)
         self._save_hint.add_css_class("dim-label")
-        self._save_hint.set_text("Saved to .env; most settings apply on restart")
         self._save_hint.set_hexpand(True)
         self._save_hint.set_ellipsize(Pango.EllipsizeMode.END)
-        actions.append(self._save_hint)
+        row.append(self._save_hint)
 
         self.save_button = Gtk.Button(label="Save")
         self.save_button.add_css_class("suggested-action")
         self.save_button.add_css_class("pill")
         self.save_button.connect("clicked", lambda *_: self._on_save())
-        actions.append(self.save_button)
+        row.append(self.save_button)
+
+        clamp = Adw.Clamp(maximum_size=CONTENT_WIDTH)
+        clamp.set_child(row)
+        actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        actions.add_css_class("save-bar")
+        actions.append(clamp)
+        clamp.set_hexpand(True)
+        actions.set_margin_start(12)
+        actions.set_margin_end(12)
+        actions.set_margin_top(10)
+        actions.set_margin_bottom(12)
         toolbar.add_bottom_bar(actions)
 
         builders = {
@@ -479,6 +499,33 @@ class SettingsWindow(Adw.ApplicationWindow):
                 continue
             row.set_text("" if value is None else str(value))
             self._current[field.key] = "" if value is None else str(value)
+
+    def _refresh_dirty(self) -> bool:
+        """Keep Save honest about whether there is anything to save.
+
+        An always-enabled Save button on a page with nothing pending says
+        nothing, and the only way to find out was to press it and read a
+        "Nothing changed" toast. Polled rather than wired to every widget:
+        four kinds of row each announce a change differently, and reading
+        two dozen widgets four times a second costs nothing measurable.
+        """
+        if self._working:
+            return True
+        try:
+            changed = dict(settings_def.updates_from(self._values(),
+                                                     self._current))
+            model = self._selected_model()
+            if model and model != self._current_model:
+                changed["WHISPER_FLOW_MODEL_NAME"] = model
+        except Exception:
+            return True         # a half-built row must not stop the timer
+
+        self.save_button.set_sensitive(bool(changed))
+        self._save_hint.set_text(
+            f"{len(changed)} unsaved change"
+            f"{'s' if len(changed) != 1 else ''} - applies on restart"
+            if changed else "")
+        return True
 
     def _values(self) -> dict:
         values = {}

@@ -223,6 +223,31 @@ def _ease(t: float) -> float:
     return t * t * (3.0 - 2.0 * t)
 
 
+def _squircle_points(x, y, w, h, n=SQUIRCLE_N, cap=CAP_EXT, steps=SQUIRCLE_STEPS):
+    """The capsule outline as a point list. See _squircle for the shape.
+
+    Separate from the drawing so the window region can be cut from the very
+    same geometry: a region that only approximated the pill would clip its
+    caps or leave a rim of window outside them, and the two would drift
+    apart the moment either was tuned.
+    """
+    b = h / 2.0
+    rx = min(b * cap, w / 2.0)
+    cy = y + b
+    left_j, right_j = x + rx, x + w - rx
+    e = 2.0 / n
+    pts = []
+    for base, lo in ((right_j, -math.pi / 2), (left_j, math.pi / 2)):
+        for i in range(steps + 1):
+            t = lo + math.pi * i / steps
+            ct, st = math.cos(t), math.sin(t)
+            pts.append((
+                base + rx * math.copysign(abs(ct) ** e, ct),
+                cy + b * math.copysign(abs(st) ** e, st),
+            ))
+    return pts
+
+
 def _squircle(cr, x, y, w, h, n=SQUIRCLE_N, cap=CAP_EXT, steps=SQUIRCLE_STEPS):
     """Append a capsule whose end caps have continuous curvature.
 
@@ -237,20 +262,7 @@ def _squircle(cr, x, y, w, h, n=SQUIRCLE_N, cap=CAP_EXT, steps=SQUIRCLE_STEPS):
     instead of a capsule. Each cap reaches `cap` times the half-height along
     the edge, which is what gives the curvature room to ramp.
     """
-    b = h / 2.0
-    rx = min(b * cap, w / 2.0)
-    cy = y + b
-    left_j, right_j = x + rx, x + w - rx
-    e = 2.0 / n
-    pts = []
-    for j, (base, lo) in enumerate(((right_j, -math.pi / 2), (left_j, math.pi / 2))):
-        for i in range(steps + 1):
-            t = lo + math.pi * i / steps
-            ct, st = math.cos(t), math.sin(t)
-            pts.append((
-                base + rx * math.copysign(abs(ct) ** e, ct),
-                cy + b * math.copysign(abs(st) ** e, st),
-            ))
+    pts = _squircle_points(x, y, w, h, n, cap, steps)
     cr.move_to(*pts[0])
     for px, py in pts[1:]:
         cr.line_to(px, py)
@@ -389,6 +401,12 @@ class HudWindow(Gtk.Window):
 
     def _reposition(self):
         self._apply_position()
+        # Re-cut here too: at realize the surface has not been sized yet, so
+        # the region built there is against a provisional rectangle.
+        self._apply_shape_win32()
+        # And re-claim the topmost band, which another window may have taken
+        # since this overlay was last on screen.
+        self._raise_win32()
         return GLib.SOURCE_REMOVE
 
     def _pick_monitor(self, hint: str | None):
@@ -491,6 +509,38 @@ class HudWindow(Gtk.Window):
         user32.EnumWindows(each, None)
         return found[0] if found else None
 
+    def _raise_win32(self):
+        """Put the pill above everything, including the taskbar.
+
+        Re-asserted on every show, not just at realize. WS_EX_TOPMOST is
+        supposed to be sticky, but the band is ordered by whoever claimed it
+        last: a shell surface or another topmost window that appears after
+        us ends up in front, and the overlay spends the recording behind the
+        taskbar. Claiming it again each time the pill is shown costs one
+        call and settles it.
+
+        argtypes are declared because HWND_TOPMOST is the sentinel -1 and
+        this is a 64-bit process. Left untyped, ctypes marshals it as a
+        32-bit int and what the callee reads for a pointer-sized handle is
+        not -1 at all.
+        """
+        if not self._hwnd:
+            return
+        try:
+            user32 = ctypes.windll.user32
+            user32.SetWindowPos.argtypes = [
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+                ctypes.c_int, ctypes.c_int, ctypes.c_uint,
+            ]
+            user32.SetWindowPos.restype = ctypes.c_bool
+            HWND_TOPMOST = -1
+            SWP_NOSIZE, SWP_NOMOVE, SWP_NOACTIVATE = 0x1, 0x2, 0x10
+            user32.SetWindowPos(
+                ctypes.c_void_p(self._hwnd), ctypes.c_void_p(HWND_TOPMOST),
+                0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE)
+        except Exception as e:
+            print(f"[HUD] could not raise the overlay: {e}", flush=True)
+
     def _realize_win32(self):
         """Topmost, positioned, acrylic and rounded - DWM does the styling."""
         try:
@@ -498,17 +548,50 @@ class HudWindow(Gtk.Window):
             if not self._hwnd:
                 print("[HUD] no HWND yet", flush=True)
                 return
-            user32 = ctypes.windll.user32
-            HWND_TOPMOST = -1
-            SWP_NOACTIVATE = 0x10
-            user32.SetWindowPos(self._hwnd, HWND_TOPMOST, 0, 0, 0, 0,
-                                0x1 | 0x2 | SWP_NOACTIVATE)  # NOSIZE|NOMOVE
+            self._raise_win32()
             self._apply_position()
+            self._apply_shape_win32()
             if not os.environ.get("WHISPER_FLOW_HUD_NO_BLUR"):
                 style = _win_blur.apply_window_style(self._hwnd)
                 print(f"[HUD] window style: {style or 'not applied'}", flush=True)
         except Exception as e:
             print(f"[HUD] Windows window setup failed: {e}", flush=True)
+
+    # How far the region is pushed past the drawn outline. The cut has no
+    # antialiasing, so landing it exactly on the outline would replace the
+    # pill's soft rim with a staircase. One physical pixel out, the ragged
+    # edge falls on fully transparent pixels and the drawn rim survives
+    # intact - the same reasoning as BLUR_INSET on the Wayland side, in the
+    # opposite direction, because there the region sits under the glass and
+    # here it decides what exists at all.
+    SHAPE_BLEED = 1
+
+    def _apply_shape_win32(self):
+        """Cut the window down to the pill, so the rest is really transparent.
+
+        Measured from the window rather than computed from WIDTH and HEIGHT:
+        GTK owns the surface size and applies the display scale itself, and a
+        region built from what we assumed the size was would be wrong on
+        every display that is not at 100%.
+        """
+        if not self._hwnd:
+            return
+        try:
+            rect = (ctypes.c_long * 4)()
+            if not ctypes.windll.user32.GetWindowRect(
+                    ctypes.c_void_p(self._hwnd), ctypes.byref(rect)):
+                return
+            w, h = rect[2] - rect[0], rect[3] - rect[1]
+            if w <= 0 or h <= 0:
+                return
+            bleed = self.SHAPE_BLEED
+            points = _squircle_points(-bleed, -bleed, w + 2 * bleed, h + 2 * bleed)
+            applied = _win_blur.set_shape(self._hwnd, points)
+            print(f"[HUD] window shape: {w}x{h} "
+                  f"{'clipped to the pill' if applied else 'not applied'}",
+                  flush=True)
+        except Exception as e:
+            print(f"[HUD] could not shape the window: {e}", flush=True)
 
     def _monitor_scale(self) -> float:
         """Logical-to-physical factor for the output the pill is on.

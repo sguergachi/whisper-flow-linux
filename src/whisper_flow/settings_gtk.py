@@ -49,7 +49,10 @@ SECTION_ICONS = {
     "Dictation": "audio-input-microphone-symbolic",
     "General": "emblem-system-symbolic",
 }
-STATUS_ICONS = ("emblem-ok-symbolic", "dialog-warning-symbolic")
+# object-select-symbolic, not emblem-ok-symbolic: Adwaita 50 dropped the
+# latter, and the running-daemon row would have drawn the broken-image glyph.
+# The selftest caught it, which is the whole reason it checks these by name.
+STATUS_ICONS = ("object-select-symbolic", "dialog-warning-symbolic")
 ICON_NAMES = tuple(SECTION_ICONS.values()) + STATUS_ICONS
 
 CSS = b"""
@@ -350,8 +353,7 @@ class SettingsWindow(Adw.ApplicationWindow):
         # two different subjects.
         row = Adw.ActionRow(title="Status")
         pid = restart.daemon_pid()
-        icon = Gtk.Image.new_from_icon_name(
-            "emblem-ok-symbolic" if pid else "dialog-warning-symbolic")
+        icon = Gtk.Image.new_from_icon_name(STATUS_ICONS[0 if pid else 1])
         icon.add_css_class("daemon-ok" if pid else "daemon-bad")
         row.add_prefix(icon)
         row.set_subtitle(f"running (pid {pid})" if pid else

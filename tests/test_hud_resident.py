@@ -10,6 +10,7 @@ all, that a resident overlay can never be stranded on screen.
 import sys
 import threading
 import time
+from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
@@ -154,7 +155,6 @@ def test_the_overlay_opens_the_display_itself():
 
 
 def _hud_app_source() -> str:
-    from pathlib import Path
     return (Path(__file__).resolve().parents[1]
             / "src/whisper_flow/hud_app.py").read_text(encoding="utf-8")
 
@@ -184,6 +184,41 @@ def test_the_overlay_is_placed_after_it_is_mapped():
     assert '"map"' in source and "_on_map" in source, (
         "the overlay must re-apply its position on map; a position set at "
         "realize is overwritten by GTK's own placement")
+
+
+def test_the_window_is_cut_down_to_the_pill():
+    """A toplevel is a rectangle, and DWM paints its backdrop across all of it.
+
+    The pill drew transparent corners and they went nowhere: the acrylic
+    filled the whole rect, so the capsule sat on an opaque slab. A window
+    region is what actually removes those pixels.
+    """
+    source = _hud_app_source()
+    assert "_apply_shape_win32" in source, (
+        "the overlay must clip its window to the pill, or the corners stay "
+        "opaque whatever cairo draws")
+    assert "_squircle_points" in source, (
+        "the region must be cut from the same geometry the pill is drawn "
+        "with, or the two drift apart")
+    blur = (Path(__file__).resolve().parents[1]
+            / "src/whisper_flow/blur_win.py").read_text(encoding="utf-8")
+    assert "SetWindowRgn" in blur and "CreatePolygonRgn" in blur
+    assert "restype = ctypes.c_void_p" in blur, (
+        "a region handle is pointer-sized; untyped ctypes truncates it")
+
+
+def test_the_overlay_reclaims_topmost_every_time_it_is_shown():
+    """The topmost band is ordered by whoever claimed it last.
+
+    Set once at realize, the pill ended up behind the taskbar and behind any
+    other topmost window that appeared later.
+    """
+    source = _hud_app_source()
+    assert "_raise_win32" in source, "the overlay needs an explicit raise"
+    body = source.split("def _reposition(", 1)[1].split("\n    def ", 1)[0]
+    assert "_raise_win32()" in body, (
+        "topmost must be re-asserted when the pill is shown, not only when "
+        "the window is first realized")
 
 
 def test_a_parked_overlay_keeps_following_the_level_file():

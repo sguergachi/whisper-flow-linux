@@ -114,6 +114,63 @@ def apply_window_style(hwnd: int) -> str | None:
     return "dwm-acrylic"
 
 
+def set_shape(hwnd: int, points) -> bool:
+    """Clip the window to a polygon; everything outside it becomes nothing.
+
+    A top-level window on Windows is a rectangle, and DWM composites its
+    backdrop across all of it. The pill was drawn with transparent corners
+    and the transparency went nowhere: the acrylic filled the full rect, so
+    the capsule sat on an opaque grey slab with the desktop hidden behind it.
+
+    A window region is the one mechanism that removes those pixels rather
+    than colouring them - outside the region the window does not exist, so
+    the desktop shows through and clicks pass to whatever is underneath.
+    The cut is hard-edged, with none of the compositor's antialiasing, which
+    is why the caller inflates it past the drawn outline: the ragged edge
+    then falls outside the pill instead of eating into its rim.
+
+    Args:
+        hwnd: Native window handle.
+        points: The outline, in physical pixels relative to the window's
+            top-left corner.
+
+    Returns:
+        Whether the region was applied.
+
+    """
+    if not hwnd or not points:
+        return False
+    try:
+        gdi32 = ctypes.WinDLL("gdi32")
+        user32 = ctypes.WinDLL("user32")
+        # A region handle is pointer-sized. Untyped, ctypes would marshal it
+        # as a 32-bit int and hand SetWindowRgn a handle that is not the one
+        # CreatePolygonRgn returned.
+        gdi32.CreatePolygonRgn.argtypes = [
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+        gdi32.CreatePolygonRgn.restype = ctypes.c_void_p
+        user32.SetWindowRgn.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_bool]
+        user32.SetWindowRgn.restype = ctypes.c_int
+
+        count = len(points)
+        buffer = (wintypes.POINT * count)()
+        for i, (x, y) in enumerate(points):
+            buffer[i].x = round(x)
+            buffer[i].y = round(y)
+        WINDING = 2      # correct for a closed outline that never self-crosses
+        region = gdi32.CreatePolygonRgn(ctypes.byref(buffer), count, WINDING)
+        if not region:
+            return False
+        # Redraw: without it the old rectangle stays on screen until
+        # something else invalidates the window. Windows owns the region
+        # after this call, so it must not be deleted here.
+        return bool(user32.SetWindowRgn(
+            ctypes.c_void_p(hwnd), ctypes.c_void_p(region), True))
+    except Exception:
+        return False
+
+
 def unsupported_reason() -> str:
     """Why this machine cannot run the overlay, for the log."""
     build = windows_build()

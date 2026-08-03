@@ -251,8 +251,10 @@ class SettingsWindow(Adw.ApplicationWindow):
         self._save_hint.set_ellipsize(Pango.EllipsizeMode.END)
         row.append(self._save_hint)
 
+        # No suggested-action here: _refresh_dirty owns that class, and adding
+        # it up front means the window flashes an accented button for the
+        # frame before the first check runs.
         self.save_button = Gtk.Button(label="Save")
-        self.save_button.add_css_class("suggested-action")
         self.save_button.add_css_class("pill")
         self.save_button.connect("clicked", lambda *_: self._on_save())
         row.append(self.save_button)
@@ -265,8 +267,8 @@ class SettingsWindow(Adw.ApplicationWindow):
         clamp.set_hexpand(True)
         actions.set_margin_start(12)
         actions.set_margin_end(12)
-        actions.set_margin_top(10)
-        actions.set_margin_bottom(12)
+        actions.set_margin_top(12)
+        actions.set_margin_bottom(16)
         toolbar.add_bottom_bar(actions)
 
         builders = {
@@ -520,7 +522,17 @@ class SettingsWindow(Adw.ApplicationWindow):
         except Exception:
             return True         # a half-built row must not stop the timer
 
-        self.save_button.set_sensitive(bool(changed))
+        # The accent goes on only when pressing it would do something. An
+        # insensitive suggested-action button renders as a muddy blue-grey
+        # slab with grey text on it, which reads as broken rather than as
+        # "nothing to save" - and it is the one control on the page, sitting
+        # by itself, so there is nothing around it to read it against.
+        dirty = bool(changed)
+        self.save_button.set_sensitive(dirty)
+        if dirty:
+            self.save_button.add_css_class("suggested-action")
+        else:
+            self.save_button.remove_css_class("suggested-action")
         self._save_hint.set_text(
             f"{len(changed)} unsaved change"
             f"{'s' if len(changed) != 1 else ''} - applies on restart"

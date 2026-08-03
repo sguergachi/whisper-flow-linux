@@ -107,3 +107,46 @@ def test_validate_rejects_non_numbers_and_out_of_range():
 def test_validate_rejects_a_hotkey_with_an_empty_part():
     problem = settings_def.validate({"hotkey_transcribe": "super++alt"})
     assert "empty key name" in problem
+
+
+# ------------------------------------------------------------------- layout
+def test_every_field_names_a_group():
+    """A field with no group renders in an untitled block above the rest.
+
+    That is how the pages looked before they were grouped: one undivided
+    column per section, ten rows deep on Dictation. A new field must not be
+    able to reintroduce it by omission.
+    """
+    ungrouped = [f.key for f in settings_def.FIELDS if not f.group]
+    assert not ungrouped, f"no group set for: {', '.join(ungrouped)}"
+
+
+def test_each_group_keeps_a_readable_number_of_ordinary_rows():
+    """The reason for grouping in the first place, held to a number.
+
+    Expert rows sit behind an expander and do not count against this: they
+    are one row until someone opens them.
+    """
+    from collections import Counter
+
+    counts = Counter((f.section, f.group)
+                     for f in settings_def.FIELDS if not f.advanced)
+    too_long = {key: n for key, n in counts.items() if n > 5}
+    assert not too_long, f"groups needing a split: {too_long}"
+
+
+def test_advanced_fields_sit_in_a_group_that_also_has_ordinary_ones():
+    """Otherwise a group renders as a title over a lone Advanced expander."""
+    from collections import defaultdict
+
+    kinds = defaultdict(set)
+    for field in settings_def.FIELDS:
+        kinds[(field.section, field.group)].add(field.advanced)
+    orphans = [key for key, seen in kinds.items() if seen == {True}]
+    assert not orphans, f"only-advanced groups: {orphans}"
+
+
+def test_group_help_refers_to_groups_that_exist():
+    """A typo in a heading would silently drop its description."""
+    real = {(f.section, f.group) for f in settings_def.FIELDS}
+    assert set(settings_def.GROUP_HELP) <= real

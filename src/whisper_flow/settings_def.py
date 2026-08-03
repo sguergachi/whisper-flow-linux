@@ -27,74 +27,132 @@ class Field:
     maximum: float | None = None
     choices: tuple = ()
     help: str = ""
+    # Which titled group inside the page this belongs to. Layout lives here
+    # rather than in the window because this module is the part that can be
+    # tested without a display, and because a page that lists every field of
+    # a section in one undivided column - which is what there was - stops
+    # being readable at about six rows. Dictation had ten.
+    group: str = ""
+    # Real but rarely touched: watchdog intervals, frame sizes, lock
+    # timeouts. Shown behind one expander so the page opens on the settings
+    # people actually came for, without hiding anything from those who did.
+    advanced: bool = False
 
 
 SECTIONS = ("Speech", "Hotkeys", "Dictation", "General")
 
+# One line of orientation per group, where the title alone leaves a question.
+GROUP_HELP = {
+    ("Speech", "Engine"):
+        "Where speech is turned into text. Everything stays on this machine.",
+    ("Hotkeys", "Shortcuts"):
+        "Key names joined with '+', e.g. super+alt or ctrl+shift+space. "
+        "Applies on restart.",
+    ("Dictation", "Microphone"):
+        "Which device is recorded, and how it is sampled.",
+    ("Dictation", "While you speak"):
+        "Whether words appear as you talk or all at once when you stop.",
+    ("Dictation", "Stopping"):
+        "When a recording ends by itself.",
+    ("General", "Notifications"): "",
+    ("General", "Daemon"):
+        "The background process that owns the hotkeys and the tray icon.",
+}
+
+ADVANCED_HELP = "Rarely needed. The defaults suit almost every machine."
+
 FIELDS = (
-    # Speech: the local engine, then the hosted fallback
+    # ---------------------------------------------------------------- Speech
     Field("manage_local_server", "WHISPER_FLOW_MANAGE_LOCAL_SERVER",
           "Run the speech engine locally", "Speech", "bool",
-          help="Download and supervise a whisper.cpp server on this machine"),
-    Field("local_server_port", "WHISPER_FLOW_LOCAL_SERVER_PORT",
-          "Local server port", "Speech", "int", 1024, 65535),
-    Field("fast_encoder", "WHISPER_FLOW_FAST_ENCODER",
-          "Match encoder window to clip length", "Speech", "bool",
-          help="Up to 1.9x quicker, and it does change some words"),
+          help="Download and supervise a whisper.cpp server on this machine",
+          group="Engine"),
     Field("local_whisper_url", "WHISPER_FLOW_LOCAL_WHISPER_URL",
           "Whisper server URL", "Speech",
-          help="Point at an existing server instead; empty uses the managed one"),
-    # Hotkeys
+          help="Point at an existing server instead; empty uses the managed one",
+          group="Engine"),
+    Field("local_server_port", "WHISPER_FLOW_LOCAL_SERVER_PORT",
+          "Local server port", "Speech", "int", 1024, 65535,
+          group="Engine", advanced=True),
+    Field("fast_encoder", "WHISPER_FLOW_FAST_ENCODER",
+          "Match encoder window to clip length", "Speech", "bool",
+          help="Up to 1.9x quicker, and it does change some words",
+          group="Engine", advanced=True),
+
+    # --------------------------------------------------------------- Hotkeys
     Field("hotkey_transcribe", "WHISPER_FLOW_HOTKEY_TRANSCRIBE",
-          "Transcribe (push-to-talk)", "Hotkeys"),
+          "Transcribe (push-to-talk)", "Hotkeys", group="Shortcuts"),
     Field("hotkey_auto_transcribe", "WHISPER_FLOW_HOTKEY_AUTO_TRANSCRIBE",
-          "Auto-transcribe (single press)", "Hotkeys"),
+          "Auto-transcribe (single press)", "Hotkeys", group="Shortcuts"),
     Field("hotkey_command", "WHISPER_FLOW_HOTKEY_COMMAND",
-          "Command (push-to-talk)", "Hotkeys"),
-    # Dictation
-    Field("live_transcription", "WHISPER_FLOW_LIVE_TRANSCRIPTION",
-          "Type while you speak", "Dictation", "bool"),
-    Field("live_interval", "WHISPER_FLOW_LIVE_INTERVAL",
-          "Live pass interval (s)", "Dictation", "float", 0.3, 5.0),
-    Field("vad_mode", "VAD_MODE", "Voice detection aggressiveness",
-          "Dictation", "choice", choices=("0", "1", "2", "3")),
-    Field("mic_device_index", "MIC_DEVICE_INDEX", "Microphone",
-          "Dictation", "choice"),   # choices filled in from the device list
+          "Command (push-to-talk)", "Hotkeys", group="Shortcuts"),
+
+    # ------------------------------------------------------------- Dictation
+    Field("mic_device_index", "MIC_DEVICE_INDEX", "Input device",
+          "Dictation", "choice",   # choices filled in from the device list
+          group="Microphone"),
     Field("sample_rate", "SAMPLE_RATE", "Sample rate (Hz)", "Dictation",
-          "choice", choices=("8000", "16000", "32000", "48000")),
+          "choice", choices=("8000", "16000", "32000", "48000"),
+          group="Microphone", advanced=True),
     Field("frame_ms", "WHISPER_FLOW_FRAME_MS", "Audio frame (ms)", "Dictation",
-          "choice", choices=("10", "20", "30")),
-    Field("silence_timeout", "SILENCE_TIMEOUT", "Silence timeout (s)",
-          "Dictation", "float", 0.1, 30.0),
-    Field("auto_stop_silence_duration", "WHISPER_FLOW_AUTO_STOP_SILENCE",
-          "Auto-stop after silence (s)", "Dictation", "float", 0.5, 10.0),
+          "choice", choices=("10", "20", "30"),
+          group="Microphone", advanced=True),
+    Field("vad_mode", "VAD_MODE", "Voice detection aggressiveness",
+          "Dictation", "choice", choices=("0", "1", "2", "3"),
+          group="Microphone", advanced=True),
+
+    Field("live_transcription", "WHISPER_FLOW_LIVE_TRANSCRIPTION",
+          "Type while you speak", "Dictation", "bool",
+          group="While you speak"),
+    Field("live_interval", "WHISPER_FLOW_LIVE_INTERVAL",
+          "Live pass interval (s)", "Dictation", "float", 0.3, 5.0,
+          group="While you speak"),
     Field("speedup_audio", "WHISPER_FLOW_SPEEDUP_AUDIO",
           "Audio speed multiplier", "Dictation", "float", 0.5, 3.0,
-          help="1 leaves audio untouched"),
+          help="1 leaves audio untouched",
+          group="While you speak", advanced=True),
     Field("trim_silence", "WHISPER_FLOW_TRIM_SILENCE",
           "Trim silence before transcribing", "Dictation", "bool",
-          help="Much quicker on long recordings with pauses in them"),
+          help="Much quicker on long recordings with pauses in them",
+          group="While you speak", advanced=True),
+
+    Field("auto_stop_silence_duration", "WHISPER_FLOW_AUTO_STOP_SILENCE",
+          "Auto-stop after silence (s)", "Dictation", "float", 0.5, 10.0,
+          group="Stopping"),
+    Field("silence_timeout", "SILENCE_TIMEOUT", "Silence timeout (s)",
+          "Dictation", "float", 0.1, 30.0, group="Stopping"),
     Field("max_recording_duration", "WHISPER_FLOW_MAX_RECORDING_DURATION",
-          "Maximum recording (s)", "Dictation", "float", 60.0, 1800.0),
-    # General
+          "Maximum recording (s)", "Dictation", "float", 60.0, 1800.0,
+          group="Stopping"),
+
+    # --------------------------------------------------------------- General
     Field("notifications_enabled", "WHISPER_FLOW_NOTIFICATIONS_ENABLED",
-          "Desktop notifications", "General", "bool"),
+          "Desktop notifications", "General", "bool", group="Notifications"),
     Field("notification_min_interval", "WHISPER_FLOW_NOTIFICATION_MIN_INTERVAL",
-          "Notification repeat delay (s)", "General", "float", 0.0, 3600.0),
+          "Repeat delay (s)", "General", "float", 0.0, 3600.0,
+          group="Notifications"),
     Field("notification_timeout", "WHISPER_FLOW_NOTIFICATION_TIMEOUT",
-          "Notification timeout (ms)", "General", "int", 1000, 10000),
-    Field("logging_enabled", "WHISPER_FLOW_LOGGING_ENABLED",
-          "Debug logging", "General", "bool"),
+          "On screen for (ms)", "General", "int", 1000, 10000,
+          group="Notifications"),
+
     Field("daemon_enabled", "WHISPER_FLOW_DAEMON_ENABLED",
-          "Daemon mode", "General", "bool"),
+          "Daemon mode", "General", "bool", group="Daemon"),
+    Field("logging_enabled", "WHISPER_FLOW_LOGGING_ENABLED",
+          "Debug logging", "General", "bool",
+          help="Keeps a detailed log for Copy log in the tray",
+          group="Daemon"),
     Field("pystray_backend", "PYSTRAY_BACKEND", "Tray backend", "General",
-          "choice", choices=("gtk", "appindicator", "xorg")),
+          "choice", choices=("gtk", "appindicator", "xorg"),
+          group="Daemon", advanced=True),
     Field("processing_lock_timeout", "WHISPER_FLOW_PROCESSING_LOCK_TIMEOUT",
-          "Processing lock timeout (s)", "General", "float", 1.0, 30.0),
+          "Processing lock timeout (s)", "General", "float", 1.0, 30.0,
+          group="Daemon", advanced=True),
     Field("watchdog_interval", "WHISPER_FLOW_WATCHDOG_INTERVAL",
-          "Watchdog interval (s)", "General", "float", 0.5, 10.0),
+          "Watchdog interval (s)", "General", "float", 0.5, 10.0,
+          group="Daemon", advanced=True),
     Field("queue_request_timeout", "WHISPER_FLOW_QUEUE_REQUEST_TIMEOUT",
-          "Queued request expiry (s)", "General", "float", 10.0, 300.0),
+          "Queued request expiry (s)", "General", "float", 10.0, 300.0,
+          group="Daemon", advanced=True),
 )
 
 

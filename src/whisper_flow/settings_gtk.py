@@ -28,7 +28,7 @@ import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw, Gdk, GLib, Gtk  # noqa: E402
+from gi.repository import Adw, Gdk, GLib, Gtk, Pango  # noqa: E402
 
 from . import envfile, restart, settings_def, wayland_blur  # noqa: E402
 from .backend import LocalBackend  # noqa: E402
@@ -102,6 +102,13 @@ window.blurred row.activatable:hover {
 window.blurred viewswitcher button:not(:checked) { background-color: transparent; }
 window.blurred viewswitcher button:checked {
     background-color: rgba(255, 255, 255, 0.10);
+}
+
+/* One hairline separating the action bar from the page it commits, and no
+   filled strip: the frost should run unbroken to the bottom edge. */
+window.blurred .action-bar {
+    background-color: transparent;
+    border-top: 1px solid rgba(255, 255, 255, 0.07);
 }
 """
 
@@ -206,10 +213,6 @@ class SettingsWindow(Adw.ApplicationWindow):
         # KDE's adds a dead "menu" chevron and drops min/max. Ask for the
         # ordinary set instead.
         header.set_decoration_layout(":minimize,maximize,close")
-        self.save_button = Gtk.Button(label="Save")
-        self.save_button.add_css_class("suggested-action")
-        self.save_button.connect("clicked", lambda *_: self._on_save())
-        header.pack_end(self.save_button)
         toolbar.add_top_bar(header)
 
         self._stack = Adw.ViewStack()
@@ -219,6 +222,32 @@ class SettingsWindow(Adw.ApplicationWindow):
         header.set_title_widget(switcher)
 
         toolbar.set_content(self._stack)
+
+        # Save lives on its own bar at the foot of the window, not packed
+        # into the header beside the view switcher. There it sat immediately
+        # to the right of the last tab, at the same size, on the same strip -
+        # so it read as a fifth tab rather than the action that commits the
+        # page. Navigation along the top, the action along the bottom.
+        actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        actions.add_css_class("action-bar")
+        actions.set_margin_start(12)
+        actions.set_margin_end(12)
+        actions.set_margin_top(8)
+        actions.set_margin_bottom(8)
+
+        self._save_hint = Gtk.Label(xalign=0.0)
+        self._save_hint.add_css_class("dim-label")
+        self._save_hint.set_text("Saved to .env; most settings apply on restart")
+        self._save_hint.set_hexpand(True)
+        self._save_hint.set_ellipsize(Pango.EllipsizeMode.END)
+        actions.append(self._save_hint)
+
+        self.save_button = Gtk.Button(label="Save")
+        self.save_button.add_css_class("suggested-action")
+        self.save_button.add_css_class("pill")
+        self.save_button.connect("clicked", lambda *_: self._on_save())
+        actions.append(self.save_button)
+        toolbar.add_bottom_bar(actions)
 
         builders = {
             "Speech": self._build_speech_page,
@@ -238,25 +267,57 @@ class SettingsWindow(Adw.ApplicationWindow):
             self._stack.add_titled_with_icon(
                 page, section.lower(), section, icons[section])
 
-    def _build_plain_page(self, section: str):
-        page = Adw.PreferencesPage()
-        group = Adw.PreferencesGroup()
-        if section == "Hotkeys":
-            group.set_description(
-                "Key names joined with '+', e.g. super+alt or "
-                "ctrl+shift+space. Applies on restart.")
-        page.add(group)
+    def _add_field_groups(self, page, section: str, lead_rows=None):
+        """Render a section as titled groups, expert rows behind an expander.
+
+        Every page used to be one untitled column holding everything in its
+        section, which read as a wall: Dictation put the microphone, the
+        live-typing interval, VAD aggressiveness, frame size and three
+        different timeouts in a single list of ten. The schema carries the
+        grouping, so the order and the headings are the same everywhere and
+        a new field cannot land somewhere arbitrary.
+        """
+        ordered: dict[str, list] = {}
         for field in settings_def.FIELDS:
             if field.section == section:
-                group.add(self._build_row(field))
+                ordered.setdefault(field.group, []).append(field)
+
+        for name, fields in ordered.items():
+            group = Adw.PreferencesGroup(title=name)
+            description = settings_def.GROUP_HELP.get((section, name), "")
+            if description:
+                group.set_description(description)
+            page.add(group)
+
+            for row in (lead_rows or {}).get(name, ()):
+                group.add(row)
+            for field in fields:
+                if not field.advanced:
+                    group.add(self._build_row(field))
+
+            # Per group rather than one bin at the foot of the page: sample
+            # rate belongs with the microphone, not with a watchdog timer.
+            advanced = [field for field in fields if field.advanced]
+            if advanced:
+                expander = Adw.ExpanderRow(
+                    title="Advanced", subtitle=settings_def.ADVANCED_HELP)
+                for field in advanced:
+                    expander.add_row(self._build_row(field))
+                group.add(expander)
+
+    def _build_plain_page(self, section: str):
+        page = Adw.PreferencesPage()
+        self._add_field_groups(page, section)
         return page
 
     def _build_general_page(self, section: str):
         page = Adw.PreferencesPage()
 
-        status_group = Adw.PreferencesGroup()
-        page.add(status_group)
-        row = Adw.ActionRow(title="Daemon")
+        # Inside the Daemon group, not floating in an untitled card above
+        # Notifications. It is the state of the thing that group configures,
+        # and two "Daemon" headings separated by unrelated settings read as
+        # two different subjects.
+        row = Adw.ActionRow(title="Status")
         pid = restart.daemon_pid()
         icon = Gtk.Image.new_from_icon_name(
             "emblem-ok-symbolic" if pid else "dialog-warning-symbolic")
@@ -264,13 +325,8 @@ class SettingsWindow(Adw.ApplicationWindow):
         row.add_prefix(icon)
         row.set_subtitle(f"running (pid {pid})" if pid else
                          "not running - dictation will not work")
-        status_group.add(row)
 
-        group = Adw.PreferencesGroup()
-        page.add(group)
-        for field in settings_def.FIELDS:
-            if field.section == section:
-                group.add(self._build_row(field))
+        self._add_field_groups(page, section, lead_rows={"Daemon": [row]})
         return page
 
     def _build_speech_page(self, section: str):
@@ -340,11 +396,7 @@ class SettingsWindow(Adw.ApplicationWindow):
             self._model_checks[name] = check
             model_group.add(row)
 
-        backend_group = Adw.PreferencesGroup(title="Backend")
-        page.add(backend_group)
-        for field in settings_def.FIELDS:
-            if field.section == section:
-                backend_group.add(self._build_row(field))
+        self._add_field_groups(page, section)
         return page
 
     # ------------------------------------------------------------------ rows

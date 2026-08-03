@@ -155,7 +155,36 @@ def _dll_closure(roots):
     return sorted(seen.values())
 
 
+def _cairo_bridge() -> str:
+    """The PyGObject extension that hands a cairo_t to pycairo.
+
+    GTK passes the draw callback a cairo_t*, and PyGObject turns it into a
+    cairo.Context through a "foreign struct converter" that lives in its own
+    extension module. Nothing imports that module by name: pygi-foreign.c
+    builds the string "gi._gi_" + namespace at runtime and imports it, which
+    is invisible to PyInstaller's import graph. So it was left out, and every
+    frame of the overlay raised "Couldn't find foreign struct converter for
+    'cairo.Context'" - a window that existed, was styled, and painted nothing.
+
+    Asserted rather than merely named: a hiddenimport that does not resolve is
+    a build warning, and this failed silently once already.
+    """
+    import importlib.util
+
+    name = "gi._gi_cairo"
+    try:
+        found = importlib.util.find_spec(name) is not None
+    except ImportError:
+        found = False       # no gi at all, which the typelib checks also catch
+    if not found:
+        raise SystemExit(
+            f"{name} is missing - is python-gobject built against pycairo? "
+            f"Without it the overlay draws nothing.")
+    return name
+
+
 hidden = collect_submodules("pydantic") + [
+    _cairo_bridge(),
     "whisper_flow.hotkey_win",
     "whisper_flow.system_win",
     "whisper_flow.blur_win",

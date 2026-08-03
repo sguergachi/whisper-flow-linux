@@ -1,9 +1,9 @@
-"""The settings window on Linux: GTK4 + libadwaita, with real backdrop blur.
+"""The settings window: GTK4 + libadwaita, with real backdrop blur on Wayland.
 
 Runs as its own process (``python -m whisper_flow.settings_gtk``), like every
 other window this app shows - the daemon's pystray loop and GTK each demand
-their own main thread. Windows uses the tkinter window in settings_ui.py
-instead, the same split as the HUD.
+their own main thread. One window on both platforms; there has been no
+tkinter version of it for some time.
 
 The blur is the HUD's own path: ext-background-effect-v1, with a region
 tracing the window's rounded corners, and it only engages on Wayland with a
@@ -111,6 +111,27 @@ window.blurred banner > revealer > widget {
 """
 
 
+def _load_css(provider, css: bytes):
+    """Feed CSS to a provider, whichever call this GTK offers.
+
+    load_from_data() has always taken the length as a second argument. Older
+    introspection data annotated it as the array's own length, so PyGObject
+    filled it in and the one-argument call worked; newer data does not, and
+    the same call raises TypeError instead. This window builds itself inside
+    an activate handler, where GObject prints the traceback and carries on -
+    so on Windows the process sat there for as long as you left it, holding
+    no window and reporting no error.
+
+    load_from_string() has no length to get wrong and has been there since GTK
+    4.12, so it is the call everywhere it exists. The fallback is for GTK
+    before that, where the one-argument form is the correct one.
+    """
+    if hasattr(provider, "load_from_string"):
+        provider.load_from_string(css.decode())
+    else:
+        provider.load_from_data(css)
+
+
 def _gobject_pointer(obj) -> int:
     """Address of the underlying GObject, via PyGObject's capsule."""
     ctypes.pythonapi.PyCapsule_GetPointer.restype = ctypes.c_void_p
@@ -182,7 +203,7 @@ class SettingsWindow(Adw.ApplicationWindow):
         self.set_resizable(False)
 
         provider = Gtk.CssProvider()
-        provider.load_from_data(CSS)
+        _load_css(provider, CSS)
         Gtk.StyleContext.add_provider_for_display(
             Gdk.Display.get_default(), provider,
             Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
@@ -680,7 +701,7 @@ class SettingsWindow(Adw.ApplicationWindow):
             if not self._blur:
                 return
             provider = Gtk.CssProvider()
-            provider.load_from_data(CSS_BLUR)
+            _load_css(provider, CSS_BLUR)
             Gtk.StyleContext.add_provider_for_display(
                 display, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 1)
             self.add_css_class("blurred")
@@ -701,9 +722,30 @@ def main() -> int:
         pass                    # a bad config must not cost us the window
 
     app = Adw.Application(application_id="dev.whisperflow.settings")
-    app.connect(
-        "activate", lambda app: SettingsWindow(application=app).present())
-    return app.run(sys.argv[:1])
+    # A raise inside activate is not an error anyone sees. GObject catches
+    # whatever a Python signal handler throws, prints it to a stderr nobody
+    # is reading, and returns; the application then runs its main loop with
+    # no window, forever. That is precisely how this failed on Windows - the
+    # daemon watches the exit code, saw a process still running, and reported
+    # a window it had opened. Take the process down with a code instead, so
+    # the daemon's "no window was shown" path can do its job.
+    failure = []
+
+    def build(app):
+        try:
+            SettingsWindow(application=app).present()
+        except Exception:
+            import traceback
+            failure.append(traceback.format_exc())
+            log(f"[SETTINGS] the window could not be built:\n{failure[0]}")
+            app.quit()
+
+    app.connect("activate", build)
+    status = app.run(sys.argv[:1])
+    if failure:
+        print(failure[0], file=sys.stderr, flush=True)
+        return 1
+    return status
 
 
 if __name__ == "__main__":

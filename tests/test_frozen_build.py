@@ -1,10 +1,15 @@
-"""What the frozen Windows build must contain.
+"""What the frozen Windows build must contain, and how it must call GTK.
 
 PyInstaller finds dependencies by reading the source, so it only bundles
 imports it can see. Anything deliberately imported at the point of use to
 keep it off the startup path is invisible to that analysis and has to be
 declared, or the build is missing it - and the failure surfaces on a user's
 machine, in the one code path that needed it.
+
+The GTK checks below are here for the same reason rather than beside the
+window tests: those need GTK, libadwaita and a display, so they skip on a
+Windows runner and prove nothing about the platform they exist for. These
+read the source and always run.
 """
 
 import re
@@ -108,6 +113,79 @@ def test_the_typelib_path_is_not_left_to_pyinstaller():
         "the bundled typelib directory must be assigned, and placed ahead of "
         "whatever PyInstaller's runtime hook set"
     )
+
+
+def test_the_cairo_foreign_struct_bridge_is_declared():
+    """The overlay is one cairo draw callback; without this it draws nothing.
+
+    PyGObject converts GTK's cairo_t into a cairo.Context through gi._gi_cairo,
+    which its C code imports under a name assembled at runtime. PyInstaller
+    sees no such import, left it out, and the shipped overlay raised
+    "Couldn't find foreign struct converter for 'cairo.Context'" on every
+    frame - a window that was created, styled and blank.
+    """
+    assert "gi._gi_cairo" in SPEC.read_text(encoding="utf-8"), (
+        "gi._gi_cairo is imported by name from PyGObject's C code, so "
+        "PyInstaller cannot see it; without it the overlay never paints"
+    )
+
+
+def _window_modules() -> list[Path]:
+    src = Path(__file__).resolve().parents[1] / "src/whisper_flow"
+    return [src / "hud_app.py", src / "settings_gtk.py"]
+
+
+def _outside_the_helper(text: str) -> list[tuple[int, str]]:
+    """Numbered lines, minus _load_css's body.
+
+    The helper keeps the one-argument call as its own fallback, for the GTK
+    versions where it is the correct one. That is the single place allowed to
+    name it, so it is cut out before looking for anyone else doing so.
+    """
+    lines = text.splitlines()
+    inside = False
+    kept = []
+    for number, line in enumerate(lines, 1):
+        if line.startswith("def _load_css("):
+            inside = True
+            continue
+        if inside:
+            if line and not line[0].isspace():
+                inside = False          # back at module scope
+            else:
+                continue
+        kept.append((number, line))
+    return kept
+
+
+def test_css_is_not_loaded_through_the_one_argument_call():
+    """load_from_data(css) stopped working, and took both windows with it.
+
+    The length was always a separate argument; older introspection data
+    annotated it as the array's own length so PyGObject supplied it. Newer
+    data does not, and the call raises TypeError - which killed the overlay
+    inside GTK and left the settings window unbuilt inside an activate
+    handler, with the process still running and nothing on screen.
+    """
+    offenders = []
+    for path in _window_modules():
+        for number, line in _outside_the_helper(
+                path.read_text(encoding="utf-8")):
+            if re.search(r"\bload_from_data\([^,)]+\)", line):
+                offenders.append(f"{path.name}:{number}")
+    assert not offenders, (
+        "load_from_data() with one argument raises TypeError on current "
+        "PyGObject; go through the _load_css helper: " + ", ".join(offenders)
+    )
+
+
+def test_every_window_loads_its_css_through_the_helper():
+    """A new window pasting the old call back in is the way this returns."""
+    for path in _window_modules():
+        text = path.read_text(encoding="utf-8")
+        assert "def _load_css(" in text, f"{path.name} has no _load_css helper"
+        assert text.count("_load_css(provider") >= 1, (
+            f"{path.name} defines _load_css but does not use it")
 
 
 def test_text_is_read_and_written_as_utf8_everywhere():

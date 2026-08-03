@@ -125,6 +125,34 @@ def test_shutdown_is_safe_with_no_overlay(hud):
     assert hud._process is None
 
 
+# ------------------------------------------------------------ opening at all
+def test_the_overlay_opens_the_display_itself():
+    """Nothing else does it, and GTK 4 does not check.
+
+    The overlay runs a bare GLib.MainLoop rather than a GtkApplication, to
+    skip the D-Bus round trip an application id costs on the path the user
+    waits on. GtkApplication is also what would otherwise call gtk_init(),
+    so leaving it out means calling it here. It was not called: on Windows
+    the process built a window with no display and walked off a null pointer
+    inside GTK's style machinery, dying with an access violation before its
+    first frame - no traceback, no window, and a daemon that reported an
+    overlay it had opened.
+
+    Read from the source rather than by running it, because every test that
+    drives HudWindow calls Gtk.init() first - which is exactly why this went
+    unnoticed for as long as it did.
+    """
+    from pathlib import Path
+    source = (Path(__file__).resolve().parents[1]
+              / "src/whisper_flow/hud_app.py").read_text(encoding="utf-8")
+    body = source.split("def main(")[-1]
+    assert "Gtk.init" in body, (
+        "hud_app.main() must initialise GTK; nothing else in the overlay "
+        "process does, and constructing a window without it is a crash")
+    assert body.index("Gtk.init") < body.index("HudWindow("), (
+        "GTK has to be initialised before the window is constructed")
+
+
 # ------------------------------------------------------- the overlay's states
 _GTK_CHILD = """
 import sys

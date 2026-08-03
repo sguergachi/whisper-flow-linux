@@ -52,13 +52,100 @@ def _bootstrap_gtk_runtime() -> None:
         os.path.join(base, "lib", "gdk-pixbuf-2.0", "2.10.0", "loaders"))
 
 
+def _pump(seconds: float = 5.0, until=None) -> None:
+    """Drive the main loop without owning it, so a window can map and draw.
+
+    Bounded by a deadline rather than by a count of iterations: mapping a
+    window and getting a frame out of it takes as long as the machine takes,
+    and a fixed number of turns is a check that passes on a desktop and fails
+    on a loaded runner for no reason anyone can act on.
+    """
+    import time
+
+    from gi.repository import GLib
+
+    context = GLib.MainContext.default()
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        context.iteration(False)
+        if until is not None and until():
+            return
+        time.sleep(0.005)
+
+
+def _selftest_overlay() -> str:
+    """Show the real overlay and confirm it drew.
+
+    Not "did a window object appear": the overlay's whole content is one
+    cairo draw callback, and the build that shipped created the window,
+    styled it, and threw out of every frame. `_drew` is set by that callback,
+    so it is only true if a frame really reached our code.
+    """
+    from whisper_flow.hud_app import HudWindow
+
+    window = HudWindow("", None, resident=True)
+    window.realize()
+    window.begin_show("")
+    _pump(until=lambda: getattr(window, "_drew", False))
+    drew, realized = getattr(window, "_drew", False), window.get_realized()
+    window.destroy()
+    _pump(0.2)
+    if not realized:
+        raise RuntimeError("the overlay window never realized")
+    if not drew:
+        raise RuntimeError(
+            "the overlay window realized but never drew a frame - is the "
+            "cairo foreign struct converter bundled?")
+    return "overlay window drew a frame"
+
+
+def _selftest_settings() -> str:
+    """Build the real settings window, inside an application as it runs.
+
+    It builds itself in an activate handler, where GObject swallows whatever
+    Python raises: the process kept running and simply never showed anything.
+    Re-raise here so a broken settings window is a failed build.
+    """
+    from gi.repository import Adw
+
+    from whisper_flow.settings_gtk import SettingsWindow
+
+    failure, shown = [], []
+
+    def activate(app):
+        try:
+            window = SettingsWindow(application=app)
+            window.present()
+            _pump(until=window.get_realized)
+            shown.append(window.get_realized())
+            window.destroy()
+        except Exception:
+            import traceback
+            failure.append(traceback.format_exc())
+        app.quit()
+
+    app = Adw.Application(application_id="dev.whisperflow.selftest")
+    app.connect("activate", activate)
+    app.run([sys.argv[0]])
+    if failure:
+        raise RuntimeError(f"the settings window could not be built:\n{failure[0]}")
+    if not shown or not shown[0]:
+        raise RuntimeError("the settings window never realized")
+    return "settings window realized"
+
+
 def _selftest() -> int:
-    """Resolve every GTK namespace the UI needs, then exit.
+    """Open the windows this app shows, then exit.
 
     A frozen build with missing typelibs still builds, installs and launches:
     it fails when the first window opens, on the user's machine, which is
     exactly how it shipped. CI runs this against the built folder so that
     failure lands in the build instead.
+
+    It has to open the real windows to mean anything. A version of this check
+    that resolved the namespaces and realized a bare Adw.Window passed on a
+    build where neither the overlay nor the settings window could appear at
+    all - the runtime was fine and the calls into it were not.
 
     The executable is windowed, so there is no console to print to. The
     report goes to the file named by WHISPER_FLOW_SELFTEST_OUT when set.
@@ -103,16 +190,22 @@ def _selftest() -> int:
         if not Gtk.init_check():
             raise RuntimeError("Gtk.init_check() failed - no usable display")
         Adw.init()
-        # Adw.Window, not the Adw.ApplicationWindow the real windows use:
-        # binding one to an Adw.Application outside that application's
-        # startup signal earns a Gtk-CRITICAL, and a check that prints a
-        # warning every run is one whose warnings stop being read. Both
-        # realize the same native surface, which is what is under test.
-        window = Adw.Window(default_width=200)
-        window.set_content(Gtk.Label(label="selftest"))
-        window.realize()
-        report.append("Adw.Window realized")
-        window.destroy()
+
+        # The overlay paints itself with cairo, and PyGObject hands GTK's
+        # cairo_t to pycairo through an extension it imports by a name built
+        # at runtime - so PyInstaller never saw it and never bundled it. The
+        # overlay then opened a window and raised on every single frame,
+        # drawing nothing. Ask for the converter by name; it is the one check
+        # here that does not depend on a window manager.
+        gi.require_foreign("cairo")
+        report.append("cairo foreign struct converter present")
+
+        # A generic Adw.Window realized fine while both real windows were
+        # broken, which is how this check stayed green through the whole
+        # thing. Build the windows the app actually shows, the way it shows
+        # them, and let them fail here rather than on someone's desktop.
+        report.append(_selftest_overlay())
+        report.append(_selftest_settings())
     except Exception:
         import traceback
 

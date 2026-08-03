@@ -36,6 +36,10 @@ import cairo
 import gi
 
 gi.require_version("Gtk", "4.0")
+# Named too, not left to Gtk to pull in: without it every overlay start
+# printed a PyGIWarning about Gdk's version being unspecified, on the one
+# stream anyone reads when the overlay has not appeared.
+gi.require_version("Gdk", "4.0")
 if sys.platform != "win32":
     # Before Gdk, so it can intercept surface creation: after it the window
     # silently becomes an ordinary toplevel with decorations.
@@ -182,6 +186,27 @@ drawingarea { background-color: transparent; background-image: none; }
 """
 
 
+def _load_css(provider, css: bytes):
+    """Feed CSS to a provider, whichever call this GTK offers.
+
+    load_from_data() has always taken the length as a second argument. Older
+    introspection data annotated it as the array's own length, so PyGObject
+    filled it in and the one-argument call worked; newer data does not, and
+    the same call raises TypeError instead. That is what left every window on
+    Windows unbuilt: the overlay died inside GTK before the first frame, and
+    the settings window threw inside an activate handler, where GObject prints
+    the traceback and carries on with no window to show.
+
+    load_from_string() has no length to get wrong and has been there since GTK
+    4.12, so it is the call everywhere it exists. The fallback is for GTK
+    before that, where the one-argument form is the correct one.
+    """
+    if hasattr(provider, "load_from_string"):
+        provider.load_from_string(css.decode())
+    else:
+        provider.load_from_data(css)
+
+
 def _unix_signal_add(sig, callback):
     """Route a POSIX signal through the main loop, across GLib versions."""
     try:
@@ -271,7 +296,7 @@ class HudWindow(Gtk.Window):
         self.set_resizable(False)
 
         provider = Gtk.CssProvider()
-        provider.load_from_data(CSS)
+        _load_css(provider, CSS)
         Gtk.StyleContext.add_provider_for_display(
             Gdk.Display.get_default(), provider,
             Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
@@ -819,6 +844,19 @@ def main() -> int:
     # A plain window and main loop, not Gtk.Application: registering an
     # application id costs a D-Bus round trip before anything can be drawn,
     # and this window is opened every time the user starts talking.
+    #
+    # Which also means nothing here opens the display for us. GtkApplication
+    # calls gtk_init() during startup; without one it is this process's job,
+    # and GTK 4 does not check. Constructing a window with no display walked
+    # off a null pointer deep inside GTK's style machinery, so the overlay
+    # died with an access violation before its first frame - no traceback,
+    # no window, and a daemon that went on believing it had one. Every test
+    # that drives HudWindow called Gtk.init() itself, so this was the one
+    # line no test covered.
+    if not Gtk.init_check():
+        print("[HUD] no display: GTK could not be initialised", flush=True)
+        return 1
+
     loop = GLib.MainLoop()
     win = HudWindow(level_file, monitor, on_quit=loop.quit, resident=resident)
     win.connect("close-request", lambda *_: (win.quit(), False)[1])

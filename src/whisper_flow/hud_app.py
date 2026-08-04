@@ -162,6 +162,9 @@ PEAK_FLOOR = 150.0   # below this the gain stops opening up, or idle noise dance
 LEVEL_GAMMA = 0.65   # loudness is perceptual; linear RMS leaves speech near flat
 # Longer than the daemon's max recording; purely a stuck-overlay backstop.
 MAX_LIFETIME_S = 600
+# How often the level thread looks for new samples. Its own thread, so this
+# costs nothing the render loop can feel.
+LEVEL_POLL_S = 0.02
 
 DRAG_SLOP = 4  # movement under this is a tap, not a drag
 POSITION_FILE = os.path.join(
@@ -330,6 +333,14 @@ class HudWindow(Gtk.Window):
         # What Windows composition gave us; decides whether the window still
         # has to be cut to shape. See blur_win.apply_window_style.
         self._style = None
+        # The pill's chrome, drawn once and blitted after that.
+        self._chrome = None
+        self._chrome_size = None
+        # Guards targets and peak, which the level thread writes and the
+        # render loop reads. Held only to hand over values, never across a
+        # read of the file.
+        self._levels_lock = threading.Lock()
+        self._levels_done = None
         # The blurred picture of whatever is behind the pill, and its size.
         # Windows only: on Wayland the compositor supplies the real thing.
         # Gtk.Window.close() only emits close-request; on a layer-shell surface
@@ -410,7 +421,14 @@ class HudWindow(Gtk.Window):
         area.add_controller(motion)
 
         GLib.timeout_add(16, self._frame)
-        GLib.timeout_add(33, self._read_levels)
+        # The lifetime cap is all that is left on the main loop; the levels
+        # are followed on their own thread so disk never lands in a frame.
+        GLib.timeout_add(500, self._watchdog)
+        self._levels_done = threading.Event()
+        self._levels_thread = threading.Thread(
+            target=self._levels_loop, daemon=True,
+            name="whisper-flow-hud-levels")
+        self._levels_thread.start()
         # The daemon takes this overlay down with SIGTERM. Handle it through
         # the main loop so the pill can fade out instead of blinking away;
         # the manager waits a couple of seconds, which is ample.
@@ -587,6 +605,9 @@ class HudWindow(Gtk.Window):
                 self._style = _win_blur.apply_window_style(self._hwnd)
                 print(f"[HUD] window style: {self._style or 'not applied'}",
                       flush=True)
+                # The style decides the pill's shape and how much tint goes
+                # over it, so anything cached before now is of another pill.
+                self._chrome = None
             self._apply_shape_win32()
         except Exception as e:
             print(f"[HUD] Windows window setup failed: {e}", flush=True)
@@ -825,50 +846,63 @@ class HudWindow(Gtk.Window):
             if t >= 1.0:
                 self._after_fade_out()
         self.hover += ((1.0 if self.want_hover else 0.0) - self.hover) * 0.25
-        for i, target in enumerate(self.targets):
+        with self._levels_lock:
+            targets = list(self.targets)
+        for i, target in enumerate(targets):
             self.shown[i] += (target - self.shown[i]) * LEVEL_EASE
         self.area.queue_draw()
         return True
 
-    def _read_levels(self):
-        if not self.level_file:
-            # Nothing driving this window; still bound by the lifetime cap.
-            return self._check_lifetime()
+    def _levels_loop(self):
+        """Follow the level file on its own thread, off the render path.
 
-        # The daemon deletes the level file when the recording ends. If it is
-        # gone, this overlay has been orphaned - never sit on screen forever
-        # because whoever spawned us failed to take us down.
-        if not os.path.exists(self.level_file):
-            print("[HUD] level file gone, closing", flush=True)
-            # Stop following it before quitting, or the next tick reports it
-            # missing all over again.
-            self.level_file = ""
-            self.quit()
-            # A resident overlay parks rather than exits, and it needs this
-            # timer for the next recording. Removing the source left every
-            # later recording with a waveform frozen where the last one
-            # ended, and nothing watching for an orphaned overlay either.
-            return self._resident
+        This is disk I/O - an open, a seek and a read - and it used to run on
+        the main loop between frames. Every stall on the filesystem landed
+        squarely in a frame, on the one thread that has 16ms to do everything
+        and is also the thread GTK draws on. Reading here leaves the main
+        loop doing nothing but drawing what has already arrived.
+
+        The main loop is never made to wait on this thread either: it takes
+        the lock only to copy out the levels, and never holds it across a
+        read.
+        """
+        while not self._levels_done.wait(LEVEL_POLL_S):
+            path = self.level_file
+            if not path:
+                continue
+            # The daemon deletes the level file when the recording ends. If
+            # it is gone this overlay has been orphaned - it must never sit
+            # on screen forever because whoever spawned it failed to.
+            if not os.path.exists(path):
+                print("[HUD] level file gone, closing", flush=True)
+                self.level_file = ""
+                GLib.idle_add(self.quit)
+                continue
+            try:
+                with open(path, "rb") as handle:
+                    handle.seek(0, 2)
+                    count = handle.tell() // 4
+                    if count <= self.level_pos:
+                        continue
+                    handle.seek(self.level_pos * 4)
+                    data = handle.read((count - self.level_pos) * 4)
+                    self.level_pos = count
+                values = struct.unpack("<%di" % (len(data) // 4), data)
+            except Exception:
+                continue
+
+            with self._levels_lock:
+                for value in values:
+                    value = abs(value)
+                    self.peak = max(self.peak * PEAK_DECAY, float(value),
+                                    PEAK_FLOOR)
+                    self.targets.append(
+                        min(1.0, (value / self.peak) ** LEVEL_GAMMA))
+
+    def _watchdog(self):
+        """The lifetime cap, which no longer has a level timer to live on."""
         if not self._check_lifetime():
             return False
-
-        try:
-            with open(self.level_file, "rb") as f:
-                f.seek(0, 2)
-                count = f.tell() // 4
-                if count <= self.level_pos:
-                    return True
-                f.seek(self.level_pos * 4)
-                data = f.read((count - self.level_pos) * 4)
-                self.level_pos = count
-            vals = struct.unpack("<%di" % (len(data) // 4), data)
-        except Exception:
-            return True
-
-        for v in vals:
-            v = abs(v)
-            self.peak = max(self.peak * PEAK_DECAY, float(v), PEAK_FLOOR)
-            self.targets.append(min(1.0, (v / self.peak) ** LEVEL_GAMMA))
         return True
 
     def _outline(self, cr, x, y, w, h):
@@ -887,6 +921,77 @@ class HudWindow(Gtk.Window):
             _round_rect(cr, x, y, w, h, DWM_CORNER_RADIUS)
         else:
             _squircle(cr, x, y, w, h)
+
+    def _paint_chrome(self, cr, w, h, a):
+        """Everything about the pill that is not the dot or the waveform.
+
+        Depends only on the alpha, which is why it can be cached: the fill,
+        the sheen, the rim, the inner shadow and the outline are the same
+        picture on every frame once the fade is over.
+
+        The outline used to be drawn after the bars, to be certain nothing
+        painted over it. It is safe here - the waveform stops well inside
+        the glass - and it has to be here for the cache to hold all of it.
+        """
+        inner = STROKE_W / 2
+        material = (ACRYLIC_TINT_ALPHA if self._style == "accent-acrylic"
+                    else MATERIAL_ALPHA)
+        self._outline(cr, inner, inner, w - 2 * inner, h - 2 * inner)
+        cr.set_source_rgba(*MATERIAL_RGB, material * a)
+        cr.fill_preserve()
+
+        sheen = cairo.LinearGradient(0, 0, 0, h)
+        sheen.add_color_stop_rgba(0.0, 1, 1, 1, 0.10 * a)
+        sheen.add_color_stop_rgba(0.45, 1, 1, 1, 0.015 * a)
+        sheen.add_color_stop_rgba(1.0, 0, 0, 0, 0.14 * a)
+        cr.set_source(sheen)
+        cr.fill()
+
+        # Everything to the border is clipped to the pill, so strokes centred
+        # on the outline only paint inwards.
+        cr.save()
+        self._outline(cr, 0, 0, w, h)
+        cr.clip()
+
+        # Opaque rim covering the blur region's staircase. The region is
+        # built from rectangles and cannot be antialiased, so its curved ends
+        # are ragged; this hides that boundary rather than leaving it on show.
+        self._outline(cr, 0, 0, w, h)
+        cr.set_line_width(2 * EDGE_COVER)
+        cr.set_source_rgba(*MATERIAL_RGB, EDGE_COVER_ALPHA * a)
+        cr.stroke()
+
+        # Inner shadow. Layers composite as 1-(1-x)^n rather than adding, so
+        # solve for the per-band alpha that lands on the target.
+        band = 1.0 - (1.0 - INNER_SHADOW_ALPHA) ** (1.0 / INNER_SHADOW_STEPS)
+        for i in range(INNER_SHADOW_STEPS):
+            frac = i / max(1, INNER_SHADOW_STEPS - 1)
+            reach = INNER_SHADOW_SPREAD + INNER_SHADOW_BLUR * frac
+            self._outline(cr, 0, 0, w, h)
+            cr.set_line_width(2 * reach)
+            cr.set_source_rgba(*INNER_SHADOW_RGB, band * a)
+            cr.stroke()
+        cr.restore()
+
+        # Solid and fully opaque: a translucent hairline picks up whatever is
+        # behind the glass and reads as a ragged edge rather than a clean one.
+        self._outline(cr, inner, inner, w - 2 * inner, h - 2 * inner)
+        cr.set_line_width(STROKE_W)
+        cr.set_source_rgba(*STROKE_RGB, a)
+        cr.stroke()
+
+    def _chrome_surface(self, w, h):
+        """The chrome at full opacity, drawn once and kept."""
+        size = (int(w), int(h))
+        if self._chrome is not None and self._chrome_size == size:
+            return self._chrome
+        surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, *size)
+        context = cairo.Context(surface)
+        context.set_antialias(cairo.ANTIALIAS_BEST)
+        self._paint_chrome(context, w, h, 1.0)
+        self._chrome = surface
+        self._chrome_size = size
+        return surface
 
     def _draw(self, area, cr, w, h):
         if not getattr(self, "_drew", False):
@@ -917,45 +1022,17 @@ class HudWindow(Gtk.Window):
         # sits over the frost. On Windows it depends what the window got:
         # acrylic arrives already blurred and tinted, so the full material
         # over the top would flatten it back into the slab it replaced.
-        inner = STROKE_W / 2
-        material = (ACRYLIC_TINT_ALPHA if self._style == "accent-acrylic"
-                    else MATERIAL_ALPHA)
-        self._outline(cr, inner, inner, w - 2 * inner, h - 2 * inner)
-        cr.set_source_rgba(*MATERIAL_RGB, material * a)
-        cr.fill_preserve()
-
-        sheen = cairo.LinearGradient(0, 0, 0, h)
-        sheen.add_color_stop_rgba(0.0, 1, 1, 1, 0.10 * a)
-        sheen.add_color_stop_rgba(0.45, 1, 1, 1, 0.015 * a)
-        sheen.add_color_stop_rgba(1.0, 0, 0, 0, 0.14 * a)
-        cr.set_source(sheen)
-        cr.fill()
-
-        # Everything from here to the border is clipped to the pill, so strokes
-        # centred on the outline only paint inwards.
-        cr.save()
-        self._outline(cr, 0, 0, w, h)
-        cr.clip()
-
-        # Opaque rim covering the blur region's staircase. The region is built
-        # from rectangles and cannot be antialiased, so its curved ends are
-        # ragged; this hides that boundary rather than leaving it on show.
-        self._outline(cr, 0, 0, w, h)
-        cr.set_line_width(2 * EDGE_COVER)
-        cr.set_source_rgba(*MATERIAL_RGB, EDGE_COVER_ALPHA * a)
-        cr.stroke()
-
-        # Inner shadow. Layers composite as 1-(1-x)^n rather than adding, so
-        # solve for the per-band alpha that lands on the target.
-        band = 1.0 - (1.0 - INNER_SHADOW_ALPHA) ** (1.0 / INNER_SHADOW_STEPS)
-        for i in range(INNER_SHADOW_STEPS):
-            frac = i / max(1, INNER_SHADOW_STEPS - 1)
-            reach = INNER_SHADOW_SPREAD + INNER_SHADOW_BLUR * frac
-            self._outline(cr, 0, 0, w, h)
-            cr.set_line_width(2 * reach)
-            cr.set_source_rgba(*INNER_SHADOW_RGB, band * a)
-            cr.stroke()
-        cr.restore()
+        # The chrome, from a cached image whenever it can be. None of it -
+        # fill, sheen, rim, inner shadow, outline - depends on anything but
+        # the alpha, and the alpha is 1 for all but the 200ms of a fade. It
+        # was being rebuilt sixty times a second regardless: ten outline
+        # paths and a gradient per frame, for a picture identical to the
+        # last one.
+        if a >= 0.999:
+            cr.set_source_surface(self._chrome_surface(w, h), 0, 0)
+            cr.paint()
+        else:
+            self._paint_chrome(cr, w, h, a)
 
         elapsed = time.monotonic() - self.start
         breathe = 0.62 + 0.38 * (0.5 + 0.5 * math.sin(elapsed * 3.0))
@@ -967,40 +1044,44 @@ class HudWindow(Gtk.Window):
         cr.arc(DOT_X, mid, DOT_R, 0, 2 * math.pi)
         cr.fill()
 
+        # Bars as round-capped strokes rather than filled rounded rects.
+        # A capsule BAR_W wide is exactly a line of width BAR_W with round
+        # caps, drawn between the centres of its end caps - the same shape
+        # from one path operation instead of four arcs. Ninety filled paths
+        # a frame was the single largest cost in here.
         step = (WAVE_R - WAVE_L) / float(BARS)
         dim = 1.0 - 0.55 * self.hover
+        half_cap = BAR_W / 2
+        ends = []
         for i, level in enumerate(self.shown):
-            bar_h = max(BAR_W, level * BAR_MAX * 2)
-            x = WAVE_L + i * step
+            reach = max(0.0, max(BAR_W, level * BAR_MAX * 2) / 2 - half_cap)
+            ends.append((WAVE_L + i * step + half_cap, reach, level))
 
-            top = mid - bar_h / 2
+        cr.set_line_cap(cairo.LINE_CAP_ROUND)
 
-            # Cast shadow, offset down-right, so the bars sit above the glass
-            # rather than being painted flat onto it.
-            cr.set_source_rgba(0, 0, 0, 0.34 * dim * a)
-            _round_rect(cr, x + BAR_SHADOW_DX, top + BAR_SHADOW_DY,
-                        BAR_W, bar_h, BAR_W / 2)
-            cr.fill()
-
-            # Tight outline around the bar itself. Doubles as contrast against
-            # a light window behind the translucent glass.
-            cr.set_source_rgba(0, 0, 0, 0.46 * dim * a)
-            _round_rect(cr, x - BAR_OUTLINE, top - BAR_OUTLINE,
-                        BAR_W + 2 * BAR_OUTLINE, bar_h + 2 * BAR_OUTLINE,
-                        (BAR_W + 2 * BAR_OUTLINE) / 2)
-            cr.fill()
-
-            cr.set_source_rgba(1, 1, 1, (0.34 + 0.66 * level) * dim * a)
-            _round_rect(cr, x, top, BAR_W, bar_h, BAR_W / 2)
-            cr.fill()
-
-        # Outline last, so nothing can paint over it. Solid and fully opaque:
-        # a translucent hairline picks up whatever is behind the glass and
-        # reads as a ragged edge rather than a clean one.
-        self._outline(cr, inner, inner, w - 2 * inner, h - 2 * inner)
-        cr.set_line_width(STROKE_W)
-        cr.set_source_rgba(*STROKE_RGB, a)
+        # Shadow and outline are one colour across every bar, so each is a
+        # single path of thirty subpaths and one stroke, not thirty of each.
+        cr.set_line_width(BAR_W)
+        cr.set_source_rgba(0, 0, 0, 0.34 * dim * a)
+        for x, reach, _ in ends:
+            cr.move_to(x + BAR_SHADOW_DX, mid - reach + BAR_SHADOW_DY)
+            cr.line_to(x + BAR_SHADOW_DX, mid + reach + BAR_SHADOW_DY)
         cr.stroke()
+
+        cr.set_line_width(BAR_W + 2 * BAR_OUTLINE)
+        cr.set_source_rgba(0, 0, 0, 0.46 * dim * a)
+        for x, reach, _ in ends:
+            cr.move_to(x, mid - reach)
+            cr.line_to(x, mid + reach)
+        cr.stroke()
+
+        # The bars themselves carry a per-bar alpha, so these stay separate.
+        cr.set_line_width(BAR_W)
+        for x, reach, level in ends:
+            cr.set_source_rgba(1, 1, 1, (0.34 + 0.66 * level) * dim * a)
+            cr.move_to(x, mid - reach)
+            cr.line_to(x, mid + reach)
+            cr.stroke()
 
         if self.hover > 0.01:
             cx, r = w - 21 * SIZE_SCALE, 4.0 * SIZE_SCALE

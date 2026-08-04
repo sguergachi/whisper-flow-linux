@@ -241,19 +241,30 @@ def test_the_overlay_reclaims_topmost_every_time_it_is_shown():
         "the window is first realized")
 
 
-def test_a_parked_overlay_keeps_following_the_level_file():
-    """The timer must survive the recording that ends, or later ones are dead.
+def test_the_levels_are_read_off_the_render_thread():
+    """Disk I/O between frames is disk I/O inside a frame.
 
-    _read_levels returned False when the daemon deleted the level file, which
-    removes the GLib source for good. A resident overlay parks and is shown
-    again, and every later recording drew a waveform frozen where the last
-    one ended.
+    Reading the level file was an open, a seek and a read on the main loop,
+    the same thread GTK draws on and the one with 16ms to do everything. Any
+    stall on the filesystem showed up as a stutter in the waveform.
+
+    It also fixes what the old GLib timer got wrong: that timer returned
+    False when the daemon deleted the level file, removing the source for
+    good, so every later recording on a parked overlay drew a waveform
+    frozen where the last one ended. A thread that loops has no such edge.
     """
     source = _hud_app_source()
-    body = source.split("def _read_levels(", 1)[1].split("\n    def ", 1)[0]
-    assert "return self._resident" in body, (
-        "a resident overlay must keep its level timer when the file goes "
-        "away; returning False removes the source permanently")
+    assert "_levels_loop" in source and "_levels_thread" in source, (
+        "the level file must be followed on its own thread")
+    body = source.split("def _levels_loop(", 1)[1].split("\n    def ", 1)[0]
+    assert "while not self._levels_done" in body, (
+        "the reader must loop rather than being a one-shot, or a parked "
+        "overlay stops following levels after the first recording")
+    assert "_levels_lock" in source, (
+        "targets are written by the reader and read by the render loop")
+    frame = source.split("def _frame(", 1)[1].split("\n    def ", 1)[0]
+    assert "_levels_lock" in frame, (
+        "the render loop must take the lock to copy the levels out")
 
 
 # ------------------------------------------------------- the overlay's states

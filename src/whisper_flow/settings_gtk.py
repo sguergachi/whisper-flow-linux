@@ -611,6 +611,38 @@ class SettingsWindow(Adw.ApplicationWindow):
         self._banner.set_revealed(bool(changed))
         return True
 
+    def _apply_values(self, values: dict) -> None:
+        """Put values back into the rows, after a page has been rebuilt.
+
+        The mirror of _values(). _load() reads the running config instead,
+        which is right when the window opens and wrong here: a model
+        download must not quietly undo edits made before it started.
+        """
+        for field in settings_def.FIELDS:
+            if field.key not in values or field.key not in self._rows:
+                continue
+            row = self._rows[field.key]
+            raw = values[field.key]
+            if field.kind == "bool":
+                row.set_active(bool(raw))
+            elif field.kind == "choice":
+                model = row.get_model()
+                for i in range(model.get_n_items()):
+                    display = model.get_string(i)
+                    candidate = (self._mic_display.get(display, display)
+                                 if field.key == "mic_device_index"
+                                 else display)
+                    if candidate == str(raw):
+                        row.set_selected(i)
+                        break
+            elif field.kind in ("int", "float") and field.key in _SPIN:
+                try:
+                    row.set_value(float(raw))
+                except (TypeError, ValueError):
+                    pass        # leave the row at its own default
+            else:
+                row.set_text("" if raw is None else str(raw))
+
     def _values(self) -> dict:
         values = {}
         for field in settings_def.FIELDS:
@@ -728,10 +760,25 @@ class SettingsWindow(Adw.ApplicationWindow):
             button.set_sensitive(True)
         if ok:
             # Rebuild so the new model gains a radio and loses the button.
+            #
+            # Every row on this page is replaced by that, and the new ones
+            # start empty: the port read 0, "Run the speech engine locally"
+            # read off, and the server URL blank - none of which the user
+            # touched. _current still held the real values, so Save saw the
+            # difference as deliberate and would have written it. What
+            # stopped it was the port failing validation at 0, which is why
+            # this surfaced as a confusing complaint about a port nobody had
+            # edited rather than as local transcription silently turning
+            # itself off.
+            #
+            # Carried across rather than reloaded from config, because a
+            # download does not discard edits made before it started.
+            keep = self._values()
             self._stack.remove(self._stack.get_child_by_name("speech"))
             page = self._build_speech_page("Speech")
             self._stack.add_titled(page, "speech", "Speech")
             self._stack.set_visible_child_name("speech")
+            self._apply_values(keep)
             self._model_checks[model].set_active(True)
             self._toast(f"Downloaded {model.replace('ggml-', '')} - "
                         f"Save to use it.")

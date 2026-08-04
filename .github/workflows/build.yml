@@ -375,18 +375,22 @@ jobs:
           }
           "VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Also keep the plain folder, for anyone who will not run an installer
-        shell: pwsh
-        run: |
-          Move-Item packaging/windows/dist/whisper-flow `
-                    "whisper-flow-$env:VERSION-windows"
-
+      # The unpacked folder is not uploaded. vpk already produces
+      # WhisperFlow-win-Portable.zip from exactly those files, so sending the
+      # folder as well put the whole application into the artifact a fourth
+      # time - alongside the setup exe, the nupkg and that very zip. It was
+      # most of a 900MB artifact, on every push, kept for the default ninety
+      # days. The release job uses vpk's zip instead.
       - uses: actions/upload-artifact@v4
         with:
           name: windows-build
-          path: |
-            installer-out/*
-            whisper-flow-${{ env.VERSION }}-windows
+          path: installer-out/*
+          # A branch build is for testing a change and is worth nothing a
+          # week later; master and tags feed the release and are worth
+          # keeping a little longer.
+          retention-days: >-
+            ${{ (github.ref == 'refs/heads/master' ||
+                 startsWith(github.ref, 'refs/tags/v')) && 30 || 5 }}
 
   release:
     name: release
@@ -417,14 +421,19 @@ jobs:
           # package and the release index are the update feed: the app reads
           # them from this release's download URL to find and fetch deltas,
           # so omitting them would leave it unable to update itself.
+          #
+          # The artifact now holds installer-out's contents at its root - the
+          # unpacked folder is no longer uploaded, so installer-out is the
+          # only path in it and becomes the archive root.
           mkdir -p release-files
-          cp artifacts/windows-build/installer-out/* release-files/
-          ls -la release-files
+          cp artifacts/windows-build/* release-files/
 
-          # The plain folder, for anyone who would rather not run an installer.
-          cd artifacts/windows-build
-          rm -rf installer-out
-          zip -qr "$GITHUB_WORKSPACE/release-files/whisper-flow-windows-portable.zip" .
+          # The portable download is vpk's own zip, under the name people
+          # were given before. It is built from the same files the unpacked
+          # folder held, so re-zipping that folder only ever duplicated it.
+          mv release-files/WhisperFlow-win-Portable.zip \
+             release-files/whisper-flow-windows-portable.zip
+          ls -la release-files
 
       - name: Work out what kind of release this is
         id: plan
@@ -477,3 +486,46 @@ jobs:
             artifacts/linux-installer/*.tar.gz \
             artifacts/linux-installer/dist/*.whl \
             release-files/*
+
+  prune:
+    name: prune old artifacts
+    # After the builds, and whatever they did: a failed run still uploads
+    # nothing worth keeping, and the artifacts from every earlier run are
+    # still there taking space.
+    needs: [linux, windows]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      # The default token can read Actions but not delete from it.
+      actions: write
+    steps:
+      - name: Keep this run's artifacts and no others
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # A build artifact is worth having until the next build and not
+          # much beyond it, and each Windows one is several hundred MB.
+          # Left alone they reached 194 artifacts and 46.7GB, which is how
+          # this repository ran out of storage. retention-days bounds how
+          # long one lives; this bounds how many exist.
+          #
+          # Failures here never fail the build. Running out of storage is
+          # worth fixing, and it is not worth failing a green build over.
+          deleted=0
+          gh api --paginate "repos/$GITHUB_REPOSITORY/actions/artifacts" \
+            --jq '.artifacts[]
+                  | select(.expired == false)
+                  | "\(.id) \(.workflow_run.id)"' |
+          while read -r id run; do
+            # Anything from a run still in flight is left alone; deleting a
+            # concurrent build's output would be a confusing way to save
+            # space.
+            if [ "$run" = "$GITHUB_RUN_ID" ]; then
+              continue
+            fi
+            if gh api -X DELETE \
+                 "repos/$GITHUB_REPOSITORY/actions/artifacts/$id" --silent; then
+              deleted=$((deleted + 1))
+            fi
+          done
+          echo "pruned $deleted artifacts from earlier runs"

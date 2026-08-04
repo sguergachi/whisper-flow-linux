@@ -15,6 +15,7 @@ from .logging import log
 INPUT_KEYBOARD = 1
 KEYEVENTF_KEYUP = 0x0002
 KEYEVENTF_UNICODE = 0x0004
+HELD_MASK = 0x8000      # high bit of GetAsyncKeyState means currently down
 
 # Stamped on every event this module injects. Nothing reads it back
 # today - the hotkey listener polls key state rather than hooking the
@@ -124,19 +125,39 @@ def spoil_start_menu() -> None:
     ])
 
 
-def release_modifiers() -> None:
+def release_modifiers() -> tuple:
     """Tell Windows no modifiers are held before injecting text.
 
     Live transcription types while the push-to-talk keys are physically down,
-    and a held Alt or Ctrl would turn every character into a shortcut. Only
-    releases are sent, never presses, so nothing can be left stuck.
+    and a held Alt or Ctrl would turn every character into a shortcut.
+
+    Returns the modifiers that were actually down, for restore_modifiers to
+    put back. They must go back: the hotkey listener reads the same state
+    table this writes to, so releasing the keys the user is holding tells it
+    the push-to-talk was let go. It ended the recording at the first
+    committed word, every time, while the key was still down - the overlay
+    vanishing mid-sentence was this, not a crash.
 
     The no-op key goes first, while Windows still believes its own key is
     down. Sent afterwards it would be too late: the release below is what
     arms the Start menu.
     """
+    held = tuple(vk for vk in MODIFIERS
+                 if _user32.GetAsyncKeyState(vk) & HELD_MASK)
     spoil_start_menu()
     _send([_key_event(vk, 0, KEYEVENTF_KEYUP) for vk in MODIFIERS])
+    return held
+
+
+def restore_modifiers(held) -> None:
+    """Put back the modifiers the user never let go of.
+
+    Only the ones that were down before we interfered, so a recording that
+    ends between the snapshot and here cannot leave a key stuck: nothing is
+    pressed that was not already pressed.
+    """
+    if held:
+        _send([_key_event(vk, 0, 0) for vk in held])
 
 
 def type_text(text: str) -> bool:
@@ -150,20 +171,27 @@ def type_text(text: str) -> bool:
     """
     if not text:
         return True
-    release_modifiers()
-    events = []
-    for ch in text:
-        for code in _utf16_units(ch):
-            events.append(_key_event(0, code, KEYEVENTF_UNICODE))
-            events.append(_key_event(0, code, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP))
-    # SendInput takes the whole batch atomically, so nothing can interleave.
-    if _send(events):
-        return True
+    held = release_modifiers()
+    try:
+        events = []
+        for ch in text:
+            for code in _utf16_units(ch):
+                events.append(_key_event(0, code, KEYEVENTF_UNICODE))
+                events.append(
+                    _key_event(0, code, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP))
+        # SendInput takes the whole batch atomically, so nothing can
+        # interleave.
+        if _send(events):
+            return True
 
-    error = ctypes.get_last_error()
-    log(f"[WIN] SendInput refused {len(text)} chars (error {error}); "
-        f"falling back to the clipboard")
-    return copy_to_clipboard(text) and send_paste()
+        error = ctypes.get_last_error()
+        log(f"[WIN] SendInput refused {len(text)} chars (error {error}); "
+            f"falling back to the clipboard")
+        return copy_to_clipboard(text) and send_paste(release_first=False)
+    finally:
+        # Whatever happened above, the user is still holding the hotkey and
+        # the state table has to say so again.
+        restore_modifiers(held)
 
 
 def _utf16_units(ch: str):
@@ -173,9 +201,15 @@ def _utf16_units(ch: str):
             for i in range(0, len(encoded), 2)]
 
 
-def send_paste() -> bool:
-    """Ctrl+V, for the clipboard fallback path."""
-    release_modifiers()
+def send_paste(release_first: bool = True) -> bool:
+    """Ctrl+V, for the clipboard fallback path.
+
+    release_first is False when type_text calls this: it has already
+    released the modifiers and holds the list to restore afterwards, and a
+    second release would lose the record of what the user was holding.
+    """
+    if release_first:
+        release_modifiers()
     return _send([
         _key_event(VK_CONTROL, 0, 0),
         _key_event(VK_V, 0, 0),

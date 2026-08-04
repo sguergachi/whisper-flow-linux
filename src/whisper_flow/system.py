@@ -148,8 +148,32 @@ class SystemManager:
             return False
 
     def save_active_window(self) -> None:
-        """Save the currently active window UUID for later activation."""
+        """Remember where the dictation was started, to type back into it.
+
+        On Windows this was never recorded at all - the only implementation
+        was kdotool's, which does not exist there - so every Windows paste
+        went to whatever happened to be focused when the transcript arrived.
+        """
+        if IS_WINDOWS:
+            self._saved_window = system_win.foreground_window() or None
+            return
         self._saved_window = self._get_active_window()
+
+    def _restore_saved_focus(self) -> None:
+        """Bring the window the user dictated into back to the front.
+
+        Only when focus has actually moved elsewhere. Calling it regardless
+        would be a no-op in the normal case, but this runs between the words
+        of a live dictation and there is no reason to touch the foreground
+        window on every committed phrase.
+        """
+        if not IS_WINDOWS or not self._saved_window:
+            return
+        if system_win.foreground_window() == self._saved_window:
+            return
+        if not system_win.focus_window(self._saved_window):
+            log("[PASTE] the window this dictation started in would not come "
+                "back to the front; typing into whatever has focus")
 
     def _kdotool_available(self) -> bool:
         return shutil.which("kdotool") is not None
@@ -233,6 +257,7 @@ class SystemManager:
 
             if IS_WINDOWS:
                 sanitized = text.replace("\n", " ")
+                self._restore_saved_focus()
                 if system_win.type_text(sanitized):
                     return True
                 return (system_win.copy_to_clipboard(sanitized)
@@ -271,17 +296,25 @@ class SystemManager:
             return False
 
     def type_text(self, text: str) -> bool:
-        """Type text into whatever is focused, right now.
+        """Type text into the window this dictation was started in.
 
         Used by live transcription, which appends to what the user is already
-        looking at. Deliberately does not touch the clipboard and does not
-        re-activate a saved window: focus is already correct, and stealing it
-        mid-sentence would fight the user.
+        looking at, and for the tail that follows the closing pass. It does
+        not touch the clipboard.
+
+        It used to trust the current focus outright, on the grounds that
+        stealing it mid-sentence would fight the user. That holds while the
+        words keep up with the speaking; it stops holding for the tail, which
+        is typed whenever the closing transcription finishes - and on a
+        machine where that took twenty seconds, the utterance landed in
+        whatever the user had clicked into since. Restoring focus only when it
+        has moved keeps the ordinary case untouched.
         """
         if not text:
             return True
         sanitized = text.replace("\n", " ")
         if IS_WINDOWS:
+            self._restore_saved_focus()
             return system_win.type_text(sanitized)
         if self._is_wayland():
             return self._ydotool_type(sanitized) or self._wtype_type(sanitized)

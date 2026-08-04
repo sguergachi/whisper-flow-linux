@@ -60,20 +60,44 @@ HELD_MASK = 0x8000      # high bit of GetAsyncKeyState means currently down
 #
 # Restoring the keys is not enough on its own: the poll can land inside the
 # gap however narrow it is. This closes it instead of racing it.
-_suppressed_until = 0.0
 _suppress_lock = threading.Lock()
 
+# How long the state table is given to settle after the last injected event.
+# The events are queued, so the keys we put back are not necessarily readable
+# the instant SendInput returns.
+SETTLE_SECONDS = 0.05
 
-def suppress(seconds: float = 0.25) -> None:
-    """Ignore the keyboard for a moment, while we are the one typing."""
-    global _suppressed_until
+_typing_depth = 0
+_settled_at = 0.0
+
+
+def begin_typing() -> None:
+    """Mark the start of a batch of injected keystrokes."""
+    global _typing_depth
     with _suppress_lock:
-        _suppressed_until = max(_suppressed_until, time.monotonic() + seconds)
+        _typing_depth += 1
+
+
+def end_typing() -> None:
+    """Mark the end of one, and start the settling window.
+
+    This replaced a fixed window - 0.2s plus a millisecond per character -
+    guessed at before the typing began. A guess long enough to cover a long
+    commit is also a guess that goes on ignoring the keyboard well after the
+    typing has finished, and that reads as a hotkey that does not respond.
+    Half a second of it, right after a dictation, is exactly when the next
+    one is pressed.
+    """
+    global _typing_depth, _settled_at
+    with _suppress_lock:
+        _typing_depth = max(0, _typing_depth - 1)
+        if _typing_depth == 0:
+            _settled_at = time.monotonic() + SETTLE_SECONDS
 
 
 def _suppressed() -> bool:
     with _suppress_lock:
-        return time.monotonic() < _suppressed_until
+        return _typing_depth > 0 or time.monotonic() < _settled_at
 
 # Both physical sides of a modifier mean the same thing, exactly as the Linux
 # listener treats them. Ctrl, Alt and Shift need no entry: 0x11, 0x12 and 0x10

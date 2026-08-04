@@ -255,3 +255,62 @@ def test_a_prepare_that_returns_nothing_falls_back_to_the_raw_audio():
     )
     lt._run_pass([b"\0\0" * 160, b"\1\1" * 160])
     assert seen["frames"] == 320
+
+
+# ------------------------------------------------------- quiescing for the end
+def test_quiesce_stops_further_passes_but_still_allows_the_tail():
+    """The closing pass must not queue behind live ones over the same audio.
+
+    whisper.cpp serves one request at a time. Recording ends, the final pass
+    goes out, and the live loop - which knows nothing about that - was free to
+    start another pass and get in front of it. A pass was seen starting seven
+    seconds after the key was released, on a machine where the whole
+    transcription took twenty-five.
+    """
+    import threading
+
+    started = []
+    release = threading.Event()
+
+    def transcribe(path):
+        started.append(path)
+        release.wait(timeout=2)
+        return "one two three"
+
+    typed = []
+    lt = LiveTranscriber(
+        transcribe=transcribe, emit=typed.append, sample_rate=16000,
+        interval=0.01,
+    )
+    lt.start()
+    lt.offer([b"\0\0" * 160])
+    for _ in range(200):                        # wait for the pass to begin
+        if started:
+            break
+        time.sleep(0.005)
+    assert started, "the live loop never ran a pass"
+
+    lt.offer([b"\0\0" * 160])                   # more audio, mid-pass
+    release.set()
+    lt.quiesce(timeout=2)
+    time.sleep(0.05)                            # a loop still running would go again
+    passes_after_quiesce = len(started)
+
+    lt.finalize("one two three four")
+    assert len(started) == passes_after_quiesce, (
+        "a live pass started after quiesce; it would delay the final one")
+    assert "".join(typed).split() == ["one", "two", "three", "four"], (
+        f"the tail was not typed after quiesce: {typed}")
+
+
+def test_quiesce_before_a_pass_has_ever_run_is_harmless():
+    lt = LiveTranscriber(
+        transcribe=lambda path: None, emit=lambda text: None,
+        sample_rate=16000, interval=0.01,
+    )
+    lt.start()
+    lt.quiesce(timeout=1)
+    typed = []
+    lt._emit = typed.append
+    lt.finalize("hello there")
+    assert typed == ["hello there"]

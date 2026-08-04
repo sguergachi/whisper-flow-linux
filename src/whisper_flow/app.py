@@ -147,6 +147,11 @@ class WhisperFlow:
                 log("No audio recorded")
                 return False
 
+            # Before the closing pass, not after: the live loop would
+            # otherwise keep issuing passes over the same audio and queue them
+            # in front of the one transcript the user is actually waiting for.
+            live.quiesce()
+
             # One last pass over the complete utterance, then type the tail.
             final_text = self._transcribe_allowing_for_a_whisper(audio_file)
             live.finalize(final_text)

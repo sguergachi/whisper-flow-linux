@@ -306,6 +306,187 @@ def test_old_drivers_get_the_cuda_11_build(monkeypatch):
     assert backend_module.detect_accelerator() == "cuda11"
 
 
+# -------------------------------------------------------------- engine choice
+def _bundled_cpu_engine(local_backend, config, monkeypatch):
+    """A frozen build's payload: the CPU engine and a small model."""
+    bundled = Path(config.config_dir) / "bundled"
+    (bundled / "engine").mkdir(parents=True)
+    (bundled / "engine" / local_backend._exe_name).write_text("cpu engine")
+    (bundled / "models").mkdir(parents=True)
+    (bundled / "models" / "ggml-base.en-q8_0.bin").write_text("")
+    monkeypatch.setattr(backend_module, "bundled_dir", lambda: bundled)
+    return bundled
+
+
+def test_a_gpu_machine_fetches_the_cuda_engine_over_the_bundled_cpu_one(
+        local_backend, config, monkeypatch):
+    """The bug that made an NVIDIA desktop slower than a laptop.
+
+    install() asked "is there an engine", a frozen build always bundles one,
+    and so the cuBLAS engine was never fetched. Downloading large-v3-turbo
+    from the settings window then ran a GPU-sized model on the CPU engine:
+    sixteen to twenty-five seconds per utterance, every press during which was
+    dropped as busy, and the transcript arriving wherever the focus had gone.
+    """
+    monkeypatch.setattr(sys, "platform", "win32")
+    _bundled_cpu_engine(local_backend, config, monkeypatch)
+    monkeypatch.setattr(backend_module, "detect_accelerator", lambda: "cuda12")
+
+    fetched = []
+
+    def fake_download(url, dest, progress=None):
+        fetched.append(url)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text("")
+
+    def fake_extract(archive, into):
+        """Unpack what the real cuBLAS zip holds: the binary and cuBLAS."""
+        (into / local_backend._exe_name).write_text("cuda engine")
+        (into / "cublas64_12.dll").write_text("")
+
+    monkeypatch.setattr(backend_module, "_download", fake_download)
+    monkeypatch.setattr(backend_module, "_extract", fake_extract)
+
+    assert local_backend.install("ggml-large-v3-turbo") is True
+    assert any("cublas-12.4" in url for url in fetched), (
+        f"the GPU engine was never fetched; only {fetched}")
+    assert local_backend.installed_engine() == "cuda12"
+    assert local_backend.engine_is_gpu()
+
+
+def test_a_cpu_machine_keeps_the_bundled_engine(
+        local_backend, config, monkeypatch):
+    """The whole point of bundling one: no download on the common machine."""
+    monkeypatch.setattr(sys, "platform", "win32")
+    _bundled_cpu_engine(local_backend, config, monkeypatch)
+    monkeypatch.setattr(backend_module, "detect_accelerator", lambda: "cpu")
+
+    fetched = []
+    monkeypatch.setattr(
+        backend_module, "_download",
+        lambda url, dest, progress=None: fetched.append(url))
+
+    local_backend.install("ggml-base.en-q8_0")
+    assert fetched == [], f"downloaded {fetched} with everything already here"
+
+
+def test_an_engine_installed_before_the_marker_is_read_from_its_libraries(
+        local_backend, config, monkeypatch):
+    """Upgrades must not have to re-download to know what they already have."""
+    monkeypatch.setattr(sys, "platform", "win32")
+    runtime = Path(config.config_dir) / "runtime"
+    runtime.mkdir(parents=True)
+    (runtime / local_backend._exe_name).write_text("")
+    assert local_backend.installed_engine() == "cpu"
+
+    (runtime / "cublas64_12.dll").write_text("")
+    assert local_backend.installed_engine() == "cuda12"
+
+
+def test_the_gpu_offer_survives_downloading_a_model(
+        local_backend, config, monkeypatch):
+    """Fetching a model creates the runtime directory too.
+
+    needs_gpu_upgrade() used to ask whether anything had been downloaded, so
+    accepting a model from the settings window silenced the offer - at exactly
+    the moment the machine most needed the engine to go with it.
+    """
+    monkeypatch.setattr(sys, "platform", "win32")
+    _bundled_cpu_engine(local_backend, config, monkeypatch)
+    monkeypatch.setattr(backend_module, "detect_accelerator", lambda: "cuda12")
+    assert local_backend.needs_gpu_upgrade() is True
+
+    models = Path(config.config_dir) / "models"
+    models.mkdir(parents=True)
+    (models / "ggml-large-v3-turbo.bin").write_text("")
+    assert local_backend.needs_gpu_upgrade() is True, (
+        "a downloaded model was mistaken for a downloaded engine")
+
+    runtime = Path(config.config_dir) / "runtime"
+    runtime.mkdir(parents=True, exist_ok=True)
+    (runtime / local_backend._exe_name).write_text("")
+    local_backend._record_engine("cuda12")
+    assert local_backend.needs_gpu_upgrade() is False
+
+
+# ------------------------------------------------------- the model chosen
+def test_a_saved_model_choice_is_read_from_disk_not_from_the_stale_config(
+        local_backend, config):
+    """Picking a model in the settings window has to actually change the model.
+
+    The window writes .env and offers a restart; the daemon that comes back
+    resolves .env at import, so working_model() reading config.model_name saw
+    the value from before. It reported the old model as in use and went on
+    running it - the "In Use" label never moved however many times the choice
+    was saved and the daemon restarted.
+    """
+    models = Path(config.config_dir) / "models"
+    models.mkdir(parents=True)
+    for name in ("ggml-large-v3-turbo", "ggml-base.en-q8_0"):
+        (models / f"{name}.bin").write_text("")
+    assert local_backend.working_model() == "ggml-large-v3-turbo"
+
+    env = Path(config.config_dir) / ".env"
+    env.write_text("WHISPER_FLOW_MODEL_NAME=ggml-base.en-q8_0\n",
+                   encoding="utf-8")
+    assert local_backend.working_model() == "ggml-base.en-q8_0"
+
+
+def test_a_saved_choice_of_a_bundled_model_is_honoured_too(
+        local_backend, config, monkeypatch):
+    """The chosen model need not be one that was downloaded."""
+    bundled = _bundled_cpu_engine(local_backend, config, monkeypatch)
+    assert (bundled / "models" / "ggml-base.en-q8_0.bin").exists()
+    models = Path(config.config_dir) / "models"
+    models.mkdir(parents=True)
+    (models / "ggml-large-v3-turbo.bin").write_text("")
+
+    (Path(config.config_dir) / ".env").write_text(
+        "WHISPER_FLOW_MODEL_NAME=ggml-base.en-q8_0\n", encoding="utf-8")
+    assert local_backend.working_model() == "ggml-base.en-q8_0"
+
+
+def test_a_saved_choice_that_is_not_on_this_machine_is_ignored(
+        local_backend, config):
+    """A name with no file behind it must not stop transcription dead."""
+    models = Path(config.config_dir) / "models"
+    models.mkdir(parents=True)
+    (models / "ggml-large-v3-turbo.bin").write_text("")
+    (Path(config.config_dir) / ".env").write_text(
+        "WHISPER_FLOW_MODEL_NAME=ggml-medium.en-q8_0\n", encoding="utf-8")
+    assert local_backend.working_model() == "ggml-large-v3-turbo"
+
+
+# ------------------------------------------------------------- accelerator
+def test_the_accelerator_is_detected_once_and_remembered(monkeypatch):
+    """nvidia-smi loads a driver before it answers; it is not a cheap call."""
+    calls = []
+
+    def counted(_name):
+        calls.append(_name)
+        return None
+
+    monkeypatch.setattr(backend_module.shutil, "which", counted)
+    assert backend_module.detect_accelerator() == "cpu"
+    assert backend_module.detect_accelerator() == "cpu"
+    assert len(calls) == 1
+
+
+def test_the_accelerator_can_be_inherited_from_the_environment(monkeypatch):
+    """So the windows the daemon launches do not each pay for the probe."""
+    monkeypatch.setenv(backend_module.ACCELERATOR_ENV, "cuda12")
+    monkeypatch.setattr(
+        backend_module.shutil, "which",
+        lambda _: pytest.fail("probed despite being told the answer"))
+    assert backend_module.detect_accelerator() == "cuda12"
+
+
+def test_a_nonsense_value_in_the_environment_is_probed_past(monkeypatch):
+    monkeypatch.setenv(backend_module.ACCELERATOR_ENV, "quantum")
+    monkeypatch.setattr(backend_module.shutil, "which", lambda _: None)
+    assert backend_module.detect_accelerator() == "cpu"
+
+
 # ------------------------------------------------------------------- version
 def test_the_two_recorded_versions_agree():
     """pyproject names the installer; __version__ had drifted two releases."""

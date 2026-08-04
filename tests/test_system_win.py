@@ -117,3 +117,115 @@ def test_a_key_event_carries_the_tag_as_a_number(system_win):
     event = system_win._key_event(0, 65, system_win.KEYEVENTF_UNICODE)
     assert event.union.ki.dwExtraInfo == system_win.INJECTED_TAG
     assert event.union.ki.wScan == 65
+
+
+# ----------------------------------------------------------------- focus
+def test_focus_is_restored_through_the_foreground_thread(system_win, monkeypatch):
+    """SetForegroundWindow refuses a caller that is not already in front.
+
+    Which is exactly this caller. Attaching to the foreground thread's input
+    queue first is the documented way round it; without the attach the call
+    is a silent no-op and the transcript still lands in the wrong window.
+    """
+    from unittest.mock import Mock
+
+    user32 = Mock()
+    user32.IsWindow.return_value = True
+    foreground = [4321]
+    user32.GetForegroundWindow.side_effect = lambda: foreground[0]
+    user32.GetWindowThreadProcessId.return_value = 77
+    user32.AttachThreadInput.return_value = 1
+
+    def set_foreground(hwnd):
+        foreground[0] = 1234
+        return 1
+
+    user32.SetForegroundWindow.side_effect = set_foreground
+    monkeypatch.setattr(system_win, "_user32", user32)
+    kernel32 = Mock()
+    kernel32.GetCurrentThreadId.return_value = 11
+    monkeypatch.setattr(system_win, "_kernel32", kernel32)
+
+    assert system_win.focus_window(1234) is True
+    assert user32.AttachThreadInput.call_args_list[0][0][2] is True
+    assert user32.AttachThreadInput.call_args_list[-1][0][2] is False, (
+        "the input queues were left attached")
+
+
+def test_a_window_already_in_front_is_left_alone(system_win, monkeypatch):
+    from unittest.mock import Mock
+
+    user32 = Mock()
+    user32.IsWindow.return_value = True
+    user32.GetForegroundWindow.return_value = 1234
+    monkeypatch.setattr(system_win, "_user32", user32)
+
+    assert system_win.focus_window(1234) is True
+    user32.SetForegroundWindow.assert_not_called()
+
+
+def test_a_window_that_has_closed_is_not_chased(system_win, monkeypatch):
+    from unittest.mock import Mock
+
+    user32 = Mock()
+    user32.IsWindow.return_value = False
+    monkeypatch.setattr(system_win, "_user32", user32)
+
+    assert system_win.focus_window(1234) is False
+    user32.SetForegroundWindow.assert_not_called()
+
+
+def test_no_saved_window_is_not_an_error(system_win):
+    assert system_win.focus_window(0) is False
+
+
+# --------------------------------------------------- blinding the listener
+def test_the_listener_is_blinded_for_exactly_the_injection(system_win):
+    """Not for a guess at how long the injection will take.
+
+    The guess was 0.2s plus a millisecond per character. Too short for a long
+    commit, so the race it exists to close could reopen; and far too long for
+    a short one, leaving the listener ignoring the keyboard for up to half a
+    second after the last word - which is when the next hotkey gets pressed,
+    and why holding it appeared to do nothing.
+    """
+    from whisper_flow import hotkey_win
+
+    hotkey_win._typing_depth = 0
+    hotkey_win._settled_at = 0.0
+
+    assert not hotkey_win._suppressed()
+    with system_win._hotkeys_blinded():
+        assert hotkey_win._suppressed(), (
+            "the keyboard was still being read while we typed into it")
+    # Still blind through the settling window: the events we queued are not
+    # necessarily readable the instant SendInput returns.
+    assert hotkey_win._suppressed()
+    hotkey_win._settled_at = 0.0
+    assert not hotkey_win._suppressed(), (
+        "suppression outlived the typing; the hotkey would stop responding")
+
+
+def test_nested_injections_do_not_uncover_each_other(system_win):
+    from whisper_flow import hotkey_win
+
+    hotkey_win._typing_depth = 0
+    hotkey_win._settled_at = 0.0
+
+    with system_win._hotkeys_blinded():
+        with system_win._hotkeys_blinded():
+            assert hotkey_win._suppressed()
+        assert hotkey_win._typing_depth == 1
+        assert hotkey_win._suppressed()
+    assert hotkey_win._typing_depth == 0
+
+
+def test_the_listener_is_uncovered_even_when_typing_throws(system_win):
+    from whisper_flow import hotkey_win
+
+    hotkey_win._typing_depth = 0
+    with pytest.raises(RuntimeError):
+        with system_win._hotkeys_blinded():
+            raise RuntimeError("SendInput exploded")
+    assert hotkey_win._typing_depth == 0, (
+        "a failed injection left the keyboard permanently ignored")

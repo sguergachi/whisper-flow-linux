@@ -61,6 +61,32 @@ MIC_KEEP_WARM_SECONDS = 90.0
 TRIM_PAD_MS = 150
 
 
+# MME device names are cut to MAXPNAMELEN, which is 32 bytes including the
+# terminator - so 31 characters, and no warning that anything was lost.
+MME_NAME_LIMIT = 31
+
+
+def _same_device(a: str, b: str) -> bool:
+    """Whether two PortAudio names refer to the same physical device.
+
+    Not string equality. PortAudio's default input device is reported
+    through MME, which truncates, while WASAPI reports the full name - so
+    the same microphone has two spellings and matching exactly finds
+    neither. It is visible in a real device list:
+
+        [2]  Microphone (2- Realtek(R) Audio     (MME)
+        [17] Microphone (2- Realtek(R) Audio)    (WASAPI)
+
+    The closing bracket is the 32nd character. Comparing the part that
+    survives truncation matches the two, and cannot confuse devices that
+    MME could tell apart in the first place - if two names share their
+    first 31 characters, MME reports them identically anyway.
+    """
+    if not a or not b:
+        return False
+    return a[:MME_NAME_LIMIT] == b[:MME_NAME_LIMIT]
+
+
 def trim_silence(frames: list, vad, sample_rate: int, frame_ms: int,
                  pad_ms: int = TRIM_PAD_MS) -> list:
     """Drop leading and trailing frames that hold no speech.
@@ -167,8 +193,31 @@ class AudioRecorder:
                 if "wasapi" not in str(api.get("name", "")).lower():
                     continue
                 device = api.get("defaultInputDevice", -1)
-                if device is None or device < 0:
-                    continue
+                # Trust the answer only if the device agrees it belongs to
+                # this API, and go looking ourselves when it does not.
+                #
+                # PortAudio reports defaultInputDevice as a global index, and
+                # on at least one machine the WASAPI entry named a WDM-KS
+                # device - kernel streaming, exclusive to whatever already
+                # holds the endpoint. It failed to open with "Unanticipated
+                # host error" and capture fell back to the platform default,
+                # which is MME: the same microphone several times quieter.
+                #
+                # Merely refusing the bad answer lands in that same fallback,
+                # so it has to be replaced rather than dropped. The machine
+                # that produced this had the right microphone sitting at
+                # index 18 on the very API that had just misreported it.
+                if device is None or device < 0 or not self._device_belongs_to(
+                        device, index):
+                    if device is not None and device >= 0:
+                        log(f"[AUDIO] host API {api.get('name')} names device "
+                            f"{device}, which is not one of its own")
+                    replacement = self._first_input_on(index)
+                    if replacement is None:
+                        continue
+                    log(f"[AUDIO] using WASAPI input device {replacement} "
+                        f"instead")
+                    device = replacement
                 # WASAPI shared mode does not resample: it plays back only at
                 # the rate the device is configured for, and rejects anything
                 # else with "invalid sample rate". MME quietly converted, which
@@ -187,6 +236,54 @@ class AudioRecorder:
         except Exception as e:
             log(f"[AUDIO] could not pick a WASAPI device: {e}")
         return None
+
+    def _first_input_on(self, host_api: int) -> int | None:
+        """An input device served by this host API, or None.
+
+        Prefers the one carrying the same name as the system default input,
+        so the microphone Windows was told to use is the one reached - just
+        through WASAPI rather than through MME. Falling back to whichever
+        input comes first would otherwise be a coin toss between a headset
+        and a webcam.
+        """
+        try:
+            default_name = str(
+                self.pa.get_default_input_device_info().get("name", ""))
+        except Exception:
+            default_name = ""
+
+        first = None
+        try:
+            for index in range(self.pa.get_device_count()):
+                try:
+                    info = self.pa.get_device_info_by_index(index)
+                    if int(info.get("hostApi", -1)) != host_api:
+                        continue
+                    if int(info.get("maxInputChannels", 0)) <= 0:
+                        continue
+                except Exception:
+                    continue
+                if first is None:
+                    first = index
+                if _same_device(str(info.get("name", "")), default_name):
+                    return index
+        except Exception:
+            return first
+        return first
+
+    def _device_belongs_to(self, device: int, host_api: int) -> bool:
+        """Whether `device` is really served by `host_api`.
+
+        Fails open: only a device that positively names a different host API
+        is rejected. This is a sanity check on one implausible answer, not a
+        licence to discard a working microphone because PortAudio declined to
+        describe it.
+        """
+        try:
+            reported = int(self.pa.get_device_info_by_index(device)["hostApi"])
+        except Exception:
+            return True
+        return reported == host_api
 
     def _device_supports_our_rate(self, device: int) -> bool:
         """Whether the device will capture at the rate whisper needs."""

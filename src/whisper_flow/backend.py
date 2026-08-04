@@ -27,6 +27,7 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
+from . import envfile
 from .logging import log
 
 WHISPER_CPP_RELEASE = "v1.9.1"
@@ -53,6 +54,14 @@ MODELS = {
     "ggml-tiny.en-q8_0": (42, "~80MB"),
 }
 
+# Models that only make sense on the GPU engine. Not "runs faster on a GPU" -
+# every model does - but "unusable without one": large-v3-turbo on a CPU takes
+# fifteen to twenty-five seconds for a two second clip, which is not a slower
+# dictation but a broken one, and it is exactly what shipped to someone who
+# downloaded it from the settings window on a machine whose CUDA engine had
+# never been fetched.
+GPU_MODELS = frozenset({"ggml-large-v3-turbo"})
+
 
 def bundled_dir() -> Path | None:
     """Where the installer put the engine and model, if this is a real build.
@@ -78,6 +87,14 @@ def _model_dir(config_dir: Path) -> Path:
     return Path(config_dir) / "models"
 
 
+# Answered once per process. nvidia-smi is a real program that has to load a
+# driver before it prints a version, and on Windows that is most of a second;
+# this used to be asked afresh six times while the settings window was being
+# built, which is most of the wait before it appeared.
+ACCELERATOR_ENV = "WHISPER_FLOW_ACCELERATOR"
+_accelerator: str | None = None
+
+
 def detect_accelerator() -> str:
     """What this machine can run whisper.cpp on: 'cuda12', 'cuda11' or 'cpu'.
 
@@ -87,10 +104,25 @@ def detect_accelerator() -> str:
     to point at, and pretending otherwise would mean shipping a build of our
     own that nobody here can test against those drivers. Those machines get
     the CPU engine, sized to the CPU they actually have.
+
+    Cached, and seedable through the environment so the windows the daemon
+    launches inherit the answer instead of paying for it again.
     """
-    if not shutil.which("nvidia-smi"):
-        return "cpu"
+    global _accelerator
+    if _accelerator is not None:
+        return _accelerator
+    inherited = os.environ.get(ACCELERATOR_ENV, "").strip()
+    if inherited in ("cpu", "cuda11", "cuda12"):
+        _accelerator = inherited
+        return _accelerator
+    _accelerator = _probe_accelerator()
+    return _accelerator
+
+
+def _probe_accelerator() -> str:
     try:
+        if not shutil.which("nvidia-smi"):
+            return "cpu"
         out = subprocess.run(
             ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
             capture_output=True, text=True, timeout=10,
@@ -231,6 +263,17 @@ def recommended_model(accelerator: str) -> str:
     if cores >= 4:
         return "ggml-base.en-q8_0"
     return "ggml-tiny.en-q8_0"
+
+
+def wanted_engine(accelerator: str) -> str:
+    """The engine kind that should be installed for this machine.
+
+    Only Windows has a CUDA asset to fetch; upstream's Linux build is
+    CPU-only, so on Linux the answer is 'cpu' whatever card is fitted.
+    """
+    if sys.platform != "win32":
+        return "cpu"
+    return accelerator if accelerator.startswith("cuda") else "cpu"
 
 
 def _server_archive(accelerator: str) -> str:
@@ -479,6 +522,45 @@ class LocalBackend:
             return bundled / "engine" / self._exe_name
         return downloaded
 
+    @property
+    def _engine_marker(self) -> Path:
+        """Which engine the downloaded one is, written when it is unpacked."""
+        return _runtime_dir(self.config.config_dir) / "engine.kind"
+
+    def installed_engine(self) -> str:
+        """The kind of engine that will actually run: 'cuda12', 'cuda11', 'cpu'.
+
+        This is the question nothing used to ask. `install()` skipped the
+        download whenever *any* engine was present, and a frozen build always
+        bundles one - the CPU build - so a machine with an NVIDIA card
+        downloaded the 1.6GB GPU model, ran it on the CPU engine that shipped
+        beside it, and took twenty seconds a sentence. The engine and the
+        model were each fine; nothing compared them.
+        """
+        downloaded = _runtime_dir(self.config.config_dir) / self._exe_name
+        if not downloaded.exists():
+            return "cpu"        # bundled, or nothing: the shipped build is CPU
+        try:
+            recorded = self._engine_marker.read_text(encoding="utf-8").strip()
+            if recorded in ("cpu", "cuda11", "cuda12"):
+                return recorded
+        except OSError:
+            pass
+        # Installed before the marker existed. cuBLAS ships its own libraries
+        # beside the binary and the CPU build has none, so the directory says
+        # what it is without needing to have been told.
+        names = {path.name.lower() for path in downloaded.parent.glob("*")}
+        if any(name.startswith("cublas64_12") for name in names):
+            return "cuda12"
+        if any(name.startswith("cublas64_11") for name in names):
+            return "cuda11"
+        if any(name.startswith(("ggml-cuda", "cudart64_")) for name in names):
+            return "cuda12"     # a CUDA build of unknown vintage; not the CPU one
+        return "cpu"
+
+    def engine_is_gpu(self) -> bool:
+        return self.installed_engine().startswith("cuda")
+
     def model_path(self, name: str | None = None) -> Path:
         name = name or self.config.model_name
         downloaded = _model_dir(self.config.config_dir) / f"{name}.bin"
@@ -510,6 +592,7 @@ class LocalBackend:
         """
         recommended = recommended_model(detect_accelerator())
         current = self.working_model()
+        on_gpu = self.engine_is_gpu()
         rows = [
             {
                 "name": name,
@@ -518,6 +601,11 @@ class LocalBackend:
                 "installed": self.model_path(name).exists(),
                 "current": name == current,
                 "recommended": name == recommended,
+                # Whether it needs a GPU to keep up, and whether it would get
+                # one here. A row that says both is a row that cannot be
+                # chosen by mistake.
+                "gpu_only": name in GPU_MODELS,
+                "accelerated": on_gpu,
             }
             for name, (size_mb, wants) in MODELS.items()
         ]
@@ -538,19 +626,49 @@ class LocalBackend:
                 "installed": True,
                 "current": True,
                 "recommended": current == recommended,
+                "gpu_only": current in GPU_MODELS,
+                "accelerated": on_gpu,
             })
         return rows
+
+    def chosen_model(self) -> str | None:
+        """The model last asked for, read from disk rather than from memory.
+
+        Not `config.model_name`: pydantic resolves the .env path once at
+        import, so what the settings window wrote a moment ago is not in the
+        running config and will not be until the next launch. Reading the file
+        is what lets a saved choice take effect on the restart the window
+        offers - without it the daemon restarted, re-read nothing, and the
+        page went on reporting the old model as in use.
+        """
+        # The environment first, because that is the order Config resolves
+        # them in: pydantic-settings lets a real environment variable beat
+        # the .env file. Nothing in this app sets this one - it is there for
+        # someone who exports it in their shell - but reading the file first
+        # would quietly invert that precedence for this one setting.
+        from_env = os.environ.get("WHISPER_FLOW_MODEL_NAME", "").strip()
+        if from_env:
+            return from_env
+        saved = envfile.get(Path(self.config.config_dir) / ".env",
+                            "WHISPER_FLOW_MODEL_NAME")
+        return saved.strip() if saved else None
 
     def working_model(self) -> str | None:
         """The best model actually present.
 
-        A downloaded model outranks the bundled one, and outranks the
-        configured name too: a model is only ever downloaded because someone
-        pressed the button asking for it. Relying on the config file instead
-        would lose that choice, because pydantic resolves the .env path once
-        at import - so a file the setup window writes afterwards is not read
-        back until the next launch.
+        A model the user has explicitly chosen wins, provided it is on this
+        machine at all - that choice is the whole content of the Speech page,
+        and ignoring it is why picking a smaller model there changed nothing.
+
+        Failing that a downloaded model outranks the bundled one: a model is
+        only ever downloaded because someone pressed the button asking for it,
+        and that has to take effect the moment the window closes, before
+        anything has been saved or restarted.
         """
+        chosen = self.chosen_model()
+        if chosen and self.model_path(chosen).exists():
+            return chosen
+
         downloaded = sorted(
             p.stem for p in _model_dir(self.config.config_dir).glob("*.bin"))
         if downloaded:
@@ -582,6 +700,22 @@ class LocalBackend:
         downloaded_exe = _runtime_dir(self.config.config_dir) / self._exe_name
         downloaded_model = _model_dir(self.config.config_dir) / f"{model}.bin"
         have_exe = downloaded_exe.exists() if force_download else self.server_exe.exists()
+        # An engine built for the wrong thing is not an engine we have.
+        #
+        # This is the whole of the bug that made a GPU machine slower than a
+        # laptop: the check was "is there an engine", the bundled CPU build
+        # always answered yes, and so the cuBLAS engine was never fetched no
+        # matter which model was chosen. Downloading large-v3-turbo then put a
+        # GPU-sized model on a CPU engine - fifteen to twenty-five seconds per
+        # utterance, during which every further press was dropped as busy and
+        # the text landed wherever the focus had wandered to by the time it
+        # arrived.
+        wanted = wanted_engine(accelerator)
+        if have_exe and self.installed_engine() != wanted:
+            log(f"[BACKEND] the installed {self.installed_engine()} engine is "
+                f"not the {wanted} one this machine wants; fetching it")
+            have_exe = False
+
         have_model = (downloaded_model.exists() if force_download
                       else self.model_path(model).exists())
 
@@ -612,6 +746,10 @@ class LocalBackend:
                 if sys.platform != "win32":
                     # A tarball's mode bits do not survive every extraction path.
                     downloaded_exe.chmod(0o755)
+                # Last, and only once the binary is in place: the marker is
+                # read as "this engine is that kind", so it must never be
+                # there describing an engine that failed to unpack.
+                self._record_engine(wanted)
 
             if not have_model:
                 size_mb = MODELS.get(model, (0, ""))[0]
@@ -636,6 +774,13 @@ class LocalBackend:
             log(f"[BACKEND] install failed: {e}")
             self._notify(f"Could not set up the speech model: {e}")
             return False
+
+    def _record_engine(self, kind: str) -> None:
+        try:
+            self._engine_marker.parent.mkdir(parents=True, exist_ok=True)
+            self._engine_marker.write_text(kind, encoding="utf-8")
+        except OSError as e:
+            log(f"[BACKEND] could not record the engine kind: {e}")
 
     # --------------------------------------------------------------- serve
     def start(self, model: str | None = None) -> str | None:
@@ -756,8 +901,12 @@ class LocalBackend:
     def needs_gpu_upgrade(self) -> bool:
         """Whether this machine could do better than what is installed.
 
-        True when there is an NVIDIA GPU but the app is still running the
-        bundled CPU engine and small model.
+        True when there is an NVIDIA GPU but the engine that will run is a
+        CPU one. Asked of the engine rather than of whether anything was ever
+        downloaded: downloading a *model* also creates the runtime directory,
+        so the old test went quiet the moment someone accepted a model from
+        the settings window - which is precisely when the machine was left
+        running a GPU model on the CPU engine with nothing saying so.
         """
         # Only Windows has a CUDA engine to move up to. Upstream's Linux
         # asset is CPU-only, so on Linux an NVIDIA card changes nothing that
@@ -766,12 +915,21 @@ class LocalBackend:
             return False
         if not detect_accelerator().startswith("cuda"):
             return False
-        downloaded = _runtime_dir(self.config.config_dir) / self._exe_name
-        return not downloaded.exists()
+        return not self.engine_is_gpu()
+
+    def engine_summary(self) -> str:
+        """What the speech engine runs on, in words, for the settings window."""
+        engine = self.installed_engine()
+        if engine.startswith("cuda"):
+            return f"NVIDIA GPU ({engine})"
+        if detect_accelerator().startswith("cuda") and sys.platform == "win32":
+            return f"CPU, {usable_cores()} threads - GPU engine not installed"
+        return f"CPU, {usable_cores()} threads"
 
     def describe(self) -> str:
         """One line for the diagnostics report."""
         accelerator = detect_accelerator()
         return (f"{platform.system()} / {accelerator} / "
+                f"engine {self.installed_engine()} / "
                 f"server {'present' if self.server_exe.exists() else 'missing'} / "
                 f"model {'present' if self.model_path().exists() else 'missing'}")

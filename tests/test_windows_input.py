@@ -69,40 +69,63 @@ def test_nothing_is_pressed_that_was_not_already_held(win, monkeypatch):
         "a modifier was pressed that the user was not holding")
 
 
-def test_typing_blinds_the_listener_for_the_duration(win, monkeypatch):
+def _unsuppressed(monkeypatch):
+    """Clear both routes to suppression, so a test starts from looking.
+
+    Both are module state and a preceding type_text leaves them set, so
+    zeroing only the one a test happens to read is how it would pass or fail
+    on the order it ran in.
+    """
+    from whisper_flow import hotkey_win
+
+    monkeypatch.setattr(hotkey_win, "_settled_at", 0.0)
+    monkeypatch.setattr(hotkey_win, "_typing_depth", 0)
+    return hotkey_win
+
+
+def test_typing_blinds_the_listener_while_it_types(win, monkeypatch):
     """Restoring the keys is not enough on its own.
 
     The poll runs every 16ms and the gap between releasing the modifiers and
     putting them back is a few milliseconds wide - narrow, and caught often
     enough that the recording still ended at the first word after the
     restore was added. The listener has to not look at all.
-    """
-    from whisper_flow import hotkey_win
 
+    Observed from inside the injection rather than after it. What matters is
+    that the keyboard is ignored for every event we send, and asserting that
+    from the outside afterwards measures the settling window instead - which
+    is deliberately short, and would make this a race.
+    """
+    hotkey_win = _unsuppressed(monkeypatch)
     system_win, _ = win
     monkeypatch.setattr(system_win._user32, "GetAsyncKeyState", lambda vk: 0)
-    monkeypatch.setattr(hotkey_win, "_suppressed_until", 0.0)
+
+    seen = []
+    monkeypatch.setattr(
+        system_win, "_send",
+        lambda events: (seen.append(hotkey_win._suppressed()), True)[1])
 
     assert not hotkey_win._suppressed()
     system_win.type_text("hello")
-    assert hotkey_win._suppressed(), (
+
+    assert seen, "nothing was sent"
+    assert all(seen), (
         "the listener was still reading the keyboard while we typed into it")
 
 
-def test_suppression_is_not_permanent(monkeypatch):
+def test_the_listener_is_looking_again_once_typing_is_over(win, monkeypatch):
     """A window that never closes is a hotkey that never works again."""
     import time
 
-    from whisper_flow import hotkey_win
+    hotkey_win = _unsuppressed(monkeypatch)
+    system_win, _ = win
+    monkeypatch.setattr(system_win._user32, "GetAsyncKeyState", lambda vk: 0)
 
-    # suppress() extends rather than replaces, so an earlier test's window
-    # would still be open here.
-    monkeypatch.setattr(hotkey_win, "_suppressed_until", 0.0)
-    hotkey_win.suppress(0.05)
-    assert hotkey_win._suppressed()
-    time.sleep(0.12)
+    system_win.type_text("hello")
+    assert hotkey_win._typing_depth == 0, "the injection did not release it"
+    time.sleep(hotkey_win.SETTLE_SECONDS * 3)
     assert not hotkey_win._suppressed(), (
-        "suppression outlived its window; the hotkey would stop responding")
+        "suppression outlived the typing; the hotkey would stop responding")
 
 
 def test_a_genuine_release_still_ends_the_recording(win, monkeypatch):

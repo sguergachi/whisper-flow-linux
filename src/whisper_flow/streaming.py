@@ -201,6 +201,26 @@ class LiveTranscriber:
             self._delivery_failures += 1
             log(f"[LIVE] emit failed: {e}")
 
+    def quiesce(self, timeout: float = 1.0) -> None:
+        """Stop starting new passes, before the closing one is issued.
+
+        whisper.cpp serves one request at a time. Recording ends, the final
+        pass is sent, and the live loop - which knows nothing about that - was
+        still free to start another pass over the same audio and get in front
+        of it. Each one delays the transcript the user is waiting for by its
+        own duration, and a pass was seen starting seven seconds after the key
+        was released.
+
+        The wait here is short and does not have to succeed: a pass already
+        in flight cannot be recalled, and the point is only that no *further*
+        pass begins. Unlike stop(), the transcriber stays open, so finalize
+        can still type the tail.
+        """
+        self._running = False
+        self._wake.set()
+        if self._thread:
+            self._thread.join(timeout=timeout)
+
     def finalize(self, final_text: str | None) -> None:
         """Emit whatever the final transcript holds beyond what was committed.
 

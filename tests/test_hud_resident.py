@@ -10,6 +10,7 @@ all, that a resident overlay can never be stranded on screen.
 import sys
 import threading
 import time
+from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
@@ -151,6 +152,108 @@ def test_the_overlay_opens_the_display_itself():
         "process does, and constructing a window without it is a crash")
     assert body.index("Gtk.init") < body.index("HudWindow("), (
         "GTK has to be initialised before the window is constructed")
+
+
+def _hud_app_source() -> str:
+    return (Path(__file__).resolve().parents[1]
+            / "src/whisper_flow/hud_app.py").read_text(encoding="utf-8")
+
+
+def test_the_overlay_is_placed_in_physical_pixels():
+    """GDK measures in logical units; SetWindowPos takes physical pixels.
+
+    Nothing converted between them, so on a 2x display the pill went to half
+    its intended offset - the upper-left quadrant rather than bottom-centre.
+    It was on screen the whole time, nowhere near where anyone was looking.
+    """
+    source = _hud_app_source()
+    assert "_monitor_scale" in source, (
+        "the overlay needs the monitor's logical-to-physical factor")
+    branch = source.split("def _apply_position(", 1)[1].split("\n    def ", 1)[0]
+    assert "_monitor_scale()" in branch, (
+        "the Win32 branch of _apply_position must scale GDK's logical "
+        "coordinates to physical pixels before calling SetWindowPos")
+
+
+def test_the_overlay_is_placed_after_it_is_mapped():
+    """GTK places the window itself when it maps it, and maps after realize.
+
+    Positioning at realize alone was silently undone every time.
+    """
+    source = _hud_app_source()
+    assert '"map"' in source and "_on_map" in source, (
+        "the overlay must re-apply its position on map; a position set at "
+        "realize is overwritten by GTK's own placement")
+
+
+def test_the_pill_keeps_its_proportions_at_any_height():
+    """Windows draws a smaller pill, and it must be the same pill.
+
+    Its outline there is whatever DWM rounds the window to - a region will
+    not clip the acrylic behind it - and DWM has one radius. Making that
+    read as round means making the pill smaller, which is only acceptable
+    if everything scales together rather than the contents being squashed
+    into a shorter box.
+    """
+    source = _hud_app_source()
+    assert "SIZE_SCALE" in source, (
+        "the pill's measurements must derive from one scale factor")
+    for name in ("WIDTH = ", "DOT_X", "WAVE_L", "BAR_MAX", "BAR_W"):
+        line = next((line for line in source.splitlines()
+                     if line.startswith(name)), "")
+        assert "SIZE_SCALE" in line, (
+            f"{name.strip()} does not scale with the pill; a shorter pill "
+            f"would keep this measurement and lose the proportions")
+
+
+def test_the_window_is_cut_down_to_the_pill():
+    """A toplevel is a rectangle, and DWM paints its backdrop across all of it.
+
+    The pill drew transparent corners and they went nowhere: the acrylic
+    filled the whole rect, so the capsule sat on an opaque slab. A window
+    region is what actually removes those pixels.
+    """
+    source = _hud_app_source()
+    assert "_apply_shape_win32" in source, (
+        "the overlay must clip its window to the pill, or the corners stay "
+        "opaque whatever cairo draws")
+    assert "_squircle_points" in source, (
+        "the region must be cut from the same geometry the pill is drawn "
+        "with, or the two drift apart")
+    blur = (Path(__file__).resolve().parents[1]
+            / "src/whisper_flow/blur_win.py").read_text(encoding="utf-8")
+    assert "SetWindowRgn" in blur and "CreatePolygonRgn" in blur
+    assert "restype = ctypes.c_void_p" in blur, (
+        "a region handle is pointer-sized; untyped ctypes truncates it")
+
+
+def test_the_overlay_reclaims_topmost_every_time_it_is_shown():
+    """The topmost band is ordered by whoever claimed it last.
+
+    Set once at realize, the pill ended up behind the taskbar and behind any
+    other topmost window that appeared later.
+    """
+    source = _hud_app_source()
+    assert "_raise_win32" in source, "the overlay needs an explicit raise"
+    body = source.split("def _reposition(", 1)[1].split("\n    def ", 1)[0]
+    assert "_raise_win32()" in body, (
+        "topmost must be re-asserted when the pill is shown, not only when "
+        "the window is first realized")
+
+
+def test_a_parked_overlay_keeps_following_the_level_file():
+    """The timer must survive the recording that ends, or later ones are dead.
+
+    _read_levels returned False when the daemon deleted the level file, which
+    removes the GLib source for good. A resident overlay parks and is shown
+    again, and every later recording drew a waveform frozen where the last
+    one ended.
+    """
+    source = _hud_app_source()
+    body = source.split("def _read_levels(", 1)[1].split("\n    def ", 1)[0]
+    assert "return self._resident" in body, (
+        "a resident overlay must keep its level timer when the file goes "
+        "away; returning False removes the source permanently")
 
 
 # ------------------------------------------------------- the overlay's states

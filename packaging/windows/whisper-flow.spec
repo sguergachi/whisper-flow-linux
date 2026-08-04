@@ -56,6 +56,29 @@ def gtk_runtime():
         for path in found:
             datas.append((path, dest))
 
+    def add_tree(source, dest, suffixes, required=False):
+        """Copy a directory tree, keeping its shape.
+
+        add() flattens - every match lands in the one destination directory.
+        That is right for typelibs, which are a flat set, and wrong for an
+        icon theme: index.theme names the subdirectories its icons live in,
+        symbolic/actions and symbolic/status and the rest, and GTK looks in
+        exactly those. Flattened into symbolic/, every lookup missed, and the
+        settings window drew the broken-image glyph where its tab icons go.
+        """
+        root = os.path.join(GTK_PREFIX, source)
+        found = 0
+        for folder, _subdirs, names in os.walk(root):
+            relative = os.path.relpath(folder, root)
+            target = dest if relative == "." else f"{dest}/{relative}"
+            for name in names:
+                if name.endswith(suffixes):
+                    datas.append((os.path.join(folder, name),
+                                  target.replace("\\", "/")))
+                    found += 1
+        if required and not found:
+            raise SystemExit(f"nothing matched {suffixes} under {root}")
+
     # Every typelib in the prefix, rather than a hand-picked list.
     #
     # The list was wrong twice. Gdk-4.0 was missing and shipped a build that
@@ -85,9 +108,18 @@ def gtk_runtime():
     add(r"share\glib-2.0\schemas\gschemas.compiled", "share/glib-2.0/schemas",
         required=True)
     # The symbolic icons the UI names, and the cursor/edit affordances.
-    add(r"share\icons\Adwaita\symbolic\**\*.svg", "share/icons/Adwaita/symbolic",
-        required=True)
-    add(r"share\icons\hicolor\scalable\**\*.svg", "share/icons/hicolor/scalable")
+    #
+    # index.theme is the theme. Without it GTK does not see a theme here at
+    # all - it sees a directory of SVGs it has no reason to look in - and
+    # every named icon falls back to the broken-image glyph. The few that
+    # still rendered came from the set GTK compiles into libgtk as a
+    # GResource, which needs no theme and hid how completely this was broken.
+    add(r"share\icons\Adwaita\index.theme", "share/icons/Adwaita", required=True)
+    add_tree(r"share\icons\Adwaita\symbolic", "share/icons/Adwaita/symbolic",
+             (".svg",), required=True)
+    add(r"share\icons\hicolor\index.theme", "share/icons/hicolor")
+    add_tree(r"share\icons\hicolor\scalable", "share/icons/hicolor/scalable",
+             (".svg",))
     # gdk-pixbuf loaders, or no icon renders at all. No loaders.cache: it
     # carries absolute build-machine paths, and GDK_PIXBUF_MODULEDIR scans
     # the directory at runtime instead.

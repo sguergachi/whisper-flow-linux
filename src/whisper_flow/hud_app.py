@@ -75,21 +75,36 @@ else:
     enable_blur = _load_sibling("wayland_blur").enable_blur
 _mark("imports done")
 
-WIDTH = 268
-HEIGHT = 54
+# The pill was drawn at 268x54, and every measurement below is in terms of
+# that. A different height scales all of them together rather than squashing
+# the same contents into a shorter box - bars, dot and margins keep their
+# proportions and the silhouette stays the shape it was designed as.
+#
+# Windows is smaller on purpose. There the pill's outline is whatever DWM
+# rounds the window to, because a region will not clip the acrylic behind
+# it, and DWM offers one radius: 8 logical pixels, take it or leave it. On a
+# 54-tall pill that reads as a barely-softened rectangle. The only way to
+# make it look round is to make the pill smaller against that fixed 8, so it
+# is, and the two platforms end up different sizes - the price of having a
+# material behind it at all. Wayland keeps the full size and the squircle.
+BASE_WIDTH, BASE_HEIGHT = 268, 54
+DEFAULT_HEIGHT = 38 if IS_WINDOWS else BASE_HEIGHT
+HEIGHT = int(os.environ.get("WHISPER_FLOW_HUD_HEIGHT", str(DEFAULT_HEIGHT)))
+SIZE_SCALE = HEIGHT / BASE_HEIGHT
+WIDTH = round(BASE_WIDTH * SIZE_SCALE)
 RADIUS = HEIGHT / 2
 BOTTOM_MARGIN = int(os.environ.get("WHISPER_FLOW_HUD_BOTTOM_MARGIN", "28"))
 
-DOT_X = 27
-DOT_R = 4.5
-WAVE_L = 48
-WAVE_R = WIDTH - 24
-BARS = 30
-BAR_W = 2.6
-BAR_MAX = 15.0
-BAR_OUTLINE = 0.9    # dark ring hugging each bar
-BAR_SHADOW_DX = 0.9  # cast shadow offset, down and to the right
-BAR_SHADOW_DY = 1.4
+DOT_X = 27 * SIZE_SCALE
+DOT_R = 4.5 * SIZE_SCALE
+WAVE_L = 48 * SIZE_SCALE
+WAVE_R = WIDTH - 24 * SIZE_SCALE
+BARS = 30                       # a count, not a measurement
+BAR_W = 2.6 * SIZE_SCALE
+BAR_MAX = 15.0 * SIZE_SCALE
+BAR_OUTLINE = 0.9 * SIZE_SCALE   # dark ring hugging each bar
+BAR_SHADOW_DX = 0.9 * SIZE_SCALE  # cast shadow offset, down and to the right
+BAR_SHADOW_DY = 1.4 * SIZE_SCALE
 
 STROKE_W = 1.0              # outline width in surface-local units
 STROKE_RGB = (0.42, 0.43, 0.47)
@@ -111,6 +126,19 @@ CAP_EXT = 1.12   # cap reaches this many half-heights along the edge
 # more of the frost, so this is the one knob that trades the two off.
 MATERIAL_RGB = (0.03, 0.03, 0.04)
 MATERIAL_ALPHA = 0.80
+if IS_WINDOWS:
+    # Opaque when there is nothing behind the pill to show. Translucency
+    # over a raw desktop is not glass, it just looks like a bug. This is
+    # the fallback for when acrylic could not be applied - with it, the
+    # tint below is used instead.
+    MATERIAL_ALPHA = 1.0
+# Over acrylic instead. Barely a tint: the material is already blurred and
+# tinted, and anything heavier turns it back into the flat slab it replaced.
+ACRYLIC_TINT_ALPHA = 0.12
+# What DWM rounds a window to, in logical pixels. With acrylic behind the
+# pill this is its silhouette - a region cannot clip a material, so DWM's
+# rounding is the only shape on offer.
+DWM_CORNER_RADIUS = 8
 # Rim masking the blur region's edge. Only just wider than the inset: it is
 # darker than the glass, so every extra pixel reads as a heavy border.
 EDGE_COVER = BLUR_INSET + 0.5
@@ -223,6 +251,31 @@ def _ease(t: float) -> float:
     return t * t * (3.0 - 2.0 * t)
 
 
+def _squircle_points(x, y, w, h, n=SQUIRCLE_N, cap=CAP_EXT, steps=SQUIRCLE_STEPS):
+    """The capsule outline as a point list. See _squircle for the shape.
+
+    Separate from the drawing so the window region can be cut from the very
+    same geometry: a region that only approximated the pill would clip its
+    caps or leave a rim of window outside them, and the two would drift
+    apart the moment either was tuned.
+    """
+    b = h / 2.0
+    rx = min(b * cap, w / 2.0)
+    cy = y + b
+    left_j, right_j = x + rx, x + w - rx
+    e = 2.0 / n
+    pts = []
+    for base, lo in ((right_j, -math.pi / 2), (left_j, math.pi / 2)):
+        for i in range(steps + 1):
+            t = lo + math.pi * i / steps
+            ct, st = math.cos(t), math.sin(t)
+            pts.append((
+                base + rx * math.copysign(abs(ct) ** e, ct),
+                cy + b * math.copysign(abs(st) ** e, st),
+            ))
+    return pts
+
+
 def _squircle(cr, x, y, w, h, n=SQUIRCLE_N, cap=CAP_EXT, steps=SQUIRCLE_STEPS):
     """Append a capsule whose end caps have continuous curvature.
 
@@ -237,20 +290,7 @@ def _squircle(cr, x, y, w, h, n=SQUIRCLE_N, cap=CAP_EXT, steps=SQUIRCLE_STEPS):
     instead of a capsule. Each cap reaches `cap` times the half-height along
     the edge, which is what gives the curvature room to ramp.
     """
-    b = h / 2.0
-    rx = min(b * cap, w / 2.0)
-    cy = y + b
-    left_j, right_j = x + rx, x + w - rx
-    e = 2.0 / n
-    pts = []
-    for j, (base, lo) in enumerate(((right_j, -math.pi / 2), (left_j, math.pi / 2))):
-        for i in range(steps + 1):
-            t = lo + math.pi * i / steps
-            ct, st = math.cos(t), math.sin(t)
-            pts.append((
-                base + rx * math.copysign(abs(ct) ** e, ct),
-                cy + b * math.copysign(abs(st) ** e, st),
-            ))
+    pts = _squircle_points(x, y, w, h, n, cap, steps)
     cr.move_to(*pts[0])
     for px, py in pts[1:]:
         cr.line_to(px, py)
@@ -287,6 +327,11 @@ class HudWindow(Gtk.Window):
         # hotkey and seeing anything.
         self._resident = resident
         self._hwnd = None
+        # What Windows composition gave us; decides whether the window still
+        # has to be cut to shape. See blur_win.apply_window_style.
+        self._style = None
+        # The blurred picture of whatever is behind the pill, and its size.
+        # Windows only: on Wayland the compositor supplies the real thing.
         # Gtk.Window.close() only emits close-request; on a layer-shell surface
         # that does not end the main loop, so the process would linger with the
         # pill still on screen. Always tear down through this instead.
@@ -373,7 +418,29 @@ class HudWindow(Gtk.Window):
             for sig in (signal.SIGTERM, signal.SIGINT):
                 _unix_signal_add(sig, self._on_signal)
         self.connect("realize", self._on_realize)
+        if IS_WINDOWS:
+            # Position again once the window is on screen. Placing it at
+            # realize is too early: GTK sets the surface's own position as
+            # part of the map that follows, which overwrote ours - so the
+            # pill appeared at Windows' default cascade spot in the top-left
+            # corner rather than bottom-centre, on every recording. It was
+            # never invisible, only never where anyone was looking.
+            self.connect("map", self._on_map)
         _mark("window constructed")
+
+    def _on_map(self, *_):
+        """Re-apply the position after GTK has placed the window itself."""
+        GLib.idle_add(self._reposition)
+
+    def _reposition(self):
+        self._apply_position()
+        # Re-cut here too: at realize the surface has not been sized yet, so
+        # the region built there is against a provisional rectangle.
+        self._apply_shape_win32()
+        # And re-claim the topmost band, which another window may have taken
+        # since this overlay was last on screen.
+        self._raise_win32()
+        return GLib.SOURCE_REMOVE
 
     def _pick_monitor(self, hint: str | None):
         """Choose the output to show on.
@@ -475,6 +542,38 @@ class HudWindow(Gtk.Window):
         user32.EnumWindows(each, None)
         return found[0] if found else None
 
+    def _raise_win32(self):
+        """Put the pill above everything, including the taskbar.
+
+        Re-asserted on every show, not just at realize. WS_EX_TOPMOST is
+        supposed to be sticky, but the band is ordered by whoever claimed it
+        last: a shell surface or another topmost window that appears after
+        us ends up in front, and the overlay spends the recording behind the
+        taskbar. Claiming it again each time the pill is shown costs one
+        call and settles it.
+
+        argtypes are declared because HWND_TOPMOST is the sentinel -1 and
+        this is a 64-bit process. Left untyped, ctypes marshals it as a
+        32-bit int and what the callee reads for a pointer-sized handle is
+        not -1 at all.
+        """
+        if not self._hwnd:
+            return
+        try:
+            user32 = ctypes.windll.user32
+            user32.SetWindowPos.argtypes = [
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+                ctypes.c_int, ctypes.c_int, ctypes.c_uint,
+            ]
+            user32.SetWindowPos.restype = ctypes.c_bool
+            HWND_TOPMOST = -1
+            SWP_NOSIZE, SWP_NOMOVE, SWP_NOACTIVATE = 0x1, 0x2, 0x10
+            user32.SetWindowPos(
+                ctypes.c_void_p(self._hwnd), ctypes.c_void_p(HWND_TOPMOST),
+                0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE)
+        except Exception as e:
+            print(f"[HUD] could not raise the overlay: {e}", flush=True)
+
     def _realize_win32(self):
         """Topmost, positioned, acrylic and rounded - DWM does the styling."""
         try:
@@ -482,17 +581,87 @@ class HudWindow(Gtk.Window):
             if not self._hwnd:
                 print("[HUD] no HWND yet", flush=True)
                 return
-            user32 = ctypes.windll.user32
-            HWND_TOPMOST = -1
-            SWP_NOACTIVATE = 0x10
-            user32.SetWindowPos(self._hwnd, HWND_TOPMOST, 0, 0, 0, 0,
-                                0x1 | 0x2 | SWP_NOACTIVATE)  # NOSIZE|NOMOVE
+            self._raise_win32()
             self._apply_position()
             if not os.environ.get("WHISPER_FLOW_HUD_NO_BLUR"):
-                style = _win_blur.apply_window_style(self._hwnd)
-                print(f"[HUD] window style: {style or 'not applied'}", flush=True)
+                self._style = _win_blur.apply_window_style(self._hwnd)
+                print(f"[HUD] window style: {self._style or 'not applied'}",
+                      flush=True)
+            self._apply_shape_win32()
         except Exception as e:
             print(f"[HUD] Windows window setup failed: {e}", flush=True)
+
+    # How far the region is pushed past the drawn outline. The cut has no
+    # antialiasing, so landing it exactly on the outline would replace the
+    # pill's soft rim with a staircase. One physical pixel out, the ragged
+    # edge falls on fully transparent pixels and the drawn rim survives
+    # intact - the same reasoning as BLUR_INSET on the Wayland side, in the
+    # opposite direction, because there the region sits under the glass and
+    # here it decides what exists at all.
+    SHAPE_BLEED = 1
+
+    def _apply_shape_win32(self):
+        """Cut the window down to the pill, when nothing honours the alpha.
+
+        A last resort, not the normal path. The region's edge has no
+        antialiasing, so it replaces the pill's soft rim with a staircase;
+        with per-pixel alpha working, the transparent corners cost nothing
+        and the rim survives. This is what is left when the alpha channel is
+        being thrown away and every transparent pixel comes out opaque.
+
+        Measured from the window rather than computed from WIDTH and HEIGHT:
+        GTK owns the surface size and applies the display scale itself, and a
+        region built from what we assumed the size was would be wrong on
+        every display that is not at 100%.
+        """
+        # Not with a material: a region does not clip one, so cutting the
+        # window would leave the acrylic rectangular and the content capsule
+        # shaped - the two disagreeing is worse than either alone.
+        if not self._hwnd or self._style in ("per-pixel-alpha", "accent-acrylic"):
+            return
+        try:
+            rect = (ctypes.c_long * 4)()
+            if not ctypes.windll.user32.GetWindowRect(
+                    ctypes.c_void_p(self._hwnd), ctypes.byref(rect)):
+                return
+            w, h = rect[2] - rect[0], rect[3] - rect[1]
+            if w <= 0 or h <= 0:
+                return
+            bleed = self.SHAPE_BLEED
+            points = _squircle_points(-bleed, -bleed, w + 2 * bleed, h + 2 * bleed)
+            applied = _win_blur.set_shape(self._hwnd, points)
+            print(f"[HUD] window shape: {w}x{h} "
+                  f"{'clipped to the pill' if applied else 'not applied'}",
+                  flush=True)
+        except Exception as e:
+            print(f"[HUD] could not shape the window: {e}", flush=True)
+
+    def _monitor_scale(self) -> float:
+        """Logical-to-physical factor for the output the pill is on.
+
+        GDK measures in logical units and SetWindowPos takes physical pixels,
+        so every coordinate has to cross that boundary. Nothing converted, so
+        on a 2x display the pill went to half its intended offset - the
+        upper-left quadrant instead of bottom-centre, which read as the
+        overlay simply not appearing.
+
+        get_scale() before get_scale_factor(): the latter is an integer and
+        reports 1 at 125% and 150%, where the real factor is fractional and
+        the error is smaller but just as wrong.
+        """
+        if self._monitor is None:
+            return 1.0
+        for name in ("get_scale", "get_scale_factor"):
+            getter = getattr(self._monitor, name, None)
+            if getter is None:
+                continue
+            try:
+                scale = float(getter())
+            except Exception:
+                continue
+            if scale > 0:
+                return scale
+        return 1.0
 
     def _apply_position_win32(self, x: int, y: int):
         if not self._hwnd:
@@ -577,11 +746,15 @@ class HudWindow(Gtk.Window):
     def _apply_position(self):
         """Anchor bottom-centre by default, or top-left at a dragged position."""
         if LayerShell is None:
-            # Win32 coordinates are absolute; layer-shell margins were local.
+            # Win32 coordinates are absolute and physical; layer-shell margins
+            # were local, and everything above this line is in GDK's logical
+            # units. This is the one place the two meet.
             local = self._pos if self._pos is not None else self._default_pos()
             g = self._monitor.get_geometry() if self._monitor else None
+            scale = self._monitor_scale()
             self._apply_position_win32(
-                (g.x if g else 0) + local[0], (g.y if g else 0) + local[1])
+                ((g.x if g else 0) + local[0]) * scale,
+                ((g.y if g else 0) + local[1]) * scale)
             return
         if self._pos is None:
             LayerShell.set_anchor(self, LayerShell.Edge.LEFT, False)
@@ -623,7 +796,7 @@ class HudWindow(Gtk.Window):
             # A tap. Only the close affordance dismisses; anywhere else would
             # make the pill vanish whenever a drag came up a pixel short.
             sx, sy = self._drag_start_xy
-            if sx >= WIDTH - 34:
+            if sx >= WIDTH - 34 * SIZE_SCALE:
                 self.quit()
             return
         _save_position(self._connector, *self._pos)
@@ -667,8 +840,15 @@ class HudWindow(Gtk.Window):
         # because whoever spawned us failed to take us down.
         if not os.path.exists(self.level_file):
             print("[HUD] level file gone, closing", flush=True)
+            # Stop following it before quitting, or the next tick reports it
+            # missing all over again.
+            self.level_file = ""
             self.quit()
-            return False
+            # A resident overlay parks rather than exits, and it needs this
+            # timer for the next recording. Removing the source left every
+            # later recording with a waveform frozen where the last one
+            # ended, and nothing watching for an orphaned overlay either.
+            return self._resident
         if not self._check_lifetime():
             return False
 
@@ -690,6 +870,23 @@ class HudWindow(Gtk.Window):
             self.peak = max(self.peak * PEAK_DECAY, float(v), PEAK_FLOOR)
             self.targets.append(min(1.0, (v / self.peak) ** LEVEL_GAMMA))
         return True
+
+    def _outline(self, cr, x, y, w, h):
+        """The pill's silhouette, which is not the same shape on Windows.
+
+        With acrylic behind it the shape is not ours to choose: a window
+        region does not clip a material, so whatever DWM rounds the window
+        to is what the pill is - a rounded rectangle at the system radius.
+        Drawing the capsule over that would put our outline inside the
+        material's own edge, with frost showing past it at both ends.
+
+        Everywhere else, the squircle: continuous curvature into the caps,
+        which is the shape this overlay is meant to have.
+        """
+        if self._style == "accent-acrylic":
+            _round_rect(cr, x, y, w, h, DWM_CORNER_RADIUS)
+        else:
+            _squircle(cr, x, y, w, h)
 
     def _draw(self, area, cr, w, h):
         if not getattr(self, "_drew", False):
@@ -716,11 +913,15 @@ class HudWindow(Gtk.Window):
         cr.scale(scale, scale)
         cr.translate(-w / 2.0, -h / 2.0)
 
-        # A light tint only - the compositor blur behind the pill supplies the
-        # frost, and a heavy fill would just mute it into flat grey.
+        # On Wayland the compositor blurs behind the surface and this tint
+        # sits over the frost. On Windows it depends what the window got:
+        # acrylic arrives already blurred and tinted, so the full material
+        # over the top would flatten it back into the slab it replaced.
         inner = STROKE_W / 2
-        _squircle(cr, inner, inner, w - 2 * inner, h - 2 * inner)
-        cr.set_source_rgba(*MATERIAL_RGB, MATERIAL_ALPHA * a)
+        material = (ACRYLIC_TINT_ALPHA if self._style == "accent-acrylic"
+                    else MATERIAL_ALPHA)
+        self._outline(cr, inner, inner, w - 2 * inner, h - 2 * inner)
+        cr.set_source_rgba(*MATERIAL_RGB, material * a)
         cr.fill_preserve()
 
         sheen = cairo.LinearGradient(0, 0, 0, h)
@@ -733,13 +934,13 @@ class HudWindow(Gtk.Window):
         # Everything from here to the border is clipped to the pill, so strokes
         # centred on the outline only paint inwards.
         cr.save()
-        _squircle(cr, 0, 0, w, h)
+        self._outline(cr, 0, 0, w, h)
         cr.clip()
 
         # Opaque rim covering the blur region's staircase. The region is built
         # from rectangles and cannot be antialiased, so its curved ends are
         # ragged; this hides that boundary rather than leaving it on show.
-        _squircle(cr, 0, 0, w, h)
+        self._outline(cr, 0, 0, w, h)
         cr.set_line_width(2 * EDGE_COVER)
         cr.set_source_rgba(*MATERIAL_RGB, EDGE_COVER_ALPHA * a)
         cr.stroke()
@@ -750,7 +951,7 @@ class HudWindow(Gtk.Window):
         for i in range(INNER_SHADOW_STEPS):
             frac = i / max(1, INNER_SHADOW_STEPS - 1)
             reach = INNER_SHADOW_SPREAD + INNER_SHADOW_BLUR * frac
-            _squircle(cr, 0, 0, w, h)
+            self._outline(cr, 0, 0, w, h)
             cr.set_line_width(2 * reach)
             cr.set_source_rgba(*INNER_SHADOW_RGB, band * a)
             cr.stroke()
@@ -796,13 +997,13 @@ class HudWindow(Gtk.Window):
         # Outline last, so nothing can paint over it. Solid and fully opaque:
         # a translucent hairline picks up whatever is behind the glass and
         # reads as a ragged edge rather than a clean one.
-        _squircle(cr, inner, inner, w - 2 * inner, h - 2 * inner)
+        self._outline(cr, inner, inner, w - 2 * inner, h - 2 * inner)
         cr.set_line_width(STROKE_W)
         cr.set_source_rgba(*STROKE_RGB, a)
         cr.stroke()
 
         if self.hover > 0.01:
-            cx, r = w - 21, 4.0
+            cx, r = w - 21 * SIZE_SCALE, 4.0 * SIZE_SCALE
             cr.set_source_rgba(1, 1, 1, 0.75 * self.hover * a)
             cr.set_line_width(1.4)
             cr.move_to(cx - r, mid - r)

@@ -38,6 +38,23 @@ from .logging import log, set_logging_enabled  # noqa: E402
 WIDTH, HEIGHT = 760, 820
 CORNER_RADIUS = 12      # Adwaita's window corner radius
 
+# Every icon this window names, in one place so the frozen build can check
+# that the bundled theme actually has them. An icon GTK cannot find is not an
+# error it reports - it silently draws the broken-image glyph, which is what
+# the view switcher showed for three of its four tabs while the fourth, which
+# happens to be in the set GTK compiles into libgtk, looked perfectly fine.
+SECTION_ICONS = {
+    "Speech": "audio-speakers-symbolic",
+    "Hotkeys": "input-keyboard-symbolic",
+    "Dictation": "audio-input-microphone-symbolic",
+    "General": "emblem-system-symbolic",
+}
+# object-select-symbolic, not emblem-ok-symbolic: Adwaita 50 dropped the
+# latter, and the running-daemon row would have drawn the broken-image glyph.
+# The selftest caught it, which is the whole reason it checks these by name.
+STATUS_ICONS = ("object-select-symbolic", "dialog-warning-symbolic")
+ICON_NAMES = tuple(SECTION_ICONS.values()) + STATUS_ICONS
+
 CSS = b"""
 .model-pill {
     border-radius: 999px;
@@ -61,6 +78,59 @@ CSS = b"""
 # blur was real and invisible at the same time. Overriding the names frosts
 # what the eye actually sees, rather than chasing widget selectors that
 # change between libadwaita releases.
+# Windows only, and applied before the window is realized rather than after.
+#
+# GTK keeps a transparent margin around the window to draw its own drop
+# shadow into, and sizes the surface to include it. DWM knows nothing about
+# that margin and fills the whole window rectangle, so the backdrop appears
+# as a rectangle standing well outside the rounded window. Removing the
+# shadow is what shrinks the surface to the window - and it has to be in
+# place before realize, because that is when the extents are computed.
+#
+# Unscoped, deliberately: the .blurred class is only added once a backdrop
+# is confirmed, which is after realize and therefore too late for this.
+CSS_WIN_FRAME = b"""
+decoration, decoration:backdrop {
+    box-shadow: none;
+    margin: 0;
+    border-radius: 0;
+}
+"""
+
+# The few nodes the shared stylesheet does not already clear. Deliberately
+# not the window itself: its translucent fill is the frost. The blur comes
+# from DWM behind it, exactly as the compositor's does on Wayland, and a
+# fully transparent window would show a sharp desktop rather than glass.
+CSS_WIN_BACKDROP = b"""
+/* Every node between the surface and the content. One opaque box in this
+   chain hides the whole backdrop, which is exactly what happened when this
+   list was trimmed - the blur was there and covered. */
+window.blurred > widget,
+window.blurred windowhandle,
+window.blurred box,
+window.blurred toolbarview,
+window.blurred .toolbar-view,
+window.blurred stack,
+window.blurred overlay { background-color: transparent; background-image: none; }
+
+/* One radius, and it has to be DWM's. The backdrop fills the window
+   rectangle, so a corner GTK rounds is a corner where the frost carries on
+   past it - the sliver of material outside Adwaita's 12px arc. Painting
+   square lets DWM's own rounding cut the window and the material together,
+   which is also the radius every other window on this desktop uses. */
+window.blurred,
+window.blurred > .background { border-radius: 0; }
+
+/* No tint at all, unlike Wayland.
+   There the compositor hands back a raw blur and this fill is the entire
+   material - 0.66 of near-black is what makes it glass. Acrylic arrives
+   already tinted, by the alpha in ACCENT_TINT_DARK, so anything added here
+   lands on a finished material and flattens it. The window has to be clear
+   for the acrylic underneath to be the thing you see. */
+window.blurred,
+window.blurred > .background { background-color: transparent; }
+"""
+
 CSS_BLUR = b"""
 @define-color window_bg_color rgba(22, 23, 29, 0.66);
 @define-color view_bg_color rgba(22, 23, 29, 0.0);
@@ -219,6 +289,20 @@ class SettingsWindow(Adw.ApplicationWindow):
         self._load()
         self._refresh_dirty()
         GLib.timeout_add(400, self._refresh_dirty)
+        if sys.platform == "win32":
+            # Undecorated, and before realize. GTK's client-side decoration
+            # carries a shadow the surface is sized to include; DWM knows
+            # nothing of it and fills the whole window rectangle, so the
+            # backdrop appears as a rectangle standing outside the window.
+            # The header bar is Adwaita's own and is unaffected - this drops
+            # only the frame GTK draws around it. DWMWCP_ROUND supplies the
+            # corners in its place.
+            self.set_decorated(False)
+            provider = Gtk.CssProvider()
+            _load_css(provider, CSS_WIN_FRAME)
+            Gtk.StyleContext.add_provider_for_display(
+                Gdk.Display.get_default(), provider,
+                Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 2)
         self.connect("realize", self._on_realize)
 
     # ---------------------------------------------------------------- layout
@@ -278,17 +362,11 @@ class SettingsWindow(Adw.ApplicationWindow):
             "Dictation": self._build_plain_page,
             "General": self._build_general_page,
         }
-        icons = {
-            "Speech": "audio-speakers-symbolic",
-            "Hotkeys": "input-keyboard-symbolic",
-            "Dictation": "audio-input-microphone-symbolic",
-            "General": "emblem-system-symbolic",
-        }
         for section in settings_def.SECTIONS:
             page = builders[section](section)
             # Without an icon the view switcher draws the broken-image glyph.
             self._stack.add_titled_with_icon(
-                page, section.lower(), section, icons[section])
+                page, section.lower(), section, SECTION_ICONS[section])
 
     def _add_field_groups(self, page, section: str, lead_rows=None):
         """Render a section as titled groups, expert rows behind an expander.
@@ -342,8 +420,7 @@ class SettingsWindow(Adw.ApplicationWindow):
         # two different subjects.
         row = Adw.ActionRow(title="Status")
         pid = restart.daemon_pid()
-        icon = Gtk.Image.new_from_icon_name(
-            "emblem-ok-symbolic" if pid else "dialog-warning-symbolic")
+        icon = Gtk.Image.new_from_icon_name(STATUS_ICONS[0 if pid else 1])
         icon.add_css_class("daemon-ok" if pid else "daemon-bad")
         row.add_prefix(icon)
         row.set_subtitle(f"running (pid {pid})" if pid else
@@ -677,8 +754,25 @@ class SettingsWindow(Adw.ApplicationWindow):
             self._toast(f"Config folder: {path}")
 
     # ------------------------------------------------------------------ blur
+    def _frost(self):
+        """Switch to the translucent stylesheet, once there is blur behind it.
+
+        Only ever called after a backdrop is confirmed: these surfaces are
+        see-through, and over an opaque window they would show the desktop
+        grey of nothing at all rather than frosted glass.
+        """
+        provider = Gtk.CssProvider()
+        _load_css(provider, CSS_BLUR)
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(), provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 1)
+        self.add_css_class("blurred")
+
     def _on_realize(self, *_):
-        """Frost the window where the compositor offers backdrop blur."""
+        """Frost the window where the platform offers a backdrop."""
+        if sys.platform == "win32":
+            self._realize_win32()
+            return
         if not (os.environ.get("WAYLAND_DISPLAY")
                 or os.environ.get("XDG_SESSION_TYPE") == "wayland"):
             return
@@ -700,12 +794,51 @@ class SettingsWindow(Adw.ApplicationWindow):
                 inset=1, active=True)
             if not self._blur:
                 return
-            provider = Gtk.CssProvider()
-            _load_css(provider, CSS_BLUR)
-            Gtk.StyleContext.add_provider_for_display(
-                display, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 1)
-            self.add_css_class("blurred")
+            self._frost()
             log("[SETTINGS] backdrop blur enabled")
+        except Exception as e:
+            log(f"[SETTINGS] blur unavailable: {e}")
+
+    def _realize_win32(self):
+        """Acrylic behind the window, through DWM.
+
+        The pill could not use this - the backdrop is the window's rectangle
+        and ignores any attempt to shape it - but a settings window is a
+        rectangle, so it is precisely the intended case. GTK's transparent
+        pixels let it through; nothing else is needed.
+
+        Worth knowing when this looks flat: Windows drops every acrylic and
+        Mica surface to a solid fallback colour under battery saver, and
+        again in a remote session. Nothing here is wrong when that happens.
+        """
+        try:
+            from . import blur_win
+        except Exception as e:                  # not a Windows build
+            log(f"[SETTINGS] no Windows backdrop support: {e}")
+            return
+        try:
+            surface = self.get_surface()
+            hwnd = blur_win.surface_handle(_gobject_pointer(surface))
+            if not hwnd:
+                log("[SETTINGS] no HWND; window stays opaque")
+                return
+            applied = blur_win.apply_backdrop(hwnd, transient=True)
+            if not applied:
+                log("[SETTINGS] backdrop unavailable; window stays opaque")
+                return
+            self._frost()
+            # GTK reserves a transparent margin around the window for its own
+            # drop shadow. DWM does not know about it and paints the backdrop
+            # across the whole window rectangle, so the material appears as a
+            # grey rectangle standing out past the rounded corners. Take the
+            # margin away and the window rectangle is the window; DWM rounds
+            # the corners itself, which is what DWMWCP_ROUND was for.
+            provider = Gtk.CssProvider()
+            _load_css(provider, CSS_WIN_BACKDROP)
+            Gtk.StyleContext.add_provider_for_display(
+                Gdk.Display.get_default(), provider,
+                Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 2)
+            log(f"[SETTINGS] backdrop blur enabled ({applied})")
         except Exception as e:
             log(f"[SETTINGS] blur unavailable: {e}")
 

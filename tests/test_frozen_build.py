@@ -188,6 +188,41 @@ def test_every_window_loads_its_css_through_the_helper():
             f"{path.name} defines _load_css but does not use it")
 
 
+def test_the_icon_theme_ships_its_index_and_keeps_its_shape():
+    """653 icons and no index.theme is not a theme, it is a directory.
+
+    GTK finds icons through index.theme, which names the subdirectories they
+    live in. The spec globbed symbolic/**/*.svg into one flat destination and
+    shipped no index.theme at all, so every icon the settings window named
+    came out as the broken-image glyph - except the handful GTK compiles into
+    libgtk, which need no theme and made it look like most of it worked.
+    """
+    spec = SPEC.read_text(encoding="utf-8")
+    assert "index.theme" in spec, (
+        "no index.theme is bundled; GTK will not see an icon theme and every "
+        "named icon falls back to the broken-image glyph")
+    assert "add_tree(" in spec, (
+        "the icon tree must be copied with its subdirectories intact; add() "
+        "flattens every match into one directory")
+    flattened = re.search(r'add\(r"share\\icons\\[^"]*\*\*', spec)
+    assert not flattened, (
+        f"{flattened.group(0) if flattened else ''} flattens the icon tree "
+        f"into a single directory; use add_tree")
+
+
+def test_the_icons_the_window_names_live_in_one_list():
+    """So the frozen build can check them, rather than a copy that drifts."""
+    settings = (Path(__file__).resolve().parents[1]
+                / "src/whisper_flow/settings_gtk.py").read_text(encoding="utf-8")
+    entry = (Path(__file__).resolve().parents[1]
+             / "src/whisper_flow/__main__win__.py").read_text(encoding="utf-8")
+    assert "ICON_NAMES" in settings and "SECTION_ICONS" in settings, (
+        "settings_gtk must name its icons in one module-level list")
+    assert "ICON_NAMES" in entry, (
+        "the selftest must check the icons against that list, or a missing "
+        "icon ships and is only found by looking at the window")
+
+
 def test_text_is_read_and_written_as_utf8_everywhere():
     """Windows defaults to cp1252, and these files hold arrows and check marks.
 

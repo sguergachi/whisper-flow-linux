@@ -33,7 +33,7 @@ if scenario == "mic_race":
     # there is something to change the selection *to* before the real list
     # lands. Without one the placeholder holds only "Default" and the window
     # this tests cannot be entered.
-    os.environ["WHISPER_FLOW_MIC_DEVICE_INDEX"] = "0"
+    os.environ["MIC_DEVICE_INDEX"] = "0"    # the name settings_def writes
 
 import gi
 gi.require_version("Gtk", "4.0")
@@ -41,7 +41,21 @@ gi.require_version("Adw", "1")
 from gi.repository import GLib, Gtk
 
 from whisper_flow import settings_def, settings_gtk
-settings_gtk._list_input_devices = lambda: [(0, "Built-in mic")]
+
+import threading
+_gate = threading.Event()
+if scenario != "mic_race":
+    _gate.set()
+
+def _devices():
+    # Held shut for mic_race, so "before the list arrives" is a state the
+    # test controls rather than a race it hopes to win. This is what the
+    # real enumeration does anyway: it blocks, for as long as PortAudio
+    # takes to walk four host APIs.
+    _gate.wait(10)
+    return [(0, "Built-in mic")]
+
+settings_gtk._list_input_devices = _devices
 Gtk.init()
 w = settings_gtk.SettingsWindow()
 w.config.config_dir = config_dir
@@ -71,7 +85,12 @@ def mic_row():
 
 
 def mics_listed():
-    return mic_row().get_model().get_n_items() > 1
+    # By name, not by count. The placeholder already holds two entries when
+    # a device is configured - "Default" and the bare index - so counting
+    # them says the list has arrived before it has.
+    model = mic_row().get_model()
+    return any("Built-in mic" in (model.get_string(i) or "")
+               for i in range(model.get_n_items()))
 
 if scenario == "rows_exist":
     for field in settings_def.FIELDS:
@@ -108,6 +127,7 @@ elif scenario == "mic_race":
     mic.set_selected(0)                     # back to Default, unsaved
     assert mic.get_model().get_string(mic.get_selected()) == "Default"
 
+    _gate.set()                             # now let the enumeration finish
     assert pump(mics_listed), "the microphone list never arrived"
     after = mic.get_model().get_string(mic.get_selected())
     assert after == "Default", (

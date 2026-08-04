@@ -188,6 +188,27 @@ def test_every_window_loads_its_css_through_the_helper():
             f"{path.name} defines _load_css but does not use it")
 
 
+def test_a_velopack_hook_exits_instead_of_becoming_the_daemon():
+    """The installer waits 30 seconds for the hook process to end.
+
+    velopack.App().run() returns rather than exiting, so control carried on
+    into the daemon and the hook never came back. The installer killed it
+    and told the user "Install Partially Succeeded" - on an install that had
+    already copied every file, made every shortcut and written the uninstall
+    key. Nothing was wrong except that the app would not leave.
+    """
+    entry = (Path(__file__).resolve().parents[1]
+             / "src/whisper_flow/__main__win__.py").read_text(encoding="utf-8")
+    assert "--veloapp-" in entry, (
+        "the entry point must recognise Velopack's hook arguments")
+    hook_index = entry.index("--veloapp-")
+    daemon_index = entry.index("WhisperFlowDaemon().run(")
+    between = entry[hook_index:daemon_index]
+    assert "return 0" in between, (
+        "a --veloapp-* hook must return before the daemon starts, or the "
+        "installer waits 30s, kills it, and reports a partial install")
+
+
 def test_the_icon_theme_ships_its_index_and_keeps_its_shape():
     """653 icons and no index.theme is not a theme, it is a directory.
 

@@ -278,13 +278,15 @@ def main() -> int:
     #
     # The installer runs this executable with --veloapp-* arguments at
     # install, update and uninstall to create shortcuts and tidy up old
-    # versions; run() acts on them and exits. Doing anything first - reading
-    # config, opening a device - would happen during an install, which is
-    # not a moment when this app should be doing work.
+    # versions. Doing anything first - reading config, opening a device -
+    # would happen during an install, which is not a moment when this app
+    # should be doing work.
     #
     # Deliberately after the two branches above. Those are our own child
     # processes and never receive a Velopack hook, and the overlay is the
     # thing the user waits for, so it is kept clear of anything avoidable.
+    hook = next((arg for arg in sys.argv[1:]
+                 if arg.startswith("--veloapp-")), None)
     try:
         import velopack
         velopack.App().run()
@@ -292,6 +294,20 @@ def main() -> int:
         pass                    # a source checkout, not an installed build
     except Exception as e:
         print(f"[whisper-flow] velopack startup failed: {e}", flush=True)
+
+    # Exit on a hook rather than trusting run() to have done it.
+    #
+    # It does not. The installer waits 30 seconds for this process to end,
+    # and run() returns instead of exiting, so control reached the daemon
+    # below and the hook became a daemon that never returns. Velopack killed
+    # it and reported "Install Partially Succeeded" - an install that had in
+    # fact done everything, undone by the app refusing to leave.
+    #
+    # There is nothing for us to do in a hook anyway: shortcuts, the package
+    # directory and the uninstall entry are all Velopack's own work. Leaving
+    # promptly is the entire contract.
+    if hook:
+        return 0
 
     from whisper_flow.daemon import WhisperFlowDaemon
     WhisperFlowDaemon().run(foreground=True)

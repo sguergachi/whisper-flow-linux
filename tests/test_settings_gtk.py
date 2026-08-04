@@ -122,3 +122,27 @@ def test_a_cleared_field_removes_the_key(tmp_path):
     assert "OK" in result.stdout, result.stderr
     from whisper_flow import envfile
     assert envfile.get(tmp_path / ".env", "MIC_DEVICE_INDEX") == "0"
+
+
+def test_a_rebuilt_page_puts_its_values_back():
+    """Downloading a model replaces every row on the Speech page.
+
+    _build_speech_page constructs fresh rows, and fresh rows are empty: the
+    port read 0, "Run the speech engine locally" read off and the server URL
+    blank, none of which anyone had touched. _current still held the real
+    values, so Save saw the difference as deliberate and would have written
+    it - local transcription turning itself off because a model was
+    downloaded. The port failing validation at 0 is the only thing that
+    stopped it, which is why this was reported as a confusing complaint
+    about a port rather than as the setting loss it was.
+    """
+    source = (Path(__file__).resolve().parents[1]
+              / "src/whisper_flow/settings_gtk.py").read_text(encoding="utf-8")
+    body = source.split("def _download_done(", 1)[1].split("\n    def ", 1)[0]
+    assert "_apply_values(" in body, (
+        "the rows are rebuilt here and must be filled in again, or every "
+        "Speech setting reads as empty afterwards")
+    assert body.index("_values()") < body.index("_build_speech_page"), (
+        "the values have to be captured before the rows are replaced")
+    assert "_apply_values" in source and "def _apply_values" in source, (
+        "_apply_values must exist to restore them")

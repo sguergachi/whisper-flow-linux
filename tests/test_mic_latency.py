@@ -148,15 +148,49 @@ def test_a_stream_that_will_not_stop_is_closed_outright(recorder):
 
 
 # ------------------------------------------- the device must never break it
-def test_a_wasapi_device_that_cannot_do_our_rate_is_not_used(recorder, monkeypatch):
-    """WASAPI shared mode does not resample; MME did. Choosing it blindly
-    broke recording outright with "invalid sample rate"."""
+def test_a_wasapi_device_that_cannot_do_our_rate_is_still_used(recorder, monkeypatch):
+    """It is kept and converted, rather than handed back for MME to take.
+
+    WASAPI shared mode does not resample, so asking a 48kHz array for 16kHz
+    fails - and returning None here meant the platform default through MME,
+    which delivers the same microphone several times quieter. Measured on an
+    AMD array in one room seconds apart: 429 peak through MME at 16kHz,
+    1579 at its native 48kHz. That gap is whisper hearing a sentence or
+    returning nothing at all.
+    """
     monkeypatch.setattr(sys, "platform", "win32")
     recorder.pa.get_host_api_count.return_value = 1
     recorder.pa.get_host_api_info_by_index.return_value = {
         "name": "Windows WASAPI", "defaultInputDevice": 9}
     recorder.pa.is_format_supported.return_value = False
-    assert recorder._input_device_index() is None
+    recorder.pa.get_device_info_by_index.return_value = {
+        "defaultSampleRate": 48000.0}
+    assert recorder._input_device_index() == 9
+
+
+def test_audio_is_converted_to_the_rate_whisper_expects(recorder):
+    """Whatever the device runs at, what leaves here is 16kHz.
+
+    The frame length has to be exact as well as the rate: webrtcvad takes
+    whole 10, 20 or 30ms frames and rejects anything a sample short, so a
+    conversion that rounded would silently disable voice detection.
+    """
+    import numpy as np
+
+    chunk = int(recorder.config.sample_rate * recorder.config.frame_ms / 1000)
+    for source in (48000, 44100, 16000):
+        frames = recorder._capture_frames(chunk, source)
+        assert frames == (chunk if source == recorder.config.sample_rate
+                          else round(chunk * source / recorder.config.sample_rate))
+        # A tone in, the same tone out, at the right length.
+        moment = np.arange(frames) / source
+        tone = (np.sin(2 * np.pi * 440 * moment) * 12000).astype(np.int16)
+        converted = recorder._resample(tone.tobytes(), source, chunk)
+        assert len(converted) == chunk * 2, (
+            f"{source}Hz produced {len(converted) // 2} samples, not {chunk}")
+        loudest = int(np.abs(np.frombuffer(converted, dtype=np.int16)).max())
+        assert loudest > 8000, (
+            f"{source}Hz conversion lost the signal (peak {loudest})")
 
 
 def test_a_wasapi_device_that_can_do_our_rate_is_used(recorder, monkeypatch):

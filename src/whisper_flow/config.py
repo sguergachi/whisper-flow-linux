@@ -242,6 +242,12 @@ class Config(BaseSettings):
         le=65535,
         env="WHISPER_FLOW_LOCAL_SERVER_PORT",
     )
+    noise_filter: bool = Field(
+        default=True,
+        description=("Remove rumble and turn down the room between words "
+                     "before transcribing"),
+        env="WHISPER_FLOW_NOISE_FILTER",
+    )
     fast_encoder: bool = Field(
         # Whisper encodes a full 30 seconds whatever it was given, so a short
         # dictation spends most of its time on silence. Cutting the window to

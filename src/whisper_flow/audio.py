@@ -40,6 +40,7 @@ try:
 except ImportError:
     pyaudio = None
 
+from . import denoise
 from .boost import DEAD_PEAK, needs_boost
 from .config import Config
 from .logging import log
@@ -129,6 +130,10 @@ class AudioRecorder:
         self._warm_stream = None
         self._devices_logged = False
         self._warm_chunk = None
+        # What the device is actually running at. Equal to the configured
+        # rate until a stream opens at something else, which is the usual
+        # case on Windows: the arrays run at 48kHz and will not do 16.
+        self._capture_rate = config.sample_rate
         self._warm_timer = None
         self._stream_lock = threading.Lock()
         if pyaudio is None:
@@ -169,9 +174,14 @@ class AudioRecorder:
                 # else with "invalid sample rate". MME quietly converted, which
                 # is why moving to WASAPI broke recording outright. Ask first.
                 if not self._device_supports_our_rate(device):
+                    # Kept, not abandoned. It runs at its own rate and we
+                    # convert; handing it back meant the platform default
+                    # through MME, which is the same microphone several
+                    # times quieter.
                     log(f"[AUDIO] WASAPI device {device} will not do "
-                        f"{self.config.sample_rate}Hz; using the default device")
-                    return None
+                        f"{self.config.sample_rate}Hz; capturing at "
+                        f"{self._native_rate(device)}Hz and converting")
+                    return device
                 log(f"[AUDIO] using WASAPI input device {device}")
                 return device
         except Exception as e:
@@ -189,6 +199,60 @@ class AudioRecorder:
             ))
         except Exception:
             return False
+
+    def _native_rate(self, device: int | None) -> int:
+        """The rate this device actually runs at, for capturing at it.
+
+        Asking a device for 16kHz it does not have meant falling back to the
+        platform default through MME, and MME's conversion of the same
+        microphone is markedly quieter: measured on an AMD array, 429 peak
+        against 1579 at its native 48kHz - the same room, seconds apart.
+        That gap is the difference between whisper hearing a sentence and
+        returning nothing.
+        """
+        if device is None:
+            return self.config.sample_rate
+        try:
+            info = self.pa.get_device_info_by_index(device)
+            rate = int(info.get("defaultSampleRate") or 0)
+            return rate if rate > 0 else self.config.sample_rate
+        except Exception:
+            return self.config.sample_rate
+
+    def _resample(self, data: bytes, source_rate: int, samples_out: int) -> bytes:
+        """Convert captured audio to the rate whisper is given.
+
+        Averaging over the decimation window before interpolating is what
+        keeps this honest: dropping samples outright folds everything above
+        8kHz back into the speech as aliasing, and sibilance is exactly
+        where a microphone puts its energy.
+
+        The output length is given rather than derived, because the frames
+        downstream have to line up: webrtcvad accepts only whole 10, 20 or
+        30ms frames and rejects anything a sample short.
+        """
+        target = self.config.sample_rate
+        if source_rate == target or not data:
+            return data
+        samples = np.frombuffer(data, dtype=np.int16)
+        if samples.size == 0:
+            return data
+
+        window = max(1, int(round(source_rate / target)))
+        if window > 1:
+            padding = (-samples.size) % window
+            if padding:
+                samples = np.concatenate(
+                    [samples, np.zeros(padding, dtype=np.int16)])
+            smoothed = samples.reshape(-1, window).mean(axis=1)
+        else:
+            smoothed = samples.astype(np.float32)
+
+        if smoothed.size < 2:
+            return np.zeros(samples_out, dtype=np.int16).tobytes()
+        positions = np.linspace(0, smoothed.size - 1, samples_out)
+        converted = np.interp(positions, np.arange(smoothed.size), smoothed)
+        return np.clip(converted, -32768, 32767).astype(np.int16).tobytes()
 
     def log_input_devices(self) -> None:
         """List the capture devices once, with the one we would choose marked.
@@ -241,24 +305,32 @@ class AudioRecorder:
 
         self.log_input_devices()
         device = self._input_device_index()
+        capture_rate = self._native_rate(device)
         try:
             with suppress_alsa_warnings():
-                return self.pa.open(
+                stream = self.pa.open(
                     format=pyaudio.paInt16,
                     channels=1,
-                    rate=self.config.sample_rate,
+                    rate=capture_rate,
                     input_device_index=device,
                     input=True,
-                    frames_per_buffer=chunk,
+                    frames_per_buffer=self._capture_frames(chunk, capture_rate),
                 )
+            self._capture_rate = capture_rate
+            if capture_rate != self.config.sample_rate:
+                log(f"[AUDIO] capturing at {capture_rate}Hz, converting to "
+                    f"{self.config.sample_rate}Hz")
+            return stream
         except Exception as e:
             if device is None:
+                self._capture_rate = self.config.sample_rate
                 raise
             # Whatever the reason, a chosen device must never be the thing
             # that stops a recording. The platform default is what worked
             # before any of this and is always the fallback.
             log(f"[AUDIO] input device {device} would not open ({e}); "
                 f"falling back to the default device")
+            self._capture_rate = self.config.sample_rate
             with suppress_alsa_warnings():
                 return self.pa.open(
                     format=pyaudio.paInt16,
@@ -314,13 +386,33 @@ class AudioRecorder:
         except Exception:
             pass
 
+    def _capture_frames(self, chunk: int, capture_rate: int) -> int:
+        """How many frames to read to yield `chunk` at whisper's rate."""
+        if capture_rate == self.config.sample_rate:
+            return chunk
+        return max(1, int(round(chunk * capture_rate / self.config.sample_rate)))
+
     def _read_audio_with_timeout(self, stream, chunk, timeout=0.1):
-        """Read audio data (no timeout, PyAudio does not support timeout argument)."""
+        """Read one chunk, at whisper's rate whatever the device runs at.
+
+        The conversion belongs here so that everything downstream - the
+        voice detector, the level file, the wav - keeps seeing the rate it
+        was written for.
+        """
+        capture_rate = getattr(self, "_capture_rate", self.config.sample_rate)
         try:
-            return stream.read(chunk, exception_on_overflow=False)
+            data = stream.read(self._capture_frames(chunk, capture_rate),
+                               exception_on_overflow=False)
         except Exception as e:
             log(f"Audio read error: {e}")
             return None
+        try:
+            return self._resample(data, capture_rate, chunk)
+        except Exception as e:
+            # Never let conversion be the thing that ends a recording; the
+            # raw audio is wrong-rated but present.
+            log(f"[AUDIO] could not convert {capture_rate}Hz audio: {e}")
+            return data
 
     @staticmethod
     def _loudness(frames: list) -> tuple[int, int]:
@@ -623,11 +715,24 @@ class AudioRecorder:
         if self.config.speedup_audio != 1.0:
             frames = self._speedup_audio_frames(frames, self.config.speedup_audio)
 
+        audio = b"".join(frames)
+        if self.config.noise_filter and audio:
+            # Here rather than per chunk: the gate measures the room from the
+            # recording it is given, and a 30ms chunk has no idea whether it
+            # is quiet because nobody is speaking or because the whole room
+            # is quiet.
+            try:
+                samples = np.frombuffer(audio, dtype=np.int16)
+                audio = denoise.clean(
+                    samples, self.config.sample_rate).tobytes()
+            except Exception as e:
+                log(f"[AUDIO] noise filter skipped: {e}")
+
         with wave.open(output_path, "wb") as wf:
             wf.setnchannels(1)
             wf.setsampwidth(2)  # 16-bit
             wf.setframerate(self.config.sample_rate)
-            wf.writeframes(b"".join(frames))
+            wf.writeframes(audio)
 
     def _speedup_audio_frames(self, frames: list, speed_multiplier: float) -> list:
         """Speed up audio frames by 1.5x using linear interpolation.

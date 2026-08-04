@@ -188,6 +188,47 @@ def test_every_window_loads_its_css_through_the_helper():
             f"{path.name} defines _load_css but does not use it")
 
 
+def test_the_speech_server_cannot_outlive_the_daemon():
+    """stop() only runs on a clean shutdown, and that is the easy case.
+
+    Killed, crashed, or killed by an installer wanting its files back, the
+    server was orphaned: still holding the port, still holding a model, still
+    taking threads. Two were found running at once, one with five minutes of
+    CPU behind it, which is most of what "inference got slow" was.
+    """
+    backend = (Path(__file__).resolve().parents[1]
+               / "src/whisper_flow/backend.py").read_text(encoding="utf-8")
+    assert "KILL_ON_JOB_CLOSE" in backend or "_kill_on_exit_job" in backend, (
+        "the server must be started inside a job that dies with us; stop() "
+        "alone never runs when the daemon is killed")
+    assert "_adopt_into_job" in backend, (
+        "creating the job is not enough - the server has to be put in it")
+    assert "stop_strays" in backend, (
+        "a server left by an earlier run still holds the port, and the "
+        "readiness check will happily connect to it and report success")
+
+
+def test_a_velopack_hook_exits_instead_of_becoming_the_daemon():
+    """The installer waits 30 seconds for the hook process to end.
+
+    velopack.App().run() returns rather than exiting, so control carried on
+    into the daemon and the hook never came back. The installer killed it
+    and told the user "Install Partially Succeeded" - on an install that had
+    already copied every file, made every shortcut and written the uninstall
+    key. Nothing was wrong except that the app would not leave.
+    """
+    entry = (Path(__file__).resolve().parents[1]
+             / "src/whisper_flow/__main__win__.py").read_text(encoding="utf-8")
+    assert "--veloapp-" in entry, (
+        "the entry point must recognise Velopack's hook arguments")
+    hook_index = entry.index("--veloapp-")
+    daemon_index = entry.index("WhisperFlowDaemon().run(")
+    between = entry[hook_index:daemon_index]
+    assert "return 0" in between, (
+        "a --veloapp-* hook must return before the daemon starts, or the "
+        "installer waits 30s, kills it, and reports a partial install")
+
+
 def test_the_icon_theme_ships_its_index_and_keeps_its_shape():
     """653 icons and no index.theme is not a theme, it is a directory.
 

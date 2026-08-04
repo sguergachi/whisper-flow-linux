@@ -169,6 +169,19 @@ class AudioRecorder:
                 device = api.get("defaultInputDevice", -1)
                 if device is None or device < 0:
                     continue
+                # Trust it only if the device agrees it belongs to this API.
+                #
+                # PortAudio reports defaultInputDevice as a global index, and
+                # on at least one machine the WASAPI entry named a WDM-KS
+                # device - kernel streaming, exclusive to whatever already has
+                # the endpoint open. It failed with "Unanticipated host
+                # error", capture fell back to the platform default, and the
+                # recording came back several times quieter than the
+                # microphone can manage.
+                if not self._device_belongs_to(device, index):
+                    log(f"[AUDIO] host API {api.get('name')} names device "
+                        f"{device}, which is not one of its own; ignoring it")
+                    continue
                 # WASAPI shared mode does not resample: it plays back only at
                 # the rate the device is configured for, and rejects anything
                 # else with "invalid sample rate". MME quietly converted, which
@@ -187,6 +200,20 @@ class AudioRecorder:
         except Exception as e:
             log(f"[AUDIO] could not pick a WASAPI device: {e}")
         return None
+
+    def _device_belongs_to(self, device: int, host_api: int) -> bool:
+        """Whether `device` is really served by `host_api`.
+
+        Fails open: only a device that positively names a different host API
+        is rejected. This is a sanity check on one implausible answer, not a
+        licence to discard a working microphone because PortAudio declined to
+        describe it.
+        """
+        try:
+            reported = int(self.pa.get_device_info_by_index(device)["hostApi"])
+        except Exception:
+            return True
+        return reported == host_api
 
     def _device_supports_our_rate(self, device: int) -> bool:
         """Whether the device will capture at the rate whisper needs."""

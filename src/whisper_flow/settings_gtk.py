@@ -64,6 +64,8 @@ CSS = b"""
 }
 .pill-recommended { background: #1b2c4a; color: #9ec2fc; }
 .pill-current { background: #16301f; color: #4ade80; }
+.pill-gpu { background: #1d3220; color: #86efac; }
+.pill-warning { background: #3a2a12; color: #fbbf24; }
 .model-progress { min-width: 110px; }
 .daemon-ok { color: #4ade80; }
 .daemon-bad { color: #f87171; }
@@ -288,6 +290,7 @@ class SettingsWindow(Adw.ApplicationWindow):
         self._build()
         self._load()
         self._refresh_dirty()
+        self._load_mics_in_background()
         GLib.timeout_add(400, self._refresh_dirty)
         if sys.platform == "win32":
             # Undecorated, and before realize. GTK's client-side decoration
@@ -444,6 +447,7 @@ class SettingsWindow(Adw.ApplicationWindow):
             description=in_use + "Bigger is more accurate and slower; "
                                  "the recommendation is sized to this machine.")
         page.add(model_group)
+        model_group.add(self._engine_row())
 
         group_leader = None
         for item in self.backend.model_inventory():
@@ -469,6 +473,20 @@ class SettingsWindow(Adw.ApplicationWindow):
 
             suffix = Gtk.Box(spacing=6)
             suffix.set_valign(Gtk.Align.CENTER)
+            # Which model uses the GPU, and whether this machine will give it
+            # one. Both halves matter: "GPU" alone on a machine running the
+            # CPU engine is the reassurance that hid the whole problem.
+            if item["gpu_only"]:
+                pill = Gtk.Label(label="GPU" if item["accelerated"]
+                                 else "needs GPU")
+                pill.add_css_class("model-pill")
+                pill.add_css_class("pill-gpu" if item["accelerated"]
+                                   else "pill-warning")
+                pill.set_tooltip_text(
+                    "Runs on the NVIDIA GPU." if item["accelerated"] else
+                    "This model needs the GPU engine. On the CPU engine it "
+                    "takes tens of seconds per sentence.")
+                suffix.append(pill)
             if item["recommended"]:
                 pill = Gtk.Label(label="recommended")
                 pill.add_css_class("model-pill")
@@ -498,6 +516,86 @@ class SettingsWindow(Adw.ApplicationWindow):
 
         self._add_field_groups(page, section)
         return page
+
+    def _engine_row(self) -> Gtk.Widget:
+        """What the models above will actually run on, and how to improve it.
+
+        The page listed five models and never said which engine would run
+        them, so a machine with an NVIDIA card could download the GPU model,
+        run it on the bundled CPU engine, and look exactly like a machine
+        doing the right thing while taking twenty seconds a sentence. The
+        engine is the other half of the answer, so it goes above the models
+        rather than in a diagnostics report nobody opens.
+        """
+        row = Adw.ActionRow(title="Speech engine")
+        summary = self.backend.engine_summary()
+        row.set_subtitle(summary)
+
+        accelerated = self.backend.engine_is_gpu()
+        icon = Gtk.Image.new_from_icon_name(
+            STATUS_ICONS[0] if accelerated else STATUS_ICONS[1])
+        icon.add_css_class("daemon-ok" if accelerated else "daemon-bad")
+        row.add_prefix(icon)
+
+        if self.backend.needs_gpu_upgrade():
+            row.set_subtitle(
+                summary + " - the GPU engine is a 1.6GB download and makes "
+                          "the larger models usable")
+            button = Gtk.Button(label="Install GPU engine")
+            button.add_css_class("suggested-action")
+            button.set_valign(Gtk.Align.CENTER)
+            button.connect("clicked", lambda _b: self._start_engine_download())
+            self._download_buttons.append(button)
+            row.add_suffix(button)
+            bar = Gtk.ProgressBar()
+            bar.add_css_class("model-progress")
+            bar.set_visible(False)
+            bar.set_valign(Gtk.Align.CENTER)
+            self._progress_bars["engine"] = bar
+            row.add_suffix(bar)
+        return row
+
+    def _start_engine_download(self):
+        """Fetch the cuBLAS engine, keeping whatever model is already here.
+
+        install() compares the engine on disk against the one this machine
+        wants, so the bundled CPU build no longer counts as "an engine is
+        present" and the cuBLAS one is fetched. Naming the model in use keeps
+        it from re-fetching gigabytes of weights that are already here.
+        """
+        if self._working:
+            return
+        self._working = True
+        for button in self._download_buttons:
+            button.set_sensitive(False)
+        bar = self._progress_bars.get("engine")
+        if bar:
+            bar.set_visible(True)
+
+        model = self._current_model or self._selected_model() or None
+
+        def work():
+            try:
+                ok = self.backend.install(model, progress=self._on_progress)
+            except Exception as e:
+                log(f"[SETTINGS] engine download failed: {e}")
+                ok = False
+            GLib.idle_add(self._engine_download_done, ok)
+
+        threading.Thread(target=work, daemon=True,
+                         name="whisper-flow-engine-download").start()
+
+    def _engine_download_done(self, ok: bool):
+        self._working = False
+        for button in self._download_buttons:
+            button.set_sensitive(True)
+        if not ok:
+            self._toast("Could not install the GPU engine. "
+                        "Check the connection and try again.")
+            return
+        self._rebuild_speech_page()
+        self._toast("GPU engine installed - restart the daemon to use it.",
+                    button="Restart now", on_button=self._on_restart)
 
     # ------------------------------------------------------------------ rows
     def _build_row(self, field) -> Gtk.Widget:
@@ -542,11 +640,57 @@ class SettingsWindow(Adw.ApplicationWindow):
         return row
 
     def _mic_choices(self) -> list[str]:
-        """Display strings for the microphone dropdown, default first."""
+        """Display strings for the microphone dropdown, default first.
+
+        Deliberately does not enumerate anything. Opening PortAudio walks
+        every host API on the machine - MME, DirectSound, WASAPI and WDM-KS,
+        forty-odd devices between them on a laptop with a headset paired -
+        and the window cannot be shown until it returns. The real list
+        arrives from a thread once there is a window to put it in; until then
+        this is enough for the configured device to be selected correctly.
+        """
         self._mic_display = {"Default": ""}
-        for index, name in _list_input_devices():
-            self._mic_display[f"{index}: {name}"] = str(index)
+        configured = self.config.mic_device_index
+        if configured is not None:
+            self._mic_display[f"{configured}: ..."] = str(configured)
         return list(self._mic_display)
+
+    def _load_mics_in_background(self):
+        """Fill the microphone dropdown once the window is up."""
+        def work():
+            devices = _list_input_devices()
+            GLib.idle_add(self._apply_mics, devices)
+
+        threading.Thread(target=work, daemon=True,
+                         name="whisper-flow-mic-list").start()
+
+    def _apply_mics(self, devices: list) -> bool:
+        """Swap in the real device list, keeping whatever is selected.
+
+        One idle callback for the whole swap, so the dirty poll never sees a
+        dropdown mid-rebuild and offers to save a change nobody made.
+        """
+        row = self._rows.get("mic_device_index")
+        if row is None:
+            return False
+        selected = self._current.get("mic_device_index", "")
+
+        self._mic_display = {"Default": ""}
+        for index, name in devices:
+            self._mic_display[f"{index}: {name}"] = str(index)
+        # A device that is configured but no longer present keeps its row,
+        # or selecting it would silently fall back to the default and read
+        # as a change the user made.
+        if selected and selected not in self._mic_display.values():
+            self._mic_display[f"{selected}: (not connected)"] = selected
+
+        displays = list(self._mic_display)
+        row.set_model(Gtk.StringList.new(displays))
+        for i, display in enumerate(displays):
+            if self._mic_display[display] == selected:
+                row.set_selected(i)
+                break
+        return False
 
     # -------------------------------------------------------------- values
     def _load(self):
@@ -760,30 +904,43 @@ class SettingsWindow(Adw.ApplicationWindow):
             button.set_sensitive(True)
         if ok:
             # Rebuild so the new model gains a radio and loses the button.
-            #
-            # Every row on this page is replaced by that, and the new ones
-            # start empty: the port read 0, "Run the speech engine locally"
-            # read off, and the server URL blank - none of which the user
-            # touched. _current still held the real values, so Save saw the
-            # difference as deliberate and would have written it. What
-            # stopped it was the port failing validation at 0, which is why
-            # this surfaced as a confusing complaint about a port nobody had
-            # edited rather than as local transcription silently turning
-            # itself off.
-            #
-            # Carried across rather than reloaded from config, because a
-            # download does not discard edits made before it started.
-            keep = self._values()
-            self._stack.remove(self._stack.get_child_by_name("speech"))
-            page = self._build_speech_page("Speech")
-            self._stack.add_titled(page, "speech", "Speech")
-            self._stack.set_visible_child_name("speech")
-            self._apply_values(keep)
+            self._rebuild_speech_page()
             self._model_checks[model].set_active(True)
             self._toast(f"Downloaded {model.replace('ggml-', '')} - "
                         f"Save to use it.")
         else:
             self._toast("Download failed. Check the connection and try again.")
+
+    def _rebuild_speech_page(self):
+        """Redraw the Speech page after a download changed what is on disk.
+
+        Every row on this page is replaced by that, and the new ones start
+        empty: the port read 0, "Run the speech engine locally" read off, and
+        the server URL blank - none of which the user touched. _current still
+        held the real values, so Save saw the difference as deliberate and
+        would have written it. What stopped it was the port failing validation
+        at 0, which is why this surfaced as a confusing complaint about a port
+        nobody had edited rather than as local transcription silently turning
+        itself off.
+
+        Carried across rather than reloaded from config, because a download
+        does not discard edits made before it started.
+        """
+        keep = self._values()
+        # The old page's widgets are about to be dropped; holding references
+        # to them means a later download re-enables buttons that are no
+        # longer on screen, and writes progress into a bar nobody can see.
+        self._download_buttons = []
+        self._progress_bars = {}
+        self._model_checks = {}
+        self._stack.remove(self._stack.get_child_by_name("speech"))
+        page = self._build_speech_page("Speech")
+        # With the icon, as _build adds it: the view switcher draws the
+        # broken-image glyph for a page that has none.
+        self._stack.add_titled_with_icon(
+            page, "speech", "Speech", SECTION_ICONS["Speech"])
+        self._stack.set_visible_child_name("speech")
+        self._apply_values(keep)
 
     def _on_progress(self, stage: str, fraction: float):
         GLib.idle_add(self._apply_progress, fraction)

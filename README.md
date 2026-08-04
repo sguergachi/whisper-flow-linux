@@ -35,20 +35,30 @@ whole installer again.
 Windows 11 22H2 or newer, because the overlay uses composition attributes
 added in that release.
 
-## Which model runs
+## Which model runs, and on what
 
-The app ships `base.en`, which keeps up with speech on any machine from a
-two-core laptop upwards. Where the hardware can do better, the setup window
-offers better — one button, with a progress bar. Decline and the bundled model
-keeps working; switch later from **Settings** in the tray, where every model
-can be downloaded and picked.
+Two separate things decide how fast dictation is: the **model**, and the
+**engine** that runs it. **Settings → Speech** shows both, the engine first,
+because a model is only as fast as what it runs on.
+
+The installer ships the CPU engine and `base.en`, which keeps up with speech
+on any machine from a two-core laptop upwards. On a PC with an NVIDIA card,
+**Install GPU engine** on that page fetches the cuBLAS build — 1.6GB, with a
+progress bar. Until it is installed every model runs on the CPU, `large-v3-turbo`
+included, and that model on a CPU takes tens of seconds per sentence rather
+than a fraction of one. The page labels it `needs GPU` while that is the case
+and `GPU` once it is not.
 
 | Machine | Model | Why |
 |---|---|---|
-| NVIDIA GPU | `large-v3-turbo` | Far more accurate, still faster than speech |
+| NVIDIA GPU, GPU engine installed | `large-v3-turbo` | Far more accurate, still faster than speech |
 | Desktop or workstation CPU | `small.en-q8_0` | Keeps up given enough cores and RAM |
 | Typical laptop | `base.en-q8_0` | Bundled; the safe default everywhere |
 | Thin, old or 4GB machine | `tiny.en-q8_0` | Anything larger falls behind |
+
+Picking a model there and saving it takes effect on the next daemon restart,
+which the toast offers; the **in use** label reflects what is actually
+loaded, not what was asked for.
 
 The CPU models are the 8-bit builds. On a six-core desktop those transcribe
 20–25% faster than the same model in full precision and download at half the

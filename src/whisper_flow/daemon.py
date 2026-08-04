@@ -15,6 +15,7 @@ from pathlib import Path
 from PIL import Image, ImageDraw, ImageFilter
 
 from . import __version__
+from . import backend as backend_module
 from . import updater
 from .app import WhisperFlow
 from .backend import LocalBackend
@@ -200,6 +201,7 @@ class WhisperFlowDaemon:
         # Managed speech engine, so a fresh install has something to talk to
         self.backend = LocalBackend(self.config, notify=self.notify)
         self._backend_model = None
+        self._backend_engine = None
         self._pressed_at = None
         self._setup_process = None
         self._setup_lock = threading.Lock()
@@ -848,8 +850,16 @@ class WhisperFlowDaemon:
                 cmd = [sys.executable, flag]
             else:
                 cmd = [sys.executable, "-m", module]
+            # Hand down what this process already knows. Detecting the
+            # accelerator means running nvidia-smi, which has to load a driver
+            # before it prints a version - most of a second on Windows, and
+            # the settings window asks for it several times while building the
+            # Speech page. The daemon paid that cost at startup; the window
+            # should not pay it again while the user waits at a blank screen.
+            env = dict(os.environ)
+            env[backend_module.ACCELERATOR_ENV] = backend_module.detect_accelerator()
             try:
-                process = self._setup_process = subprocess.Popen(cmd)
+                process = self._setup_process = subprocess.Popen(cmd, env=env)
             except Exception as e:
                 log(f"[DAEMON] could not open the setup window: {e}")
                 return False
@@ -893,10 +903,16 @@ class WhisperFlowDaemon:
             self.notify("That window could not open - see the log")
 
         # working_model() reads the disk rather than the config file, so
-        # whatever the window downloaded is picked up here and now. The .env
-        # it wrote only matters for the next launch.
+        # whatever the window downloaded or saved is picked up here and now.
         model = self.backend.working_model()
-        if not model or model == self._backend_model:
+        engine = self.backend.installed_engine()
+        # The engine matters as much as the model. Installing the GPU one
+        # leaves the model exactly as it was, and restarting only on a changed
+        # model meant the server kept running on the CPU engine it was started
+        # with - so the upgrade appeared to do nothing at all until the next
+        # sign-in.
+        if not model or (model == self._backend_model
+                         and engine == self._backend_engine):
             return                      # dismissed, or nothing new
 
         self.backend.stop()
@@ -906,8 +922,10 @@ class WhisperFlowDaemon:
             return
         self.config.model_name = model
         self._backend_model = model
+        self._backend_engine = engine
         self._use_backend_url(url)
-        self.notify(f"Speech model ready ({model.replace('ggml-', '')})")
+        self.notify(f"Speech model ready ({model.replace('ggml-', '')}, "
+                    f"{self.backend.engine_summary()})")
 
     def _start_managed_backend(self) -> None:
         """Bring up the bundled server if one is configured and present.
@@ -933,7 +951,9 @@ class WhisperFlowDaemon:
         if not url:
             return
         self._backend_model = model
+        self._backend_engine = self.backend.installed_engine()
         self._use_backend_url(url)
+        log(f"[BACKEND] {model} on {self.backend.engine_summary()}")
 
         # It already works, so the GPU model is an offer rather than a
         # requirement. Mention it once: downloading 1.6GB unprompted on a
@@ -941,7 +961,11 @@ class WhisperFlowDaemon:
         # someone's behalf, and neither is taking over their screen with a
         # window they did not ask for while the app is already working.
         if self.backend.setup_reason() == "gpu":
-            self.notify("A faster GPU speech model is available - see Settings")
+            # Name the engine, not the model. Someone who reads this as "get
+            # the big model" downloads it, gets no engine to go with it, and
+            # ends up far slower than before they were told anything.
+            self.notify("This PC has an NVIDIA GPU - install the GPU speech "
+                        "engine in Settings to use it")
 
     def copy_log(self, icon=None, item=None):
         """Put the recent log on the clipboard, whether or not anything failed.

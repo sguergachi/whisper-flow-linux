@@ -106,6 +106,23 @@ def sample_audio_file():
 
 
 @pytest.fixture(autouse=True)
+def forget_the_detected_accelerator():
+    """Clear the accelerator cache between tests.
+
+    detect_accelerator() answers once per process - nvidia-smi is far too
+    slow to run six times while a window is being built - which would
+    otherwise let whichever test ran first decide the answer for all of them.
+    """
+    from whisper_flow import backend
+
+    backend._accelerator = None
+    with patch.dict(os.environ, {}, clear=False):
+        os.environ.pop(backend.ACCELERATOR_ENV, None)
+        yield
+    backend._accelerator = None
+
+
+@pytest.fixture(autouse=True)
 def suppress_warnings():
     """Suppress warnings during tests."""
     import warnings

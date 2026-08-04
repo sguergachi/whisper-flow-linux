@@ -171,8 +171,31 @@ def test_a_new_model_is_picked_up_when_the_window_closes(daemon):
 def test_a_dismissed_window_does_not_restart_a_working_server(daemon):
     daemon._setup_process = Mock(returncode=0)
     daemon._backend_model = "ggml-small.en"
+    daemon._backend_engine = "cpu"
     daemon.backend.working_model.return_value = "ggml-small.en"
+    daemon.backend.installed_engine.return_value = "cpu"
     with patch.object(daemon, "_use_backend_url") as used:
         daemon._after_tool_window()
     daemon.backend.stop.assert_not_called()
     used.assert_not_called()
+
+
+def test_a_new_engine_restarts_the_server_even_on_the_same_model(daemon):
+    """Installing the GPU engine leaves the model exactly as it was.
+
+    Restarting only on a changed model meant the server carried on running
+    against the CPU engine it was started with, so the upgrade appeared to do
+    nothing whatever until the next sign-in.
+    """
+    daemon._setup_process = Mock(returncode=0)
+    daemon._backend_model = "ggml-large-v3-turbo"
+    daemon._backend_engine = "cpu"
+    daemon.backend.working_model.return_value = "ggml-large-v3-turbo"
+    daemon.backend.installed_engine.return_value = "cuda12"
+    daemon.backend.start.return_value = "http://127.0.0.1:18080"
+    with patch.object(daemon, "_use_backend_url") as used:
+        with patch.object(daemon, "notify"):
+            daemon._after_tool_window()
+    daemon.backend.stop.assert_called_once()
+    used.assert_called_once_with("http://127.0.0.1:18080")
+    assert daemon._backend_engine == "cuda12"

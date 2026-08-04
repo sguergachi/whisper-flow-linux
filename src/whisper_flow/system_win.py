@@ -5,6 +5,7 @@ character rather than a keystroke, so it needs no keyboard layout mapping and
 is unaffected by which modifiers happen to be held.
 """
 
+import contextlib
 import ctypes
 import ctypes.wintypes as wintypes
 import subprocess
@@ -32,6 +33,7 @@ VK_NONAME = 0xFC
 MODIFIERS = (VK_CONTROL, VK_MENU, VK_SHIFT, VK_LWIN, VK_RWIN)
 
 _user32 = ctypes.WinDLL("user32", use_last_error=True)
+_kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
 
 class KEYBDINPUT(ctypes.Structure):
@@ -86,6 +88,25 @@ class INPUT(ctypes.Structure):
 _user32.SendInput.restype = wintypes.UINT
 _user32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int]
 
+# Declared for the same reason SendInput is: ctypes assumes every function
+# returns a C int, and an HWND on 64-bit Windows does not fit in one. A
+# truncated window handle compares equal to nothing and is refused by every
+# call it is passed to, which would make restoring focus a silent no-op.
+try:
+    _user32.GetForegroundWindow.restype = wintypes.HWND
+    _user32.GetForegroundWindow.argtypes = []
+    _user32.IsWindow.argtypes = [wintypes.HWND]
+    _user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+    _user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    _user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.c_void_p]
+    _user32.AttachThreadInput.restype = wintypes.BOOL
+    _user32.AttachThreadInput.argtypes = [
+        wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
+    _kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+    _kernel32.GetCurrentThreadId.argtypes = []
+except Exception:                       # a stubbed loader off Windows
+    pass
+
 
 _TAG = INJECTED_TAG
 
@@ -107,6 +128,65 @@ def _send(events: list) -> bool:
     return sent == len(events)
 
 
+def foreground_window() -> int:
+    """The window that had focus, to type back into later. 0 if there is none."""
+    try:
+        return int(_user32.GetForegroundWindow() or 0)
+    except Exception:
+        return 0
+
+
+def _window_thread(hwnd: int) -> int:
+    return int(_user32.GetWindowThreadProcessId(wintypes.HWND(hwnd), None))
+
+
+def focus_window(hwnd: int) -> bool:
+    """Put focus back on the window the dictation was started in.
+
+    Text is typed into whatever has focus at the moment it is typed, which is
+    not necessarily where the user was when they spoke: the closing
+    transcription takes as long as it takes, and a click during it sends the
+    whole utterance into whichever field is focused when it lands. It arrived
+    in the wrong window entirely, which is worse than arriving late - a
+    transcript can end up in a chat box or a terminal.
+
+    SetForegroundWindow refuses a caller that does not own the foreground
+    window, which is exactly this case. Attaching to the foreground thread's
+    input queue first makes Windows treat the call as coming from the
+    foreground itself, which is the documented way round it.
+    """
+    if not hwnd:
+        return False
+    try:
+        if not _user32.IsWindow(wintypes.HWND(hwnd)):
+            return False
+        current = foreground_window()
+        if current == hwnd:
+            return True
+
+        ours = int(_kernel32.GetCurrentThreadId())
+        theirs = _window_thread(current) if current else 0
+        attached = bool(
+            theirs and theirs != ours
+            and _user32.AttachThreadInput(ours, theirs, True))
+        try:
+            _user32.SetForegroundWindow(wintypes.HWND(hwnd))
+        finally:
+            if attached:
+                _user32.AttachThreadInput(ours, theirs, False)
+
+        # Focus changes are asynchronous; typing into a window that has not
+        # taken it yet loses the first characters.
+        for _ in range(10):
+            if foreground_window() == hwnd:
+                return True
+            time.sleep(0.01)
+        return False
+    except Exception as e:
+        log(f"[WIN] could not restore focus to {hwnd}: {e}")
+        return False
+
+
 def spoil_start_menu() -> None:
     """Stop the Start menu opening when the user lets go of the Windows key.
 
@@ -125,25 +205,40 @@ def spoil_start_menu() -> None:
     ])
 
 
-def _suppress_hotkeys(characters: int = 0) -> None:
-    """Ask the hotkey listener to ignore the keyboard while we type.
+@contextlib.contextmanager
+def _hotkeys_blinded():
+    """Have the hotkey listener ignore the keyboard while we inject into it.
 
     Imported here rather than at module scope: this is the typing path and
     the listener is the keyboard path, and neither should need the other to
     exist. A build without it still types, it just races again.
 
-    The window scales a little with the text, because SendInput delivers the
-    whole batch before returning and a long commit takes proportionally
-    longer to land.
+    Bracketed around the injection rather than timed from a guess at how long
+    it will take. The guess was 0.2s plus a millisecond per character, which
+    is wrong in both directions: too short for a long commit, so the race it
+    exists to close could reopen, and far too long for a short one - the
+    listener went on ignoring the keyboard for up to half a second after the
+    last word of a dictation was typed, which is precisely when the next
+    hotkey is pressed. Pressing and holding then did nothing visible until
+    the window lapsed.
     """
     try:
         from . import hotkey_win
     except Exception:
+        yield
         return
     try:
-        hotkey_win.suppress(0.20 + min(0.30, characters * 0.001))
+        hotkey_win.begin_typing()
     except Exception:
-        pass
+        yield
+        return
+    try:
+        yield
+    finally:
+        try:
+            hotkey_win.end_typing()
+        except Exception:
+            pass
 
 
 def release_modifiers() -> tuple:
@@ -192,33 +287,33 @@ def type_text(text: str) -> bool:
     """
     if not text:
         return True
-    # Blind the hotkey listener first. Everything below writes to the key
-    # state table it polls, and the gap between releasing the modifiers and
-    # putting them back reads as the user letting go of the hotkey. Putting
-    # them back is not enough by itself - a 16ms poll can land inside any
-    # gap - so the listener is told not to look at all.
-    _suppress_hotkeys(len(text))
-    held = release_modifiers()
-    try:
-        events = []
-        for ch in text:
-            for code in _utf16_units(ch):
-                events.append(_key_event(0, code, KEYEVENTF_UNICODE))
-                events.append(
-                    _key_event(0, code, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP))
-        # SendInput takes the whole batch atomically, so nothing can
-        # interleave.
-        if _send(events):
-            return True
+    # Blind the hotkey listener for the whole of this. Everything below writes
+    # to the key state table it polls, and the gap between releasing the
+    # modifiers and putting them back reads as the user letting go of the
+    # hotkey. Putting them back is not enough by itself - a 16ms poll can land
+    # inside any gap - so the listener is told not to look at all.
+    with _hotkeys_blinded():
+        held = release_modifiers()
+        try:
+            events = []
+            for ch in text:
+                for code in _utf16_units(ch):
+                    events.append(_key_event(0, code, KEYEVENTF_UNICODE))
+                    events.append(
+                        _key_event(0, code, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP))
+            # SendInput takes the whole batch atomically, so nothing can
+            # interleave.
+            if _send(events):
+                return True
 
-        error = ctypes.get_last_error()
-        log(f"[WIN] SendInput refused {len(text)} chars (error {error}); "
-            f"falling back to the clipboard")
-        return copy_to_clipboard(text) and send_paste(release_first=False)
-    finally:
-        # Whatever happened above, the user is still holding the hotkey and
-        # the state table has to say so again.
-        restore_modifiers(held)
+            error = ctypes.get_last_error()
+            log(f"[WIN] SendInput refused {len(text)} chars (error {error}); "
+                f"falling back to the clipboard")
+            return copy_to_clipboard(text) and send_paste(release_first=False)
+        finally:
+            # Whatever happened above, the user is still holding the hotkey and
+            # the state table has to say so again.
+            restore_modifiers(held)
 
 
 def _utf16_units(ch: str):

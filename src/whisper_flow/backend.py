@@ -295,6 +295,159 @@ def _download(url: str, dest: Path, progress=None) -> None:
     tmp.replace(dest)
 
 
+def stop_strays(exe_path, keep_pid: int | None = None) -> int:
+    """Kill any copy of our server left behind by an earlier run.
+
+    Matched by executable path, never by name: another application ships a
+    whisper-server too, and killing that one would be inexcusable.
+
+    Without this a second server is started while the first still holds the
+    port. The new one cannot bind, exits, and the readiness check connects
+    to the *orphan* and reports success - so the daemon believes it owns a
+    server it never started and cannot stop, and two models sit in memory
+    competing for the same cores.
+    """
+    if sys.platform != "win32":
+        return 0
+    stopped = 0
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _ENTRY(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+                ("th32ModuleID", wintypes.DWORD),
+                ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", ctypes.c_long),
+                ("dwFlags", wintypes.DWORD),
+                ("szExeFile", ctypes.c_wchar * 260),
+            ]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        wanted = os.path.normcase(os.path.abspath(str(exe_path)))
+        name = os.path.basename(wanted)
+
+        snapshot = kernel32.CreateToolhelp32Snapshot(0x2, 0)   # PROCESSES
+        entry = _ENTRY()
+        entry.dwSize = ctypes.sizeof(_ENTRY)
+        more = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
+        while more:
+            pid = entry.th32ProcessID
+            if (os.path.normcase(entry.szExeFile) == name
+                    and pid != keep_pid and pid != os.getpid()):
+                # PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE
+                handle = kernel32.OpenProcess(0x1000 | 0x1, False, pid)
+                if handle:
+                    try:
+                        buffer = ctypes.create_unicode_buffer(32768)
+                        size = wintypes.DWORD(32768)
+                        if kernel32.QueryFullProcessImageNameW(
+                                handle, 0, buffer, ctypes.byref(size)):
+                            if os.path.normcase(buffer.value) == wanted:
+                                kernel32.TerminateProcess(handle, 1)
+                                stopped += 1
+                                log(f"[BACKEND] stopped a stray server, pid {pid}")
+                    finally:
+                        kernel32.CloseHandle(handle)
+            more = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+        kernel32.CloseHandle(snapshot)
+    except Exception as e:
+        log(f"[BACKEND] could not look for stray servers: {e}")
+    return stopped
+
+
+def _kill_on_exit_job():
+    """A Windows job object that kills its members when this process dies.
+
+    stop() only runs when the daemon shuts down cleanly. Killed, crashed, or
+    killed by an installer that wants its files back, it never runs and the
+    server is orphaned - still holding the port, still holding a model in
+    memory, still charging for threads. Two of them were found running at
+    once, one with five minutes of CPU behind it, which is most of what
+    "inference got slow" was.
+
+    A job with KILL_ON_JOB_CLOSE closes the gap: the handle is held by this
+    process, and Windows closes every handle a process owns when it dies,
+    however it dies. There is no path out of here that leaves the server
+    behind.
+    """
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _BASIC(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_int64),
+                ("PerJobUserTimeLimit", ctypes.c_int64),
+                ("LimitFlags", wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.POINTER(ctypes.c_ulong)),
+                ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        class _IO(ctypes.Structure):
+            _fields_ = [(name, ctypes.c_uint64) for name in (
+                "ReadOperationCount", "WriteOperationCount",
+                "OtherOperationCount", "ReadTransferCount",
+                "WriteTransferCount", "OtherTransferCount")]
+
+        class _EXTENDED(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", _BASIC),
+                ("IoInfo", _IO),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+        job = kernel32.CreateJobObjectW(None, None)
+        if not job:
+            return None
+        limits = _EXTENDED()
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+        limits.BasicLimitInformation.LimitFlags = (
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)
+        JobObjectExtendedLimitInformation = 9
+        if not kernel32.SetInformationJobObject(
+                job, JobObjectExtendedLimitInformation,
+                ctypes.byref(limits), ctypes.sizeof(limits)):
+            kernel32.CloseHandle(job)
+            return None
+        return job
+    except Exception as e:
+        log(f"[BACKEND] no job object, the server may outlive us: {e}")
+        return None
+
+
+def _adopt_into_job(job, process) -> bool:
+    """Put a started process into the job, so it cannot outlive us."""
+    if not job or sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        return bool(kernel32.AssignProcessToJobObject(
+            job, int(process._handle)))
+    except Exception as e:
+        log(f"[BACKEND] could not put the server in the job: {e}")
+        return False
+
+
 class LocalBackend:
     """Downloads, starts and supervises a local whisper.cpp server."""
 
@@ -303,6 +456,8 @@ class LocalBackend:
         self._notify = notify or (lambda msg: None)
         self._process = None
         self._lock = threading.Lock()
+        # Held for the life of this process; closing it kills the server.
+        self._job = _kill_on_exit_job()
 
     # ---------------------------------------------------------------- paths
     @property
@@ -492,6 +647,11 @@ class LocalBackend:
             if not self.is_installed(model):
                 return None
 
+            # Clear anything a previous run left holding the port, or the
+            # server started below cannot bind and the readiness check ends
+            # up connecting to the orphan instead.
+            stop_strays(self.server_exe)
+
             cmd = [
                 str(self.server_exe),
                 "-m", str(self.model_path(model)),
@@ -514,6 +674,9 @@ class LocalBackend:
             except Exception as e:
                 log(f"[BACKEND] could not start the server: {e}")
                 return None
+
+            # Before it has done anything: from here on it dies with us.
+            _adopt_into_job(self._job, self._process)
 
             if self._wait_until_ready():
                 log(f"[BACKEND] server ready on {self.url}")

@@ -255,6 +255,47 @@ def _selftest() -> int:
     return status
 
 
+def _stop_running_app() -> None:
+    """Take the previous version down, so the installer can replace it.
+
+    Every install today failed on this. The daemon runs out of the very
+    directory being replaced, so Velopack could not move it: four retries
+    of "Access is denied" and then "Install Partially Succeeded" with the
+    old version still in place. It says as much in its own message - close
+    the application and try again - and an installer that needs the user to
+    know that is not one that installs cleanly.
+
+    The daemon writes its pid, so there is no guessing involved. The speech
+    server dies with it, through the job object it was started in.
+    """
+    try:
+        from pathlib import Path
+        pid_file = Path.home() / ".config" / "whisper-flow" / "daemon.pid"
+        if not pid_file.exists():
+            return
+        pid = int(pid_file.read_text(encoding="utf-8").strip())
+    except Exception:
+        return
+
+    try:
+        import ctypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        # PROCESS_TERMINATE | SYNCHRONIZE
+        handle = kernel32.OpenProcess(0x1 | 0x00100000, False, pid)
+        if not handle:
+            return                  # already gone; nothing holding the files
+        try:
+            kernel32.TerminateProcess(handle, 0)
+            kernel32.WaitForSingleObject(handle, 10000)
+            print(f"[whisper-flow] stopped the running daemon ({pid}) so the "
+                  f"installer can replace it", flush=True)
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception as e:
+        print(f"[whisper-flow] could not stop the running daemon: {e}",
+              flush=True)
+
+
 def main() -> int:
     # Without this a frozen build re-runs the whole program in every worker
     # process it spawns.
@@ -307,6 +348,7 @@ def main() -> int:
     # directory and the uninstall entry are all Velopack's own work. Leaving
     # promptly is the entire contract.
     if hook:
+        _stop_running_app()
         return 0
 
     from whisper_flow.daemon import WhisperFlowDaemon

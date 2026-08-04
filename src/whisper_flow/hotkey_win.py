@@ -48,6 +48,33 @@ for _n in range(1, 25):
 POLL_INTERVAL = 0.016   # ~60Hz; a tap shorter than this can be missed
 HELD_MASK = 0x8000      # high bit of GetAsyncKeyState means currently down
 
+# While this app is injecting keystrokes of its own, the key state is not the
+# user's and must not be read as if it were.
+#
+# Typing releases every modifier first, so a held Alt cannot turn dictated
+# text into shortcuts, and puts back whatever was down afterwards. Both go
+# through the same state table this module polls, so between the two there is
+# a window - a few milliseconds - in which the keys the user is holding read
+# as released. At a 16ms poll that window is caught often enough to end a
+# recording at the first committed word, which is exactly what it did.
+#
+# Restoring the keys is not enough on its own: the poll can land inside the
+# gap however narrow it is. This closes it instead of racing it.
+_suppressed_until = 0.0
+_suppress_lock = threading.Lock()
+
+
+def suppress(seconds: float = 0.25) -> None:
+    """Ignore the keyboard for a moment, while we are the one typing."""
+    global _suppressed_until
+    with _suppress_lock:
+        _suppressed_until = max(_suppressed_until, time.monotonic() + seconds)
+
+
+def _suppressed() -> bool:
+    with _suppress_lock:
+        return time.monotonic() < _suppressed_until
+
 # Both physical sides of a modifier mean the same thing, exactly as the Linux
 # listener treats them. Ctrl, Alt and Shift need no entry: 0x11, 0x12 and 0x10
 # are the combined codes and already report either side. Windows has no
@@ -144,6 +171,11 @@ class WinHotkeyListener:
         esc_was_down = False
         while self._running:
             try:
+                # Our own injected input is in the state table too. Reading it
+                # while typing is how a held hotkey looked released.
+                if _suppressed():
+                    time.sleep(self._poll_interval)
+                    continue
                 down = {VK_ALIASES.get(vk, vk)
                         for vk in watched if get(vk) & HELD_MASK}
                 if down != previous:

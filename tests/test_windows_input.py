@@ -69,6 +69,42 @@ def test_nothing_is_pressed_that_was_not_already_held(win, monkeypatch):
         "a modifier was pressed that the user was not holding")
 
 
+def test_typing_blinds_the_listener_for_the_duration(win, monkeypatch):
+    """Restoring the keys is not enough on its own.
+
+    The poll runs every 16ms and the gap between releasing the modifiers and
+    putting them back is a few milliseconds wide - narrow, and caught often
+    enough that the recording still ended at the first word after the
+    restore was added. The listener has to not look at all.
+    """
+    from whisper_flow import hotkey_win
+
+    system_win, _ = win
+    monkeypatch.setattr(system_win._user32, "GetAsyncKeyState", lambda vk: 0)
+    monkeypatch.setattr(hotkey_win, "_suppressed_until", 0.0)
+
+    assert not hotkey_win._suppressed()
+    system_win.type_text("hello")
+    assert hotkey_win._suppressed(), (
+        "the listener was still reading the keyboard while we typed into it")
+
+
+def test_suppression_is_not_permanent(monkeypatch):
+    """A window that never closes is a hotkey that never works again."""
+    import time
+
+    from whisper_flow import hotkey_win
+
+    # suppress() extends rather than replaces, so an earlier test's window
+    # would still be open here.
+    monkeypatch.setattr(hotkey_win, "_suppressed_until", 0.0)
+    hotkey_win.suppress(0.05)
+    assert hotkey_win._suppressed()
+    time.sleep(0.12)
+    assert not hotkey_win._suppressed(), (
+        "suppression outlived its window; the hotkey would stop responding")
+
+
 def test_a_genuine_release_still_ends_the_recording(win, monkeypatch):
     """Restoring must be of the snapshot, not unconditional.
 

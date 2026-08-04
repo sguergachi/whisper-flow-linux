@@ -125,6 +125,27 @@ def spoil_start_menu() -> None:
     ])
 
 
+def _suppress_hotkeys(characters: int = 0) -> None:
+    """Ask the hotkey listener to ignore the keyboard while we type.
+
+    Imported here rather than at module scope: this is the typing path and
+    the listener is the keyboard path, and neither should need the other to
+    exist. A build without it still types, it just races again.
+
+    The window scales a little with the text, because SendInput delivers the
+    whole batch before returning and a long commit takes proportionally
+    longer to land.
+    """
+    try:
+        from . import hotkey_win
+    except Exception:
+        return
+    try:
+        hotkey_win.suppress(0.20 + min(0.30, characters * 0.001))
+    except Exception:
+        pass
+
+
 def release_modifiers() -> tuple:
     """Tell Windows no modifiers are held before injecting text.
 
@@ -171,6 +192,12 @@ def type_text(text: str) -> bool:
     """
     if not text:
         return True
+    # Blind the hotkey listener first. Everything below writes to the key
+    # state table it polls, and the gap between releasing the modifiers and
+    # putting them back reads as the user letting go of the hotkey. Putting
+    # them back is not enough by itself - a 16ms poll can land inside any
+    # gap - so the listener is told not to look at all.
+    _suppress_hotkeys(len(text))
     held = release_modifiers()
     try:
         events = []

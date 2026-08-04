@@ -40,6 +40,7 @@ try:
 except ImportError:
     pyaudio = None
 
+from . import denoise
 from .boost import DEAD_PEAK, needs_boost
 from .config import Config
 from .logging import log
@@ -714,11 +715,24 @@ class AudioRecorder:
         if self.config.speedup_audio != 1.0:
             frames = self._speedup_audio_frames(frames, self.config.speedup_audio)
 
+        audio = b"".join(frames)
+        if self.config.noise_filter and audio:
+            # Here rather than per chunk: the gate measures the room from the
+            # recording it is given, and a 30ms chunk has no idea whether it
+            # is quiet because nobody is speaking or because the whole room
+            # is quiet.
+            try:
+                samples = np.frombuffer(audio, dtype=np.int16)
+                audio = denoise.clean(
+                    samples, self.config.sample_rate).tobytes()
+            except Exception as e:
+                log(f"[AUDIO] noise filter skipped: {e}")
+
         with wave.open(output_path, "wb") as wf:
             wf.setnchannels(1)
             wf.setsampwidth(2)  # 16-bit
             wf.setframerate(self.config.sample_rate)
-            wf.writeframes(b"".join(frames))
+            wf.writeframes(audio)
 
     def _speedup_audio_frames(self, frames: list, speed_multiplier: float) -> list:
         """Speed up audio frames by 1.5x using linear interpolation.

@@ -397,3 +397,74 @@ def test_an_unnameable_default_falls_back_to_the_first_input(
     _reported_machine(recorder, wasapi_default=21, default_input_name="")
     recorder.pa.get_default_input_device_info.side_effect = OSError("no default")
     assert recorder._input_device_index() == 17
+
+
+# ------------------------------------------------- MME truncates device names
+def test_the_default_device_matches_across_its_truncated_mme_name():
+    """MME cuts names to 31 characters and says nothing about it.
+
+    Straight from a real device list: the same Realtek arrives as
+    "Microphone (2- Realtek(R) Audio" through MME and
+    "Microphone (2- Realtek(R) Audio)" through WASAPI - the closing bracket
+    is the 32nd character. PortAudio reports the default input through MME,
+    so matching exactly would miss and fall back to whichever input came
+    first, which is the coin toss this is meant to avoid.
+    """
+    from whisper_flow.audio import _same_device
+
+    mme = "Microphone (2- Realtek(R) Audio"
+    wasapi = "Microphone (2- Realtek(R) Audio)"
+    assert len(mme) == 31 and mme != wasapi
+    assert _same_device(mme, wasapi)
+    assert _same_device(wasapi, mme)
+
+
+def test_short_names_still_have_to_match_each_other():
+    """Truncation tolerance must not turn into matching anything."""
+    from whisper_flow.audio import _same_device
+
+    assert _same_device("Microphone (Logi USB Headset)",
+                        "Microphone (Logi USB Headset)")
+    assert not _same_device("Microphone (Logi USB Headset)",
+                            "Microphone (2- Realtek(R) Audio)")
+    assert not _same_device("", "Microphone (Logi USB Headset)")
+    assert not _same_device("Microphone (Logi USB Headset)", "")
+
+
+def test_a_truncated_default_still_finds_its_wasapi_twin(recorder, monkeypatch):
+    """The end-to-end version of the above, through device selection."""
+    monkeypatch.setattr(sys, "platform", "win32")
+    MME, DSOUND, WASAPI, WDMKS = 0, 1, 2, 3
+    devices = {
+        1:  ("Microphone (Logi USB Headset)", MME, 1),
+        # MME's spelling of device 17, cut at 31 characters.
+        2:  ("Microphone (2- Realtek(R) Audio", MME, 2),
+        17: ("Microphone (2- Realtek(R) Audio)", WASAPI, 2),
+        18: ("Microphone (Logi USB Headset)", WASAPI, 1),
+        21: ("Input (btha2dp.sys, MOMENTUM 3)", WDMKS, 2),
+    }
+    apis = {
+        MME:    {"name": "MME", "defaultInputDevice": 2},
+        DSOUND: {"name": "Windows DirectSound", "defaultInputDevice": -1},
+        WASAPI: {"name": "Windows WASAPI", "defaultInputDevice": 21},
+        WDMKS:  {"name": "Windows WDM-KS", "defaultInputDevice": 21},
+    }
+
+    def info(index):
+        if index not in devices:
+            raise OSError("no such device")
+        name, api, channels = devices[index]
+        return {"name": name, "hostApi": api, "maxInputChannels": channels,
+                "defaultSampleRate": 48000.0}
+
+    recorder.pa.get_host_api_count.return_value = len(apis)
+    recorder.pa.get_host_api_info_by_index.side_effect = lambda i: apis[i]
+    recorder.pa.get_device_count.return_value = max(devices) + 1
+    recorder.pa.get_device_info_by_index.side_effect = info
+    recorder.pa.is_format_supported.return_value = False
+    # As PortAudio reports it: through MME, and so truncated.
+    recorder.pa.get_default_input_device_info.return_value = {
+        "name": "Microphone (2- Realtek(R) Audio"}
+
+    assert recorder._input_device_index() == 17, (
+        "the truncated default did not match its own WASAPI entry")

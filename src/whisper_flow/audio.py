@@ -61,6 +61,32 @@ MIC_KEEP_WARM_SECONDS = 90.0
 TRIM_PAD_MS = 150
 
 
+# MME device names are cut to MAXPNAMELEN, which is 32 bytes including the
+# terminator - so 31 characters, and no warning that anything was lost.
+MME_NAME_LIMIT = 31
+
+
+def _same_device(a: str, b: str) -> bool:
+    """Whether two PortAudio names refer to the same physical device.
+
+    Not string equality. PortAudio's default input device is reported
+    through MME, which truncates, while WASAPI reports the full name - so
+    the same microphone has two spellings and matching exactly finds
+    neither. It is visible in a real device list:
+
+        [2]  Microphone (2- Realtek(R) Audio     (MME)
+        [17] Microphone (2- Realtek(R) Audio)    (WASAPI)
+
+    The closing bracket is the 32nd character. Comparing the part that
+    survives truncation matches the two, and cannot confuse devices that
+    MME could tell apart in the first place - if two names share their
+    first 31 characters, MME reports them identically anyway.
+    """
+    if not a or not b:
+        return False
+    return a[:MME_NAME_LIMIT] == b[:MME_NAME_LIMIT]
+
+
 def trim_silence(frames: list, vad, sample_rate: int, frame_ms: int,
                  pad_ms: int = TRIM_PAD_MS) -> list:
     """Drop leading and trailing frames that hold no speech.
@@ -239,7 +265,7 @@ class AudioRecorder:
                     continue
                 if first is None:
                     first = index
-                if default_name and str(info.get("name", "")) == default_name:
+                if _same_device(str(info.get("name", "")), default_name):
                     return index
         except Exception:
             return first

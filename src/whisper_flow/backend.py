@@ -641,6 +641,11 @@ class LocalBackend:
         offers - without it the daemon restarted, re-read nothing, and the
         page went on reporting the old model as in use.
         """
+        # The environment first, because that is the order Config resolves
+        # them in: pydantic-settings lets a real environment variable beat
+        # the .env file. Nothing in this app sets this one - it is there for
+        # someone who exports it in their shell - but reading the file first
+        # would quietly invert that precedence for this one setting.
         from_env = os.environ.get("WHISPER_FLOW_MODEL_NAME", "").strip()
         if from_env:
             return from_env

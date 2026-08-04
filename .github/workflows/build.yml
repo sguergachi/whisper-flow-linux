@@ -511,11 +511,17 @@ jobs:
           #
           # Failures here never fail the build. Running out of storage is
           # worth fixing, and it is not worth failing a green build over.
-          deleted=0
+          # Listed to a file first, not piped into the loop. A piped while
+          # runs in a subshell, so the counter it kept died with it and the
+          # step reported pruning nothing while deleting hundreds of MB -
+          # a log that always says zero cannot report a real failure either.
           gh api --paginate "repos/$GITHUB_REPOSITORY/actions/artifacts" \
             --jq '.artifacts[]
                   | select(.expired == false)
-                  | "\(.id) \(.workflow_run.id)"' |
+                  | "\(.id) \(.workflow_run.id)"' > artifacts.txt
+
+          deleted=0
+          failed=0
           while read -r id run; do
             # Anything from a run still in flight is left alone; deleting a
             # concurrent build's output would be a confusing way to save
@@ -526,6 +532,8 @@ jobs:
             if gh api -X DELETE \
                  "repos/$GITHUB_REPOSITORY/actions/artifacts/$id" --silent; then
               deleted=$((deleted + 1))
+            else
+              failed=$((failed + 1))
             fi
-          done
-          echo "pruned $deleted artifacts from earlier runs"
+          done < artifacts.txt
+          echo "pruned $deleted artifacts from earlier runs ($failed failed)"

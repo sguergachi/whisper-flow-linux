@@ -70,15 +70,14 @@ def test_nothing_is_pressed_that_was_not_already_held(win, monkeypatch):
 
 
 def _unsuppressed(monkeypatch):
-    """Clear every route to suppression, so a test starts from looking.
+    """Clear both routes to suppression, so a test starts from looking.
 
-    All three are module state and a preceding type_text leaves two of them
-    set; zeroing only the one this test happens to use is how this would
-    pass or fail on the order it ran in.
+    Both are module state and a preceding type_text leaves them set, so
+    zeroing only the one a test happens to read is how it would pass or fail
+    on the order it ran in.
     """
     from whisper_flow import hotkey_win
 
-    monkeypatch.setattr(hotkey_win, "_suppressed_until", 0.0)
     monkeypatch.setattr(hotkey_win, "_settled_at", 0.0)
     monkeypatch.setattr(hotkey_win, "_typing_depth", 0)
     return hotkey_win
@@ -127,18 +126,6 @@ def test_the_listener_is_looking_again_once_typing_is_over(win, monkeypatch):
     time.sleep(hotkey_win.SETTLE_SECONDS * 3)
     assert not hotkey_win._suppressed(), (
         "suppression outlived the typing; the hotkey would stop responding")
-
-
-def test_a_fixed_suppression_window_still_expires(monkeypatch):
-    """suppress() remains for callers that cannot bracket their own typing."""
-    import time
-
-    hotkey_win = _unsuppressed(monkeypatch)
-    hotkey_win.suppress(0.05)
-    assert hotkey_win._suppressed()
-    time.sleep(0.12)
-    assert not hotkey_win._suppressed(), (
-        "suppression outlived its window; the hotkey would stop responding")
 
 
 def test_a_genuine_release_still_ends_the_recording(win, monkeypatch):

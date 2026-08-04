@@ -167,21 +167,31 @@ class AudioRecorder:
                 if "wasapi" not in str(api.get("name", "")).lower():
                     continue
                 device = api.get("defaultInputDevice", -1)
-                if device is None or device < 0:
-                    continue
-                # Trust it only if the device agrees it belongs to this API.
+                # Trust the answer only if the device agrees it belongs to
+                # this API, and go looking ourselves when it does not.
                 #
                 # PortAudio reports defaultInputDevice as a global index, and
                 # on at least one machine the WASAPI entry named a WDM-KS
-                # device - kernel streaming, exclusive to whatever already has
-                # the endpoint open. It failed with "Unanticipated host
-                # error", capture fell back to the platform default, and the
-                # recording came back several times quieter than the
-                # microphone can manage.
-                if not self._device_belongs_to(device, index):
-                    log(f"[AUDIO] host API {api.get('name')} names device "
-                        f"{device}, which is not one of its own; ignoring it")
-                    continue
+                # device - kernel streaming, exclusive to whatever already
+                # holds the endpoint. It failed to open with "Unanticipated
+                # host error" and capture fell back to the platform default,
+                # which is MME: the same microphone several times quieter.
+                #
+                # Merely refusing the bad answer lands in that same fallback,
+                # so it has to be replaced rather than dropped. The machine
+                # that produced this had the right microphone sitting at
+                # index 18 on the very API that had just misreported it.
+                if device is None or device < 0 or not self._device_belongs_to(
+                        device, index):
+                    if device is not None and device >= 0:
+                        log(f"[AUDIO] host API {api.get('name')} names device "
+                            f"{device}, which is not one of its own")
+                    replacement = self._first_input_on(index)
+                    if replacement is None:
+                        continue
+                    log(f"[AUDIO] using WASAPI input device {replacement} "
+                        f"instead")
+                    device = replacement
                 # WASAPI shared mode does not resample: it plays back only at
                 # the rate the device is configured for, and rejects anything
                 # else with "invalid sample rate". MME quietly converted, which
@@ -200,6 +210,40 @@ class AudioRecorder:
         except Exception as e:
             log(f"[AUDIO] could not pick a WASAPI device: {e}")
         return None
+
+    def _first_input_on(self, host_api: int) -> int | None:
+        """An input device served by this host API, or None.
+
+        Prefers the one carrying the same name as the system default input,
+        so the microphone Windows was told to use is the one reached - just
+        through WASAPI rather than through MME. Falling back to whichever
+        input comes first would otherwise be a coin toss between a headset
+        and a webcam.
+        """
+        try:
+            default_name = str(
+                self.pa.get_default_input_device_info().get("name", ""))
+        except Exception:
+            default_name = ""
+
+        first = None
+        try:
+            for index in range(self.pa.get_device_count()):
+                try:
+                    info = self.pa.get_device_info_by_index(index)
+                    if int(info.get("hostApi", -1)) != host_api:
+                        continue
+                    if int(info.get("maxInputChannels", 0)) <= 0:
+                        continue
+                except Exception:
+                    continue
+                if first is None:
+                    first = index
+                if default_name and str(info.get("name", "")) == default_name:
+                    return index
+        except Exception:
+            return first
+        return first
 
     def _device_belongs_to(self, device: int, host_api: int) -> bool:
         """Whether `device` is really served by `host_api`.

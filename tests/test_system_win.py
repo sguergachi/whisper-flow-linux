@@ -193,7 +193,6 @@ def test_the_listener_is_blinded_for_exactly_the_injection(system_win):
 
     hotkey_win._typing_depth = 0
     hotkey_win._settled_at = 0.0
-    hotkey_win._suppressed_until = 0.0
 
     assert not hotkey_win._suppressed()
     with system_win._hotkeys_blinded():
@@ -212,7 +211,6 @@ def test_nested_injections_do_not_uncover_each_other(system_win):
 
     hotkey_win._typing_depth = 0
     hotkey_win._settled_at = 0.0
-    hotkey_win._suppressed_until = 0.0
 
     with system_win._hotkeys_blinded():
         with system_win._hotkeys_blinded():

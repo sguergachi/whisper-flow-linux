@@ -669,11 +669,23 @@ class SettingsWindow(Adw.ApplicationWindow):
 
         One idle callback for the whole swap, so the dirty poll never sees a
         dropdown mid-rebuild and offers to save a change nobody made.
+
+        The selection is read off the row rather than out of `_current`.
+        `_current` is the saved baseline the dirty poll diffs against, not
+        live widget state, so restoring from it would silently undo a choice
+        made while the enumeration was still running - and the reason that
+        enumeration is on a thread at all is that it is slow enough for
+        someone to get there first.
         """
         row = self._rows.get("mic_device_index")
         if row is None:
             return False
-        selected = self._current.get("mic_device_index", "")
+        # get_selected() answers GTK_INVALID_LIST_POSITION when nothing is
+        # selected, and get_string() of that is None rather than an error.
+        position = row.get_selected()
+        display = (row.get_model().get_string(position)
+                   if position < row.get_model().get_n_items() else None)
+        selected = self._mic_display.get(display, "") if display else ""
 
         self._mic_display = {"Default": ""}
         for index, name in devices:

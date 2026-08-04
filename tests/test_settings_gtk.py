@@ -28,17 +28,50 @@ import os, sys
 sys.path.insert(0, sys.argv[1] + "/src")
 config_dir, scenario = sys.argv[2], sys.argv[3]
 os.environ["WHISPER_FLOW_CONFIG_DIR"] = config_dir
+if scenario == "mic_race":
+    # A configured device, so the placeholder dropdown has two entries and
+    # there is something to change the selection *to* before the real list
+    # lands. Without one the placeholder holds only "Default" and the window
+    # this tests cannot be entered.
+    os.environ["WHISPER_FLOW_MIC_DEVICE_INDEX"] = "0"
 
 import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Gtk
+from gi.repository import GLib, Gtk
 
 from whisper_flow import settings_def, settings_gtk
 settings_gtk._list_input_devices = lambda: [(0, "Built-in mic")]
 Gtk.init()
 w = settings_gtk.SettingsWindow()
 w.config.config_dir = config_dir
+
+
+def pump(until, seconds=10.0):
+    \"\"\"Drive the main loop, as the real window has one driving it.
+
+    The microphone list is enumerated on a thread and applied from an idle
+    callback - opening PortAudio is far too slow to do before the window can
+    be shown. Nothing here runs a main loop, so without this the dropdown
+    still holds only the placeholder.
+    \"\"\"
+    import time
+    context = GLib.MainContext.default()
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        context.iteration(False)
+        if until():
+            return True
+        time.sleep(0.005)
+    return False
+
+
+def mic_row():
+    return w._rows["mic_device_index"]
+
+
+def mics_listed():
+    return mic_row().get_model().get_n_items() > 1
 
 if scenario == "rows_exist":
     for field in settings_def.FIELDS:
@@ -60,10 +93,27 @@ elif scenario == "invalid":
     w._on_save()
     assert "empty key name" in w._last_toast_title
 elif scenario == "cleared":
-    mic = w._rows["mic_device_index"]
+    assert pump(mics_listed), "the microphone list never arrived"
+    mic = mic_row()
     mic.set_selected(1)
     w._on_save()
     assert (config_dir + "/.env") and True
+elif scenario == "mic_race":
+    # Change the selection before the enumeration lands. That window is
+    # exactly as long as PortAudio takes to walk four host APIs, which is
+    # the whole reason the enumeration was moved off this thread.
+    mic = mic_row()
+    assert not mics_listed(), "the list was not deferred at all"
+    assert mic.get_model().get_n_items() == 2, "no configured device to leave"
+    mic.set_selected(0)                     # back to Default, unsaved
+    assert mic.get_model().get_string(mic.get_selected()) == "Default"
+
+    assert pump(mics_listed), "the microphone list never arrived"
+    after = mic.get_model().get_string(mic.get_selected())
+    assert after == "Default", (
+        f"the pending selection was reverted to {after!r} when the device "
+        f"list arrived; the choice was taken from the saved baseline rather "
+        f"than from the row")
 print("OK")
 """
 
@@ -124,6 +174,18 @@ def test_a_cleared_field_removes_the_key(tmp_path):
     assert envfile.get(tmp_path / ".env", "MIC_DEVICE_INDEX") == "0"
 
 
+def test_a_choice_made_before_the_mic_list_arrives_survives_it(tmp_path):
+    """Enumerating PortAudio is slow enough for someone to get there first.
+
+    The dropdown is seeded with a placeholder and filled from a thread. The
+    swap restored the selection from `_current` - the saved baseline the
+    dirty poll diffs against, not live widget state - so a choice made while
+    the enumeration was still running was silently undone.
+    """
+    result = _run(tmp_path, "mic_race")
+    assert "OK" in result.stdout, result.stderr
+
+
 def test_a_rebuilt_page_puts_its_values_back():
     """Downloading a model replaces every row on the Speech page.
 
@@ -138,7 +200,10 @@ def test_a_rebuilt_page_puts_its_values_back():
     """
     source = (Path(__file__).resolve().parents[1]
               / "src/whisper_flow/settings_gtk.py").read_text(encoding="utf-8")
-    body = source.split("def _download_done(", 1)[1].split("\n    def ", 1)[0]
+    # Wherever the page is rebuilt, not wherever a download happens to end.
+    # Installing the GPU engine rebuilds it too, so the two callers share one
+    # method and this follows it there.
+    body = source.split("def _rebuild_speech_page(", 1)[1].split("\n    def ", 1)[0]
     assert "_apply_values(" in body, (
         "the rows are rebuilt here and must be filled in again, or every "
         "Speech setting reads as empty afterwards")
@@ -146,3 +211,8 @@ def test_a_rebuilt_page_puts_its_values_back():
         "the values have to be captured before the rows are replaced")
     assert "_apply_values" in source and "def _apply_values" in source, (
         "_apply_values must exist to restore them")
+    for caller in ("_download_done", "_engine_download_done"):
+        called = source.split(f"def {caller}(", 1)[1].split("\n    def ", 1)[0]
+        assert "_rebuild_speech_page()" in called, (
+            f"{caller} replaces rows without going through the rebuild, so "
+            f"the values it captured are never put back")

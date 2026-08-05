@@ -915,6 +915,13 @@ class WhisperFlowDaemon:
             # real part of it in a frozen build and cannot be seen from
             # inside the child.
             env["WHISPER_FLOW_TOOL_T0"] = repr(time.time())
+            # Where the child writes its startup timings. A file rather than
+            # its stdout because a PyInstaller windowed build has sys.stdout
+            # set to None, and print() silently does nothing there - the
+            # first round of these vanished without trace.
+            fd, tool_log = tempfile.mkstemp(suffix=".log", prefix="whisper-flow-tool-")
+            os.close(fd)
+            env["WHISPER_FLOW_TOOL_LOG"] = self._tool_log = tool_log
             try:
                 # Captured, not inherited. The frozen build is windowed, so
                 # the child has no console and everything it prints - timings,
@@ -968,9 +975,37 @@ class WhisperFlowDaemon:
             except Exception:
                 pass
 
+    def _tail_tool_log(self, process, timeout: float = 30.0) -> None:
+        """Report the child's startup timings while it is still open.
+
+        Its own thread because the drain below blocks until the child exits,
+        and the timings are wanted long before that - the window being slow
+        to open is the whole thing they exist to explain, and a report that
+        waits for it to be closed again answers too late to be read.
+        """
+        path = getattr(self, "_tool_log", None)
+        if not path:
+            return
+        seen, deadline = 0, time.time() + timeout
+        while time.time() < deadline:
+            try:
+                with open(path, encoding="utf-8", errors="replace") as fh:
+                    lines = fh.read().splitlines()
+            except OSError:
+                lines = []
+            for line in lines[seen:]:
+                if line.strip():
+                    log(line)
+            seen = len(lines)
+            if process.poll() is not None:
+                return
+            time.sleep(0.5)
+
     def _after_tool_window(self, process=None) -> None:
         """Adopt whatever the settings window installed, once it closes."""
         process = process or self._setup_process
+        threading.Thread(target=self._tail_tool_log, args=(process,),
+                         daemon=True, name="whisper-flow-tool-log").start()
         # Before wait(), and on this thread: a full pipe blocks the child, so
         # nothing may wait on a process it has not drained first.
         self._drain_tool_output(process)
@@ -978,6 +1013,13 @@ class WhisperFlowDaemon:
             process.wait()
         except Exception:
             return
+        finally:
+            path, self._tool_log = getattr(self, "_tool_log", None), None
+            if path:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
 
         # A window that dies after the 0.4s check above is invisible: the
         # user clicks Settings, nothing opens, and the log holds only the

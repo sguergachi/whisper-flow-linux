@@ -36,12 +36,52 @@ _T0 = float(os.environ.get("WHISPER_FLOW_TOOL_T0") or 0.0) or time.time()
 def _mark(label: str) -> None:
     """Report a stage of opening this window, in ms since the click.
 
-    Printed rather than logged: this process has its own ring buffer that
-    nobody can read, and the frozen build has no console. The daemon captures
-    what we print here into the log the tray menu shows.
+    To a file, not to stdout. A PyInstaller windowed build leaves sys.stdout
+    as None, and print() silently returns when it is - so the first round of
+    these went nowhere at all and the log came back with no sign the window
+    had ever been opened. The daemon names the file and reads it back into
+    the log the tray menu shows.
     """
-    print(f"[SETTINGS] +{(time.time() - _T0) * 1000:6.0f}ms {label}", flush=True)
+    line = f"[SETTINGS] +{(time.time() - _T0) * 1000:6.0f}ms {label}"
+    path = os.environ.get("WHISPER_FLOW_TOOL_LOG")
+    if path:
+        try:
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+        except OSError:
+            pass
+    try:
+        print(line, flush=True)     # a source checkout still has a console
+    except Exception:
+        pass
 
+
+def _prefetch_the_config_stack() -> None:
+    """Load the non-GTK imports while GTK is still loading.
+
+    They are independent and were strictly serial: GTK first, then 720ms of
+    pydantic-settings, measured, purely so Config can exist. Nothing about
+    that ordering is required - the window needs both before it can draw and
+    does not care which finishes first - so the slower half starts here and
+    runs alongside the GTK import below.
+
+    Python's per-module import locks make the duplicate import safe: whichever
+    thread arrives second waits for the first rather than doing the work twice.
+    Failures are ignored because the real import below will raise them again,
+    in the place that can report them.
+    """
+    def work():
+        try:
+            import whisper_flow.backend      # noqa: F401
+            import whisper_flow.config       # noqa: F401
+        except Exception:
+            pass
+
+    threading.Thread(target=work, daemon=True,
+                     name="whisper-flow-settings-prefetch").start()
+
+
+_prefetch_the_config_stack()
 
 import gi  # noqa: E402
 
@@ -93,6 +133,12 @@ CSS = b"""
 .daemon-ok { color: #4ade80; }
 .daemon-bad { color: #f87171; }
 """
+
+# The two colours of .pill-recommended again, for the badge that sits beside
+# the model name. That one is Pango markup rather than a widget, and markup
+# takes colours as literal strings - it cannot reach a CSS class.
+BADGE_BG = "#1b2c4a"
+BADGE_FG = "#9ec2fc"
 
 # Only loaded once compositor blur is confirmed, so none of this can reach a
 # window that has no frost behind it to show.
@@ -225,6 +271,45 @@ def _load_css(provider, css: bytes):
         provider.load_from_string(css.decode())
     else:
         provider.load_from_data(css)
+
+
+def _wide_list_factory() -> Gtk.SignalListItemFactory:
+    """Dropdown rows that keep their full text, however long it is.
+
+    AdwComboRow's stock factory ellipsizes to the width of the closed row.
+    A plain Gtk.Label does not ellipsize at all, and GtkDropDown's popover
+    propagates its natural width, so the popup grows to fit the widest entry
+    instead of truncating all of them to the same useless prefix.
+    """
+    factory = Gtk.SignalListItemFactory()
+
+    def setup(_factory, item):
+        item.set_child(Gtk.Label(xalign=0.0))
+
+    def bind(_factory, item):
+        value = item.get_item()
+        item.get_child().set_text(value.get_string() if value else "")
+
+    factory.connect("setup", setup)
+    factory.connect("bind", bind)
+    return factory
+
+
+def _titled(name: str, badge: str = "") -> str:
+    """A row title with an optional badge immediately after the name.
+
+    Pango markup rather than a widget, because AdwActionRow offers nowhere to
+    put one here: prefixes land left of the title and suffixes at the far
+    right end of the row, and this has to read as part of the name. Markup
+    cannot round its corners the way the CSS pills at the right-hand end do,
+    so it is drawn as a tinted tag instead of pretending to be one of them.
+    """
+    title = GLib.markup_escape_text(name)
+    if not badge:
+        return title
+    return (f"{title}  <span size='x-small' weight='bold' "
+            f"background='{BADGE_BG}' foreground='{BADGE_FG}'>"
+            f" {GLib.markup_escape_text(badge)} </span>")
 
 
 def _gobject_pointer(obj) -> int:
@@ -478,9 +563,17 @@ class SettingsWindow(Adw.ApplicationWindow):
         for item in self.backend.model_inventory():
             name = item["name"]
             row = Adw.ActionRow(
-                title=name.replace("ggml-", ""),
+                title=_titled(name.replace("ggml-", ""),
+                              "recommended" if item["recommended"] else ""),
                 subtitle=f"{item['size_mb']} MB · {item['wants']}",
             )
+            # Markup, not a widget. AdwActionRow has two slots - before the
+            # title and at the far right end of the row - and neither is
+            # "immediately after the name", which is where this belongs: it
+            # answers which model to pick, so it has to be read as part of the
+            # name rather than found at the other side of the row. A pill is
+            # a widget and cannot go there; a span can.
+            row.set_use_markup(True)
             check = Gtk.CheckButton()
             if group_leader is None:
                 group_leader = check
@@ -493,17 +586,6 @@ class SettingsWindow(Adw.ApplicationWindow):
                 # so dim on dark theme it looks like the row has none.
                 check.connect("toggled", self._guard_uninstalled)
             row.add_prefix(check)
-            # Beside the name rather than out at the right-hand edge with the
-            # rest. The others say something about the row you have already
-            # found; this one is the answer to "which of these should I pick",
-            # and it can only do that job where the eye is already running -
-            # down the column of names.
-            if item["recommended"]:
-                pill = Gtk.Label(label="recommended")
-                pill.add_css_class("model-pill")
-                pill.add_css_class("pill-recommended")
-                pill.set_valign(Gtk.Align.CENTER)
-                row.add_prefix(pill)
             if item["installed"]:
                 row.set_activatable_widget(check)
 
@@ -641,11 +723,19 @@ class SettingsWindow(Adw.ApplicationWindow):
             return row
 
         if field.kind == "choice":
-            choices = (self._mic_choices()
-                       if field.key == "mic_device_index"
-                       else list(field.choices))
+            is_mic = field.key == "mic_device_index"
+            choices = (self._mic_choices() if is_mic else list(field.choices))
             row = Adw.ComboRow(title=field.label,
                                model=Gtk.StringList.new(choices))
+            if is_mic:
+                # Capture device names are long and all alike at the front -
+                # "Microphone Array (AMD Audio Device) (Windows WASAPI...)" -
+                # so the default factory, which ellipsizes each row to the
+                # width of the closed combo, cut every one of them off at
+                # exactly the point where they start to differ. The list is
+                # unreadable and the setting unusable. A factory whose labels
+                # do not ellipsize lets the popup take its natural width.
+                row.set_list_factory(_wide_list_factory())
             if field.help:
                 row.set_subtitle(field.help)
             self._rows[field.key] = row

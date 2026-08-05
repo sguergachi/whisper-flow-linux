@@ -83,15 +83,19 @@ _mark("imports done")
 # the same contents into a shorter box - bars, dot and margins keep their
 # proportions and the silhouette stays the shape it was designed as.
 #
-# Windows is smaller on purpose. There the pill's outline is whatever DWM
-# rounds the window to, because a region will not clip the acrylic behind
-# it, and DWM offers one radius: 8 logical pixels, take it or leave it. On a
-# 54-tall pill that reads as a barely-softened rectangle. The only way to
-# make it look round is to make the pill smaller against that fixed 8, so it
-# is, and the two platforms end up different sizes - the price of having a
-# material behind it at all. Wayland keeps the full size and the squircle.
+# 38 on both platforms now. Windows arrived at it out of necessity: there the
+# pill's outline is whatever DWM rounds the window to, because a region will
+# not clip the acrylic behind it, and DWM offers one radius - 8 logical
+# pixels, take it or leave it. On a 54-tall pill that reads as a
+# barely-softened rectangle, and the only way to make it look round was to
+# make the pill smaller against that fixed 8.
+#
+# Linux was never under that constraint and kept the full 54, so the same
+# overlay was two different sizes depending on where it ran. It comes down to
+# meet Windows. It keeps its squircle either way - the cap shape is its own
+# knob and not a function of the height.
 BASE_WIDTH, BASE_HEIGHT = 268, 54
-DEFAULT_HEIGHT = 38 if IS_WINDOWS else BASE_HEIGHT
+DEFAULT_HEIGHT = 38
 HEIGHT = int(os.environ.get("WHISPER_FLOW_HUD_HEIGHT", str(DEFAULT_HEIGHT)))
 SIZE_SCALE = HEIGHT / BASE_HEIGHT
 WIDTH = round(BASE_WIDTH * SIZE_SCALE)

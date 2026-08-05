@@ -92,6 +92,11 @@ CSS = b"""
 .model-progress { min-width: 110px; }
 .daemon-ok { color: #4ade80; }
 .daemon-bad { color: #f87171; }
+/* The device list, not the row: the row stays the width of the page and
+   ellipsizes the one name it shows, while the popup you open to compare
+   names is wide enough to read them. 520px is a long Windows device name
+   with its host API suffix, inside a 760px window. */
+.mic-row popover listview { min-width: 520px; }
 """
 
 # Only loaded once compositor blur is confirmed, so none of this can reach a
@@ -493,22 +498,20 @@ class SettingsWindow(Adw.ApplicationWindow):
                 # so dim on dark theme it looks like the row has none.
                 check.connect("toggled", self._guard_uninstalled)
             row.add_prefix(check)
-            # Beside the name rather than out at the right-hand edge with the
-            # rest. The others say something about the row you have already
-            # found; this one is the answer to "which of these should I pick",
-            # and it can only do that job where the eye is already running -
-            # down the column of names.
-            if item["recommended"]:
-                pill = Gtk.Label(label="recommended")
-                pill.add_css_class("model-pill")
-                pill.add_css_class("pill-recommended")
-                pill.set_valign(Gtk.Align.CENTER)
-                row.add_prefix(pill)
             if item["installed"]:
                 row.set_activatable_widget(check)
 
             suffix = Gtk.Box(spacing=6)
             suffix.set_valign(Gtk.Align.CENTER)
+            # To the right of the name with the other pills, and first among
+            # them: a badge wedged between the radio and the name it describes
+            # pushes the column of names out of line and reads as part of the
+            # control rather than as a note about the model.
+            if item["recommended"]:
+                pill = Gtk.Label(label="recommended")
+                pill.add_css_class("model-pill")
+                pill.add_css_class("pill-recommended")
+                suffix.append(pill)
             # Which model uses the GPU, and whether this machine will give it
             # one. Both halves matter: "GPU" alone on a machine running the
             # CPU engine is the reassurance that hid the whole problem.
@@ -646,6 +649,9 @@ class SettingsWindow(Adw.ApplicationWindow):
                        else list(field.choices))
             row = Adw.ComboRow(title=field.label,
                                model=Gtk.StringList.new(choices))
+            if field.key == "mic_device_index":
+                row.add_css_class("mic-row")
+                row.set_list_factory(self._mic_list_factory())
             if field.help:
                 row.set_subtitle(field.help)
             self._rows[field.key] = row
@@ -669,6 +675,28 @@ class SettingsWindow(Adw.ApplicationWindow):
                else Adw.EntryRow(title=field.label))
         self._rows[field.key] = row
         return row
+
+    @staticmethod
+    def _mic_list_factory() -> Gtk.SignalListItemFactory:
+        """Full device names in the popup, however long they are.
+
+        A capture device on Windows is named after its driver as much as
+        itself - "1: Microphone (Realtek(R) Audio) - MME" - and the stock
+        factory ellipsizes each entry to the width of the row, which cuts
+        them at exactly the part that tells them apart. A plain label does
+        not ellipsize, so the list asks for its natural width and the popup
+        is as wide as the longest name; the CSS floor covers the case where
+        the popover declines to grow past the row.
+        """
+        factory = Gtk.SignalListItemFactory()
+        factory.connect(
+            "setup",
+            lambda _f, item: item.set_child(Gtk.Label(xalign=0)))
+        factory.connect(
+            "bind",
+            lambda _f, item: item.get_child().set_label(
+                item.get_item().get_string()))
+        return factory
 
     def _mic_choices(self) -> list[str]:
         """Display strings for the microphone dropdown, default first.

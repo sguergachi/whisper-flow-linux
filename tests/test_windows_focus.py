@@ -118,3 +118,34 @@ def test_a_window_that_will_not_come_back_does_not_stop_the_typing(
 
     assert manager.type_text("hello") is True
     assert fake.typed == [("hello", 9999)]
+
+
+def test_the_modifiers_we_hold_are_released_through_the_manager(
+        windows_manager, monkeypatch):
+    """The daemon reaches system_win through here, so the chain must connect."""
+    manager, fake = windows_manager
+    called = []
+    monkeypatch.setattr(fake, "release_injected_modifiers",
+                        lambda: called.append(True), raising=False)
+    manager.release_stuck_modifiers()
+    assert called == [True]
+
+
+def test_releasing_modifiers_off_windows_does_nothing(monkeypatch, mock_config):
+    monkeypatch.setattr(system_module, "IS_WINDOWS", False)
+    manager = system_module.SystemManager(mock_config)
+    manager.release_stuck_modifiers()        # must not raise or reach Win32
+
+
+def test_a_failure_to_release_is_not_allowed_to_escape(
+        windows_manager, monkeypatch):
+    """This runs in the recording thread's cleanup; raising there would lose
+    the release of the processing lock behind it."""
+    manager, fake = windows_manager
+
+    def explode():
+        raise OSError("user32 went away")
+
+    monkeypatch.setattr(fake, "release_injected_modifiers", explode,
+                        raising=False)
+    manager.release_stuck_modifiers()

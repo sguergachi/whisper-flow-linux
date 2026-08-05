@@ -16,6 +16,11 @@ from .logging import log
 
 IS_WINDOWS = sys.platform == "win32"
 
+# Kept in step with hud_app.PROCESSING_SUFFIX, and not imported from it: this
+# module supervises the overlay from the daemon's process, where importing
+# the overlay would pull GTK 4 in beside pystray's GTK 3.
+PROCESSING_SUFFIX = ".processing"
+
 # Keep one overlay process alive and command it, instead of starting one per
 # recording. Starting a frozen process is the largest cost between the hotkey
 # and anything appearing on screen, and no amount of making our own code
@@ -219,7 +224,10 @@ class HUD:
                 process.stdin.write(f"{line}\n")
                 process.stdin.flush()
                 return True
-            except (OSError, ValueError):
+            except (OSError, ValueError, AttributeError):
+                # AttributeError: an overlay spawned per recording has no
+                # stdin to write to. It is not a resident one and cannot be
+                # commanded; the caller falls back to another route.
                 # It died between the check and the write. Drop it and let
                 # the second attempt start a fresh one.
                 log(f"[HUD] resident overlay went away on attempt {attempt}")
@@ -234,9 +242,14 @@ class HUD:
 
         env = self._overlay_env("")
         env["WHISPER_FLOW_HUD_RESIDENT"] = "1"
-        fd, self._log_path = tempfile.mkstemp(suffix=".log", prefix="whisper-flow-hud-")
-        os.close(fd)
         try:
+            # Inside the guard, not before it. Making the log file is as able
+            # to fail as starting the process is - a full disk fails here
+            # first - and this runs on the recording path, where an exception
+            # escaping is not a missing overlay but a wedged daemon.
+            fd, self._log_path = tempfile.mkstemp(
+                suffix=".log", prefix="whisper-flow-hud-")
+            os.close(fd)
             self._log_file = open(self._log_path, "a")
             self._process = subprocess.Popen(
                 self._overlay_command(),
@@ -287,6 +300,38 @@ class HUD:
                 except Exception:
                     pass
             self._cleanup_files()
+
+    def processing(self, level_file: str = ""):
+        """Keep the overlay up, now saying the transcript is being worked out.
+
+        Both routes, because the two platforms are told things differently: a
+        resident overlay takes an order down its pipe, and one spawned per
+        recording has no pipe at all, so it is left a marker beside the level
+        file it already polls.
+
+        The marker is written whichever route worked. It costs nothing, and
+        an overlay that restarts mid-dictation - after a crash, say - then
+        comes back into the state the dictation is actually in.
+        """
+        if level_file:
+            try:
+                with open(level_file + PROCESSING_SUFFIX, "w") as marker:
+                    marker.write("1")
+            except OSError as e:
+                log(f"[HUD] could not mark processing: {e}")
+        with self._lock:
+            if RESIDENT:
+                self._command("processing")
+
+    @staticmethod
+    def clear_processing(level_file: str = ""):
+        """Remove the marker, so the next recording does not inherit it."""
+        if not level_file:
+            return
+        try:
+            os.unlink(level_file + PROCESSING_SUFFIX)
+        except OSError:
+            pass
 
     def hide(self):
         """Hide the recording HUD overlay."""

@@ -9,6 +9,7 @@ import contextlib
 import ctypes
 import ctypes.wintypes as wintypes
 import subprocess
+import threading
 import time
 
 from .logging import log
@@ -34,6 +35,11 @@ MODIFIERS = (VK_CONTROL, VK_MENU, VK_SHIFT, VK_LWIN, VK_RWIN)
 
 _user32 = ctypes.WinDLL("user32", use_last_error=True)
 _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+# Modifiers this process is holding down on the user's behalf, and which it
+# therefore owes a key-up. See restore_modifiers.
+_injected_lock = threading.Lock()
+_injected_down: set[int] = set()
 
 
 class KEYBDINPUT(ctypes.Structure):
@@ -265,15 +271,63 @@ def release_modifiers() -> tuple:
     return held
 
 
-def restore_modifiers(held) -> None:
-    """Put back the modifiers the user never let go of.
+def _restorable(held) -> tuple:
+    """Of the modifiers that were down, the ones we may press back.
 
-    Only the ones that were down before we interfered, so a recording that
-    ends between the snapshot and here cannot leave a key stuck: nothing is
-    pressed that was not already pressed.
+    Only the keys of the push-to-talk combination the user is actually
+    holding. The snapshot covers every modifier that happened to be down,
+    and pressing all of them back is how an incidental Shift became one we
+    were responsible for releasing.
     """
-    if held:
-        _send([_key_event(vk, 0, 0) for vk in held])
+    try:
+        from . import hotkey_win
+
+        combination = hotkey_win.held_combination()
+    except Exception:
+        return tuple(held)
+    if combination is None:
+        return tuple(held)          # no listener to protect; as before
+    aliases = getattr(hotkey_win, "VK_ALIASES", {})
+    return tuple(vk for vk in held if aliases.get(vk, vk) in combination)
+
+
+def restore_modifiers(held) -> None:
+    """Put back the modifiers the push-to-talk is holding down.
+
+    Recorded as ours while they are down. This is the one thing in here that
+    presses a key with no user behind it, and if the user lets go during the
+    injection - after the snapshot, before this - their real key-up lands on
+    a key already released, and the press below then has no release coming
+    at all. Windows goes on believing the key is down: with Super that turns
+    the next Shift into Win+Shift, and the desktop starts minimising itself.
+
+    So the daemon clears these at the end of every dictation through
+    release_injected_modifiers(), and the window in which a stuck key can
+    exist is bounded by the dictation rather than by the session.
+    """
+    wanted = _restorable(held)
+    if not wanted:
+        return
+    with _injected_lock:
+        _injected_down.update(wanted)
+    _send([_key_event(vk, 0, 0) for vk in wanted])
+
+
+def release_injected_modifiers() -> tuple:
+    """Let go of every modifier we pressed back down, and forget them.
+
+    Called when a dictation ends. Sending a key-up for something the user is
+    still physically holding is harmless - their own release just arrives at
+    a key that is already up - while not sending it leaves the key down for
+    every application on the desktop.
+    """
+    with _injected_lock:
+        ours = tuple(sorted(_injected_down))
+        _injected_down.clear()
+    if ours:
+        log(f"[WIN] releasing {len(ours)} modifier(s) we were holding down")
+        _send([_key_event(vk, 0, KEYEVENTF_KEYUP) for vk in ours])
+    return ours
 
 
 def type_text(text: str) -> bool:

@@ -235,11 +235,12 @@ hidden = collect_submodules("pydantic") + [
     "ctypes.wintypes",
 ]
 
-# hud_app loads these two by file path (importing them would drag pystray's
+# hud_app loads these by file path (importing them would drag pystray's
 # GTK 3 into the overlay process), so they must exist as plain files.
 module_files = [
     ("../../src/whisper_flow/wayland_blur.py", "."),
     ("../../src/whisper_flow/blur_win.py", "."),
+    ("../../src/whisper_flow/hud_anim.py", "."),
 ]
 
 gtk_datas, gtk_binaries = gtk_runtime()

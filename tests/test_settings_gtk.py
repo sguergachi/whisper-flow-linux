@@ -259,6 +259,35 @@ elif scenario == "badge":
     # And no leftover markup in any row title.
     assert not any("<span" in (x.get_label() or "") for x in labels), (
         "a title is still carrying Pango markup for the badge")
+
+    # The radio comes first, and at the same place in every row.
+    #
+    # Owning the title means owning the order, and add_prefix prepends: two
+    # calls put the text to the left of the radio, and the prefix area is
+    # sized to what is in it, so every row's radio sat wherever that row's
+    # name pushed it. A column of radios at five different offsets.
+    w.present()
+    assert pump(lambda: w.get_visible())
+    assert pump(lambda: all(c.get_allocated_width()
+                            for c in w._model_checks.values()),
+                seconds=5.0), "the rows never got a size"
+
+    def left_edge(widget):
+        ok, rect = widget.compute_bounds(w)
+        assert ok, "no bounds for a widget that is on screen"
+        return round(rect.get_x())
+
+    offsets = {name: left_edge(check)
+               for name, check in w._model_checks.items()}
+    assert len(set(offsets.values())) == 1, (
+        f"the radios are at different offsets: {offsets}")
+
+    # First: to the left of the name it belongs to, not after it.
+    for name, check in w._model_checks.items():
+        label = next(x for x in labels
+                     if x.get_label() == name.replace("ggml-", ""))
+        assert left_edge(check) < left_edge(label), (
+            f"the radio for {name} sits after its own name")
 print("OK")
 """
 
@@ -418,5 +447,12 @@ def test_the_recommended_badge_is_a_pill_beside_the_name(tmp_path):
     however much the run was padded out - it read as clipped. A widget has
     real padding and a real corner radius; the cost is that the row has to
     own its title, because AdwActionRow has no slot beside the name.
+
+    Owning the title means owning the order too, which is the part that went
+    wrong: add_prefix prepends, so adding the radio and then the text put the
+    text first, and the prefix area is sized to its contents, so each row's
+    radio ended up wherever that row's name pushed it. This checks where the
+    radios actually land, because the structure was right while the layout
+    was visibly wrong.
     """
     assert _run(tmp_path, "badge").returncode == 0

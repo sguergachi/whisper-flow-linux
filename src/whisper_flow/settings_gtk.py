@@ -688,7 +688,6 @@ class SettingsWindow(Adw.ApplicationWindow):
             row = Adw.ActionRow()
             names = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
             names.set_valign(Gtk.Align.CENTER)
-            names.set_hexpand(True)     # or the suffixes are dragged inward
             line = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
             line.append(Gtk.Label(label=name.replace("ggml-", ""), xalign=0.0))
             if item["recommended"]:
@@ -715,8 +714,24 @@ class SettingsWindow(Adw.ApplicationWindow):
                 # Stay visible but refuse the choice: an insensitive radio is
                 # so dim on dark theme it looks like the row has none.
                 check.connect("toggled", self._guard_uninstalled)
-            row.add_prefix(check)
-            row.add_prefix(names)       # after the radio, before the suffixes
+            # One prefix holding both, in the order they are to appear.
+            #
+            # Two add_prefix calls put the text to the *left* of the radio and
+            # left every radio at a different distance in: add_prefix prepends
+            # rather than appends, and the prefix area is sized to what is in
+            # it, so each row's radio landed wherever that row's name pushed
+            # it. Packing them here settles the order without depending on
+            # which end add_prefix works from, and one prefix per row is the
+            # same width in every row, so the radios line up again.
+            #
+            # Nothing here expands. The row's own title box is empty and takes
+            # the slack, which is what keeps the suffix pills against the
+            # right-hand edge.
+            content = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL,
+                              spacing=12)
+            content.append(check)
+            content.append(names)
+            row.add_prefix(content)
             if item["installed"]:
                 row.set_activatable_widget(check)
 

@@ -650,8 +650,7 @@ class SettingsWindow(Adw.ApplicationWindow):
         self._status_icon.remove_css_class("daemon-bad")
         self._status_icon.add_css_class("daemon-ok" if pid else "daemon-bad")
         self._status_row.set_subtitle(
-            f"running (pid {pid})" if pid else
-            "not running - dictation will not work")
+            f"running (pid {pid})" if pid else "not running")
 
     def _build_speech_page(self, section: str):
         page = Adw.PreferencesPage()
@@ -662,11 +661,10 @@ class SettingsWindow(Adw.ApplicationWindow):
         if self._current_model:
             in_use = f"Using {self._current_model.replace('ggml-', '')}. "
         else:
-            in_use = "No model on this machine yet - download one below. "
+            in_use = "None yet - download one below. "
         model_group = Adw.PreferencesGroup(
             title="Speech model",
-            description=in_use + "Bigger is more accurate and slower; "
-                                 "the recommendation is sized to this machine.")
+            description=in_use + "Bigger is slower and more accurate.")
         page.add(model_group)
         model_group.add(self._engine_row())
 
@@ -748,8 +746,8 @@ class SettingsWindow(Adw.ApplicationWindow):
                                    else "pill-warning")
                 pill.set_tooltip_text(
                     "Runs on the NVIDIA GPU." if item["accelerated"] else
-                    "This model needs the GPU engine. On the CPU engine it "
-                    "takes tens of seconds per sentence.")
+                    "Needs the GPU engine; on CPU, tens of seconds "
+                    "a sentence.")
                 suffix.append(pill)
             if item["current"]:
                 pill = Gtk.Label(label="in use")
@@ -798,8 +796,7 @@ class SettingsWindow(Adw.ApplicationWindow):
 
         if self.backend.needs_gpu_upgrade():
             row.set_subtitle(
-                summary + " - the GPU engine is a 1.6GB download and makes "
-                          "the larger models usable")
+                summary + " - 1.6GB, and makes the larger models usable")
             button = Gtk.Button(label="Install GPU engine")
             button.add_css_class("suggested-action")
             button.set_valign(Gtk.Align.CENTER)
@@ -849,11 +846,11 @@ class SettingsWindow(Adw.ApplicationWindow):
         for button in self._download_buttons:
             button.set_sensitive(True)
         if not ok:
-            self._toast("Could not install the GPU engine. "
-                        "Check the connection and try again.")
+            self._toast("Could not install the GPU engine - check the "
+                        "connection.")
             return
         self._rebuild_speech_page()
-        self._toast("GPU engine installed - restart the daemon to use it.",
+        self._toast("Installed - restart to use it.",
                     button="Restart now", on_button=self._on_restart)
 
     # ------------------------------------------------------------------ rows
@@ -1145,15 +1142,14 @@ class SettingsWindow(Adw.ApplicationWindow):
         self._current = values
         self._current_model = model or self._current_model
         self._toast(
-            "Saved. A new model applies when this window closes; "
-            "everything else needs a restart.",
+            "Saved. A model applies on close; the rest on restart.",
             button="Restart now", on_button=self._on_restart)
 
     def _on_restart(self):
         if self._working:
             return
         self._working = True
-        self._toast("Restarting the daemon...")
+        self._toast("Restarting...")
 
         def work():
             ok, detail = restart.restart_daemon()
@@ -1194,10 +1190,9 @@ class SettingsWindow(Adw.ApplicationWindow):
             # Rebuild so the new model gains a radio and loses the button.
             self._rebuild_speech_page()
             self._model_checks[model].set_active(True)
-            self._toast(f"Downloaded {model.replace('ggml-', '')} - "
-                        f"Save to use it.")
+            self._toast(f"Got {model.replace('ggml-', '')} - Save to use it.")
         else:
-            self._toast("Download failed. Check the connection and try again.")
+            self._toast("Download failed - check the connection.")
 
     def _rebuild_speech_page(self, focus: bool = True):
         """Redraw the Speech page after a download changed what is on disk.

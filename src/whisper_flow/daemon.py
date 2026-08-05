@@ -664,7 +664,13 @@ class WhisperFlowDaemon:
             pass
 
     def _release_stuck_modifiers(self) -> None:
-        """Drop any modifier the typing path is still holding down."""
+        """Drop any modifier the typing path is still holding down.
+
+        Any of the three apps would do. What is held is a property of the
+        keyboard, not of a mode, so it is recorded once in system_win rather
+        than per SystemManager - which is why reaching for whichever app
+        happens to be at hand is correct here rather than merely harmless.
+        """
         try:
             self.transcribe_app.system_manager.release_stuck_modifiers()
         except Exception as e:
@@ -831,7 +837,17 @@ class WhisperFlowDaemon:
         # taken down in _finish_processing, when there is something to show
         # for it. The level file goes with it, for the same reason: the
         # overlay treats that file disappearing as being orphaned.
-        self.hud.processing(getattr(self, "_level_file", None) or "")
+        #
+        # Guarded, because everything below it is the state reset. This is
+        # also reached from start_recording's rollback, where the overlay is
+        # being asked to do something in the middle of whatever just failed;
+        # letting that throw would leave is_recording set with no thread to
+        # clear it, and every later press dropped as busy for the rest of the
+        # daemon's life. The overlay is worth nothing next to that.
+        try:
+            self.hud.processing(getattr(self, "_level_file", None) or "")
+        except Exception as e:
+            log(f"[DAEMON] could not put the overlay into processing: {e}")
 
         # Reset recording state
         self.is_recording = False

@@ -242,9 +242,14 @@ class HUD:
 
         env = self._overlay_env("")
         env["WHISPER_FLOW_HUD_RESIDENT"] = "1"
-        fd, self._log_path = tempfile.mkstemp(suffix=".log", prefix="whisper-flow-hud-")
-        os.close(fd)
         try:
+            # Inside the guard, not before it. Making the log file is as able
+            # to fail as starting the process is - a full disk fails here
+            # first - and this runs on the recording path, where an exception
+            # escaping is not a missing overlay but a wedged daemon.
+            fd, self._log_path = tempfile.mkstemp(
+                suffix=".log", prefix="whisper-flow-hud-")
+            os.close(fd)
             self._log_file = open(self._log_path, "a")
             self._process = subprocess.Popen(
                 self._overlay_command(),

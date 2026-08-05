@@ -266,3 +266,57 @@ def test_the_animation_is_loaded_as_a_sibling_and_shipped():
     assert "hud_anim.py" in spec, "the overlay's animation is not bundled"
     assert os.path.exists(Path(__file__).resolve().parents[1]
                           / "src/whisper_flow/hud_anim.py")
+
+
+# ------------------------------------------- the overlay must not wedge things
+def test_a_failing_overlay_does_not_leave_the_daemon_recording(
+        temp_config_dir, monkeypatch):
+    """start_recording's rollback runs straight through the overlay.
+
+    RESIDENT is Windows-only, so the Linux job never reached the branch where
+    putting the overlay into processing tries to start a process - and the
+    rollback path asks it to do that in the middle of whatever just failed.
+    An exception there skipped the state reset below it, leaving is_recording
+    set with no thread to clear it: the watchdog ignores a recording with no
+    thread, so every later press was dropped as busy for the rest of the
+    daemon's life. That is the failure this whole state exists downstream of,
+    and it is worth more than the overlay.
+    """
+    import sys
+    from unittest.mock import patch
+
+    from whisper_flow import hud as hud_module
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from test_daemon import _stub_daemon
+
+    monkeypatch.setattr(hud_module, "RESIDENT", True)
+    daemon = _stub_daemon(temp_config_dir)
+
+    # Fails the overlay's own temp file as well as the level file, which is
+    # exactly what the rollback test does and how this surfaced.
+    with patch("whisper_flow.daemon.tempfile.mkstemp",
+               side_effect=OSError("disk full")):
+        with pytest.raises(OSError):
+            daemon.start_recording("transcribe")
+
+    assert daemon.is_recording is False, (
+        "the overlay threw during rollback and the daemon is still recording")
+    assert daemon.current_mode is None
+    assert daemon.recording_thread is None
+
+
+def test_the_resident_overlay_survives_a_disk_that_will_not_take_its_log(
+        monkeypatch):
+    """It runs on the recording path; an exception here is not a missing
+    overlay but a wedged daemon."""
+    from unittest.mock import patch
+
+    from whisper_flow import hud as hud_module
+
+    monkeypatch.setattr(hud_module, "RESIDENT", True)
+    overlay = hud_module.HUD()
+    with patch("whisper_flow.hud.tempfile.mkstemp",
+               side_effect=OSError("disk full")):
+        assert overlay._resident_process() is None
+        overlay.processing("")           # must not raise

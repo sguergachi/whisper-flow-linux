@@ -521,13 +521,30 @@ jobs:
                   | select(.expired == false)
                   | "\(.id) \(.workflow_run.id)"' > artifacts.txt
 
+          # Every run that has not finished, this one included. The check
+          # below used to be against $GITHUB_RUN_ID alone, which spared this
+          # run and nothing else - so two pushes close together meant the
+          # first build's prune deleted the second build's artifacts while
+          # it was still running, and that build's release step then failed
+          # with "no matches found" for a tarball it had built and uploaded
+          # minutes earlier. The comment already promised this; only the
+          # code was missing.
+          for state in in_progress queued; do
+            gh api --paginate \
+              "repos/$GITHUB_REPOSITORY/actions/runs?status=$state" \
+              --jq '.workflow_runs[].id' >> active.txt || true
+          done
+          echo "$GITHUB_RUN_ID" >> active.txt
+          sort -u active.txt -o active.txt
+          echo "leaving alone $(wc -l < active.txt) run(s) still in flight"
+
           deleted=0
           failed=0
           while read -r id run; do
             # Anything from a run still in flight is left alone; deleting a
             # concurrent build's output would be a confusing way to save
             # space.
-            if [ "$run" = "$GITHUB_RUN_ID" ]; then
+            if grep -qx "$run" active.txt; then
               continue
             fi
             if gh api -X DELETE \

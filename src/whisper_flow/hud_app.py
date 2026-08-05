@@ -496,7 +496,7 @@ class HudWindow(Gtk.Window):
         self._raise_win32()
         return GLib.SOURCE_REMOVE
 
-    def _pick_monitor(self, hint: str | None):
+    def _pick_monitor(self, hint: str | None, point: str | None = None):
         """Choose the output to show on.
 
         A Wayland client cannot ask where the pointer is or which window has
@@ -504,6 +504,10 @@ class HudWindow(Gtk.Window):
         a point (the centre of the window being dictated into). Falling back to
         the first monitor is a guess and will be wrong on multi-head setups,
         which is why the daemon works to supply one of these.
+
+        `point` is passed per recording by a resident overlay, which outlives
+        any one of them; the environment is the answer for an overlay spawned
+        for a single recording, whose environment was built for it.
         """
         display = Gdk.Display.get_default()
         monitors = display.get_monitors()
@@ -516,7 +520,7 @@ class HudWindow(Gtk.Window):
                 if mon.get_connector() == hint:
                     return mon
 
-        point = os.environ.get("WHISPER_FLOW_HUD_POINT", "")
+        point = point or os.environ.get("WHISPER_FLOW_HUD_POINT", "")
         if point:
             try:
                 px, py = (int(v) for v in point.split(",", 1))
@@ -528,6 +532,35 @@ class HudWindow(Gtk.Window):
                 pass
 
         return candidates[0]
+
+    def _move_to_monitor(self, point: str) -> None:
+        """Follow the window being dictated into, before showing again.
+
+        A resident overlay picks its output once, at startup - and at startup
+        the daemon has no recording and so no window to point at, which left
+        the pill pinned to whichever monitor happened to be first for the rest
+        of the session. It has to choose again per recording, because between
+        two recordings the user has moved to another screen.
+
+        The saved position is re-read with it. Positions are stored per
+        connector, so the pill returns to where it was dragged on *this*
+        screen rather than carrying the other screen's offset across.
+        """
+        if not point:
+            return
+        monitor = self._pick_monitor(None, point)
+        if monitor is None or monitor is self._monitor:
+            return
+        self._monitor = monitor
+        self._connector = (monitor.get_connector()
+                           if hasattr(monitor, "get_connector") else "")
+        saved = _load_positions().get(self._connector)
+        self._pos = (tuple(saved[:2])
+                     if isinstance(saved, list) and len(saved) >= 2 else None)
+        if LayerShell is not None:
+            LayerShell.set_monitor(self, monitor)
+        print(f"[HUD] following the active window to {self._connector}",
+              flush=True)
 
     def _on_realize(self, *_):
         """Attach platform window effects once there is a surface for them."""
@@ -772,8 +805,9 @@ class HudWindow(Gtk.Window):
         print(f"[HUD] processing {time.time():.6f}", flush=True)
         return False
 
-    def begin_show(self, level_file: str):
+    def begin_show(self, level_file: str, point: str = ""):
         """Show for a new recording. No process start, no window creation."""
+        self._move_to_monitor(point)
         self.level_file = level_file
         self.processing = False
         self.level_pos = 0
@@ -1206,8 +1240,13 @@ def _command_loop(win: "HudWindow"):
         for line in sys.stdin:
             command = line.strip()
             if command.startswith("show"):
-                _, _, path = command.partition(" ")
-                GLib.idle_add(win.begin_show, path.strip())
+                # "show <x>,<y> <path>". The point comes first so the path,
+                # which may hold spaces, is simply the rest of the line. A
+                # daemon that has no point to give sends "-".
+                _, _, rest = command.partition(" ")
+                point, _, path = rest.partition(" ")
+                GLib.idle_add(win.begin_show, path.strip(),
+                              "" if point in ("", "-") else point)
             elif command == "processing":
                 GLib.idle_add(win.begin_processing)
             elif command == "hide":

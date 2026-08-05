@@ -87,6 +87,8 @@ class HotkeyManager:
         self.last_heartbeat = time.time()
         self.heartbeat_interval = 10.0  # 10 seconds between heartbeats
         self.heartbeat_thread = None
+        # What the last heartbeat reported, so an unchanged one stays quiet.
+        self._last_heartbeat_state = None
         self.stuck_key_timeout = 15.0  # Max time a key can be held before considered stuck
 
         # Key mapping for consistent naming (runtime keys have _l/_r suffixes)
@@ -623,10 +625,22 @@ class HotkeyManager:
                 # Update heartbeat timestamp
                 self.last_heartbeat = current_time
 
-                # Log heartbeat status
-                log(
-                    f"[HOTKEY] Heartbeat - running: {self.is_running}, listener_alive: {self._listener_alive()}, pressed_keys: {len(self.pressed_keys)}, active_combination: {self.active_combination}, push_to_talk: {self.current_push_to_talk}",
-                )
+                # Only when it changes, exactly as the daemon's watchdog does.
+                #
+                # An idle heartbeat every ten seconds against a 300-line ring
+                # buffer meant the log held the last fifty minutes of "nothing
+                # happened" and nothing else. A log sent in to explain a
+                # problem arrived as 300 identical lines with every event that
+                # mattered already pushed out of the far end - which is not a
+                # diagnostic, it is proof the app was running.
+                state = (self.is_running, self._listener_alive(),
+                         len(self.pressed_keys), self.active_combination,
+                         self.current_push_to_talk)
+                if state != self._last_heartbeat_state:
+                    self._last_heartbeat_state = state
+                    log(
+                        f"[HOTKEY] Heartbeat - running: {self.is_running}, listener_alive: {self._listener_alive()}, pressed_keys: {len(self.pressed_keys)}, active_combination: {self.active_combination}, push_to_talk: {self.current_push_to_talk}",
+                    )
 
                 # Safety check: if we have an active combination but no pressed keys, clear it
                 if self.active_combination and not self.pressed_keys:

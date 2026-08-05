@@ -64,7 +64,7 @@ def test_showing_sends_a_command_rather_than_starting_a_process(hud, monkeypatch
                         lambda *a, **k: spawned.append(a) or FakeProcess())
 
     hud.show(level_file="/tmp/levels")
-    assert process.written == ["show /tmp/levels\n"]
+    assert process.written == ["show - /tmp/levels\n"]
     assert spawned == []            # nothing was started
 
 
@@ -383,7 +383,7 @@ def test_showing_after_prewarm_does_not_start_another(hud, monkeypatch):
     before = len(calls)
 
     hud.show(level_file="/tmp/levels")
-    assert process.written == ["show /tmp/levels\n"]
+    assert process.written == ["show - /tmp/levels\n"]
     assert len(calls) == before + 1      # asked for the same live one
     assert process.poll() is None
 
@@ -395,3 +395,34 @@ def _settle():
         if not any(t.name == "whisper-flow-hud-prewarm" and t.is_alive()
                    for t in threading.enumerate()):
             return
+
+
+# ------------------------------------------- which screen it appears on
+def test_the_active_windows_screen_goes_with_every_show(hud, monkeypatch):
+    """A resident overlay outlives the recording that decided the screen.
+
+    It picks its output once, at startup, and at startup there is no
+    recording and so no window to point at - which pinned the pill to
+    whichever monitor happened to be first for the whole session, wherever
+    the user was actually typing. The point has to travel per recording,
+    because only the environment of a per-recording process could carry it.
+    """
+    process = _running(hud, monkeypatch)
+    hud.show(level_file="/tmp/levels", point=(2560, 400))
+    assert process.written == ["show 2560,400 /tmp/levels\n"]
+
+
+def test_a_second_recording_can_land_on_a_different_screen(hud, monkeypatch):
+    process = _running(hud, monkeypatch)
+    hud.show(level_file="/tmp/a", point=(100, 100))
+    hud.show(level_file="/tmp/b", point=(3000, 100))
+    assert process.written == ["show 100,100 /tmp/a\n", "show 3000,100 /tmp/b\n"]
+
+
+def test_a_point_that_makes_no_sense_does_not_stop_the_overlay(hud, monkeypatch):
+    """Placement is a hint. A bad one falls back; it never costs the pill."""
+    process = _running(hud, monkeypatch)
+    for bad in (None, (), ("left", "top"), (1,)):
+        process.written.clear()
+        hud.show(level_file="/tmp/levels", point=bad)
+        assert process.written == ["show - /tmp/levels\n"]

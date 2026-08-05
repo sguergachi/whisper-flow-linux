@@ -144,3 +144,58 @@ def test_a_genuine_release_still_ends_the_recording(win, monkeypatch):
     assert not restored, (
         "nothing was held, so nothing may be restored - otherwise the "
         "hotkey can never be released")
+
+
+# --------------------------------------------------- the Start menu
+def _order_of(batches, vk):
+    """Indices of the batches that carry an event for this key."""
+    return [i for i, batch in enumerate(batches) if _flags_for(batch, vk)]
+
+
+def test_letting_go_of_the_injected_super_does_not_open_start(win):
+    """The release we send has to be spoiled, exactly as the first one is.
+
+    restore_modifiers presses Super back down while the user is still
+    holding it, and Windows sees that as a fresh press. The release at the
+    end of the dictation then completes a lone Super tap and opens Start -
+    which takes focus, so the rest of a live transcription was typed into
+    its search box.
+    """
+    system_win, batches = win
+    system_win._injected_down.clear()
+    system_win._injected_down.update({system_win.VK_LWIN, system_win.VK_MENU})
+
+    system_win.release_injected_modifiers()
+
+    noop = _order_of(batches, system_win.VK_NONAME)
+    supers = _order_of(batches, system_win.VK_LWIN)
+    assert noop, "nothing marked the Super press as used"
+    assert supers, "Super was never released"
+    assert min(noop) < min(supers), (
+        "the no-op key must be sent while Windows still believes Super is "
+        "down; after the release it is too late and Start is already armed")
+
+
+def test_nothing_is_sent_when_we_are_holding_nothing(win):
+    """No keys of ours means no keystrokes at all, spoiler included."""
+    system_win, batches = win
+    system_win._injected_down.clear()
+
+    assert system_win.release_injected_modifiers() == ()
+    assert batches == []
+
+
+def test_the_keys_are_still_released(win):
+    """The spoiler must not have displaced the thing it guards."""
+    system_win, batches = win
+    system_win._injected_down.clear()
+    system_win._injected_down.update({system_win.VK_LWIN, system_win.VK_MENU})
+
+    released = system_win.release_injected_modifiers()
+
+    assert set(released) == {system_win.VK_LWIN, system_win.VK_MENU}
+    for vk in (system_win.VK_LWIN, system_win.VK_MENU):
+        ups = [f for batch in batches for f in _flags_for(batch, vk)
+               if f & system_win.KEYEVENTF_KEYUP]
+        assert ups, f"{vk:#x} was never released"
+    assert not system_win._injected_down, "the keys must not stay recorded"

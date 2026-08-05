@@ -320,12 +320,22 @@ def release_injected_modifiers() -> tuple:
     still physically holding is harmless - their own release just arrives at
     a key that is already up - while not sending it leaves the key down for
     every application on the desktop.
+
+    Spoiled first, for the same reason release_modifiers() is and this was
+    not. restore_modifiers() presses Super back down, and from Windows' point
+    of view that is a fresh press with nothing after it; the release below
+    then completes a lone Super tap and opens the Start menu. It only showed
+    when the pass that restored the keys committed no words, because any
+    character typed in between counts as the intervening press - which is
+    what made it look random, and what put the rest of the dictation into the
+    Start menu's search box once focus had gone there.
     """
     with _injected_lock:
         ours = tuple(sorted(_injected_down))
         _injected_down.clear()
     if ours:
         log(f"[WIN] releasing {len(ours)} modifier(s) we were holding down")
+        spoil_start_menu()
         _send([_key_event(vk, 0, KEYEVENTF_KEYUP) for vk in ours])
     return ours
 

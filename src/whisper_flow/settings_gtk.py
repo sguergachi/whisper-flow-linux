@@ -51,11 +51,15 @@ def _mark(label: str, since: float | None = None) -> None:
     line = f"[SETTINGS] +{elapsed:6.0f}ms {label}"
     path = os.environ.get("WHISPER_FLOW_TOOL_LOG")
     if path:
+        # One route or the other, never both. The daemon reads the file *and*
+        # drains our stdout, so writing to each printed every stage twice in
+        # the log - which reads as the window having been built twice.
         try:
             with open(path, "a", encoding="utf-8") as fh:
                 fh.write(line + "\n")
+            return
         except OSError:
-            pass
+            pass                # fall through and print; better than silence
     try:
         print(line, flush=True)     # a source checkout still has a console
     except Exception:
@@ -140,15 +144,21 @@ CSS = b"""
 .pill-gpu { background: #2e2148; color: #c4b5fd; }
 .pill-warning { background: #3a2a12; color: #fbbf24; }
 .model-progress { min-width: 110px; }
+/* The model rows build their own title and subtitle, because the badge has
+   to sit beside the name and AdwActionRow has no slot there. This is the
+   one thing the row would otherwise have done for us. */
+.model-subtitle { font-size: 0.9em; }
+/* The device list, not the row: the row stays the width of the page and
+   ellipsizes the one name it shows, while the popup you open to compare
+   names is wide enough to read them. 520px is a long Windows device name
+   with its host API suffix, inside a 760px window. Restored - it was lost
+   resolving a merge, leaving the factory without the floor it needs for the
+   case where the popover declines to grow past the row. */
+.mic-row popover listview { min-width: 520px; }
 .daemon-ok { color: #4ade80; }
 .daemon-bad { color: #f87171; }
 """
 
-# The two colours of .pill-recommended again, for the badge that sits beside
-# the model name. That one is Pango markup rather than a widget, and markup
-# takes colours as literal strings - it cannot reach a CSS class.
-BADGE_BG = "#1b2c4a"
-BADGE_FG = "#9ec2fc"
 
 # Only loaded once compositor blur is confirmed, so none of this can reach a
 # window that has no frost behind it to show.
@@ -303,31 +313,6 @@ def _wide_list_factory() -> Gtk.SignalListItemFactory:
     factory.connect("setup", setup)
     factory.connect("bind", bind)
     return factory
-
-
-def _titled(name: str, badge: str = "") -> str:
-    """A row title with an optional badge immediately after the name.
-
-    Pango markup rather than a widget, because AdwActionRow offers nowhere to
-    put one here: prefixes land left of the title and suffixes at the far
-    right end of the row, and this has to read as part of the name. Markup
-    cannot round its corners the way the CSS pills at the right-hand end do,
-    so it is drawn as a tinted tag instead of pretending to be one of them.
-    """
-    title = GLib.markup_escape_text(name)
-    if not badge:
-        return title
-    # Markup has no padding property: the background is painted to the
-    # logical extents of the run and not a pixel further, so a badge made
-    # this way sits with its text hard against its own edges and reads as
-    # clipped. The only way to give it room is to widen the run with
-    # something that draws nothing, so the padding here is two EN SPACEs a
-    # side - written as escapes, because a literal one is invisible in a
-    # diff and indistinguishable from the ordinary space it replaced.
-    pad = "\u2002\u2002"
-    return (f"{title}\u2002<span size='x-small' weight='bold' "
-            f"background='{BADGE_BG}' foreground='{BADGE_FG}'>"
-            f"{pad}{GLib.markup_escape_text(badge)}{pad}</span>")
 
 
 def _gobject_pointer(obj) -> int:
@@ -688,18 +673,37 @@ class SettingsWindow(Adw.ApplicationWindow):
         group_leader = None
         for item in self.backend.model_inventory():
             name = item["name"]
-            row = Adw.ActionRow(
-                title=_titled(name.replace("ggml-", ""),
-                              "recommended" if item["recommended"] else ""),
-                subtitle=f"{item['size_mb']} MB · {item['wants']}",
-            )
-            # Markup, not a widget. AdwActionRow has two slots - before the
-            # title and at the far right end of the row - and neither is
-            # "immediately after the name", which is where this belongs: it
-            # answers which model to pick, so it has to be read as part of the
-            # name rather than found at the other side of the row. A pill is
-            # a widget and cannot go there; a span can.
-            row.set_use_markup(True)
+            # No title or subtitle on the row: they are built below and put in
+            # as a prefix instead.
+            #
+            # The badge belongs immediately after the name - it answers which
+            # model to pick, so it has to be read as part of the name rather
+            # than found at the far side of the row - and AdwActionRow has no
+            # slot there. It was Pango markup for a while, which does reach
+            # that spot but cannot be a pill: markup paints its background to
+            # the text's logical extents and has neither padding nor a corner
+            # radius, so it read as clipped no matter how much the run was
+            # padded out. A real widget has both, and the only way to place
+            # one beside the name is to own that part of the row.
+            row = Adw.ActionRow()
+            names = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+            names.set_valign(Gtk.Align.CENTER)
+            names.set_hexpand(True)     # or the suffixes are dragged inward
+            line = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            line.append(Gtk.Label(label=name.replace("ggml-", ""), xalign=0.0))
+            if item["recommended"]:
+                pill = Gtk.Label(label="recommended")
+                pill.add_css_class("model-pill")
+                pill.add_css_class("pill-recommended")
+                pill.set_valign(Gtk.Align.CENTER)
+                line.append(pill)
+            names.append(line)
+            subtitle = Gtk.Label(
+                label=f"{item['size_mb']} MB · {item['wants']}", xalign=0.0)
+            subtitle.add_css_class("dim-label")
+            subtitle.add_css_class("model-subtitle")
+            names.append(subtitle)
+
             check = Gtk.CheckButton()
             if group_leader is None:
                 group_leader = check
@@ -712,6 +716,7 @@ class SettingsWindow(Adw.ApplicationWindow):
                 # so dim on dark theme it looks like the row has none.
                 check.connect("toggled", self._guard_uninstalled)
             row.add_prefix(check)
+            row.add_prefix(names)       # after the radio, before the suffixes
             if item["installed"]:
                 row.set_activatable_widget(check)
 
@@ -860,8 +865,11 @@ class SettingsWindow(Adw.ApplicationWindow):
                 # width of the closed combo, cut every one of them off at
                 # exactly the point where they start to differ. The list is
                 # unreadable and the setting unusable. A factory whose labels
-                # do not ellipsize lets the popup take its natural width.
+                # do not ellipsize lets the popup take its natural width, and
+                # the CSS floor covers the case where the popover declines to
+                # grow past the row it hangs off.
                 row.set_list_factory(_wide_list_factory())
+                row.add_css_class("mic-row")
             if field.help:
                 row.set_subtitle(field.help)
             self._rows[field.key] = row

@@ -228,6 +228,37 @@ elif scenario == "mic_race":
         f"the pending selection was reverted to {after!r} when the device "
         f"list arrived; the choice was taken from the saved baseline rather "
         f"than from the row")
+elif scenario == "badge":
+    # The recommended badge is a real widget beside the name, not markup in
+    # the title. Markup did reach that spot, and could not be a pill there:
+    # it paints its background to the text's logical extents, with neither
+    # padding nor a corner radius, so it read as clipped. Walk the rows and
+    # find it.
+    def walk(widget):
+        yield widget
+        child = widget.get_first_child()
+        while child is not None:
+            yield from walk(child)
+            child = child.get_next_sibling()
+
+    labels = [x for x in walk(w) if isinstance(x, Gtk.Label)]
+    badges = [x for x in labels if x.get_label() == "recommended"]
+    assert badges, "no recommended badge anywhere in the window"
+    badge = badges[0]
+    assert badge.has_css_class("model-pill"), (
+        "the badge is not a pill; it cannot be padded or rounded without one")
+    assert badge.has_css_class("pill-recommended")
+
+    # Beside a name, not off in the suffix box: its nearest label sibling has
+    # to be one of the model names.
+    names = {n.replace("ggml-", "") for n in w._model_checks}
+    sibling = badge.get_prev_sibling()
+    assert isinstance(sibling, Gtk.Label) and sibling.get_label() in names, (
+        f"the badge follows {sibling!r}, not a model name")
+
+    # And no leftover markup in any row title.
+    assert not any("<span" in (x.get_label() or "") for x in labels), (
+        "a title is still carrying Pango markup for the badge")
 print("OK")
 """
 
@@ -377,3 +408,15 @@ def test_a_rebuilt_page_puts_its_values_back():
         assert "_rebuild_speech_page()" in called, (
             f"{caller} replaces rows without going through the rebuild, so "
             f"the values it captured are never put back")
+
+
+def test_the_recommended_badge_is_a_pill_beside_the_name(tmp_path):
+    """It was markup for a while, which cannot be padded or rounded.
+
+    Pango paints a span's background to the logical extents of the text and
+    no further, so the badge sat with its word hard against its own edges
+    however much the run was padded out - it read as clipped. A widget has
+    real padding and a real corner radius; the cost is that the row has to
+    own its title, because AdwActionRow has no slot beside the name.
+    """
+    assert _run(tmp_path, "badge").returncode == 0

@@ -153,16 +153,24 @@ elif scenario == "unsaved_model_choice":
     w.present()
     assert pump(lambda: w.get_visible())
     w._current_model = w.backend.working_model()
-    assert w._current_model == "ggml-large-v3-turbo", w._current_model
     w._rebuild_speech_page()
 
-    w._model_checks["ggml-base.en-q8_0"].set_active(True)
-    assert w._selected_model() == "ggml-base.en-q8_0", "the choice never took"
+    # Whichever of the two the backend settles on, the user picks the other.
+    # Not a fixed name: which one wins is working_model()'s business - the
+    # configured one where it is present, the largest otherwise - and this is
+    # not the test that pins that down. It needs a model that can be chosen
+    # (installed) and that is not already in use (a real choice).
+    installed = ("ggml-large-v3-turbo", "ggml-base.en-q8_0")
+    assert w._current_model in installed, w._current_model
+    other = next(name for name in installed if name != w._current_model)
+
+    w._model_checks[other].set_active(True)
+    assert w._selected_model() == other, "the choice never took"
 
     w.backend.working_model = lambda: "ggml-small.en-q8_0"
     w._watch_the_daemon()
     assert w._current_model == "ggml-small.en-q8_0"
-    assert w._model_checks["ggml-base.en-q8_0"].get_active(), (
+    assert w._model_checks[other].get_active(), (
         "a daemon restart took the model choice away from the user")
 elif scenario == "nothing_to_see":
     # Nobody is looking, so nothing is read and nothing is rebuilt.
@@ -186,11 +194,19 @@ elif scenario == "prewarm_rereads":
     # The .env is written after this window was built, which is the ordinary
     # case for one built at login: the daemon downloads a model or writes a
     # setting hours before anyone opens this.
+    #
+    # Where the .env lives is not WHISPER_FLOW_CONFIG_DIR's business - that
+    # names the config_dir field, while the file is found under the real
+    # LOCALAPPDATA or ~/.config - so the lookup is pointed at the temporary
+    # one here. What is under test is that showing the window re-reads
+    # whatever that lookup answers, not the answer it gave at import.
+    from whisper_flow import config as config_module
     assert w._rows["local_server_port"].get_value() == 8082
     with open(config_dir + "/.env", "w") as fh:
         # Escaped: this source is a string in the test that runs it, so a bare
         # newline here ends that string rather than reaching the child.
         fh.write("WHISPER_FLOW_LOCAL_SERVER_PORT=8099\\n")
+    config_module._resolve_env_file = lambda: config_dir + "/.env"
     w.show_for_click()
     assert pump(lambda: w._rows["local_server_port"].get_value() == 8099), (
         f"the window showed the config as it was when it was built "

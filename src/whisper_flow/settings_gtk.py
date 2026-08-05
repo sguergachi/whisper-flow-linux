@@ -712,14 +712,25 @@ class SettingsWindow(Adw.ApplicationWindow):
                 # Stay visible but refuse the choice: an insensitive radio is
                 # so dim on dark theme it looks like the row has none.
                 check.connect("toggled", self._guard_uninstalled)
-            # One prefix holding both, in the order they are to appear.
+            # One box, laid out by us, holding everything in the order it is
+            # to appear: name and badge, then the pills, then the radio hard
+            # against the right-hand edge.
             #
-            # The name is the only prefix. The radio goes at the far right,
-            # last of the suffixes - see below - so the column of radios sits
-            # against the edge of the card rather than in the middle of the
-            # row, and nothing about where it lands depends on how long a
-            # model's name happens to be.
-            row.add_prefix(names)
+            # Not add_prefix and add_suffix. Both of them prepend, which has
+            # now put the radio on the wrong side twice - once to the left of
+            # the name it belongs to, and once between the name and the pills
+            # - and the prefix area is sized to its contents, so a radio in
+            # there lands wherever that row's name pushes it. Owning the
+            # layout is the only way the order and the offsets are ours to
+            # state rather than to discover.
+            content = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL,
+                              spacing=12)
+            # Both, and for different reasons: the box has to claim the width
+            # of the row, and inside it the names have to take the slack so
+            # everything after them is pushed to the right-hand edge.
+            content.set_hexpand(True)
+            names.set_hexpand(True)
+            content.append(names)
             if item["installed"]:
                 row.set_activatable_widget(check)
 
@@ -756,13 +767,12 @@ class SettingsWindow(Adw.ApplicationWindow):
                 bar.set_visible(False)
                 self._progress_bars[name] = bar
                 suffix.append(bar)
-            # Last, so it is the right-most thing in the row. Appended to the
-            # same box as the pills rather than added as its own suffix,
-            # because add_suffix prepends the way add_prefix does and the
-            # radio would have come out on the wrong side of them.
+            # The pills, then the radio last of all, into the box we laid
+            # out above. Nothing goes through add_prefix or add_suffix.
             check.set_valign(Gtk.Align.CENTER)
-            suffix.append(check)
-            row.add_suffix(suffix)
+            content.append(suffix)
+            content.append(check)
+            row.add_prefix(content)
 
             self._model_checks[name] = check
             model_group.add(row)

@@ -229,3 +229,146 @@ def test_the_listener_is_uncovered_even_when_typing_throws(system_win):
             raise RuntimeError("SendInput exploded")
     assert hotkey_win._typing_depth == 0, (
         "a failed injection left the keyboard permanently ignored")
+
+
+# ------------------------------------------------- modifiers we hold ourselves
+@pytest.fixture
+def held_keys(system_win, monkeypatch):
+    """Track what is pressed and released, with nothing physically held."""
+    from whisper_flow import hotkey_win
+
+    monkeypatch.setattr(hotkey_win, "_active_listener", None, raising=False)
+    system_win._injected_down.clear()
+    batches = []
+    monkeypatch.setattr(system_win, "_send",
+                        lambda events: (batches.append(list(events)), True)[1])
+    yield system_win, batches
+    system_win._injected_down.clear()
+
+
+def _events(batches, flags):
+    return [event.union.ki.wVk for batch in batches for event in batch
+            if event.union.ki.wVk in system_win_modifiers() and
+            event.union.ki.dwFlags == flags]
+
+
+def system_win_modifiers():
+    from whisper_flow import system_win
+    return system_win.MODIFIERS
+
+
+def test_a_restored_modifier_is_released_again_at_the_end(held_keys):
+    """The stuck Super key, and why the desktop started minimising itself.
+
+    Typing releases the push-to-talk modifiers, then presses back the ones
+    the user is still holding. If they let go mid-injection their own key-up
+    lands on a key already released, and our press has no release coming -
+    so Windows believes Super is down and the next Shift is Win+Shift.
+    """
+    system_win, batches = held_keys
+    system_win.restore_modifiers((system_win.VK_LWIN, system_win.VK_MENU))
+    assert system_win._injected_down == {system_win.VK_LWIN,
+                                         system_win.VK_MENU}
+    assert _events(batches, 0) == [system_win.VK_LWIN, system_win.VK_MENU]
+
+    batches.clear()
+    released = system_win.release_injected_modifiers()
+
+    assert set(released) == {system_win.VK_LWIN, system_win.VK_MENU}
+    assert set(_events(batches, system_win.KEYEVENTF_KEYUP)) == {
+        system_win.VK_LWIN, system_win.VK_MENU}, (
+        "a key we pressed was never released; it stays down system-wide")
+    assert system_win._injected_down == set()
+
+
+def test_releasing_twice_sends_nothing_the_second_time(held_keys):
+    system_win, batches = held_keys
+    system_win.restore_modifiers((system_win.VK_CONTROL,))
+    system_win.release_injected_modifiers()
+    batches.clear()
+    assert system_win.release_injected_modifiers() == ()
+    assert batches == []
+
+
+def test_nothing_held_leaves_nothing_to_release(held_keys):
+    system_win, batches = held_keys
+    system_win.restore_modifiers(())
+    assert system_win._injected_down == set()
+    assert system_win.release_injected_modifiers() == ()
+
+
+def test_only_the_hotkeys_own_modifiers_are_pressed_back(system_win, monkeypatch):
+    """A Shift the user happens to be holding is not ours to re-press.
+
+    The snapshot covers every modifier that was down. Pressing all of them
+    back makes this app responsible for releasing keys it had no business
+    touching, and each one is another key that can be left stuck.
+    """
+    from whisper_flow import hotkey_win
+
+    system_win._injected_down.clear()
+    batches = []
+    monkeypatch.setattr(system_win, "_send",
+                        lambda events: (batches.append(list(events)), True)[1])
+
+    class Listener:
+        @staticmethod
+        def triggered_keys():
+            # super+alt, as configured on the machine that reported this
+            return frozenset({hotkey_win.NAME_TO_VK["super"],
+                              hotkey_win.NAME_TO_VK["alt"]})
+
+    monkeypatch.setattr(hotkey_win, "_active_listener", Listener,
+                        raising=False)
+    try:
+        system_win.restore_modifiers(
+            (system_win.VK_LWIN, system_win.VK_MENU, system_win.VK_SHIFT))
+        assert system_win._injected_down == {system_win.VK_LWIN,
+                                             system_win.VK_MENU}
+        assert system_win.VK_SHIFT not in _events(batches, 0)
+    finally:
+        system_win._injected_down.clear()
+
+
+def test_the_right_windows_key_counts_as_super(system_win, monkeypatch):
+    """The binding names 0x5B; the key the user held may be 0x5C."""
+    from whisper_flow import hotkey_win
+
+    system_win._injected_down.clear()
+    monkeypatch.setattr(system_win, "_send", lambda events: True)
+
+    class Listener:
+        @staticmethod
+        def triggered_keys():
+            return frozenset({hotkey_win.NAME_TO_VK["super"]})
+
+    monkeypatch.setattr(hotkey_win, "_active_listener", Listener,
+                        raising=False)
+    try:
+        system_win.restore_modifiers((system_win.VK_RWIN,))
+        assert system_win._injected_down == {system_win.VK_RWIN}, (
+            "the right-hand Windows key was not recognised as the one the "
+            "hotkey names, so the recording would end at the first word")
+    finally:
+        system_win._injected_down.clear()
+
+
+def test_nothing_is_restored_while_no_hotkey_is_held(system_win, monkeypatch):
+    """Pasting outside a push-to-talk holds nothing down on anyone's behalf."""
+    from whisper_flow import hotkey_win
+
+    system_win._injected_down.clear()
+    monkeypatch.setattr(system_win, "_send", lambda events: True)
+
+    class Listener:
+        @staticmethod
+        def triggered_keys():
+            return frozenset()
+
+    monkeypatch.setattr(hotkey_win, "_active_listener", Listener,
+                        raising=False)
+    try:
+        system_win.restore_modifiers((system_win.VK_CONTROL,))
+        assert system_win._injected_down == set()
+    finally:
+        system_win._injected_down.clear()

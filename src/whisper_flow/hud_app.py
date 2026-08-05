@@ -73,6 +73,9 @@ if IS_WINDOWS:
     _win_blur = _load_sibling("blur_win")
 else:
     enable_blur = _load_sibling("wayland_blur").enable_blur
+# The processing sweep's arithmetic. Out here so it can be tested without a
+# desktop; see hud_anim.
+_anim = _load_sibling("hud_anim")
 _mark("imports done")
 
 # The pill was drawn at 268x54, and every measurement below is in terms of
@@ -105,6 +108,23 @@ BAR_MAX = 15.0 * SIZE_SCALE
 BAR_OUTLINE = 0.9 * SIZE_SCALE   # dark ring hugging each bar
 BAR_SHADOW_DX = 0.9 * SIZE_SCALE  # cast shadow offset, down and to the right
 BAR_SHADOW_DY = 1.4 * SIZE_SCALE
+
+# The processing state: after the key is let go and while the transcript is
+# still being worked out. The pill stays up rather than vanishing into a gap
+# where nothing says whether anything is happening.
+#
+# Blue, not the recording red, because the two states must not be mistaken
+# for each other at a glance - the point of keeping the pill on screen is
+# lost if it still looks like it is listening.
+#
+# The marker the daemon drops beside the level file. It is how an overlay
+# with no command pipe - every non-Windows one, which is spawned per
+# recording - learns the recording has ended and the waiting has begun.
+PROCESSING_SUFFIX = ".processing"
+PROCESS_RGB = (0.45, 0.72, 1.0)
+PROCESS_RING_R = 1.55       # spinner radius, in dot radii
+PROCESS_TINT = 0.75         # how far the bars move towards PROCESS_RGB
+# The timings live in hud_anim, which is where they can be tested.
 
 STROKE_W = 1.0              # outline width in surface-local units
 STROKE_RGB = (0.42, 0.43, 0.47)
@@ -401,6 +421,11 @@ class HudWindow(Gtk.Window):
         self.level_pos = 0
         self.start = time.monotonic()
         self._blur = None
+        # Recording is over, the transcript is not back yet. The pill stays
+        # up and says so, instead of disappearing into a silence the user
+        # cannot tell from a failure.
+        self.processing = False
+        self._processing_t0 = 0.0
 
         area = Gtk.DrawingArea()
         area.set_content_width(WIDTH)
@@ -723,9 +748,23 @@ class HudWindow(Gtk.Window):
         os._exit(0)
 
     # ------------------------------------------------------- resident mode
+    def begin_processing(self):
+        """Recording is over; keep the pill up while the words are worked out.
+
+        Deliberately not a fresh fade-in: the pill is already on screen and
+        stays there, changing what it says rather than blinking to say it.
+        """
+        if self.processing or self._quitting:
+            return False
+        self.processing = True
+        self._processing_t0 = time.monotonic()
+        print(f"[HUD] processing {time.time():.6f}", flush=True)
+        return False
+
     def begin_show(self, level_file: str):
         """Show for a new recording. No process start, no window creation."""
         self.level_file = level_file
+        self.processing = False
         self.level_pos = 0
         self.peak = PEAK_FLOOR
         self.targets = deque([0.0] * BARS, maxlen=BARS)
@@ -846,12 +885,19 @@ class HudWindow(Gtk.Window):
             if t >= 1.0:
                 self._after_fade_out()
         self.hover += ((1.0 if self.want_hover else 0.0) - self.hover) * 0.25
-        with self._levels_lock:
-            targets = list(self.targets)
+        if self.processing:
+            targets = self._processing_levels(now)
+        else:
+            with self._levels_lock:
+                targets = list(self.targets)
         for i, target in enumerate(targets):
             self.shown[i] += (target - self.shown[i]) * LEVEL_EASE
         self.area.queue_draw()
         return True
+
+    def _processing_levels(self, now):
+        """Bar heights for the processing sweep. See hud_anim.sweep."""
+        return _anim.sweep(now - self._processing_t0, BARS)
 
     def _levels_loop(self):
         """Follow the level file on its own thread, off the render path.
@@ -878,6 +924,15 @@ class HudWindow(Gtk.Window):
                 self.level_file = ""
                 GLib.idle_add(self.quit)
                 continue
+            # An overlay spawned per recording has no pipe to be told
+            # anything on - that is Windows-only - so the daemon leaves a
+            # marker beside the level file and this notices it. One poll of
+            # latency, against a processing step measured in seconds.
+            if not self.processing and os.path.exists(path + PROCESSING_SUFFIX):
+                GLib.idle_add(self.begin_processing)
+                continue
+            if self.processing:
+                continue        # no more levels are coming; do not read
             try:
                 with open(path, "rb") as handle:
                     handle.seek(0, 2)
@@ -993,6 +1048,29 @@ class HudWindow(Gtk.Window):
         self._chrome_size = size
         return surface
 
+    def _draw_spinner(self, cr, mid, a):
+        """A turning arc where the recording dot was.
+
+        Same place, same size envelope, so the pill does not appear to
+        rearrange itself when the recording stops - only the thing in that
+        spot changes what it is doing.
+        """
+        t = time.monotonic() - self._processing_t0
+        radius = DOT_R * PROCESS_RING_R
+        cr.set_line_cap(cairo.LINE_CAP_ROUND)
+        cr.set_line_width(1.8 * SIZE_SCALE)
+
+        cr.new_path()
+        cr.set_source_rgba(*PROCESS_RGB, 0.22 * a)
+        cr.arc(DOT_X, mid, radius, 0, 2 * math.pi)
+        cr.stroke()
+
+        head = _anim.spinner_angle(t)
+        cr.new_path()
+        cr.set_source_rgba(*PROCESS_RGB, 0.95 * a)
+        cr.arc(DOT_X, mid, radius, head, head + _anim.ARC)
+        cr.stroke()
+
     def _draw(self, area, cr, w, h):
         if not getattr(self, "_drew", False):
             self._drew = True
@@ -1034,15 +1112,18 @@ class HudWindow(Gtk.Window):
         else:
             self._paint_chrome(cr, w, h, a)
 
-        elapsed = time.monotonic() - self.start
-        breathe = 0.62 + 0.38 * (0.5 + 0.5 * math.sin(elapsed * 3.0))
+        if self.processing:
+            self._draw_spinner(cr, mid, a)
+        else:
+            elapsed = time.monotonic() - self.start
+            breathe = 0.62 + 0.38 * (0.5 + 0.5 * math.sin(elapsed * 3.0))
 
-        cr.set_source_rgba(1.0, 0.25, 0.28, 0.16 * breathe * a)
-        cr.arc(DOT_X, mid, DOT_R * 2.4, 0, 2 * math.pi)
-        cr.fill()
-        cr.set_source_rgba(1.0, 0.27, 0.30, breathe * a)
-        cr.arc(DOT_X, mid, DOT_R, 0, 2 * math.pi)
-        cr.fill()
+            cr.set_source_rgba(1.0, 0.25, 0.28, 0.16 * breathe * a)
+            cr.arc(DOT_X, mid, DOT_R * 2.4, 0, 2 * math.pi)
+            cr.fill()
+            cr.set_source_rgba(1.0, 0.27, 0.30, breathe * a)
+            cr.arc(DOT_X, mid, DOT_R, 0, 2 * math.pi)
+            cr.fill()
 
         # Bars as round-capped strokes rather than filled rounded rects.
         # A capsule BAR_W wide is exactly a line of width BAR_W with round
@@ -1076,9 +1157,18 @@ class HudWindow(Gtk.Window):
         cr.stroke()
 
         # The bars themselves carry a per-bar alpha, so these stay separate.
+        # Processing tints them towards the spinner's blue: the sweep alone
+        # reads as a quiet moment in the recording rather than as a different
+        # state, and the colour is what makes it unmistakable.
+        if self.processing:
+            red, green, blue = (
+                1.0 + (channel - 1.0) * PROCESS_TINT for channel in PROCESS_RGB)
+        else:
+            red = green = blue = 1.0
         cr.set_line_width(BAR_W)
         for x, reach, level in ends:
-            cr.set_source_rgba(1, 1, 1, (0.34 + 0.66 * level) * dim * a)
+            cr.set_source_rgba(red, green, blue,
+                               (0.34 + 0.66 * level) * dim * a)
             cr.move_to(x, mid - reach)
             cr.line_to(x, mid + reach)
             cr.stroke()
@@ -1105,6 +1195,8 @@ def _command_loop(win: "HudWindow"):
             if command.startswith("show"):
                 _, _, path = command.partition(" ")
                 GLib.idle_add(win.begin_show, path.strip())
+            elif command == "processing":
+                GLib.idle_add(win.begin_processing)
             elif command == "hide":
                 GLib.idle_add(win.begin_hide)
             elif command == "quit":

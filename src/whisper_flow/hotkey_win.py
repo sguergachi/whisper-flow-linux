@@ -107,6 +107,28 @@ def _suppressed() -> bool:
 VK_RWIN = 0x5C
 VK_ALIASES = {VK_RWIN: NAME_TO_VK["super"]}
 
+# The listener currently running, so the typing path can ask what the user is
+# actually holding. Typing has to put those keys back down after releasing
+# them, and only those: re-pressing a key the user is not holding leaves it
+# down for every application on the desktop, with no release ever to come.
+_active_listener = None
+
+
+def held_combination():
+    """VKs of the push-to-talk being held right now.
+
+    None - not an empty set - when there is no listener to ask. The two mean
+    different things to the caller: "nothing is held, restore nothing" versus
+    "nobody knows, so do what you would have done anyway".
+    """
+    listener = _active_listener
+    if listener is None:
+        return None
+    try:
+        return listener.triggered_keys()
+    except Exception:
+        return None
+
 
 class WinHotkeyListener:
     """Watches for hotkey combinations by sampling keyboard state."""
@@ -144,7 +166,18 @@ class WinHotkeyListener:
     def is_alive(self):
         return bool(self._running and self._thread and self._thread.is_alive())
 
+    def triggered_keys(self) -> frozenset:
+        """Every key of every binding currently firing."""
+        keys = set()
+        for name in self._press_triggered:
+            binding = self._bindings.get(name)
+            if binding:
+                keys |= set(binding[0])
+        return frozenset(keys)
+
     def start(self):
+        global _active_listener
+        _active_listener = self
         self._running = True
         self._dispatch_thread = threading.Thread(
             target=self._dispatch_loop, daemon=True,
@@ -259,6 +292,9 @@ class WinHotkeyListener:
                     self._callbacks.put((name, "release", cb_release))
 
     def stop(self):
+        global _active_listener
+        if _active_listener is self:
+            _active_listener = None
         self._running = False
         if self._thread:
             self._thread.join(timeout=2)

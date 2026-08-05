@@ -159,6 +159,26 @@ class SystemManager:
             return
         self._saved_window = self._get_active_window()
 
+    def release_stuck_modifiers(self) -> None:
+        """Let go of any modifier this app is holding down.
+
+        Typing releases the push-to-talk modifiers so dictated text is not
+        read as shortcuts, then presses back the ones the user is still
+        holding. If the user let go during that injection their own key-up
+        landed on an already-released key, and the press that followed has
+        no release coming - so Windows believes, say, Super is down, and the
+        next Shift is Win+Shift.
+
+        Called when a dictation ends, which is the last moment any of it can
+        still be wanted.
+        """
+        if not IS_WINDOWS:
+            return
+        try:
+            system_win.release_injected_modifiers()
+        except Exception as e:
+            log(f"[PASTE] could not release the modifiers we were holding: {e}")
+
     def _restore_saved_focus(self) -> None:
         """Bring the window the user dictated into back to the front.
 

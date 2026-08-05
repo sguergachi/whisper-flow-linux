@@ -528,6 +528,9 @@ class WhisperFlowDaemon:
             log(f"[DAEMON] Processing lock released for mode: {mode}")
             self.is_processing = False
             self.recording_start_time = None
+            # Now there is a transcript, or a failure. Either way the waiting
+            # is over and the overlay has said all it can.
+            self._take_down_overlay()
             try:
                 self.processing_lock.release()
             except RuntimeError:
@@ -639,6 +642,34 @@ class WhisperFlowDaemon:
         log(f"[DAEMON] Recording thread started for mode: {mode}")
         return True
 
+    def _take_down_overlay(self) -> None:
+        """Hide the pill and remove the files it lives off.
+
+        Deleting the level file is also the overlay's own orphan guard: one
+        spawned per recording closes when it goes, so this reaches even an
+        overlay that never got the hide.
+        """
+        try:
+            self.hud.hide()
+        except Exception as e:
+            log(f"[DAEMON] could not hide the overlay: {e}")
+        level_file = getattr(self, "_level_file", None)
+        if not level_file:
+            return
+        self._level_file = None
+        self.hud.clear_processing(level_file)
+        try:
+            os.unlink(level_file)
+        except OSError:
+            pass
+
+    def _release_stuck_modifiers(self) -> None:
+        """Drop any modifier the typing path is still holding down."""
+        try:
+            self.transcribe_app.system_manager.release_stuck_modifiers()
+        except Exception as e:
+            log(f"[DAEMON] could not release held modifiers: {e}")
+
     def _mark_ptl(self, stage: str) -> None:
         """Record a stage of the press-to-listen path, if one is in flight."""
         ptl = getattr(self, "_ptl", None)
@@ -736,6 +767,10 @@ class WhisperFlowDaemon:
         finally:
             log(f"[DAEMON] Recording thread finishing for mode: {mode}")
             self._stop_recording()
+            # Again, after the last of the text has been typed: the closing
+            # tail goes in long after the recording stopped, and it releases
+            # and restores the modifiers exactly as the live words did.
+            self._release_stuck_modifiers()
             self._finish_processing(mode)
 
     def _get_app_for_mode(self, mode: str) -> WhisperFlow:
@@ -780,22 +815,23 @@ class WhisperFlowDaemon:
 
         # Force-reset hotkey state to prevent stuck modifiers
         self.hotkey_manager.force_reset()
+        # And let go of any modifier we are holding down ourselves. The
+        # hotkey manager's reset clears our own bookkeeping; this clears the
+        # keys we told Windows were pressed.
+        self._release_stuck_modifiers()
 
         # Signal the recording thread to stop
         if self.stop_recording_event:
             self.stop_recording_event.set()
 
-        # Hide HUD overlay
-        self.hud.hide()
-
-        # Clean up level file
-        level_file = getattr(self, "_level_file", None)
-        if level_file:
-            try:
-                os.unlink(level_file)
-            except OSError:
-                pass
-            self._level_file = None
+        # The overlay stays up and turns to its processing state. Hiding it
+        # here left a gap - often a long one - between letting go of the key
+        # and the words appearing, with nothing on screen to say whether
+        # anything was happening or whether the dictation had failed. It is
+        # taken down in _finish_processing, when there is something to show
+        # for it. The level file goes with it, for the same reason: the
+        # overlay treats that file disappearing as being orphaned.
+        self.hud.processing(getattr(self, "_level_file", None) or "")
 
         # Reset recording state
         self.is_recording = False

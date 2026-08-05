@@ -10,3 +10,6 @@ wheels/
 .venv
 
 .env
+# Generated at package time from src/whisper_flow/icon.py, so the exe, the
+# shortcuts and the tray cannot come to show three different marks.
+packaging/windows/whisper-flow.ico

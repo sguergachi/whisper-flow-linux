@@ -12,11 +12,13 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFilter
+from PIL import Image
 
 from . import __version__
 from . import backend as backend_module
+from . import icon
 from . import updater
+from .icon import ICON_IDLE, ICON_RECORDING
 from .app import WhisperFlow
 from .backend import LocalBackend
 from .config import Config
@@ -27,14 +29,6 @@ from .paths import pid_file as _pid_file
 
 # Modes driven by holding a hotkey down; they cannot be deferred and replayed.
 PUSH_TO_TALK_MODES = ("transcribe", "command")
-
-ICON_SIZE = 64
-ICON_SUPERSAMPLE = 8  # draw large, downscale: PIL has no antialiased primitives
-ICON_IDLE = (245, 245, 247, 255)
-ICON_RECORDING = (255, 69, 74, 255)
-# Width of the dark halo, in final icon pixels. Odd, as MaxFilter requires.
-HALO_PIXELS = 5
-
 
 def _pystray():
     """Import pystray at the point of use.
@@ -49,59 +43,6 @@ def _pystray():
     return pystray
 
 
-def _render_mic_icon(color: tuple[int, int, int, int]) -> Image.Image:
-    """Draw a microphone glyph antialiased by supersampling.
-
-    Rendered in a 512px space, then reduced to the tray size, because PIL's
-    primitives have hard edges at 64px and the icon looks ragged.
-    """
-    s = ICON_SIZE * ICON_SUPERSAMPLE
-    image = Image.new("RGBA", (s, s), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(image)
-
-    u = s / 64.0  # one unit of the 64px design grid
-    cx = s / 2
-    stroke = round(4.5 * u)
-
-    # Capsule body
-    draw.rounded_rectangle(
-        [cx - 8 * u, 9 * u, cx + 8 * u, 35 * u],
-        radius=8 * u,
-        fill=color,
-    )
-
-    # Cradle: the lower half of a circle, wrapping under the capsule.
-    # PIL angles run clockwise from 3 o'clock, so 0->180 sweeps the bottom.
-    cradle_r = 13 * u
-    cradle_cy = 34 * u
-    draw.arc(
-        [cx - cradle_r, cradle_cy - cradle_r, cx + cradle_r, cradle_cy + cradle_r],
-        start=0,
-        end=180,
-        fill=color,
-        width=stroke,
-    )
-
-    # Stem down from the cradle, then the base
-    draw.line([cx, cradle_cy + cradle_r, cx, 54 * u], fill=color, width=stroke)
-    draw.line([cx - 9 * u, 54 * u, cx + 9 * u, 54 * u], fill=color, width=stroke)
-
-    # Downscale first, then grow the halo. Growing it at the supersampled
-    # size meant a 41-pixel kernel over 512x512 - 609ms of the 615ms this
-    # function took, for a halo that is five pixels wide once it has been
-    # reduced to 64. The same operation at the final size is 0.3ms, and the
-    # supersampling still does its job on the glyph itself, which is the
-    # only part that needed it.
-    image = image.resize((ICON_SIZE, ICON_SIZE), Image.LANCZOS)
-
-    # A dark halo grown from the glyph's own alpha, so a light icon still reads
-    # against a light panel without needing to know the tray's theme.
-    halo_alpha = image.getchannel("A").filter(ImageFilter.MaxFilter(HALO_PIXELS))
-    halo = Image.new("RGBA", (ICON_SIZE, ICON_SIZE), (0, 0, 0, 0))
-    halo.putalpha(halo_alpha.point(lambda v: v * 100 // 255))
-    return Image.alpha_composite(halo, image)
-
-
 _icon_cache: dict[tuple, Image.Image] = {}
 _icon_lock = threading.Lock()
 
@@ -109,7 +50,7 @@ _icon_lock = threading.Lock()
 def _cached_icon(color: tuple[int, int, int, int]) -> Image.Image:
     """The rendered glyph, drawn once per colour.
 
-    _render_mic_icon supersamples to 512px and then runs a 41-pixel
+    icon.tray_icon supersamples to 512px and then runs a 41-pixel
     MaxFilter over it, which measures at ~615ms. It was being run on every
     recording start and every stop, on the thread that starts the recording
     - so a fixed picture of a microphone was delaying the microphone. Both
@@ -118,7 +59,7 @@ def _cached_icon(color: tuple[int, int, int, int]) -> Image.Image:
     with _icon_lock:
         if color not in _icon_cache:
             started = time.perf_counter()
-            _icon_cache[color] = _render_mic_icon(color)
+            _icon_cache[color] = icon.tray_icon(color)
             log(f"[DAEMON] rendered tray icon in "
                 f"{(time.perf_counter() - started) * 1000:.0f}ms")
         return _icon_cache[color]
@@ -391,12 +332,12 @@ class WhisperFlowDaemon:
                 enabled=False,
             ),
             pystray.MenuItem("Settings", self.open_settings),
-            pystray.MenuItem("Test Configuration", self.test_configuration),
+            pystray.MenuItem("Test setup", self.test_configuration),
             pystray.MenuItem("Copy last error", self.copy_last_error),
             pystray.MenuItem("Copy log", self.copy_log),
             pystray.MenuItem("Check for updates", self.check_for_updates,
                              visible=updater.available()),
-            pystray.MenuItem("Reload Daemon", self.reload_daemon),
+            pystray.MenuItem("Reload", self.reload_daemon),
             pystray.MenuItem("Exit", self.stop_daemon),
         )
 

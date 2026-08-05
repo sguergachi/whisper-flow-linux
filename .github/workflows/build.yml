@@ -367,6 +367,7 @@ jobs:
             --packTitle "WhisperFlow" `
             --packAuthors "Sammy Guergachi" `
             --shortcuts "Desktop,StartMenuRoot,Startup" `
+            --icon packaging/windows/whisper-flow.ico `
             --outputDir installer-out
           if ($LASTEXITCODE -ne 0) { throw "vpk pack failed with $LASTEXITCODE" }
 

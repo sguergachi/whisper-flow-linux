@@ -243,7 +243,29 @@ module_files = [
     ("../../src/whisper_flow/hud_anim.py", "."),
 ]
 
+def app_icon() -> str:
+    """Write the .ico, from the same code that draws the tray icon.
+
+    Generated rather than checked in, so the executable, the installer and
+    the tray can never come to show three different marks. It is the tray
+    glyph without the halo: that exists so a light icon reads against a
+    light panel it is composited onto, and an .ico is composited onto
+    nothing.
+    """
+    import importlib.util
+
+    source = os.path.join(os.path.dirname(os.path.abspath(SPEC)),
+                          "..", "..", "src", "whisper_flow", "icon.py")
+    spec = importlib.util.spec_from_file_location("whisper_flow_icon", source)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)         # imports PIL and nothing else
+    return module.write_ico(
+        os.path.join(os.path.dirname(os.path.abspath(SPEC)),
+                     "whisper-flow.ico"))
+
+
 gtk_datas, gtk_binaries = gtk_runtime()
+icon_file = app_icon()
 
 app = Analysis(
     ["../../src/whisper_flow/__main__win__.py"],
@@ -262,7 +284,7 @@ exe = EXE(
     exclude_binaries=True,
     name="whisper-flow",
     console=False,          # tray app; a console window would sit there
-    icon=None,
+    icon=icon_file,
 )
 
 COLLECT(

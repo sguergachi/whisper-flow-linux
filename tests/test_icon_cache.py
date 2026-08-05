@@ -1,6 +1,6 @@
 """The tray icon must not be drawn on the path that starts a recording.
 
-_render_mic_icon supersamples to 512px and runs a 41-pixel MaxFilter over
+icon.tray_icon supersamples to 512px and runs a 41-pixel MaxFilter over
 it: ~615ms measured. It was called on every recording start and every stop,
 ahead of opening the microphone, so a fixed picture of a microphone was
 delaying the microphone by over a second per dictation.
@@ -10,6 +10,7 @@ import time
 from unittest.mock import patch
 
 from whisper_flow import daemon as daemon_module
+from whisper_flow import icon as icon_module
 
 
 def setup_function():
@@ -21,8 +22,8 @@ def teardown_function():
 
 
 def test_each_icon_is_drawn_once_however_often_it_is_asked_for():
-    with patch.object(daemon_module, "_render_mic_icon",
-                      wraps=daemon_module._render_mic_icon) as render:
+    with patch.object(icon_module, "tray_icon",
+                      wraps=icon_module.tray_icon) as render:
         for _ in range(5):
             daemon_module._cached_icon(daemon_module.ICON_IDLE)
             daemon_module._cached_icon(daemon_module.ICON_RECORDING)
@@ -55,7 +56,7 @@ def test_prerendering_fills_the_cache_for_both_states():
 def test_starting_a_recording_does_not_draw_anything(monkeypatch):
     """The specific regression: no render on the hotkey path."""
     daemon_module.prerender_icons()
-    with patch.object(daemon_module, "_render_mic_icon") as render:
+    with patch.object(icon_module, "tray_icon") as render:
         daemon_module._cached_icon(daemon_module.ICON_RECORDING)
         daemon_module._cached_icon(daemon_module.ICON_IDLE)
     render.assert_not_called()
@@ -93,5 +94,53 @@ def test_the_icon_still_has_its_halo():
 
 def test_the_icon_is_the_size_the_tray_expects():
     icon = daemon_module._cached_icon(daemon_module.ICON_IDLE)
-    assert icon.size == (daemon_module.ICON_SIZE, daemon_module.ICON_SIZE)
+    assert icon.size == (icon_module.ICON_SIZE, icon_module.ICON_SIZE)
     assert icon.mode == "RGBA"
+
+
+# ------------------------------------------------------- the app icon
+def test_the_app_icon_is_the_tray_mark(tmp_path):
+    """One drawing, so the exe, the shortcuts and the tray cannot disagree.
+
+    The .ico is generated at package time from this same module rather than
+    checked in, which is the only way they stay the same picture.
+    """
+    from PIL import Image
+
+    from whisper_flow import icon
+
+    path = icon.write_ico(str(tmp_path / "app.ico"))
+    with Image.open(path) as image:
+        assert image.format == "ICO"
+        sizes = {size for size in image.info["sizes"]}
+    assert sizes == {(s, s) for s in icon.ICO_SIZES}
+
+
+def test_every_size_is_drawn_rather_than_resampled(tmp_path):
+    """A 16px frame resampled from 256 loses the stem and the base.
+
+    The glyph is mostly thin strokes, so the smallest size is the one that
+    has to be drawn at its own resolution to survive at all.
+    """
+    from whisper_flow import icon
+
+    small = icon.draw_mic(16, icon.APP_COLOR)
+    assert small.size == (16, 16)
+    # Ink in the bottom third is the stem and the base; a resampled frame
+    # washes them out to nothing.
+    bottom = small.crop((0, 11, 16, 16)).getchannel("A")
+    assert max(bottom.getdata()) > 40, "the stand vanished at 16px"
+
+
+def test_the_tray_icon_still_carries_its_halo(tmp_path):
+    """It is what makes a light glyph readable on a light panel.
+
+    The app icon deliberately drops it - there is no panel behind an .ico -
+    so the two must not have been collapsed into one drawing.
+    """
+    from whisper_flow import icon
+
+    bare = icon.draw_mic(icon.ICON_SIZE, icon.ICON_IDLE)
+    tray = icon.tray_icon(icon.ICON_IDLE)
+    assert sum(tray.getchannel("A").getdata()) > \
+        sum(bare.getchannel("A").getdata()), "no halo around the tray glyph"

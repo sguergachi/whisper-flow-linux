@@ -5,6 +5,7 @@ asked, and never asks twice about the same thing.
 """
 
 import sys
+import time
 from unittest.mock import Mock, patch
 
 import pytest
@@ -257,3 +258,178 @@ def test_the_click_is_stamped_for_the_window_to_measure_from(daemon, monkeypatch
 
     stamped = popen.call_args.kwargs["env"]["WHISPER_FLOW_TOOL_T0"]
     assert float(stamped) > 0
+
+
+# ------------------------------------------------- the window built in advance
+#
+# Measured on Windows, on the shipped build: 3.1s from the click to a window,
+# and 15.5s the first time after a boot, when the GTK runtime is still coming
+# off the disk. Almost none of that is this app's own code and none of it
+# depends on anything the user does, so it happens at login instead and the
+# click gets a window that is already built.
+
+
+class WaitingWindow:
+    """A settings process built ahead of the click, with the pipe to it."""
+
+    def __init__(self):
+        self.stdin = Mock()
+        self.written = []
+        self.stdin.write.side_effect = self.written.append
+        self.stdout = None
+        self.returncode = None
+        self.killed = False
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self, timeout=None):
+        self.returncode = self.returncode or 0
+        return self.returncode
+
+    def kill(self):
+        self.killed = True
+        self.returncode = -9
+
+
+def _waiting(daemon, window=None):
+    window = window or WaitingWindow()
+    daemon._setup_process = window
+    daemon._setup_waiting = True
+    daemon._setup_shown = False
+    return window
+
+
+def test_prewarming_builds_a_window_nobody_has_asked_for_yet(daemon, monkeypatch):
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(sys, "frozen", False, raising=False)
+    with patch("whisper_flow.daemon.subprocess.Popen") as popen:
+        popen.return_value.poll.return_value = None
+        assert daemon._start_tool_window(
+            "--settings", "whisper_flow.settings_gtk", resident=True) is True
+
+    assert popen.call_args.kwargs["env"]["WHISPER_FLOW_SETTINGS_RESIDENT"] == "1"
+    # Without a pipe there is no way to tell it the click has happened.
+    assert popen.call_args.kwargs["stdin"] is not None
+    assert daemon._setup_waiting is True
+    assert daemon._setup_shown is False
+
+
+def test_the_click_shows_the_waiting_window_rather_than_starting_a_process(
+        daemon, monkeypatch):
+    """The whole point: a map, not a process start and a GTK import."""
+    monkeypatch.setattr(sys, "platform", "win32")
+    window = _waiting(daemon)
+    with patch("whisper_flow.daemon.subprocess.Popen") as popen:
+        assert daemon._open_settings_window() is True
+        popen.assert_not_called()
+
+    assert window.written == ["show\n"]
+    assert daemon._setup_waiting is False
+    assert daemon._setup_shown is True
+
+
+def test_a_second_click_raises_the_window_rather_than_doing_nothing(
+        daemon, monkeypatch):
+    """A window buried behind other windows read as a click that missed."""
+    monkeypatch.setattr(sys, "platform", "win32")
+    window = _waiting(daemon)
+    with patch("whisper_flow.daemon.subprocess.Popen") as popen:
+        daemon._open_settings_window()
+        daemon._open_settings_window()
+        popen.assert_not_called()       # and still only ever one process
+    assert window.written == ["show\n", "show\n"]
+
+
+def test_a_window_that_cannot_be_told_is_replaced_by_one_that_can(
+        daemon, monkeypatch):
+    """It died between the poll and the write; the user still gets a window."""
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(sys, "frozen", False, raising=False)
+    window = _waiting(daemon)
+    window.stdin.write.side_effect = OSError("the pipe is closed")
+
+    with patch("whisper_flow.daemon.subprocess.Popen") as popen:
+        popen.return_value.poll.return_value = None
+        assert daemon._open_settings_window() is True
+        popen.assert_called_once()
+    # And the replacement is one that shows itself, not another that waits.
+    assert "WHISPER_FLOW_SETTINGS_RESIDENT" not in popen.call_args.kwargs["env"]
+
+
+def test_a_window_lost_before_anyone_wanted_it_is_not_announced(daemon):
+    """Nobody asked for it, so a notification would explain nothing."""
+    process = Mock(returncode=3221225477)
+    process.stdout = None
+    daemon._setup_shown = False
+    daemon.backend.working_model.return_value = None
+    with patch.object(daemon, "notify") as notify:
+        with patch.object(daemon, "prewarm_settings"):
+            daemon._after_tool_window(process)
+    notify.assert_not_called()
+
+
+def test_a_window_that_dies_after_the_click_is_still_announced(daemon):
+    process = Mock(returncode=3221225477)
+    process.stdout = None
+    daemon._setup_shown = True
+    daemon.backend.working_model.return_value = None
+    with patch.object(daemon, "notify") as notify:
+        with patch.object(daemon, "prewarm_settings"):
+            daemon._after_tool_window(process)
+    assert "could not open" in notify.call_args[0][0]
+
+
+def test_closing_the_window_builds_the_next_one(daemon):
+    """It is a process and it exits, so only the first click would be fast."""
+    process = Mock(returncode=0)
+    process.stdout = None
+    daemon.is_running = True
+    daemon._setup_shown = True
+    daemon.backend.working_model.return_value = None
+    with patch.object(daemon, "prewarm_settings") as prewarm:
+        daemon._after_tool_window(process)
+    prewarm.assert_called_once()
+
+
+def test_a_window_that_cannot_start_is_not_started_again_and_again(daemon):
+    """Otherwise a machine that cannot open it spawns a process a second."""
+    process = Mock(returncode=1)
+    process.stdout = None
+    daemon.is_running = True
+    daemon._setup_shown = False
+    daemon.backend.working_model.return_value = None
+    with patch.object(daemon, "notify"):
+        with patch.object(daemon, "prewarm_settings") as prewarm:
+            daemon._after_tool_window(process)
+    prewarm.assert_not_called()
+
+
+def test_one_that_leaves_at_once_without_being_seen_is_not_replaced(daemon):
+    """A clean exit nobody asked for is the same loop by a quieter route."""
+    process = Mock(returncode=0)
+    process.stdout = None
+    daemon.is_running = True
+    daemon._setup_shown = False
+    daemon._setup_started = time.time()      # started a moment ago
+    daemon.backend.working_model.return_value = None
+    with patch.object(daemon, "prewarm_settings") as prewarm:
+        daemon._after_tool_window(process)
+    prewarm.assert_not_called()
+
+
+def test_the_daemon_takes_the_waiting_window_with_it(daemon):
+    """An invisible process with no tray icon must not outlive the app."""
+    window = _waiting(daemon)
+    daemon.shutdown_settings()
+    window.stdin.close.assert_called_once()
+    assert daemon._setup_process is None
+
+
+def test_a_headless_machine_builds_nothing_in_advance(daemon, monkeypatch):
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.delenv("DISPLAY", raising=False)
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+    with patch.object(daemon, "_start_tool_window") as start:
+        daemon.prewarm_settings()
+    start.assert_not_called()

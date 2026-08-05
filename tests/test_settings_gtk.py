@@ -117,6 +117,28 @@ elif scenario == "cleared":
     mic.set_selected(1)
     w._on_save()
     assert (config_dir + "/.env") and True
+elif scenario == "prewarm_waits":
+    # Built, but nobody has asked for it: it must not appear on its own, and
+    # it must not sit there polling rows nobody can see.
+    assert not w.get_visible(), "a window built in advance showed itself"
+    w._banner.set_revealed(True)
+    assert w._refresh_dirty() is True        # the timer stays alive
+    assert w._banner.get_revealed(), "an unseen window was diffed anyway"
+elif scenario == "prewarm_shows":
+    assert not w.get_visible()
+    w.show_for_click()
+    assert pump(lambda: w.get_visible()), "the window never came up"
+elif scenario == "prewarm_rereads":
+    # The .env is written after this window was built, which is the ordinary
+    # case for one built at login: the daemon downloads a model or writes a
+    # setting hours before anyone opens this.
+    assert w._rows["local_server_port"].get_value() == 8082
+    with open(config_dir + "/.env", "w") as fh:
+        fh.write("WHISPER_FLOW_LOCAL_SERVER_PORT=8099\n")
+    w.show_for_click()
+    assert pump(lambda: w._rows["local_server_port"].get_value() == 8099), (
+        f"the window showed the config as it was when it was built "
+        f"({w._rows['local_server_port'].get_value()}), not as it is now")
 elif scenario == "mic_race":
     # Change the selection before the enumeration lands. That window is
     # exactly as long as PortAudio takes to walk four host APIs, which is
@@ -203,6 +225,29 @@ def test_a_choice_made_before_the_mic_list_arrives_survives_it(tmp_path):
     the enumeration was still running was silently undone.
     """
     result = _run(tmp_path, "mic_race")
+    assert "OK" in result.stdout, result.stderr
+
+
+def test_a_window_built_in_advance_stays_off_screen(tmp_path):
+    """It is built at login, and nobody asked for a window at login."""
+    result = _run(tmp_path, "prewarm_waits")
+    assert "OK" in result.stdout, result.stderr
+
+
+def test_the_click_puts_the_prewarmed_window_up(tmp_path):
+    result = _run(tmp_path, "prewarm_shows")
+    assert "OK" in result.stdout, result.stderr
+
+
+def test_a_prewarmed_window_re_reads_the_config_when_it_is_shown(tmp_path):
+    """Built at login, opened hours later, and the config moved in between.
+
+    Whatever the daemon wrote meanwhile - a downloaded model, a saved
+    setting - has to be on screen when the window appears. Showing what was
+    true at login would show stale settings and then save them back over the
+    real ones.
+    """
+    result = _run(tmp_path, "prewarm_rereads")
     assert "OK" in result.stdout, result.stderr
 
 

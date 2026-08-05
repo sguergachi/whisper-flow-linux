@@ -111,12 +111,29 @@ class HUD:
                 pass
         return env
 
+    @staticmethod
+    def _point_arg(point) -> str:
+        """The point for a show command, or "-" when there is not one."""
+        try:
+            return f"{int(point[0])},{int(point[1])}"
+        except (TypeError, ValueError, IndexError, KeyError):
+            return "-"
+
     def _show_locked(self, level_file, monitor, point):
         # A resident overlay is already running and already built; showing it
         # is a message down a pipe rather than a process start. Everything
         # below - spawning, loading Python, creating a window - is what made
         # the overlay take a visible moment to appear on Windows.
-        if RESIDENT and self._command(f"show {level_file}"):
+        #
+        # The point goes with it, per recording. A resident overlay outlives
+        # every recording and is started before there is one, so its
+        # environment carries no point at all: it picked the first monitor at
+        # startup and stayed there for the rest of the session, wherever the
+        # user was actually typing. Only an overlay spawned per recording can
+        # be told this through the environment, because only it is built per
+        # recording.
+        if RESIDENT and self._command(
+                f"show {self._point_arg(point)} {level_file}"):
             return
         self.hide()
 

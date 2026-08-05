@@ -60,6 +60,18 @@ MIC_KEEP_WARM_SECONDS = 90.0
 # flush against it clips the opening consonant.
 TRIM_PAD_MS = 150
 
+# The HUD's level file is a stream of packed int32s, so it has to be opened as
+# bytes. os.open on Windows defaults to text mode, where the CRT puts a \r in
+# front of every \n it is handed - and one byte of a packed level is 0x0A about
+# once in every 256 frames. That extra byte shifted the whole rest of the file
+# by one, so from roughly eight seconds into a recording the overlay unpacked
+# halves of neighbouring samples as single values: millions instead of
+# hundreds. Its gain is adaptive, so one of those flattened the waveform to
+# nothing until the peak decayed back down - the bars stopping mid-sentence
+# and returning a few seconds later. O_BINARY does not exist off Windows,
+# where there is no translation to turn off.
+LEVEL_O_BINARY = getattr(os, "O_BINARY", 0)
+
 
 # MME device names are cut to MAXPNAMELEN, which is 32 bytes including the
 # terminator - so 31 characters, and no warning that anything was lost.
@@ -142,7 +154,6 @@ class AudioRecorder:
         """
         self.config = config
         self.system_manager = system_manager
-        self.vad = webrtcvad.Vad(config.vad_mode)
 
         # Initialize PyAudio with ALSA warning suppression.
         #
@@ -170,6 +181,25 @@ class AudioRecorder:
                 self.pa = pyaudio.PyAudio()
         except Exception as e:
             log(f"[AUDIO] could not initialise the audio system: {e}")
+
+    def _new_vad(self):
+        """A voice detector that has never heard anything before.
+
+        webrtcvad adapts as it goes: each is_speech call folds the frame into
+        a running estimate of what the room sounds like, and the answer it
+        gives depends on everything it has been handed since it was built. One
+        detector kept on the recorder meant every use inherited every earlier
+        one - the same audio trimmed to 79 frames the first time a process
+        saw it and 54 frames every time after, because by then the estimate
+        had settled somewhere else. So the first dictation after launch kept
+        noticeably more silence than the rest of the session, and a trim ran
+        against whatever the auto-stop detector had made of the last
+        recording.
+
+        Everything that needs a detector makes its own here, so a recording
+        is judged on its own audio and nothing else.
+        """
+        return webrtcvad.Vad(self.config.vad_mode)
 
     def _input_device_index(self):
         """Which input device to open, preferring WASAPI on Windows.
@@ -550,7 +580,7 @@ class AudioRecorder:
             # recording stops, and the capture loop can run one more iteration
             # after that; opening with "ab" would resurrect it as an orphan in
             # /tmp, and the HUD uses its absence to know it has been dropped.
-            fd = os.open(level_file, os.O_WRONLY | os.O_APPEND)
+            fd = os.open(level_file, os.O_WRONLY | os.O_APPEND | LEVEL_O_BINARY)
             try:
                 os.write(fd, struct.pack("<i", rms))
             finally:
@@ -719,6 +749,9 @@ class AudioRecorder:
             stream = self._open_input_stream(chunk)
 
             frames = []
+            # Per recording, not per recorder: this one adapts to the room as
+            # it listens, and the room it adapted to last time is not this one.
+            vad = self._new_vad()
             last_voice_time = time.time()
             stop_flag = {"stop": False}
             recording_started = False
@@ -741,7 +774,7 @@ class AudioRecorder:
                     self._write_level(level_file, buf)
 
                     # Check for voice activity
-                    voiced = self.vad.is_speech(buf, self.config.sample_rate)
+                    voiced = vad.is_speech(buf, self.config.sample_rate)
 
                     if voiced:
                         last_voice_time = time.time()
@@ -789,7 +822,8 @@ class AudioRecorder:
         if not self.config.trim_silence or not frames:
             return frames
         trimmed = trim_silence(
-            frames, self.vad, self.config.sample_rate, self.config.frame_ms)
+            frames, self._new_vad(), self.config.sample_rate,
+            self.config.frame_ms)
         if len(trimmed) * self.config.frame_ms / 1000 < MIN_RECORDING_SECONDS:
             return frames
         if len(trimmed) < len(frames):

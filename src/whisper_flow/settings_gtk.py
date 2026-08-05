@@ -468,6 +468,17 @@ class SettingsWindow(Adw.ApplicationWindow):
                 # so dim on dark theme it looks like the row has none.
                 check.connect("toggled", self._guard_uninstalled)
             row.add_prefix(check)
+            # Beside the name rather than out at the right-hand edge with the
+            # rest. The others say something about the row you have already
+            # found; this one is the answer to "which of these should I pick",
+            # and it can only do that job where the eye is already running -
+            # down the column of names.
+            if item["recommended"]:
+                pill = Gtk.Label(label="recommended")
+                pill.add_css_class("model-pill")
+                pill.add_css_class("pill-recommended")
+                pill.set_valign(Gtk.Align.CENTER)
+                row.add_prefix(pill)
             if item["installed"]:
                 row.set_activatable_widget(check)
 
@@ -486,11 +497,6 @@ class SettingsWindow(Adw.ApplicationWindow):
                     "Runs on the NVIDIA GPU." if item["accelerated"] else
                     "This model needs the GPU engine. On the CPU engine it "
                     "takes tens of seconds per sentence.")
-                suffix.append(pill)
-            if item["recommended"]:
-                pill = Gtk.Label(label="recommended")
-                pill.add_css_class("model-pill")
-                pill.add_css_class("pill-recommended")
                 suffix.append(pill)
             if item["current"]:
                 pill = Gtk.Label(label="in use")

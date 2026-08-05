@@ -179,6 +179,13 @@ FADE_SCALE = 0.1     # shrink by this much at zero opacity, growing to full
 LEVEL_EASE = 0.30    # how fast a bar chases its target height
 PEAK_DECAY = 0.95    # adaptive gain, so quiet speech still reads
 PEAK_FLOOR = 150.0   # below this the gain stops opening up, or idle noise dances
+# The levels are the RMS of 16-bit audio, so nothing above this is a level at
+# all - it is a misread of the file. Skipping those rather than letting them
+# set the gain matters because the gain is sticky: one impossible value used
+# to pin the peak in the millions and flatten the waveform for several seconds
+# while it decayed back. Whatever produced the bad byte, the bars should not
+# stop moving over it.
+LEVEL_CEILING = 32767.0
 LEVEL_GAMMA = 0.65   # loudness is perceptual; linear RMS leaves speech near flat
 # Longer than the daemon's max recording; purely a stuck-overlay backstop.
 MAX_LIFETIME_S = 600
@@ -949,6 +956,8 @@ class HudWindow(Gtk.Window):
             with self._levels_lock:
                 for value in values:
                     value = abs(value)
+                    if value > LEVEL_CEILING:
+                        continue
                     self.peak = max(self.peak * PEAK_DECAY, float(value),
                                     PEAK_FLOOR)
                     self.targets.append(

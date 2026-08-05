@@ -99,7 +99,7 @@ def _recorder(trim=True):
 
 def test_the_recorder_trims_through_its_own_detector():
     recorder = _recorder()
-    recorder.vad = Vad(range(20, 30))
+    recorder._new_vad = lambda: Vad(range(20, 30))
     kept = recorder.trim_frames(_frames(40))
     assert len(kept) == 10 + 2 * (TRIM_PAD_MS // FRAME_MS)
     assert len(kept) < 40
@@ -114,7 +114,48 @@ def test_turning_the_setting_off_keeps_every_frame():
 def test_a_trim_down_to_nothing_is_refused():
     """Below the length we discard as too short, the untrimmed audio is honest."""
     recorder = _recorder()
-    recorder.vad = Vad([0])                  # one 30ms frame of "speech"
+    recorder._new_vad = lambda: Vad([0])     # one 30ms frame of "speech"
     frames = _frames(40)
     assert recorder.trim_frames(frames) is frames
     assert MIN_RECORDING_SECONDS > FRAME_MS / 1000
+
+
+def test_the_same_audio_trims_the_same_way_every_time():
+    """webrtcvad adapts as it listens; a shared one made pass one different.
+
+    The first dictation of a session used to keep noticeably more silence
+    than the rest, because the detector was still settling on its estimate of
+    the room. Real webrtcvad on purpose - a fake one cannot drift, so it
+    cannot catch this.
+    """
+    recorder = _recorder()
+    speech, room = _tone_frames(40), _room_frames(30)
+    frames = room + speech + room
+
+    kept = [len(recorder.trim_frames(list(frames))) for _ in range(4)]
+    assert len(set(kept)) == 1, f"trim drifted across passes: {kept}"
+    assert kept[0] < len(frames), "the guard is worthless if nothing is trimmed"
+
+
+def _tone_frames(count):
+    """Frames a voice detector hears speech in."""
+    import numpy as np
+
+    samples = int(RATE * FRAME_MS / 1000)
+    out = []
+    for index in range(count):
+        t = np.arange(samples) + index * samples
+        wave = (6000 * np.sin(2 * np.pi * 220 * t / RATE)
+                + 2000 * np.sin(2 * np.pi * 700 * t / RATE))
+        out.append(wave.astype(np.int16).tobytes())
+    return out
+
+
+def _room_frames(count):
+    """Frames holding nothing but a quiet room."""
+    import numpy as np
+
+    samples = int(RATE * FRAME_MS / 1000)
+    rng = np.random.default_rng(7)
+    return [rng.normal(0, 20, samples).astype(np.int16).tobytes()
+            for _ in range(count)]

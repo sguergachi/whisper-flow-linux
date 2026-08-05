@@ -63,3 +63,49 @@ def test_stale_warm_timer_cannot_close_the_current_stream():
         second.close.assert_called_once()
     finally:
         _cancel_warm_timer(recorder)
+
+
+# ------------------------------------------------- the HUD's level file
+def _frame_at(rms: int) -> bytes:
+    """A 30ms frame whose RMS is exactly `rms`."""
+    import numpy as np
+
+    return np.full(480, rms, dtype=np.int16).tobytes()
+
+
+def test_every_level_is_four_bytes_wide(tmp_path):
+    """The overlay unpacks the file as int32s and nothing tells it otherwise.
+
+    os.open defaults to text mode on Windows, where the CRT inserts a \r
+    before every \n it is given - and 0x0A is a perfectly ordinary byte of a
+    packed level. One of those shifts every later sample by a byte, and from
+    there the overlay reads halves of neighbouring values as single ones.
+    """
+    import struct
+
+    recorder = _recorder()
+    path = tmp_path / "levels"
+    path.write_bytes(b"")
+
+    # 10, 266 and 2600 each carry an 0x0A; 13 carries the \r itself.
+    written = [300, 10, 266, 2600, 13, 500]
+    for rms in written:
+        recorder._write_level(str(path), _frame_at(rms))
+
+    raw = path.read_bytes()
+    assert len(raw) == 4 * len(written), (
+        f"{len(written)} levels wrote {len(raw)} bytes, not {4 * len(written)}")
+    assert struct.unpack("<%di" % len(written), raw) == tuple(written)
+
+
+def test_a_level_the_overlay_cannot_use_is_never_written(tmp_path):
+    """Nothing above the RMS of full-scale 16-bit audio is a level at all."""
+    import struct
+
+    recorder = _recorder()
+    path = tmp_path / "levels"
+    path.write_bytes(b"")
+    recorder._write_level(str(path), _frame_at(32767))
+
+    (value,) = struct.unpack("<i", path.read_bytes())
+    assert 0 <= value <= 32767

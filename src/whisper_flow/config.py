@@ -314,3 +314,17 @@ class Config(BaseSettings):
         Creating the config directory is all there is to it: every setting
         lives in the environment or the .env file, so nothing is written here.
         """
+
+
+def reload_config() -> Config:
+    """A Config that re-resolves the .env file first.
+
+    `env_file` above is evaluated once, when this module is imported, and
+    _resolve_env_file() answers by looking for a file that exists. A process
+    that starts before the .env does - the settings window, built at login on
+    a machine that has not saved any settings yet - therefore holds a path
+    from a moment when there was nothing there, and would go on reading
+    defaults however many times it re-read the config. Anything re-reading
+    after startup wants this rather than Config().
+    """
+    return Config(_env_file=_resolve_env_file())

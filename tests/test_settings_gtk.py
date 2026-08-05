@@ -117,6 +117,100 @@ elif scenario == "cleared":
     mic.set_selected(1)
     w._on_save()
     assert (config_dir + "/.env") and True
+elif scenario == "daemon_moved_on":
+    # The daemon restarts and comes up on a different model. The page exists
+    # to say which model is in use, so it has to stop saying the old one.
+    w.present()
+    assert pump(lambda: w.get_visible())
+    before = w._current_model
+    w._rows["hotkey_transcribe"].set_text("ctrl+alt+k")   # an unsaved edit
+    w._stack.set_visible_child_name("hotkeys")
+    settings_gtk.restart.daemon_pid = lambda: 4242
+    w.backend.working_model = lambda: "ggml-small.en-q8_0"
+    assert before != "ggml-small.en-q8_0", "nothing would change"
+
+    assert w._watch_the_daemon() is True
+    assert w._current_model == "ggml-small.en-q8_0"
+    assert w._model_checks["ggml-small.en-q8_0"].get_active(), (
+        "the radio stayed on the model the daemon has stopped using")
+    # Without dragging the user off the page they were on, and without
+    # throwing away what they had typed on it.
+    assert w._stack.get_visible_child_name() == "hotkeys"
+    assert w._rows["hotkey_transcribe"].get_text() == "ctrl+alt+k"
+    assert "4242" in w._status_row.get_subtitle()
+elif scenario == "unsaved_model_choice":
+    # Same restart, but this time the user has picked a model and not saved
+    # it. That choice is theirs and outranks what the daemon is doing.
+    #
+    # Two models on disk, because an uninstalled one refuses to be chosen -
+    # the radio snaps straight back off - so there would be no choice to
+    # keep. The larger is what working_model() settles on.
+    import pathlib
+    models = pathlib.Path(config_dir) / "models"
+    models.mkdir(parents=True, exist_ok=True)
+    for name in ("ggml-large-v3-turbo", "ggml-base.en-q8_0"):
+        (models / f"{name}.bin").write_bytes(b"not a model")
+    w.present()
+    assert pump(lambda: w.get_visible())
+    w._current_model = w.backend.working_model()
+    w._rebuild_speech_page()
+
+    # Whichever of the two the backend settles on, the user picks the other.
+    # Not a fixed name: which one wins is working_model()'s business - the
+    # configured one where it is present, the largest otherwise - and this is
+    # not the test that pins that down. It needs a model that can be chosen
+    # (installed) and that is not already in use (a real choice).
+    installed = ("ggml-large-v3-turbo", "ggml-base.en-q8_0")
+    assert w._current_model in installed, w._current_model
+    other = next(name for name in installed if name != w._current_model)
+
+    w._model_checks[other].set_active(True)
+    assert w._selected_model() == other, "the choice never took"
+
+    w.backend.working_model = lambda: "ggml-small.en-q8_0"
+    w._watch_the_daemon()
+    assert w._current_model == "ggml-small.en-q8_0"
+    assert w._model_checks[other].get_active(), (
+        "a daemon restart took the model choice away from the user")
+elif scenario == "nothing_to_see":
+    # Nobody is looking, so nothing is read and nothing is rebuilt.
+    called = []
+    w.backend.working_model = lambda: called.append("read") or "x"
+    assert not w.get_visible()
+    assert w._watch_the_daemon() is True
+    assert called == [], "an unseen window went to the disk anyway"
+elif scenario == "prewarm_waits":
+    # Built, but nobody has asked for it: it must not appear on its own, and
+    # it must not sit there polling rows nobody can see.
+    assert not w.get_visible(), "a window built in advance showed itself"
+    w._banner.set_revealed(True)
+    assert w._refresh_dirty() is True        # the timer stays alive
+    assert w._banner.get_revealed(), "an unseen window was diffed anyway"
+elif scenario == "prewarm_shows":
+    assert not w.get_visible()
+    w.show_for_click()
+    assert pump(lambda: w.get_visible()), "the window never came up"
+elif scenario == "prewarm_rereads":
+    # The .env is written after this window was built, which is the ordinary
+    # case for one built at login: the daemon downloads a model or writes a
+    # setting hours before anyone opens this.
+    #
+    # Where the .env lives is not WHISPER_FLOW_CONFIG_DIR's business - that
+    # names the config_dir field, while the file is found under the real
+    # LOCALAPPDATA or ~/.config - so the lookup is pointed at the temporary
+    # one here. What is under test is that showing the window re-reads
+    # whatever that lookup answers, not the answer it gave at import.
+    from whisper_flow import config as config_module
+    assert w._rows["local_server_port"].get_value() == 8082
+    with open(config_dir + "/.env", "w") as fh:
+        # Escaped: this source is a string in the test that runs it, so a bare
+        # newline here ends that string rather than reaching the child.
+        fh.write("WHISPER_FLOW_LOCAL_SERVER_PORT=8099\\n")
+    config_module._resolve_env_file = lambda: config_dir + "/.env"
+    w.show_for_click()
+    assert pump(lambda: w._rows["local_server_port"].get_value() == 8099), (
+        f"the window showed the config as it was when it was built "
+        f"({w._rows['local_server_port'].get_value()}), not as it is now")
 elif scenario == "mic_race":
     # Change the selection before the enumeration lands. That window is
     # exactly as long as PortAudio takes to walk four host APIs, which is
@@ -203,6 +297,53 @@ def test_a_choice_made_before_the_mic_list_arrives_survives_it(tmp_path):
     the enumeration was still running was silently undone.
     """
     result = _run(tmp_path, "mic_race")
+    assert "OK" in result.stdout, result.stderr
+
+
+def test_the_model_in_use_follows_a_daemon_restart(tmp_path):
+    """The page answered "which model is in use" once, when it was built.
+
+    Saving a different model and pressing Restart left the pill naming the
+    old one against a daemon that had already moved on - the page
+    contradicting the app it describes, on the one question it exists to
+    settle. Now that the window outlives the click that opened it, that
+    window is open across the whole restart and has to keep up.
+    """
+    result = _run(tmp_path, "daemon_moved_on")
+    assert "OK" in result.stdout, result.stderr
+
+
+def test_an_unsaved_model_choice_survives_a_daemon_restart(tmp_path):
+    result = _run(tmp_path, "unsaved_model_choice")
+    assert "OK" in result.stdout, result.stderr
+
+
+def test_an_unseen_window_does_not_watch_the_daemon(tmp_path):
+    """A window built at login waits for hours; it must wait cheaply."""
+    result = _run(tmp_path, "nothing_to_see")
+    assert "OK" in result.stdout, result.stderr
+
+
+def test_a_window_built_in_advance_stays_off_screen(tmp_path):
+    """It is built at login, and nobody asked for a window at login."""
+    result = _run(tmp_path, "prewarm_waits")
+    assert "OK" in result.stdout, result.stderr
+
+
+def test_the_click_puts_the_prewarmed_window_up(tmp_path):
+    result = _run(tmp_path, "prewarm_shows")
+    assert "OK" in result.stdout, result.stderr
+
+
+def test_a_prewarmed_window_re_reads_the_config_when_it_is_shown(tmp_path):
+    """Built at login, opened hours later, and the config moved in between.
+
+    Whatever the daemon wrote meanwhile - a downloaded model, a saved
+    setting - has to be on screen when the window appears. Showing what was
+    true at login would show stale settings and then save them back over the
+    real ones.
+    """
+    result = _run(tmp_path, "prewarm_rereads")
     assert "OK" in result.stdout, result.stderr
 
 

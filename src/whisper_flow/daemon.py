@@ -204,6 +204,12 @@ class WhisperFlowDaemon:
         self._backend_engine = None
         self._pressed_at = None
         self._setup_process = None
+        # Built and standing by, versus on screen because someone asked. The
+        # two need telling apart: a prewarmed window that dies before anyone
+        # wants it is a line in the log, while one that dies after the click
+        # is a user looking at a desktop where a window should be.
+        self._setup_waiting = False
+        self._setup_shown = False
         self._setup_lock = threading.Lock()
         self._last_failure = None
 
@@ -445,6 +451,10 @@ class WhisperFlowDaemon:
             # than starting it on the first recording - which would leave the
             # first dictation of every session as slow as it always was.
             self.hud.prewarm()
+            # The same for the settings window, which costs far more to open
+            # than the overlay does and is opened from a menu nobody expects
+            # to wait three seconds for.
+            self.prewarm_settings()
             # And draw the tray icons now, so the first recording does not
             # spend ~615ms on a picture before opening the microphone.
             threading.Thread(target=prerender_icons, daemon=True,
@@ -884,8 +894,41 @@ class WhisperFlowDaemon:
                 manager._last_notified.pop(message, None)
         manager.notify(message)
 
+    def prewarm_settings(self) -> None:
+        """Build the settings window now, so opening it later is a map.
+
+        Measured on Windows: 3.1s from click to window when it is built on
+        the click, 15.5s the first time after a boot, when the GTK runtime is
+        still coming off the disk. Almost none of that is our own code - it
+        is process start, the GTK and libadwaita DLLs, and the config stack -
+        and none of it depends on anything the user does. So it happens at
+        login, where nobody is waiting, and the click gets the window that is
+        already standing by.
+
+        On a thread, like the overlay's: this starts a process that loads GTK,
+        and the tray icon must not wait for it.
+        """
+        if sys.platform != "win32" and not (
+                os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+            return                      # headless: there is no window to warm
+
+        def work():
+            try:
+                with self._setup_lock:
+                    if self._setup_process and self._setup_process.poll() is None:
+                        return          # one already standing by, or open
+                    if self._start_tool_window(
+                            "--settings", "whisper_flow.settings_gtk",
+                            resident=True):
+                        log("[DAEMON] settings window ready")
+            except Exception as e:
+                log(f"[DAEMON] could not pre-build the settings window: {e}")
+
+        threading.Thread(target=work, daemon=True,
+                         name="whisper-flow-settings-prewarm").start()
+
     def _open_tool_window(self, flag: str, module: str) -> bool:
-        """Launch the settings window as its own process.
+        """Show the settings window, building one first if none is waiting.
 
         It cannot share this process: pystray owns an event loop here and
         GTK demands the main thread of wherever it runs. Returns False where
@@ -895,57 +938,137 @@ class WhisperFlowDaemon:
                 os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
             return False                # headless: fall back to downloading
         with self._setup_lock:
-            if self._setup_process and self._setup_process.poll() is None:
-                return True             # already open; don't stack windows
+            process = self._setup_process
+            if process and process.poll() is None:
+                # A window built ahead of this click and waiting to be shown:
+                # the path that makes the click cost a map rather than a
+                # process start. The same order raises one that is already
+                # open, which is what a second click on Settings is asking
+                # for and what "already open, do nothing" never did - a
+                # window buried behind other windows looked like a click that
+                # had missed.
+                if self._show_prewarmed():
+                    return True
+                # It could not be told, so there is no window coming from it.
+                # Fall through and build one the slow way rather than report a
+                # window that is not going to appear.
 
-            if getattr(sys, "frozen", False):
-                cmd = [sys.executable, flag]
-            else:
-                cmd = [sys.executable, "-m", module]
-            # Hand down what this process already knows. Detecting the
-            # accelerator means running nvidia-smi, which has to load a driver
-            # before it prints a version - most of a second on Windows, and
-            # the settings window asks for it several times while building the
-            # Speech page. The daemon paid that cost at startup; the window
-            # should not pay it again while the user waits at a blank screen.
-            env = dict(os.environ)
-            env[backend_module.ACCELERATOR_ENV] = backend_module.detect_accelerator()
-            # When the click happened, so the window can report what the user
-            # actually waited through - process start included, which is a
-            # real part of it in a frozen build and cannot be seen from
-            # inside the child.
-            env["WHISPER_FLOW_TOOL_T0"] = repr(time.time())
-            # Where the child writes its startup timings. A file rather than
-            # its stdout because a PyInstaller windowed build has sys.stdout
-            # set to None, and print() silently does nothing there - the
-            # first round of these vanished without trace.
-            fd, tool_log = tempfile.mkstemp(suffix=".log", prefix="whisper-flow-tool-")
-            os.close(fd)
-            env["WHISPER_FLOW_TOOL_LOG"] = self._tool_log = tool_log
+            return self._start_tool_window(flag, module, resident=False)
+
+    def shutdown_settings(self) -> None:
+        """Retire the settings window process when the daemon exits.
+
+        Closing stdin is the ordinary path: the child reads end of stream and
+        leaves. It is also the safety net if this is never reached, because
+        the pipe closes when this process dies either way - which is what
+        stops a window built at login from outliving the app it belongs to.
+        """
+        with self._setup_lock:
+            process, self._setup_process = self._setup_process, None
+            self._setup_waiting = False
+            self._setup_shown = False
+        if not process:
+            return
+        try:
+            if process.stdin:
+                process.stdin.close()
+        except Exception:
+            pass
+        try:
+            process.wait(timeout=3)
+        except Exception:
             try:
-                # Captured, not inherited. The frozen build is windowed, so
-                # the child has no console and everything it prints - timings,
-                # tracebacks, the reason a window did not appear - went
-                # nowhere. Piping it here puts it in the log the tray offers,
-                # which is the only route it has to anyone who can read it.
-                process = self._setup_process = subprocess.Popen(
-                    cmd, env=env, stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT, text=True, errors="replace")
-            except Exception as e:
-                log(f"[DAEMON] could not open the setup window: {e}")
-                return False
+                process.kill()
+            except Exception:
+                pass
 
-            # Popen succeeding only means the process started, not that a
-            # window appeared. Without tkinter - which is a separate package
-            # on most Linux distributions - the child exits immediately, and
-            # claiming a window is open would leave the user with no window
-            # and no message either.
-            time.sleep(0.4)
-            if process.poll() not in (None, 0):
-                log(f"[DAEMON] the setup window exited at once "
-                    f"({process.returncode}); falling back")
-                self._setup_process = None
-                return False
+    def _show_prewarmed(self) -> bool:
+        """Tell the waiting window to show itself. False if it cannot be told."""
+        process = self._setup_process
+        try:
+            process.stdin.write("show\n")
+            process.stdin.flush()
+        except (OSError, ValueError, AttributeError) as e:
+            # It died between the poll above and this write, or it was not a
+            # prewarmed one and has no pipe. Either way there is no window
+            # coming, so drop it and let the caller build one.
+            log(f"[DAEMON] the waiting settings window would not come up: {e}")
+            self._setup_process = None
+            self._setup_waiting = False
+            return False
+        self._setup_waiting = False
+        self._setup_shown = True
+        return True
+
+    def _start_tool_window(self, flag: str, module: str,
+                           resident: bool) -> bool:
+        """Start the window process. Caller holds the lock.
+
+        `resident` builds it without showing it: the child waits on its pipe
+        for the click that a prewarmed window exists to be ready for.
+        """
+        if getattr(sys, "frozen", False):
+            cmd = [sys.executable, flag]
+        else:
+            cmd = [sys.executable, "-m", module]
+        # Hand down what this process already knows. Detecting the
+        # accelerator means running nvidia-smi, which has to load a driver
+        # before it prints a version - most of a second on Windows, and
+        # the settings window asks for it several times while building the
+        # Speech page. The daemon paid that cost at startup; the window
+        # should not pay it again while the user waits at a blank screen.
+        env = dict(os.environ)
+        env[backend_module.ACCELERATOR_ENV] = backend_module.detect_accelerator()
+        # When the click happened, so the window can report what the user
+        # actually waited through - process start included, which is a
+        # real part of it in a frozen build and cannot be seen from
+        # inside the child. A prewarmed one measures its build from its own
+        # start, and measures the click separately when the click arrives.
+        env["WHISPER_FLOW_TOOL_T0"] = repr(time.time())
+        if resident:
+            env["WHISPER_FLOW_SETTINGS_RESIDENT"] = "1"
+        else:
+            env.pop("WHISPER_FLOW_SETTINGS_RESIDENT", None)
+        # Where the child writes its startup timings. A file rather than
+        # its stdout because a PyInstaller windowed build has sys.stdout
+        # set to None, and print() silently does nothing there - the
+        # first round of these vanished without trace.
+        fd, tool_log = tempfile.mkstemp(suffix=".log", prefix="whisper-flow-tool-")
+        os.close(fd)
+        env["WHISPER_FLOW_TOOL_LOG"] = self._tool_log = tool_log
+        try:
+            # Captured, not inherited. The frozen build is windowed, so
+            # the child has no console and everything it prints - timings,
+            # tracebacks, the reason a window did not appear - went
+            # nowhere. Piping it here puts it in the log the tray offers,
+            # which is the only route it has to anyone who can read it.
+            #
+            # stdin is a pipe whether or not this one is prewarmed: it is how
+            # a waiting window is told to show itself, and closing it is how
+            # any of them is told the daemon has gone.
+            process = self._setup_process = subprocess.Popen(
+                cmd, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, text=True, errors="replace")
+        except Exception as e:
+            log(f"[DAEMON] could not open the setup window: {e}")
+            self._setup_process = None
+            return False
+        self._setup_waiting = resident
+        self._setup_shown = not resident
+        self._setup_started = time.time()
+
+        # Popen succeeding only means the process started, not that a
+        # window appeared. Without tkinter - which is a separate package
+        # on most Linux distributions - the child exits immediately, and
+        # claiming a window is open would leave the user with no window
+        # and no message either.
+        time.sleep(0.4)
+        if process.poll() not in (None, 0):
+            log(f"[DAEMON] the setup window exited at once "
+                f"({process.returncode}); falling back")
+            self._setup_process = None
+            self._setup_waiting = False
+            return False
 
         threading.Thread(target=self._after_tool_window, args=(process,),
                          daemon=True, name="whisper-flow-window-watch").start()
@@ -975,19 +1098,24 @@ class WhisperFlowDaemon:
             except Exception:
                 pass
 
-    def _tail_tool_log(self, process, timeout: float = 30.0) -> None:
+    def _tail_tool_log(self, process, timeout: float | None = 30.0) -> None:
         """Report the child's startup timings while it is still open.
 
         Its own thread because the drain below blocks until the child exits,
         and the timings are wanted long before that - the window being slow
         to open is the whole thing they exist to explain, and a report that
         waits for it to be closed again answers too late to be read.
+
+        No timeout means until the child exits, which is what a window built
+        at login needs: the line worth reading is written when the click
+        finally comes, hours after any fixed deadline would have given up.
         """
         path = getattr(self, "_tool_log", None)
         if not path:
             return
-        seen, deadline = 0, time.time() + timeout
-        while time.time() < deadline:
+        seen, started = 0, time.time()
+        deadline = None if timeout is None else started + timeout
+        while deadline is None or time.time() < deadline:
             try:
                 with open(path, encoding="utf-8", errors="replace") as fh:
                     lines = fh.read().splitlines()
@@ -999,13 +1127,20 @@ class WhisperFlowDaemon:
             seen = len(lines)
             if process.poll() is not None:
                 return
-            time.sleep(0.5)
+            # Half a second while the window is starting, where the timings
+            # are being written and are worth having promptly; slower once it
+            # has gone quiet, because a window built at login is watched for
+            # hours and a twice-a-second wakeup for that long is a cost of
+            # its own. The line it writes when the click finally comes is a
+            # log line, and five seconds late is soon enough for one.
+            time.sleep(0.5 if time.time() - started < 30 else 5.0)
 
     def _after_tool_window(self, process=None) -> None:
         """Adopt whatever the settings window installed, once it closes."""
         process = process or self._setup_process
         threading.Thread(target=self._tail_tool_log, args=(process,),
-                         daemon=True, name="whisper-flow-tool-log").start()
+                         kwargs={"timeout": None}, daemon=True,
+                         name="whisper-flow-tool-log").start()
         # Before wait(), and on this thread: a full pipe blocks the child, so
         # nothing may wait on a process it has not drained first.
         self._drain_tool_output(process)
@@ -1021,6 +1156,13 @@ class WhisperFlowDaemon:
                 except OSError:
                     pass
 
+        with self._setup_lock:
+            if self._setup_process is process:
+                self._setup_process = None
+            shown, self._setup_shown = self._setup_shown, False
+            self._setup_waiting = False
+            lived = time.time() - getattr(self, "_setup_started", 0.0)
+
         # A window that dies after the 0.4s check above is invisible: the
         # user clicks Settings, nothing opens, and the log holds only the
         # click. That is exactly how a GTK runtime crashing on a missing
@@ -1033,7 +1175,24 @@ class WhisperFlowDaemon:
             log(f"[DAEMON] the tool window exited with {code} "
                 f"(0x{code & 0xFFFFFFFF:08X}) without being closed; "
                 f"no window was shown")
-            self.notify("That window could not open - see the log")
+            # Only to someone who asked for a window. One built at login and
+            # lost before anyone wanted it is worth a log line and nothing
+            # more: a notification about a window the user never asked for
+            # explains nothing and interrupts whatever they were doing.
+            if shown:
+                self.notify("That window could not open - see the log")
+
+        # Have the next one ready. The window just closed is gone for good -
+        # it is a process, and it exits - so without this only the first
+        # click of a session gets a window that was waiting for it.
+        #
+        # Not after one that failed, and not after one that was never shown
+        # and did not last: both are how a machine that cannot open this
+        # window at all would look, and replacing it each time would turn
+        # that into a process started every second for as long as the daemon
+        # runs. A window someone actually used is a window that works.
+        if self.is_running and code == 0 and (shown or lived > 60):
+            self.prewarm_settings()
 
         # working_model() reads the disk rather than the config file, so
         # whatever the window downloaded or saved is picked up here and now.
@@ -1581,6 +1740,14 @@ Use 'whisper-flow stop' to exit daemon
             self.hud.shutdown()
         except Exception as e:
             log(f"[DAEMON] Error stopping the overlay: {e}")
+
+        # And the settings window, for the same reason: one built at login
+        # and never asked for is an invisible process, and leaving it behind
+        # would strand it with no tray icon and no window to close.
+        try:
+            self.shutdown_settings()
+        except Exception as e:
+            log(f"[DAEMON] Error stopping the settings window: {e}")
 
         # Stop the managed speech server
         try:

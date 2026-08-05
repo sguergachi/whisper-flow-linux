@@ -33,7 +33,7 @@ from pathlib import Path
 _T0 = float(os.environ.get("WHISPER_FLOW_TOOL_T0") or 0.0) or time.time()
 
 
-def _mark(label: str) -> None:
+def _mark(label: str, since: float | None = None) -> None:
     """Report a stage of opening this window, in ms since the click.
 
     To a file, not to stdout. A PyInstaller windowed build leaves sys.stdout
@@ -41,8 +41,14 @@ def _mark(label: str) -> None:
     these went nowhere at all and the log came back with no sign the window
     had ever been opened. The daemon names the file and reads it back into
     the log the tray menu shows.
+
+    `since` is for a window that was built before anyone asked for it: the
+    stages of that build are measured from the process start as usual, but
+    the number that matters afterwards is measured from the click, which
+    happens minutes or hours later.
     """
-    line = f"[SETTINGS] +{(time.time() - _T0) * 1000:6.0f}ms {label}"
+    elapsed = (time.time() - (_T0 if since is None else since)) * 1000
+    line = f"[SETTINGS] +{elapsed:6.0f}ms {label}"
     path = os.environ.get("WHISPER_FLOW_TOOL_LOG")
     if path:
         try:
@@ -93,7 +99,7 @@ _mark("gtk imported")
 
 from . import envfile, restart, settings_def, wayland_blur  # noqa: E402
 from .backend import LocalBackend  # noqa: E402
-from .config import Config  # noqa: E402
+from .config import Config, reload_config  # noqa: E402
 from .logging import log, set_logging_enabled  # noqa: E402
 
 _mark("imports done")
@@ -358,14 +364,20 @@ _SPIN = {
 class SettingsWindow(Adw.ApplicationWindow):
     """The preferences window itself."""
 
-    def __init__(self, application=None):
+    def __init__(self, application=None, config=None):
         super().__init__(title="WhisperFlow settings")
         if application is not None:
             # Registered, or closing the window leaves the process running.
             self.set_application(application)
-        self.config = Config()
+        # Handed the one main() already built where there is one. Constructing
+        # a second Config re-reads and re-validates the whole schema for an
+        # answer this process is holding, and it happens on the path the user
+        # is waiting on.
+        self.config = config if config is not None else Config()
         self.backend = LocalBackend(self.config)
         self._current_model = self.backend.working_model()
+        self._daemon_pid = restart.daemon_pid()
+        self._show_t0 = _T0
         _mark("config and backend read")
         self._working = False
         self._rows: dict[str, Gtk.Widget] = {}
@@ -402,6 +414,7 @@ class SettingsWindow(Adw.ApplicationWindow):
         self._refresh_dirty()
         self._load_mics_in_background()
         GLib.timeout_add(400, self._refresh_dirty)
+        GLib.timeout_add(2000, self._watch_the_daemon)
         if sys.platform == "win32":
             # Undecorated, and before realize. GTK's client-side decoration
             # carries a shadow the surface is sized to include; DWM knows
@@ -417,6 +430,95 @@ class SettingsWindow(Adw.ApplicationWindow):
                 Gdk.Display.get_default(), provider,
                 Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 2)
         self.connect("realize", self._on_realize)
+
+    # ------------------------------------------------------ shown on request
+    def show_for_click(self, at: float | None = None) -> bool:
+        """Put a window that was built in advance on screen.
+
+        The whole point of building it in advance is that this costs a map
+        and nothing else, so what happens here has to stay small. The reload
+        is the exception, and it is not optional: this window may have been
+        built at login and asked for hours later, by which time the daemon
+        could have downloaded a model, installed the GPU engine, or written
+        the .env itself. Showing what was true at login would be showing the
+        user stale settings and then saving them back.
+
+        Only on the way up from hidden, though. Clicking Settings while this
+        window is already open is someone asking for it to be raised, and
+        re-reading the config there would throw away edits they have made and
+        not yet saved. Skipped while a download is running too, because that
+        owns these rows and holds progress bars this would drop mid-flight.
+        """
+        self._show_t0 = at or time.time()
+        if not self.get_visible() and not self._working:
+            self._reload_from_disk()
+        self.present()
+        return False                    # idle_add: run once
+
+    def _watch_the_daemon(self) -> bool:
+        """Follow what the daemon does while this window is open.
+
+        The Speech page answers "which model is being used", and it answered
+        it once, when the page was built. Saving a different model and
+        pressing Restart therefore left the pill reading the old one against
+        a daemon that had already moved on - the page contradicting the app
+        it describes, on the one question it exists to settle. The same goes
+        for the daemon's own status row and the pid in it.
+
+        Two seconds rather than the dirty poll's 400ms, and only while the
+        window is on screen: this reads the .env and the models directory,
+        which is cheap but not free, and nothing here changes faster than a
+        person can restart a daemon.
+        """
+        if not self.get_visible():
+            return True
+        try:
+            model = self.backend.working_model()
+            pid = restart.daemon_pid()
+        except Exception as e:
+            log(f"[SETTINGS] could not check on the daemon: {e}")
+            return True
+
+        if model != self._current_model:
+            # What the radio says now, before the rebuild rewrites it from
+            # _current_model. An unsaved choice is the user's, and a daemon
+            # restarting underneath is no reason to throw it away.
+            chosen = self._selected_model()
+            picked = chosen if chosen != self._current_model else None
+            self._current_model = model
+            self._rebuild_speech_page(focus=False)
+            if picked and picked in self._model_checks:
+                self._model_checks[picked].set_active(True)
+
+        if pid != self._daemon_pid:
+            self._daemon_pid = pid
+            self._apply_daemon_status()
+        return True
+
+    def _reload_from_disk(self) -> None:
+        """Catch up with everything that changed since this window was built."""
+        try:
+            self.config = reload_config()
+            self.backend = LocalBackend(self.config)
+            self._current_model = self.backend.working_model()
+        except Exception as e:
+            # A window showing what it read at login beats no window at all.
+            log(f"[SETTINGS] could not re-read the config: {e}")
+            return
+        self._rebuild_speech_page()
+        # In the same breath, so the status row is right on the first frame
+        # rather than two seconds into it: the daemon that built this window
+        # need not be the one running now.
+        self._daemon_pid = restart.daemon_pid()
+        self._apply_daemon_status()
+        # After the rebuild, which carries edits across rather than reloading:
+        # right for a download that lands mid-edit, wrong here, where the
+        # window has been sitting unseen and has no edits worth keeping.
+        self._load()
+        self._refresh_dirty()
+        # Devices come and go while this window waits - a headset paired after
+        # login is exactly the case someone opens this window to deal with.
+        self._load_mics_in_background()
 
     # ---------------------------------------------------------------- layout
     def _build(self):
@@ -532,15 +634,27 @@ class SettingsWindow(Adw.ApplicationWindow):
         # and two "Daemon" headings separated by unrelated settings read as
         # two different subjects.
         row = Adw.ActionRow(title="Status")
-        pid = restart.daemon_pid()
-        icon = Gtk.Image.new_from_icon_name(STATUS_ICONS[0 if pid else 1])
-        icon.add_css_class("daemon-ok" if pid else "daemon-bad")
+        icon = Gtk.Image()
         row.add_prefix(icon)
-        row.set_subtitle(f"running (pid {pid})" if pid else
-                         "not running - dictation will not work")
+        self._status_row, self._status_icon = row, icon
+        self._apply_daemon_status()
 
         self._add_field_groups(page, section, lead_rows={"Daemon": [row]})
         return page
+
+    def _apply_daemon_status(self) -> None:
+        """Say whether the daemon is running, as of now."""
+        pid = self._daemon_pid
+        self._status_icon.set_from_icon_name(STATUS_ICONS[0 if pid else 1])
+        # Both dropped first: this runs again when the daemon comes and goes,
+        # and a green tick left carrying the red class is how a row ends up
+        # saying one thing and looking like another.
+        self._status_icon.remove_css_class("daemon-ok")
+        self._status_icon.remove_css_class("daemon-bad")
+        self._status_icon.add_css_class("daemon-ok" if pid else "daemon-bad")
+        self._status_row.set_subtitle(
+            f"running (pid {pid})" if pid else
+            "not running - dictation will not work")
 
     def _build_speech_page(self, section: str):
         page = Adw.PreferencesPage()
@@ -868,6 +982,12 @@ class SettingsWindow(Adw.ApplicationWindow):
         """
         if self._working:
             return True
+        # Nothing to keep honest while nobody can see it. A window built at
+        # login and not yet asked for would otherwise diff every row against
+        # the config twice a second for as long as it waits, which is the
+        # kind of cost that makes prewarming not worth having.
+        if not self.get_visible():
+            return True
         try:
             changed = dict(settings_def.updates_from(self._values(),
                                                      self._current))
@@ -1044,7 +1164,7 @@ class SettingsWindow(Adw.ApplicationWindow):
         else:
             self._toast("Download failed. Check the connection and try again.")
 
-    def _rebuild_speech_page(self):
+    def _rebuild_speech_page(self, focus: bool = True):
         """Redraw the Speech page after a download changed what is on disk.
 
         Every row on this page is replaced by that, and the new ones start
@@ -1058,6 +1178,12 @@ class SettingsWindow(Adw.ApplicationWindow):
 
         Carried across rather than reloaded from config, because a download
         does not discard edits made before it started.
+
+        `focus` is for the callers this follows a click on: a download or an
+        engine install happens on this page and the result belongs in front of
+        the person who pressed the button. The daemon changing model underneath
+        is not a click, and yanking someone off the Hotkeys page to show them
+        a pill they did not ask about is not an improvement.
         """
         keep = self._values()
         # The old page's widgets are about to be dropped; holding references
@@ -1072,7 +1198,8 @@ class SettingsWindow(Adw.ApplicationWindow):
         # broken-image glyph for a page that has none.
         self._stack.add_titled_with_icon(
             page, "speech", "Speech", SECTION_ICONS["Speech"])
-        self._stack.set_visible_child_name("speech")
+        if focus:
+            self._stack.set_visible_child_name("speech")
         self._apply_values(keep)
 
     def _on_progress(self, stage: str, fraction: float):
@@ -1180,16 +1307,63 @@ class SettingsWindow(Adw.ApplicationWindow):
             log(f"[SETTINGS] blur unavailable: {e}")
 
 
+def _retire_if_unseen(window: "SettingsWindow") -> bool:
+    """Leave, unless there is a window on screen that someone is using.
+
+    End of stream means the daemon has gone, and a window nobody has asked
+    for goes with it - that is what stops a prewarmed one, which has no tray
+    icon and nothing on screen, from being stranded as an invisible process
+    after the app it belongs to has quit.
+
+    A window that is up is a different thing entirely. The commonest way for
+    the daemon to go is the Restart button on this very window, and taking
+    the window away as the button is pressed is not a restart, it is the
+    settings vanishing mid-sentence. So it stops being the daemon's and
+    becomes an ordinary window: no more orders, and it exits when it is
+    closed, exactly as one opened before any of this existed did.
+    """
+    if window.get_visible():
+        log("[SETTINGS] the daemon has gone; this window stays until closed")
+        return False
+    os._exit(0)
+
+
+def _command_loop(window: "SettingsWindow") -> None:
+    """Read the daemon's orders from stdin, for a window built in advance."""
+    try:
+        for line in sys.stdin:
+            command = line.strip()
+            if command == "show":
+                # Stamped here rather than in the callback: the click is what
+                # the user is timing, and idle_add may not run for a frame.
+                at = time.time()
+                GLib.idle_add(window.show_for_click, at)
+            elif command == "quit":
+                os._exit(0)
+    except Exception:
+        pass
+    # Asked on the main loop, because that is the thread that knows whether
+    # anything is on screen.
+    GLib.idle_add(_retire_if_unseen, window)
+
+
 def main() -> int:
     # This window runs as its own process and never turned logging on, so
     # every log() in it went to the ring buffer and nowhere else - including
     # the line saying whether backdrop blur was applied, and the one saying
     # why it was not. Diagnosing "the blur is missing" meant re-running it by
     # hand with the flag forced; the daemon's own setting answers it now.
+    config = None
     try:
-        set_logging_enabled(Config().logging_enabled)
+        config = Config()
+        set_logging_enabled(config.logging_enabled)
     except Exception:
         pass                    # a bad config must not cost us the window
+
+    # Started before the click, to be shown when it comes. Only when the
+    # daemon says so: run by hand, stdin is inherited and reaches end of
+    # stream at once, which would close the window as soon as it opened.
+    resident = os.environ.get("WHISPER_FLOW_SETTINGS_RESIDENT") == "1"
 
     app = Adw.Application(application_id="dev.whisperflow.settings")
     # A raise inside activate is not an error anyone sees. GObject catches
@@ -1203,13 +1377,36 @@ def main() -> int:
 
     def build(app):
         try:
-            window = SettingsWindow(application=app)
+            window = SettingsWindow(application=app, config=config)
             _mark("window constructed")
-            window.present()
             # present() only queues the window. The frame clock is what says
             # something is actually on screen, which is the number that
             # matches what the user is waiting for.
-            window.connect("map", lambda *_: _mark("window mapped"))
+            window.connect(
+                "map", lambda *_: _mark("window mapped", window._show_t0))
+            if resident:
+                # No window on screen and none wanted yet. hold() is what
+                # keeps the process alive meanwhile: GtkApplication ends its
+                # main loop when the last window goes, and a window that has
+                # never been shown is close enough to none for that to bite.
+                app.hold()
+                # And released when the window is closed, or the process
+                # would go on running with nothing on screen: the daemon
+                # adopts a newly downloaded model when this process exits,
+                # so one that never exits is one that never hands anything
+                # over. False lets the close proceed as it normally would.
+                window.connect("close-request",
+                               lambda *_: (app.release(), False)[1])
+                # Realized now, so the surface, its HWND, the CSS and the
+                # first style pass are all done before the click. What is
+                # left for the click is a map.
+                window.realize()
+                _mark("built and waiting for the click")
+                threading.Thread(
+                    target=_command_loop, args=(window,), daemon=True,
+                    name="whisper-flow-settings-commands").start()
+                return
+            window.present()
         except Exception:
             import traceback
             failure.append(traceback.format_exc())

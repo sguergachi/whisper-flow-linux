@@ -910,8 +910,20 @@ class WhisperFlowDaemon:
             # should not pay it again while the user waits at a blank screen.
             env = dict(os.environ)
             env[backend_module.ACCELERATOR_ENV] = backend_module.detect_accelerator()
+            # When the click happened, so the window can report what the user
+            # actually waited through - process start included, which is a
+            # real part of it in a frozen build and cannot be seen from
+            # inside the child.
+            env["WHISPER_FLOW_TOOL_T0"] = repr(time.time())
             try:
-                process = self._setup_process = subprocess.Popen(cmd, env=env)
+                # Captured, not inherited. The frozen build is windowed, so
+                # the child has no console and everything it prints - timings,
+                # tracebacks, the reason a window did not appear - went
+                # nowhere. Piping it here puts it in the log the tray offers,
+                # which is the only route it has to anyone who can read it.
+                process = self._setup_process = subprocess.Popen(
+                    cmd, env=env, stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT, text=True, errors="replace")
             except Exception as e:
                 log(f"[DAEMON] could not open the setup window: {e}")
                 return False
@@ -932,9 +944,36 @@ class WhisperFlowDaemon:
                          daemon=True, name="whisper-flow-window-watch").start()
         return True
 
+    @staticmethod
+    def _drain_tool_output(process) -> None:
+        """Copy the child's output into our log until it closes the pipe.
+
+        Line by line as it arrives rather than in one read at the end: the
+        interesting case is a window that is slow or never appears, and a
+        report that only lands once the process exits is no use for either.
+        """
+        stream = getattr(process, "stdout", None)
+        if stream is None:
+            return
+        try:
+            for line in stream:
+                line = line.rstrip()
+                if line:
+                    log(line if line.startswith("[") else f"[TOOL] {line}")
+        except Exception as e:
+            log(f"[DAEMON] lost the tool window's output: {e}")
+        finally:
+            try:
+                stream.close()
+            except Exception:
+                pass
+
     def _after_tool_window(self, process=None) -> None:
         """Adopt whatever the settings window installed, once it closes."""
         process = process or self._setup_process
+        # Before wait(), and on this thread: a full pipe blocks the child, so
+        # nothing may wait on a process it has not drained first.
+        self._drain_tool_output(process)
         try:
             process.wait()
         except Exception:

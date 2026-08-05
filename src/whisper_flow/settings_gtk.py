@@ -22,18 +22,41 @@ import os
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
-import gi
+# Measured from the click, not from this import. The daemon stamps the moment
+# it launched us into the environment, so these numbers include the process
+# start - which in a frozen build is a real part of what the user waits for
+# and is invisible from inside. Wall clock rather than monotonic because it
+# has to mean the same thing in two processes.
+_T0 = float(os.environ.get("WHISPER_FLOW_TOOL_T0") or 0.0) or time.time()
+
+
+def _mark(label: str) -> None:
+    """Report a stage of opening this window, in ms since the click.
+
+    Printed rather than logged: this process has its own ring buffer that
+    nobody can read, and the frozen build has no console. The daemon captures
+    what we print here into the log the tray menu shows.
+    """
+    print(f"[SETTINGS] +{(time.time() - _T0) * 1000:6.0f}ms {label}", flush=True)
+
+
+import gi  # noqa: E402
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
 
+_mark("gtk imported")
+
 from . import envfile, restart, settings_def, wayland_blur  # noqa: E402
 from .backend import LocalBackend  # noqa: E402
 from .config import Config  # noqa: E402
 from .logging import log, set_logging_enabled  # noqa: E402
+
+_mark("imports done")
 
 WIDTH, HEIGHT = 760, 820
 CORNER_RADIUS = 12      # Adwaita's window corner radius
@@ -258,6 +281,7 @@ class SettingsWindow(Adw.ApplicationWindow):
         self.config = Config()
         self.backend = LocalBackend(self.config)
         self._current_model = self.backend.working_model()
+        _mark("config and backend read")
         self._working = False
         self._rows: dict[str, Gtk.Widget] = {}
         self._mic_display: dict[str, str] = {}
@@ -288,6 +312,7 @@ class SettingsWindow(Adw.ApplicationWindow):
         icon_theme.add_resource_path("/org/gnome/Adwaita/icons")
 
         self._build()
+        _mark("pages built")
         self._load()
         self._refresh_dirty()
         self._load_mics_in_background()
@@ -1088,7 +1113,13 @@ def main() -> int:
 
     def build(app):
         try:
-            SettingsWindow(application=app).present()
+            window = SettingsWindow(application=app)
+            _mark("window constructed")
+            window.present()
+            # present() only queues the window. The frame clock is what says
+            # something is actually on screen, which is the number that
+            # matches what the user is waiting for.
+            window.connect("map", lambda *_: _mark("window mapped"))
         except Exception:
             import traceback
             failure.append(traceback.format_exc())

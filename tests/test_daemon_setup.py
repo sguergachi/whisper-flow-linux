@@ -199,3 +199,61 @@ def test_a_new_engine_restarts_the_server_even_on_the_same_model(daemon):
     daemon.backend.stop.assert_called_once()
     used.assert_called_once_with("http://127.0.0.1:18080")
     assert daemon._backend_engine == "cuda12"
+
+
+# ------------------------------------------- what the window has to say
+def test_the_windows_output_reaches_the_log(daemon):
+    """The frozen build is windowed, so the child has no console of its own.
+
+    Everything it prints - the startup timings, a traceback, the reason no
+    window appeared - went to a handle nobody was reading. It has to land in
+    the log the tray menu offers or it may as well not be written.
+    """
+    import io
+
+    from whisper_flow import logging as log_module
+
+    process = Mock()
+    process.stdout = io.StringIO(
+        "[SETTINGS] +   12ms gtk imported\n"
+        "\n"                                   # blank lines are not events
+        "Traceback (most recent call last):\n")
+
+    log_module.clear_log()
+    daemon._drain_tool_output(process)
+    recorded = log_module.recent_log()
+
+    assert "+   12ms gtk imported" in recorded
+    assert "[TOOL] Traceback (most recent call last):" in recorded
+
+
+def test_a_window_with_no_pipe_is_not_an_error(daemon):
+    """Popen can be mocked, or the process replaced; neither may raise here."""
+    daemon._drain_tool_output(Mock(stdout=None))
+
+
+def test_the_output_is_drained_before_anything_waits_on_the_process(daemon):
+    """A full pipe blocks the child, so wait() before a read is a deadlock."""
+    order = []
+    process = Mock(returncode=0)
+    process.stdout = None
+    process.wait.side_effect = lambda *a, **k: order.append("wait")
+
+    with patch.object(WhisperFlowDaemon, "_drain_tool_output",
+                      side_effect=lambda p: order.append("drain")):
+        daemon.backend.working_model.return_value = None
+        daemon._after_tool_window(process)
+
+    assert order == ["drain", "wait"]
+
+
+def test_the_click_is_stamped_for_the_window_to_measure_from(daemon, monkeypatch):
+    """Process start is most of the wait and is invisible from inside."""
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    with patch("whisper_flow.daemon.subprocess.Popen") as popen:
+        popen.return_value.poll.return_value = None
+        assert daemon._open_settings_window() is True
+
+    stamped = popen.call_args.kwargs["env"]["WHISPER_FLOW_TOOL_T0"]
+    assert float(stamped) > 0

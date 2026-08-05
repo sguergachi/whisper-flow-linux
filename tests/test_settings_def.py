@@ -150,3 +150,66 @@ def test_group_help_refers_to_groups_that_exist():
     """A typo in a heading would silently drop its description."""
     real = {(f.section, f.group) for f in settings_def.FIELDS}
     assert set(settings_def.GROUP_HELP) <= real
+
+
+# ------------------------------------------------ the model-name badge
+def _titled():
+    """_titled without importing settings_gtk, which needs GTK 4.
+
+    The module cannot be imported on a machine with no desktop, and this is
+    string work that has nothing to do with one.
+    """
+    import re
+    from pathlib import Path
+
+    source = (Path(__file__).resolve().parents[1]
+              / "src/whisper_flow/settings_gtk.py").read_text(encoding="utf-8")
+    body = source.split("def _titled(", 1)[1].split("\ndef ", 1)[0]
+    body = "def _titled(" + body
+
+    class _GLib:
+        @staticmethod
+        def markup_escape_text(text):
+            return (text.replace("&", "&amp;").replace("<", "&lt;")
+                        .replace(">", "&gt;"))
+
+    scope = {"GLib": _GLib, "BADGE_BG": "#1b2c4a", "BADGE_FG": "#9ec2fc"}
+    exec(re.sub(r"^def _titled", "def _titled", body), scope)   # noqa: S102
+    return scope["_titled"]
+
+
+def test_the_badge_is_well_formed_markup():
+    """A title Pango cannot parse takes the whole window down with it."""
+    from xml.etree import ElementTree
+
+    markup = _titled()("large-v3-turbo", "recommended")
+    ElementTree.fromstring(f"<t>{markup}</t>")      # raises if malformed
+    assert "recommended" in markup
+
+
+def test_the_badge_has_room_around_its_text():
+    """Markup has no padding; the run has to be widened by hand.
+
+    Without it the word sits hard against the edge of its own background and
+    the badge reads as clipped.
+    """
+    from xml.etree import ElementTree
+
+    markup = _titled()("base.en-q8_0", "recommended")
+    inner = ElementTree.fromstring(f"<t>{markup}</t>").find("span").text
+    assert inner.strip("\u2002") == "recommended"
+    assert inner.startswith("\u2002"), "no padding before the word"
+    assert inner.endswith("\u2002"), "no padding after the word"
+
+
+def test_a_model_name_cannot_inject_markup():
+    """Names come off disk, and a stray & is enough to fail the parse."""
+    from xml.etree import ElementTree
+
+    markup = _titled()("a & b <span>", "recommended")
+    ElementTree.fromstring(f"<t>{markup}</t>")
+    assert "&amp;" in markup
+
+
+def test_no_badge_means_no_markup_at_all():
+    assert _titled()("tiny.en-q8_0") == "tiny.en-q8_0"

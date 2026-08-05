@@ -133,7 +133,11 @@ CSS = b"""
 }
 .pill-recommended { background: #1b2c4a; color: #9ec2fc; }
 .pill-current { background: #16301f; color: #4ade80; }
-.pill-gpu { background: #1d3220; color: #86efac; }
+/* Violet, not another green. This sits directly beside "in use", which is
+   green, and two green pills an inch apart read as one status repeated
+   rather than as two different facts - which engine will run the model, and
+   which model is running. The hue is the difference; nothing else is. */
+.pill-gpu { background: #2e2148; color: #c4b5fd; }
 .pill-warning { background: #3a2a12; color: #fbbf24; }
 .model-progress { min-width: 110px; }
 .daemon-ok { color: #4ade80; }
@@ -313,9 +317,17 @@ def _titled(name: str, badge: str = "") -> str:
     title = GLib.markup_escape_text(name)
     if not badge:
         return title
-    return (f"{title}  <span size='x-small' weight='bold' "
+    # Markup has no padding property: the background is painted to the
+    # logical extents of the run and not a pixel further, so a badge made
+    # this way sits with its text hard against its own edges and reads as
+    # clipped. The only way to give it room is to widen the run with
+    # something that draws nothing, so the padding here is two EN SPACEs a
+    # side - written as escapes, because a literal one is invisible in a
+    # diff and indistinguishable from the ordinary space it replaced.
+    pad = "\u2002\u2002"
+    return (f"{title}\u2002<span size='x-small' weight='bold' "
             f"background='{BADGE_BG}' foreground='{BADGE_FG}'>"
-            f" {GLib.markup_escape_text(badge)} </span>")
+            f"{pad}{GLib.markup_escape_text(badge)}{pad}</span>")
 
 
 def _gobject_pointer(obj) -> int:

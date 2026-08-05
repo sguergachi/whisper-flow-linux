@@ -260,14 +260,12 @@ elif scenario == "badge":
     assert not any("<span" in (x.get_label() or "") for x in labels), (
         "a title is still carrying Pango markup for the badge")
 
-    # The radio is the right-most thing in the row, and at the same place in
-    # every row.
+    # The radio comes first, and at the same place in every row.
     #
-    # Both halves have been wrong. add_prefix and add_suffix both prepend,
-    # so the obvious call order puts the radio on the wrong side of what it
-    # is packed with; and a radio sized into a prefix area lands wherever
-    # that row's name pushes it, which was a column of radios at five
-    # different offsets.
+    # Owning the title means owning the order, and add_prefix prepends: two
+    # calls put the text to the left of the radio, and the prefix area is
+    # sized to what is in it, so every row's radio sat wherever that row's
+    # name pushed it. A column of radios at five different offsets.
     w.present()
     assert pump(lambda: w.get_visible())
     assert pump(lambda: all(c.get_allocated_width()
@@ -284,15 +282,12 @@ elif scenario == "badge":
     assert len(set(offsets.values())) == 1, (
         f"the radios are at different offsets: {offsets}")
 
-    # Right-most: past its own name, and past every pill in its row.
+    # First: to the left of the name it belongs to, not after it.
     for name, check in w._model_checks.items():
         label = next(x for x in labels
                      if x.get_label() == name.replace("ggml-", ""))
-        assert left_edge(check) > left_edge(label), (
-            f"the radio for {name} sits before its own name")
-    badge_x = left_edge(badge)
-    assert min(offsets.values()) > badge_x, (
-        "a radio is to the left of the recommended badge")
+        assert left_edge(check) < left_edge(label), (
+            f"the radio for {name} sits after its own name")
 print("OK")
 """
 

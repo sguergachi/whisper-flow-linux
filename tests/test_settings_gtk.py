@@ -188,7 +188,9 @@ elif scenario == "prewarm_rereads":
     # setting hours before anyone opens this.
     assert w._rows["local_server_port"].get_value() == 8082
     with open(config_dir + "/.env", "w") as fh:
-        fh.write("WHISPER_FLOW_LOCAL_SERVER_PORT=8099\n")
+        # Escaped: this source is a string in the test that runs it, so a bare
+        # newline here ends that string rather than reaching the child.
+        fh.write("WHISPER_FLOW_LOCAL_SERVER_PORT=8099\\n")
     w.show_for_click()
     assert pump(lambda: w._rows["local_server_port"].get_value() == 8099), (
         f"the window showed the config as it was when it was built "

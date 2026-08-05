@@ -714,22 +714,12 @@ class SettingsWindow(Adw.ApplicationWindow):
                 check.connect("toggled", self._guard_uninstalled)
             # One prefix holding both, in the order they are to appear.
             #
-            # Two add_prefix calls put the text to the *left* of the radio and
-            # left every radio at a different distance in: add_prefix prepends
-            # rather than appends, and the prefix area is sized to what is in
-            # it, so each row's radio landed wherever that row's name pushed
-            # it. Packing them here settles the order without depending on
-            # which end add_prefix works from, and one prefix per row is the
-            # same width in every row, so the radios line up again.
-            #
-            # Nothing here expands. The row's own title box is empty and takes
-            # the slack, which is what keeps the suffix pills against the
-            # right-hand edge.
-            content = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL,
-                              spacing=12)
-            content.append(check)
-            content.append(names)
-            row.add_prefix(content)
+            # The name is the only prefix. The radio goes at the far right,
+            # last of the suffixes - see below - so the column of radios sits
+            # against the edge of the card rather than in the middle of the
+            # row, and nothing about where it lands depends on how long a
+            # model's name happens to be.
+            row.add_prefix(names)
             if item["installed"]:
                 row.set_activatable_widget(check)
 
@@ -766,6 +756,12 @@ class SettingsWindow(Adw.ApplicationWindow):
                 bar.set_visible(False)
                 self._progress_bars[name] = bar
                 suffix.append(bar)
+            # Last, so it is the right-most thing in the row. Appended to the
+            # same box as the pills rather than added as its own suffix,
+            # because add_suffix prepends the way add_prefix does and the
+            # radio would have come out on the wrong side of them.
+            check.set_valign(Gtk.Align.CENTER)
+            suffix.append(check)
             row.add_suffix(suffix)
 
             self._model_checks[name] = check

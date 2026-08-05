@@ -176,17 +176,25 @@ class LiveTranscriber:
 
         if agreed > len(self._committed):
             new = words[len(self._committed):agreed]
-            self._committed = words[:agreed]
-            self._send(new)
+            # Committed only once they have actually been typed. It means
+            # "the user has these already", and it is what finalize()
+            # subtracts to find the tail - so counting a refused delivery as
+            # committed dropped those words from the live pass *and* from the
+            # closing one. Left uncommitted they are simply offered again on
+            # the next pass, and the closing transcript covers them anyway.
+            if self._send(new):
+                self._committed = words[:agreed]
 
-    def _send(self, words: list[str]):
-        """Type words. Caller must hold _emit_lock."""
+    def _send(self, words: list[str]) -> bool:
+        """Type words, reporting whether they arrived.
+
+        Caller must hold _emit_lock.
+        """
         if not words:
-            return
+            return True
         chunk = " ".join(words)
         if self._emitted_any:
             chunk = " " + chunk
-        self._emitted_any = True
         try:
             # A False return means the text never reached the application.
             # Ignoring it produced the worst failure this has had: the
@@ -195,11 +203,17 @@ class LiveTranscriber:
             if self._emit(chunk) is False:
                 self._delivery_failures += 1
                 log(f"[LIVE] emit reported failure for {len(chunk)} chars")
-            else:
-                self._delivered_any = True
+                return False
         except Exception as e:
             self._delivery_failures += 1
             log(f"[LIVE] emit failed: {e}")
+            return False
+        # Only on the way out, and only on success: it decides whether the
+        # next chunk is given a leading space, and a refused chunk has not
+        # put anything on screen for one to separate from.
+        self._emitted_any = True
+        self._delivered_any = True
+        return True
 
     def quiesce(self, timeout: float = 1.0) -> None:
         """Stop starting new passes, before the closing one is issued.

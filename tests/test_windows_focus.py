@@ -28,6 +28,9 @@ class _FakeWin:
     def foreground_window(self):
         return self.foreground
 
+    def describe_foreground(self):
+        return f"hwnd {self.foreground}"
+
     def focus_window(self, hwnd):
         self.focused.append(hwnd)
         self.foreground = hwnd
@@ -149,3 +152,22 @@ def test_a_failure_to_release_is_not_allowed_to_escape(
     monkeypatch.setattr(fake, "release_injected_modifiers", explode,
                         raising=False)
     manager.release_stuck_modifiers()
+
+
+def test_a_live_pass_will_not_type_into_the_wrong_window(windows_manager,
+                                                         monkeypatch):
+    """The closing transcript takes what it can get; a live pass does not.
+
+    Live words get another chance on every pass and again at the end, so
+    typing them wherever focus happens to be scatters one dictation across
+    two windows - which is how the tail of a sentence ended up in the Start
+    menu's search box while the rest was in the editor.
+    """
+    manager, fake = windows_manager
+    fake.foreground = 4321
+    manager.save_active_window()
+    fake.foreground = 9999
+    monkeypatch.setattr(fake, "focus_window", lambda hwnd: False)
+
+    assert manager.type_text("hello", only_where_it_started=True) is False
+    assert fake.typed == [], "it typed into the window it could not reach"

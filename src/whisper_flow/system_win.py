@@ -142,6 +142,27 @@ def foreground_window() -> int:
         return 0
 
 
+def describe_foreground() -> str:
+    """What has the foreground, as class and title, for a log line.
+
+    The class is the useful half: the Start menu and the search box are
+    Windows.UI.Core.CoreWindow, the taskbar is Shell_TrayWnd, and our own
+    overlay is a GTK window - three different problems that all read as
+    "focus went somewhere" without it.
+    """
+    hwnd = foreground_window()
+    if not hwnd:
+        return "nothing"
+    try:
+        name = ctypes.create_unicode_buffer(256)
+        _user32.GetClassNameW(wintypes.HWND(hwnd), name, 256)
+        title = ctypes.create_unicode_buffer(256)
+        _user32.GetWindowTextW(wintypes.HWND(hwnd), title, 256)
+        return f"{name.value or '?'} {title.value!r} (hwnd {hwnd})"
+    except Exception:
+        return f"hwnd {hwnd}"
+
+
 def _window_thread(hwnd: int) -> int:
     return int(_user32.GetWindowThreadProcessId(wintypes.HWND(hwnd), None))
 

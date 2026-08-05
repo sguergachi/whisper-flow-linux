@@ -314,3 +314,36 @@ def test_quiesce_before_a_pass_has_ever_run_is_harmless():
     lt._emit = typed.append
     lt.finalize("hello there")
     assert typed == ["hello there"]
+
+
+def test_words_that_could_not_be_typed_are_not_counted_as_committed():
+    """Committed means the user has them, and finalize subtracts it.
+
+    Counting a refused delivery as committed dropped those words from the
+    live pass and from the closing one too: spoken, agreed on twice, and
+    never appearing anywhere.
+    """
+    typed = []
+
+    refusing = [True]
+
+    def emit(text):
+        if refusing[0]:
+            return False        # the window will not come back, yet
+        typed.append(text)
+        return True
+
+    live = LiveTranscriber(transcribe=lambda path: None, emit=emit,
+                           sample_rate=16000)
+    live._commit("one two three")
+    live._commit("one two three")
+
+    # Refused whole - the chunk is "one two", the agreed words less the one
+    # held back - so none of it is committed rather than part of it.
+    assert live.committed_text == "", "a refused chunk was marked delivered"
+    assert typed == [], "something reached the screen after a refusal"
+
+    refusing[0] = False         # the user is back in the window they started in
+    live.finalize("one two three")
+    assert "".join(typed) == "one two three", (
+        "the closing transcript did not make up for the refused chunk")

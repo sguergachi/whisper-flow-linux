@@ -188,12 +188,20 @@ class SystemManager:
         window on every committed phrase.
         """
         if not IS_WINDOWS or not self._saved_window:
-            return
+            return True
         if system_win.foreground_window() == self._saved_window:
-            return
-        if not system_win.focus_window(self._saved_window):
-            log("[PASTE] the window this dictation started in would not come "
-                "back to the front; typing into whatever has focus")
+            return True
+        if system_win.focus_window(self._saved_window):
+            return True
+        # Name what is in front instead. "Would not come back" says a window
+        # refused, not which one refused it, and the answer decides what this
+        # is: the overlay taking focus is our own bug, the Start menu is
+        # Windows opening on a Super release, and anything else is the user
+        # having clicked away mid-sentence.
+        log(f"[PASTE] {system_win.describe_foreground()} is in front and the "
+            f"window this dictation started in will not come back; "
+            f"holding the text rather than typing it there")
+        return False
 
     def _kdotool_available(self) -> bool:
         return shutil.which("kdotool") is not None
@@ -277,6 +285,8 @@ class SystemManager:
 
             if IS_WINDOWS:
                 sanitized = text.replace("\n", " ")
+                # Not refused when the window will not come back: this is the
+                # closing transcript and there is no next pass to hold it for.
                 self._restore_saved_focus()
                 if system_win.type_text(sanitized):
                     return True
@@ -315,8 +325,16 @@ class SystemManager:
             log(f"Error pasting text: {e}")
             return False
 
-    def type_text(self, text: str) -> bool:
+    def type_text(self, text: str, only_where_it_started: bool = False) -> bool:
         """Type text into the window this dictation was started in.
+
+        `only_where_it_started` refuses rather than typing somewhere else.
+        Off by default, because for the closing transcript half a transcript
+        somewhere beats none anywhere - it is the last chance those words
+        get. Live transcription sets it: those words get another chance on
+        every pass and again at the end, so typing them into whatever
+        happens to be in front buys nothing and is how a dictation ended up
+        in the Start menu's search box.
 
         Used by live transcription, which appends to what the user is already
         looking at, and for the tail that follows the closing pass. It does
@@ -334,7 +352,8 @@ class SystemManager:
             return True
         sanitized = text.replace("\n", " ")
         if IS_WINDOWS:
-            self._restore_saved_focus()
+            if not self._restore_saved_focus() and only_where_it_started:
+                return False
             return system_win.type_text(sanitized)
         if self._is_wayland():
             return self._ydotool_type(sanitized) or self._wtype_type(sanitized)

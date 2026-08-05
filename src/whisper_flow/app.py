@@ -124,7 +124,12 @@ class WhisperFlow:
 
         live = LiveTranscriber(
             transcribe=live_pass,
-            emit=self.system_manager.type_text,
+            # Into the window this dictation started in, or not at all. A
+            # live pass has another chance every pass and again at the end,
+            # so typing it into whatever is in front instead only scatters
+            # the dictation across two windows.
+            emit=lambda text: self.system_manager.type_text(
+                text, only_where_it_started=True),
             sample_rate=self.config.sample_rate,
             interval=self.config.live_interval,
             prepare=self.audio_recorder.trim_frames,

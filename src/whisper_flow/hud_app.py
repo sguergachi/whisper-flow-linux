@@ -424,6 +424,10 @@ class HudWindow(Gtk.Window):
         self._fade_in_t0 = time.monotonic()
         self._fade_out_t0 = None
         self._fade_out_from = 1.0
+        # Windows places the window itself on map and we move it afterwards;
+        # nothing is drawn in between. Everywhere else the surface is placed
+        # by the compositor before it is ever shown.
+        self._placed = not IS_WINDOWS
         self.hover = 0.0
         self.want_hover = False
         self.peak = PEAK_FLOOR
@@ -488,6 +492,17 @@ class HudWindow(Gtk.Window):
 
     def _reposition(self):
         self._apply_position()
+        # Only now may anything be drawn, and the fade starts from here.
+        #
+        # GTK maps the window where it likes and this correction arrives on
+        # an idle callback, a frame or more later - so the pill faded up at
+        # GTK's spot and then jumped to ours. Holding the fade until the
+        # move has happened means the frames at the wrong place are the ones
+        # nobody can see.
+        if not self._placed:
+            self._placed = True
+            self.alpha = 0.0
+            self._fade_in_t0 = time.monotonic()
         # Re-cut here too: at realize the surface has not been sized yet, so
         # the region built there is against a provisional rectangle.
         self._apply_shape_win32()
@@ -820,6 +835,9 @@ class HudWindow(Gtk.Window):
         self._fade_out_t0 = None
         self._quitting = False
         self._apply_position()
+        # A window already on screen gets no map event, so no correction is
+        # coming and the position applied just above is the final one.
+        self._placed = not IS_WINDOWS or self.get_mapped()
         self.present()
         print(f"[HUD] visible {time.time():.6f}", flush=True)
 
@@ -916,6 +934,8 @@ class HudWindow(Gtk.Window):
     def _frame(self):
         if self._resident and not self.get_visible():
             return True                 # parked between recordings
+        if not self._placed:
+            return True         # mapped, but not yet moved where it belongs
         now = time.monotonic()
         if self._fade_out_t0 is None:
             self.alpha = _ease((now - self._fade_in_t0) * 1000.0 / FADE_MS)

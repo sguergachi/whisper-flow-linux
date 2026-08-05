@@ -426,3 +426,39 @@ def test_a_point_that_makes_no_sense_does_not_stop_the_overlay(hud, monkeypatch)
         process.written.clear()
         hud.show(level_file="/tmp/levels", point=bad)
         assert process.written == ["show - /tmp/levels\n"]
+
+
+def test_nothing_is_drawn_before_the_pill_has_been_placed():
+    """GTK maps the window where it likes; we move it a frame later.
+
+    The correction arrives on an idle callback, so the pill used to fade up
+    at GTK's spot and then jump to ours. Read from the source, like the rest
+    of the overlay's layout checks - it needs GTK 4 and a display to run.
+    """
+    source = _hud_app_source()
+    assert "_placed" in source, (
+        "the overlay needs to know whether it has been moved yet")
+
+    frame = source.split("def _frame(", 1)[1].split("\n    def ", 1)[0]
+    assert "_placed" in frame, (
+        "_frame must not advance the fade before the window has been moved; "
+        "those are the frames drawn at the wrong position")
+
+    reposition = source.split("def _reposition(", 1)[1].split("\n    def ", 1)[0]
+    assert "_fade_in_t0" in reposition, (
+        "the fade has to start from the move, or it is already part-way "
+        "through by the time the pill is where it belongs")
+
+
+def test_the_hold_cannot_strand_the_pill_off_screen():
+    """Every platform and path has to end with something visible.
+
+    Only Windows places the window after mapping it, and only a window that
+    is not already up gets a map event - so both of those must start placed
+    or the pill waits for a correction that is never coming.
+    """
+    source = _hud_app_source()
+    assert "self._placed = not IS_WINDOWS" in source, (
+        "off Windows the compositor places the surface; nothing holds it")
+    assert "self._placed = not IS_WINDOWS or self.get_mapped()" in source, (
+        "a window already on screen gets no map event and no correction")

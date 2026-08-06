@@ -526,11 +526,22 @@ def test_the_hold_cannot_strand_the_pill_off_screen():
     """Every platform and path has to end with something visible.
 
     Only Windows places the window after mapping it, and only a window that
-    is not already up gets a map event - so both of those must start placed
-    or the pill waits for a correction that is never coming.
+    is not already up gets a map event - so anything else has to start
+    placed, or the pill waits for a correction that is never coming. A
+    pinned position is a third way out: the map cannot move the window off
+    it, so there is nothing to wait for.
+
+    Written as the conditions rather than as one line of source, because the
+    ways out are a list and a list grows.
     """
     source = _hud_app_source()
     assert "self._placed = not IS_WINDOWS" in source, (
         "off Windows the compositor places the surface; nothing holds it")
-    assert "self._placed = not IS_WINDOWS or self.get_mapped()" in source, (
-        "a window already on screen gets no map event and no correction")
+    show = source.split("def begin_show(", 1)[1].split("\n    def ", 1)[0]
+    assert "self._placed" in show, (
+        "showing again must decide afresh whether a correction is coming")
+    for way_out in ("not IS_WINDOWS", "self.get_mapped()",
+                    "self._pin_proc is not None"):
+        assert way_out in show, (
+            f"{way_out} no longer clears the hold, so a pill shown that way "
+            f"waits for a correction that is never coming")

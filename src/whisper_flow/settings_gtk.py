@@ -97,7 +97,7 @@ import gi  # noqa: E402
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
+from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk  # noqa: E402
 
 _mark("gtk imported")
 
@@ -105,6 +105,7 @@ from . import envfile, restart, settings_def, wayland_blur  # noqa: E402
 from .backend import LocalBackend  # noqa: E402
 from .config import Config, reload_config  # noqa: E402
 from .logging import log, set_logging_enabled  # noqa: E402
+from .version import build_version  # noqa: E402
 
 _mark("imports done")
 
@@ -126,7 +127,9 @@ SECTION_ICONS = {
 # latter, and the running-daemon row would have drawn the broken-image glyph.
 # The selftest caught it, which is the whole reason it checks these by name.
 STATUS_ICONS = ("object-select-symbolic", "dialog-warning-symbolic")
-ICON_NAMES = tuple(SECTION_ICONS.values()) + STATUS_ICONS
+# The copy button beside the version, on the About group.
+ACTION_ICONS = ("edit-copy-symbolic",)
+ICON_NAMES = tuple(SECTION_ICONS.values()) + STATUS_ICONS + ACTION_ICONS
 
 CSS = b"""
 .model-pill {
@@ -667,7 +670,45 @@ class SettingsWindow(Adw.ApplicationWindow):
         self._apply_daemon_status()
 
         self._add_field_groups(page, section, lead_rows={"Daemon": [row]})
+        page.add(self._about_group())
         return page
+
+    def _about_group(self) -> Adw.PreferencesGroup:
+        """Which build this is, at the foot of the last page.
+
+        Nowhere in the app said so. The tray menu says it too, but that is a
+        menu that closes the moment you look away from it - somebody writing
+        a bug report needs a version they can read and copy, and the settings
+        window is where people already go looking for one.
+        """
+        group = Adw.PreferencesGroup(title="About")
+        self._version_row = Adw.ActionRow(
+            title="Version", subtitle=build_version())
+        # Selectable in the sense that matters: a button that puts it on the
+        # clipboard. Label text in a row is not selectable by dragging.
+        copy = Gtk.Button(icon_name="edit-copy-symbolic",
+                          tooltip_text="Copy version")
+        copy.set_valign(Gtk.Align.CENTER)
+        copy.add_css_class("flat")
+        copy.connect("clicked", lambda *_: self._copy_version())
+        self._version_row.add_suffix(copy)
+        group.add(self._version_row)
+        return group
+
+    def _copy_version(self) -> None:
+        """Put the version on the clipboard, and say that it went there.
+
+        Through a content provider rather than Gdk.Clipboard.set(), which is
+        a varargs C convenience with no binding: the introspected pair is
+        what every GTK4 version here offers.
+        """
+        version = build_version()
+        display = self.get_display()
+        if display is not None:
+            provider = Gdk.ContentProvider.new_for_value(
+                GObject.Value(str, version))
+            display.get_clipboard().set_content(provider)
+        self._toast(f"Copied {version}")
 
     def _apply_daemon_status(self) -> None:
         """Say whether the daemon is running, as of now."""

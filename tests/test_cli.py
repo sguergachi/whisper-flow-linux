@@ -59,3 +59,28 @@ def test_set_device_rejects_an_output_only_device(monkeypatch, tmp_path):
 
     assert result.exit_code == 1
     assert not (tmp_path / ".env").exists()
+
+
+def test_version_reports_the_build_rather_than_a_literal():
+    """`--version` printed a hardcoded 0.1.0 that nothing ever updated, so
+    the one command whose whole job is to say which version this is had been
+    wrong since 0.2. It reads the same source as the tray and the report."""
+    import whisper_flow
+
+    result = CliRunner().invoke(cli.app, ["--version"])
+
+    assert result.exit_code == 0
+    assert whisper_flow.__version__ in result.output, result.output
+
+
+def test_version_prefers_the_stamp_a_packaged_build_leaves(monkeypatch,
+                                                           tmp_path):
+    exe = tmp_path / "whisper-flow.exe"
+    exe.write_bytes(b"")
+    (tmp_path / "BUILD.txt").write_text("0.4.171", encoding="utf-8")
+    monkeypatch.setattr(sys, "executable", str(exe))
+
+    result = CliRunner().invoke(cli.app, ["--version"])
+
+    assert result.exit_code == 0
+    assert "0.4.171" in result.output, result.output

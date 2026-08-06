@@ -343,6 +343,32 @@ elif scenario == "badge":
                      if x.get_label() == name.replace("ggml-", ""))
         assert left_edge(check) < left_edge(label), (
             f"the radio for {name} sits after its own name")
+elif scenario == "version":
+    # The build, on screen, where someone writing a bug report can find it.
+    # Nowhere in the window said which version it was.
+    from whisper_flow.version import build_version
+
+    version = build_version()
+    assert w._version_row.get_subtitle() == version
+
+    def walk(widget):
+        yield widget
+        child = widget.get_first_child()
+        while child is not None:
+            yield from walk(child)
+            child = child.get_next_sibling()
+
+    w.present()
+    assert pump(lambda: w.get_visible())
+    w._stack.set_visible_child_name("general")
+    labels = [x.get_label() or "" for x in walk(w) if isinstance(x, Gtk.Label)]
+    assert version in labels, (
+        f"the version is not drawn anywhere in the window: {labels}")
+
+    # And it can be taken away from the screen, which is the point of
+    # showing it: a version nobody can copy gets retyped wrongly.
+    w._copy_version()
+    assert version in w._last_toast_title
 print("OK")
 """
 
@@ -523,3 +549,13 @@ def test_the_recommended_badge_is_a_pill_beside_the_name(tmp_path):
     was visibly wrong.
     """
     assert _run(tmp_path, "badge").returncode == 0
+
+
+def test_the_window_says_which_build_it_is(tmp_path):
+    """Nothing in the app said so where it could be read and copied.
+
+    The tray menu names the build too, but a menu closes the moment you look
+    away from it, and the settings window is where people already go.
+    """
+    result = _run(tmp_path, "version")
+    assert "OK" in result.stdout, result.stderr

@@ -11,6 +11,7 @@ from typer import Option
 
 from . import envfile
 from .app import WhisperFlow
+from .version import build_version
 
 # Suppress warnings for cleaner CLI output
 warnings.filterwarnings("ignore", message=".*pkg_resources.*")
@@ -37,9 +38,14 @@ ConfigDirOption = Annotated[
 
 
 def version_callback(value: bool) -> None:
-    """Show version and exit."""
+    """Show version and exit.
+
+    From the same place the tray menu and the failure report read it. This
+    was a literal "0.1.0" that nothing updated, so the one command whose
+    entire job is to say which version this is had been wrong since 0.2.
+    """
     if value:
-        typer.echo("whisper-flow 0.1.0")
+        typer.echo(f"whisper-flow {build_version()}")
         raise typer.Exit()
 
 

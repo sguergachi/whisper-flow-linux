@@ -17,35 +17,71 @@ jobs:
   test:
     name: test (linux)
     runs-on: ubuntu-latest
+    # pystray resolves a backend when it is imported, and with gi now visible
+    # it picks GTK - meaning GTK 3, which is not installed here and cannot
+    # share a process with the GTK 4 the app itself uses. Its X11 backend is
+    # what this job has always actually run on; now it is asked for by name.
+    env:
+      PYSTRAY_BACKEND: xorg
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
 
       - name: Install system dependencies
         run: |
           sudo apt-get update
           # portaudio and libevdev are needed to build pyaudio and evdev;
-          # gobject/gtk4 so the HUD module imports during collection.
+          # gobject/gtk4/libadwaita so the HUD and the settings window import.
+          # gir1.2-adw-1 is what the settings tests probe for: without it all
+          # eighteen skipped here and Windows was the only job running them,
+          # which is how a test that read back its own stub reached master.
           sudo apt-get install -y \
             portaudio19-dev libevdev-dev \
-            python3-gi gir1.2-gtk-4.0 libgtk-4-dev libcairo2-dev \
+            python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 \
+            libgtk-4-dev libcairo2-dev \
             xvfb
 
       - name: Install
+        # The runner's own python3, not setup-python's: PyGObject comes from
+        # apt and lives in /usr/lib/python3/dist-packages, which setup-python's
+        # interpreter cannot see. It is also PEP 668 externally managed, so a
+        # venv with system site packages is the way to keep apt's gi visible
+        # while still installing this package - the same shape as the Windows
+        # job's MSYS2 venv.
         run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[dev]"
+          python3 -m venv --system-site-packages .venv
+          .venv/bin/python -m pip install --upgrade pip
+          .venv/bin/pip install -e ".[dev]"
 
       - name: Lint
         # Only the checks that catch real breakage; style is not gated.
-        run: ruff check src/ tests/ --select F,E9
+        run: .venv/bin/ruff check src/ tests/ --select F,E9
 
       - name: Test
         # Under xvfb because pystray resolves its backend at import time and
         # its X11 one refuses to load without a display.
-        run: xvfb-run -a pytest -q -p no:cacheprovider
+        run: xvfb-run -a .venv/bin/pytest -q -p no:cacheprovider
+
+      - name: Confirm the settings-window tests really ran
+        # They are skipped whenever GTK4, libadwaita or a display is missing,
+        # and a skip is silent: this job reported success for months while
+        # every one of them sat out. Skips here mean the environment lost
+        # something, not that there is nothing to test.
+        run: |
+          out=$(xvfb-run -a .venv/bin/pytest tests/test_settings_gtk.py \
+                  -q -p no:cacheprovider 2>&1) || true
+          echo "$out"
+          passed=$(echo "$out" | grep -oE '[0-9]+ passed' \
+                   | grep -oE '^[0-9]+' || true)
+          skipped=$(echo "$out" | grep -oE '[0-9]+ skipped' \
+                    | grep -oE '^[0-9]+' || echo 0)
+          if [ -z "$passed" ] || [ "$passed" -lt 1 ]; then
+            echo "the settings-window tests did not run at all"; exit 1
+          fi
+          if [ "$skipped" -ne 0 ]; then
+            echo "$skipped settings-window tests skipped; GTK4, libadwaita"
+            echo "or the display is missing on this runner"; exit 1
+          fi
+          echo "settings-window tests run here: $passed"
 
   test-windows:
     name: test (windows)

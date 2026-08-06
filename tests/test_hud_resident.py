@@ -375,15 +375,25 @@ print("OK")
 
 
 def _gtk_available() -> bool:
+    """Everything the child imports, not just GTK.
+
+    The overlay requires Gtk4LayerShell before Gdk on Linux - without it the
+    pill becomes an ordinary decorated toplevel, so it is not optional and
+    hud_app does not treat it as such. Probing for GTK alone said yes on a
+    machine that has GTK 4 and no layer-shell typelib, which is every Ubuntu
+    runner: Ubuntu packages gtk-layer-shell for GTK 3 and nothing for GTK 4.
+    The tests then ran and failed on an import, rather than skipping.
+    """
     import os
     import subprocess
     if sys.platform != "win32" and not os.environ.get("DISPLAY"):
         return False
-    result = subprocess.run(
-        [sys.executable, "-c",
-         "import gi; gi.require_version('Gtk', '4.0'); "
-         "from gi.repository import Gtk; Gtk.init()"],
-        capture_output=True, check=False)
+    probe = "import gi; gi.require_version('Gtk', '4.0'); "
+    if sys.platform != "win32":
+        probe += "gi.require_version('Gtk4LayerShell', '1.0'); "
+    probe += "from gi.repository import Gtk; Gtk.init()"
+    result = subprocess.run([sys.executable, "-c", probe],
+                            capture_output=True, check=False)
     return result.returncode == 0
 
 

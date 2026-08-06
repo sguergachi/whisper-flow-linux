@@ -144,3 +144,63 @@ def test_the_tray_icon_still_carries_its_halo(tmp_path):
     tray = icon.tray_icon(icon.ICON_IDLE)
     assert sum(tray.getchannel("A").getdata()) > \
         sum(bare.getchannel("A").getdata()), "no halo around the tray glyph"
+
+
+def test_a_window_asks_for_the_small_sizes_only(tmp_path):
+    """The taskbar and title bar never show anything above 64px.
+
+    This one is drawn while a window is opening rather than at package time,
+    and the 256px frame alone is most of what that costs - for a size only
+    Explorer ever asks for.
+    """
+    from PIL import Image
+
+    from whisper_flow import icon
+
+    path = icon.write_ico(str(tmp_path / "window.ico"),
+                          sizes=icon.WINDOW_ICO_SIZES)
+    with Image.open(path) as image:
+        sizes = {size for size in image.info["sizes"]}
+    assert sizes == {(s, s) for s in icon.WINDOW_ICO_SIZES}
+    assert max(icon.WINDOW_ICO_SIZES) <= 64, (
+        "a window icon this large is drawn for nobody")
+    # And the small sizes a window does use are all there.
+    assert {(16, 16), (32, 32), (48, 48)} <= sizes
+
+
+def test_the_window_icon_is_cheaper_than_the_full_set(tmp_path):
+    """It is drawn on the path between the click and the window appearing.
+
+    A budget rather than a stopwatch: what matters is that a window is not
+    paying for the 256px frame, which is most of the cost of the whole set
+    and is only ever shown by Explorer. Timed against the full set rather
+    than against a fixed number of milliseconds, which would only measure
+    how busy the machine running the tests is.
+    """
+    from whisper_flow import icon
+
+    # PIL loads its PNG codec on the first save, which costs more than either
+    # of these and would land entirely on whichever runs first.
+    icon.write_ico(str(tmp_path / "warm.ico"), sizes=(16,))
+
+    started = time.perf_counter()
+    icon.write_ico(str(tmp_path / "window.ico"), sizes=icon.WINDOW_ICO_SIZES)
+    window = time.perf_counter() - started
+
+    started = time.perf_counter()
+    icon.write_ico(str(tmp_path / "app.ico"))
+    everything = time.perf_counter() - started
+
+    assert window < everything / 2, (
+        f"the window icon costs {window*1000:.0f}ms against "
+        f"{everything*1000:.0f}ms for the full set; it is not saving anything")
+
+
+def test_the_build_still_gets_every_size(tmp_path):
+    """The default is the executable's, and the executable needs 256."""
+    from PIL import Image
+
+    from whisper_flow import icon
+
+    with Image.open(icon.write_ico(str(tmp_path / "app.ico"))) as image:
+        assert (256, 256) in image.info["sizes"]

@@ -514,3 +514,52 @@ def test_an_unreadable_window_is_not_the_start_menu(system_win, monkeypatch):
     monkeypatch.setattr(system_win, "foreground_window", lambda: 0)
     assert system_win.start_menu_in_front() is False
     assert "" not in system_win.START_MENU_PROCESSES
+
+
+# ------------------------------------------ what we did just before it
+def test_what_we_last_injected_is_remembered(system_win, monkeypatch):
+    """The menu opening is still unexplained, and this is the missing half.
+
+    Three fixes have aimed at the keystrokes around it. Which of ours it
+    actually followed, and by how long, is what no log has ever said.
+    """
+    _no_modifiers_held(system_win, monkeypatch)
+    _batches(system_win, monkeypatch)
+
+    system_win.release_modifiers()
+    ago, what = system_win.last_injection()
+    assert "released" in what, what
+    assert ago < 1.0, "the timestamp is not being taken"
+
+    system_win.spoil_start_menu()
+    _ago, what = system_win.last_injection()
+    assert "no-op" in what, what
+
+
+def test_the_close_says_what_it_followed(system_win, monkeypatch):
+    """A log line naming only the menu leaves the cause to be guessed at."""
+    _no_modifiers_held(system_win, monkeypatch)
+    _batches(system_win, monkeypatch)
+    _in_front(system_win, monkeypatch, True, False)
+    lines = []
+    monkeypatch.setattr(system_win, "log", lines.append)
+
+    system_win.spoil_start_menu()
+    system_win.dismiss_start_menu()
+
+    opened = [line for line in lines if "Start menu has the foreground" in line]
+    assert opened, lines
+    assert "no-op" in opened[0], (
+        f"the line does not say what we did last: {opened[0]}")
+    assert "s after we" in opened[0], "nor how long before"
+
+
+def test_typing_counts_as_the_last_thing_we_did(system_win, monkeypatch):
+    """Live typing is where the user says this comes from, so it has to
+    be one of the answers this can give."""
+    _no_modifiers_held(system_win, monkeypatch)
+    _batches(system_win, monkeypatch)
+
+    system_win.type_text("hello")
+    _ago, what = system_win.last_injection()
+    assert "modifier" in what or "character" in what, what

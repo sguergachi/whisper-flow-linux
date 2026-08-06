@@ -131,7 +131,7 @@ def test_escape_fires_even_during_a_held_combination(listener):
 
 
 
-def _fake_system_win(monkeypatch, spoil):
+def _fake_system_win(monkeypatch, spoil, dismiss=None):
     """Replace whisper_flow.system_win for `from . import system_win`.
 
     Patching sys.modules alone is not enough: once the package has the
@@ -145,6 +145,7 @@ def _fake_system_win(monkeypatch, spoil):
 
     fake = types.ModuleType("whisper_flow.system_win")
     fake.spoil_start_menu = spoil
+    fake.dismiss_start_menu = dismiss or (lambda: False)
     monkeypatch.setitem(sys.modules, "whisper_flow.system_win", fake)
     monkeypatch.setattr(whisper_flow, "system_win", fake, raising=False)
     return fake
@@ -294,3 +295,103 @@ def test_suppression_failing_does_not_stop_the_hotkey(listener, monkeypatch):
     name, kind, cb = listener._callbacks.get_nowait()
     cb()
     assert fired == ["press"]
+
+
+# --------------------------------------- closing one that opened anyway
+def test_a_start_menu_that_opened_is_closed_during_the_hold(listener,
+                                                            monkeypatch):
+    """The typing path only notices when it has words to deliver.
+
+    Holds that commit nothing - a long pause, a quiet room - have no pass to
+    notice with, so the menu stayed up, kept the foreground, and everything
+    said afterwards had nowhere to go.
+    """
+    module = listener._module
+    closed = []
+    _fake_system_win(monkeypatch, lambda: None,
+                     dismiss=lambda: (closed.append(1), True)[1])
+    monkeypatch.setattr(module, "START_MENU_CHECK", 0.0)
+
+    listener.register_hotkey("transcribe", "super+alt", lambda: None)
+    listener._press_triggered.add("transcribe")
+    down = {module.NAME_TO_VK["super"], module.NAME_TO_VK["alt"]}
+
+    assert listener._close_start_menu_if_it_opened(down) is True
+    assert closed == [1]
+
+
+def test_the_foreground_is_not_read_on_every_poll(listener, monkeypatch):
+    """It is three Win32 calls, and the loop runs at 60Hz."""
+    module = listener._module
+    looked = []
+    _fake_system_win(monkeypatch, lambda: None,
+                     dismiss=lambda: (looked.append(1), False)[1])
+
+    listener.register_hotkey("transcribe", "super+alt", lambda: None)
+    listener._press_triggered.add("transcribe")
+    down = {module.NAME_TO_VK["super"], module.NAME_TO_VK["alt"]}
+
+    for _ in range(10):
+        listener._close_start_menu_if_it_opened(down)
+    assert len(looked) == 1
+
+
+def test_nobody_elses_start_menu_is_touched(listener, monkeypatch):
+    """No hotkey of ours is held, so an open Start menu is the user's."""
+    module = listener._module
+    looked = []
+    _fake_system_win(monkeypatch, lambda: None,
+                     dismiss=lambda: (looked.append(1), True)[1])
+
+    listener.register_hotkey("transcribe", "super+alt", lambda: None)
+    listener._close_start_menu_if_it_opened({module.NAME_TO_VK["super"]})
+    assert looked == []
+
+
+def test_a_hotkey_without_super_never_looks(listener, monkeypatch):
+    module = listener._module
+    looked = []
+    _fake_system_win(monkeypatch, lambda: None,
+                     dismiss=lambda: (looked.append(1), True)[1])
+
+    listener.register_hotkey("auto", "ctrl+alt+space", lambda: None)
+    listener._press_triggered.add("auto")
+    listener._close_start_menu_if_it_opened(
+        {module.NAME_TO_VK[n] for n in ("ctrl", "alt", "space")})
+    assert looked == []
+
+
+def test_closing_it_does_not_cancel_the_dictation(listener, monkeypatch):
+    """Escape closes the menu and Escape is also the cancel key.
+
+    The poll that follows the close must not read our own Escape out of the
+    key state and cancel the recording it was rescuing.
+    """
+    import threading
+    import time
+
+    module = listener._module
+    _fake_system_win(monkeypatch, lambda: None, dismiss=lambda: True)
+    monkeypatch.setattr(module, "START_MENU_CHECK", 0.0)
+    monkeypatch.setattr(module, "SPOIL_INTERVAL", 0.0)
+    monkeypatch.setattr(module, "_typing_depth", 0)
+    monkeypatch.setattr(module, "_settled_at", 0.0)
+
+    listener.escape_callback = lambda: None
+    listener.register_hotkey("transcribe", "super+alt", lambda: None)
+    listener._held_set.update({module.NAME_TO_VK["super"],
+                               module.NAME_TO_VK["alt"],
+                               module.NAME_TO_VK["esc"]})   # Escape still down
+
+    listener._running = True
+    thread = threading.Thread(target=listener._poll_loop, daemon=True)
+    thread.start()
+    time.sleep(0.1)
+    listener._running = False
+    thread.join(timeout=2)
+
+    fired = []
+    while not listener._callbacks.empty():
+        fired.append(listener._callbacks.get_nowait()[0])
+    assert "escape" not in fired, (
+        "the Escape that closed the Start menu cancelled the dictation")

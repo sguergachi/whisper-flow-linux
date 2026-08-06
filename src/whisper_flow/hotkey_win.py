@@ -55,6 +55,10 @@ HELD_MASK = 0x8000      # high bit of GetAsyncKeyState means currently down
 # _keep_start_menu_spoiled.
 SPOIL_INTERVAL = 0.1
 
+# How often the foreground is checked, while a Super hotkey is held, for a
+# Start menu that opened anyway. See _close_start_menu_if_it_opened.
+START_MENU_CHECK = 0.2
+
 # While this app is injecting keystrokes of its own, the key state is not the
 # user's and must not be read as if it were.
 #
@@ -153,6 +157,7 @@ class WinHotkeyListener:
         # held - which is the whole point of a cancel key. Set by the manager.
         self.escape_callback = None
         self._spoil_due = 0.0
+        self._start_menu_check_due = 0.0
         self._user32 = ctypes.WinDLL("user32", use_last_error=True)
         self._user32.GetAsyncKeyState.restype = ctypes.c_short
         self._user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
@@ -247,6 +252,12 @@ class WinHotkeyListener:
                     self._check_bindings(down, rising=len(down) > len(previous))
                     previous = down
                 self._keep_start_menu_spoiled(down)
+                if self._close_start_menu_if_it_opened(down):
+                    # The Escape that closed it is still in the key state,
+                    # and Escape is the cancel key. Read it now and this
+                    # would cancel the dictation it just rescued.
+                    time.sleep(self._poll_interval)
+                    continue
                 # Escape is tracked beside the bindings, not among them: it
                 # must fire even while a push-to-talk combination is held.
                 esc_down = bool(get(esc) & HELD_MASK)
@@ -310,6 +321,42 @@ class WinHotkeyListener:
             return
         self._spoil_due = now + SPOIL_INTERVAL
         self._spoil_start_menu_if_needed(keys)
+
+    def _close_start_menu_if_it_opened(self, down: set) -> bool:
+        """Shut the Start menu if it appeared while the hotkey is held.
+
+        The typing path already does this when it has words to deliver, and
+        that is too late and too conditional: the menu opens during holds
+        that commit nothing at all - a long pause, a quiet room - and then
+        there is no pass to notice it. It stays up, takes the foreground, and
+        the words that do arrive have nowhere to go.
+
+        Here it is noticed within a fifth of a second of appearing, whatever
+        the dictation is doing, and closing it puts the foreground back where
+        it was. That is the symptom gone regardless of which keystroke opened
+        it, which matters because three fixes aimed at those keystrokes have
+        not stopped it; the log line it writes names what this process last
+        injected and how long before, which is the evidence that has been
+        missing.
+
+        Returns whether a menu was actually closed, so the caller can leave
+        the injected Escape alone.
+        """
+        keys = self.triggered_keys()
+        super_vk = NAME_TO_VK["super"]
+        if super_vk not in keys or super_vk not in down:
+            return False
+        now = time.monotonic()
+        if now < self._start_menu_check_due:
+            return False
+        self._start_menu_check_due = now + START_MENU_CHECK
+        try:
+            from . import system_win
+
+            return system_win.dismiss_start_menu()
+        except Exception as e:
+            log.debug("could not close the Start menu: %s", e)
+            return False
 
     def _check_bindings(self, down: set, rising: bool):
         satisfied = [

@@ -440,8 +440,16 @@ jobs:
     name: release
     # Every merge to master publishes, and so does a version tag. Pull
     # requests build but never publish.
+    #
+    # A hand-started run on master publishes too. Pushes stopped raising
+    # workflow events on this repository, so the only runs that happen are
+    # dispatched by hand - and with this gated to push events, master moved
+    # three commits ahead of the release the app updates from while every
+    # dispatched run went green and published nothing. A dispatch on master
+    # is a merge to master someone had to start themselves.
     if: >-
-      github.event_name == 'push' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+      &&
       (github.ref == 'refs/heads/master' ||
        github.ref == 'refs/heads/main' ||
        startsWith(github.ref, 'refs/tags/v'))

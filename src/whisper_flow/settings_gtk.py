@@ -353,7 +353,16 @@ def _gobject_pointer(obj) -> int:
 
 
 def _list_input_devices() -> list[tuple[int, str]]:
-    """(index, name) for every capture device, or nothing if audio is down."""
+    """(index, name) for every capture device, or nothing if audio is down.
+
+    The name carries the host API, because without it the list reads as
+    duplicates: PortAudio enumerates each physical microphone once per
+    Windows audio API - MME, DirectSound, WASAPI, WDM-KS - so one headset is
+    four entries with the same name and four different indices. They are not
+    interchangeable either. WASAPI is the modern path and the one that says
+    what it will and will not resample; MME is the oldest and the loosest.
+    Which was picked is exactly what a name repeated four times cannot say.
+    """
     try:
         import pyaudio
         pa = pyaudio.PyAudio()
@@ -361,14 +370,32 @@ def _list_input_devices() -> list[tuple[int, str]]:
             devices = []
             for i in range(pa.get_device_count()):
                 info = pa.get_device_info_by_index(i)
-                if int(info.get("maxInputChannels", 0)) > 0:
-                    devices.append((i, str(info.get("name", f"device {i}"))))
+                if int(info.get("maxInputChannels", 0)) <= 0:
+                    continue
+                name = str(info.get("name", f"device {i}"))
+                api = _host_api_name(pa, info)
+                devices.append((i, f"{name} ({api})" if api else name))
             return devices
         finally:
             pa.terminate()
     except Exception as e:
         log(f"[SETTINGS] could not list microphones: {e}")
         return []
+
+
+def _host_api_name(pa, info) -> str:
+    """Which Windows audio API serves a device, "" if it cannot be read.
+
+    Shortened the way the system does: PortAudio calls them "Windows WASAPI"
+    and "Windows DirectSound", and the word is on every entry in the list, so
+    it is on none of them here.
+    """
+    try:
+        name = str(pa.get_host_api_info_by_index(info["hostApi"])["name"])
+    except Exception:
+        return ""
+    prefix = "Windows "
+    return name[len(prefix):] if name.startswith(prefix) else name
 
 
 # Spin adjustment (digits, step) per numeric field; anything not listed is a
@@ -1346,6 +1373,10 @@ class SettingsWindow(Adw.ApplicationWindow):
             if not hwnd:
                 log("[SETTINGS] no HWND; window stays opaque")
                 return
+            # Before the backdrop, and not conditional on it: the icon is
+            # what the taskbar draws, and a window with no backdrop still has
+            # a taskbar button.
+            self._set_window_icon(hwnd)
             applied = blur_win.apply_backdrop(hwnd, transient=True)
             if not applied:
                 log("[SETTINGS] backdrop unavailable; window stays opaque")
@@ -1365,6 +1396,44 @@ class SettingsWindow(Adw.ApplicationWindow):
             log(f"[SETTINGS] backdrop blur enabled ({applied})")
         except Exception as e:
             log(f"[SETTINGS] blur unavailable: {e}")
+
+    @staticmethod
+    def _set_window_icon(hwnd: int) -> None:
+        """Put the app's mark on the taskbar button.
+
+        GTK sets a window's icon by name, out of the icon theme, and the
+        theme shipped with this build is Adwaita's symbolic set - which has
+        no entry for this application. So the window carried no icon at all
+        and the taskbar drew a blank sheet beside a tray showing a
+        microphone.
+
+        Drawn here rather than shipped as a file, from the same code as the
+        tray and the executable, which is the only arrangement in which the
+        three cannot drift apart. It is the small sizes only and it costs a
+        few milliseconds; the file goes as soon as Windows has read it.
+        """
+        import tempfile
+
+        try:
+            from . import blur_win, icon
+        except Exception as e:                  # not a Windows build
+            log(f"[SETTINGS] no window icon: {e}")
+            return
+        path = None
+        try:
+            fd, path = tempfile.mkstemp(suffix=".ico", prefix="whisper-flow-")
+            os.close(fd)
+            icon.write_ico(path, sizes=icon.WINDOW_ICO_SIZES)
+            if not blur_win.set_window_icon(hwnd, path):
+                log("[SETTINGS] the window icon was refused")
+        except Exception as e:
+            log(f"[SETTINGS] could not set the window icon: {e}")
+        finally:
+            if path:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
 
 
 def _retire_if_unseen(window: "SettingsWindow") -> bool:

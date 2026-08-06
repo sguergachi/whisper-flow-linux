@@ -228,6 +228,40 @@ elif scenario == "mic_race":
         f"the pending selection was reverted to {after!r} when the device "
         f"list arrived; the choice was taken from the saved baseline rather "
         f"than from the row")
+elif scenario == "mic_host_api":
+    # PortAudio lists every microphone once per Windows audio API, so the
+    # same headset is four entries with the same name and four indices. The
+    # list read as duplicates and there was no way to tell which was which.
+    import types
+    fake = types.ModuleType("pyaudio")
+
+    class _PA:
+        devices = [
+            {"name": "Headset", "maxInputChannels": 1, "hostApi": 0},
+            {"name": "Headset", "maxInputChannels": 1, "hostApi": 1},
+            {"name": "Speakers", "maxInputChannels": 0, "hostApi": 1},
+        ]
+        apis = [{"name": "MME"}, {"name": "Windows WASAPI"}]
+
+        def get_device_count(self):
+            return len(self.devices)
+
+        def get_device_info_by_index(self, i):
+            return self.devices[i]
+
+        def get_host_api_info_by_index(self, i):
+            return self.apis[i]
+
+        def terminate(self):
+            pass
+
+    fake.PyAudio = _PA
+    sys.modules["pyaudio"] = fake
+
+    listed = settings_gtk._list_input_devices()
+    assert listed == [(0, "Headset (MME)"), (1, "Headset (WASAPI)")], listed
+    # Outputs are still left out, and "Windows " is not repeated on every row.
+    assert all("Speakers" not in name for _, name in listed)
 elif scenario == "mic_selected":
     # Which device is in use, in the open list. Replacing the factory to stop
     # it ellipsizing the names also dropped the tick the stock one draws, so
@@ -412,6 +446,17 @@ def test_a_choice_made_before_the_mic_list_arrives_survives_it(tmp_path):
     the enumeration was still running was silently undone.
     """
     result = _run(tmp_path, "mic_race")
+    assert "OK" in result.stdout, result.stderr
+
+
+def test_the_device_list_says_which_audio_api_each_entry_is(tmp_path):
+    """One microphone, four entries: PortAudio lists it per host API.
+
+    Without the API on the label they are indistinguishable duplicates, and
+    they are not interchangeable - WASAPI and MME differ in what they will
+    resample and in how they behave when a device is busy.
+    """
+    result = _run(tmp_path, "mic_host_api")
     assert "OK" in result.stdout, result.stderr
 
 

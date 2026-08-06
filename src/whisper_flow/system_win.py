@@ -160,6 +160,24 @@ def _send(events: list) -> bool:
     return sent == len(events)
 
 
+# The last thing this process put into the keyboard, and when. Only ever read
+# to describe the moment the Start menu appeared: it has now survived three
+# fixes aimed at the keystrokes around it, so the next report should say which
+# of ours it followed rather than leaving it to be inferred.
+_last_injection = (0.0, "sent nothing yet this session")
+
+
+def _note(what: str) -> None:
+    global _last_injection
+    _last_injection = (time.monotonic(), what)
+
+
+def last_injection() -> tuple[float, str]:
+    """Seconds since this process last injected keys, and what it was."""
+    when, what = _last_injection
+    return (time.monotonic() - when if when else float("inf")), what
+
+
 def foreground_window() -> int:
     """The window that had focus, to type back into later. 0 if there is none."""
     try:
@@ -243,12 +261,19 @@ def dismiss_start_menu() -> bool:
 
     The modifiers come off first for the same reason typing takes them off:
     the user is still holding Alt, and Alt+Escape cycles windows. Blinded
-    throughout, or the listener reads our Escape as the user's and cancels
-    the dictation it is trying to rescue.
+    throughout - the wait included, so the injected Escape has gone from the
+    key state before anyone reads it again - or the listener takes our Escape
+    for the user's and cancels the dictation this is trying to rescue.
+
+    The log line names what this process did last and how long ago, because
+    the menu opening at all is still unexplained. Which keystroke of ours it
+    followed, and by how much, is the one thing a log has never said.
     """
     if not start_menu_in_front():
         return False
-    log("[WIN] the Start menu has the foreground; closing it")
+    ago, what = last_injection()
+    log(f"[WIN] the Start menu has the foreground {ago:.2f}s after we "
+        f"{what}; closing it")
     with _hotkeys_blinded():
         held = release_modifiers()
         try:
@@ -256,11 +281,11 @@ def dismiss_start_menu() -> bool:
                    _key_event(VK_ESCAPE, 0, KEYEVENTF_KEYUP)])
         finally:
             restore_modifiers(held)
-    # It closes on its own schedule, and focus moves back a moment after that.
-    for _ in range(30):
-        if not start_menu_in_front():
-            return True
-        time.sleep(0.01)
+        # It closes on its own schedule, and focus moves back a moment later.
+        for _ in range(30):
+            if not start_menu_in_front():
+                return True
+            time.sleep(0.01)
     log("[WIN] the Start menu did not close")
     return False
 
@@ -372,6 +397,7 @@ def spoil_start_menu() -> None:
     the release is then ignored. VK_NONAME is reserved as a no-op precisely
     for this: it reaches no application and does nothing on its way past.
     """
+    _note("sent the no-op key on its own")
     _send(_spoil_events())
 
 
@@ -430,6 +456,7 @@ def release_modifiers() -> tuple:
     """
     held = tuple(vk for vk in MODIFIERS
                  if _user32.GetAsyncKeyState(vk) & HELD_MASK)
+    _note("released every modifier, to type")
     _send(_spoil_events()
           + [_key_event(vk, 0, KEYEVENTF_KEYUP) for vk in MODIFIERS])
     return held
@@ -484,6 +511,7 @@ def restore_modifiers(held) -> None:
         return
     with _injected_lock:
         _injected_down.update(wanted)
+    _note(f"pressed {len(wanted)} modifier(s) back down after typing")
     _send([_key_event(vk, 0, 0) for vk in wanted] + _spoil_events())
 
 
@@ -509,6 +537,7 @@ def release_injected_modifiers() -> tuple:
         _injected_down.clear()
     if ours:
         log(f"[WIN] releasing {len(ours)} modifier(s) we were holding down")
+        _note(f"let go of the {len(ours)} modifier(s) we were holding")
         _send(_spoil_events()
               + [_key_event(vk, 0, KEYEVENTF_KEYUP) for vk in ours])
     return ours
@@ -541,6 +570,7 @@ def type_text(text: str) -> bool:
                         _key_event(0, code, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP))
             # SendInput takes the whole batch atomically, so nothing can
             # interleave.
+            _note(f"typed {len(text)} character(s)")
             if _send(events):
                 return True
 

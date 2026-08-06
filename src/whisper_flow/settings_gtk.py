@@ -1312,6 +1312,13 @@ class SettingsWindow(Adw.ApplicationWindow):
         the person who pressed the button. The daemon changing model underneath
         is not a click, and yanking someone off the Hotkeys page to show them
         a pill they did not ask about is not an improvement.
+
+        ViewStack.add_* always appends, so replacing Speech alone shoved it
+        to the far right of the switcher (Hotkeys | Dictation | General |
+        Speech). That path runs on every open via _reload_from_disk, not only
+        after a download. After Speech is re-appended, rotate the other pages
+        to the end so SECTIONS order is restored without emptying the stack
+        (an empty ViewStack crashes the switcher).
         """
         keep = self._values()
         # The old page's widgets are about to be dropped; holding references
@@ -1320,14 +1327,32 @@ class SettingsWindow(Adw.ApplicationWindow):
         self._download_buttons = []
         self._progress_bars = {}
         self._model_checks = {}
+        was = None if focus else self._stack.get_visible_child_name()
         self._stack.remove(self._stack.get_child_by_name("speech"))
         page = self._build_speech_page("Speech")
         # With the icon, as _build adds it: the view switcher draws the
         # broken-image glyph for a page that has none.
         self._stack.add_titled_with_icon(
             page, "speech", "Speech", SECTION_ICONS["Speech"])
-        if focus:
-            self._stack.set_visible_child_name("speech")
+        # Stack is now Hotkeys | Dictation | General | Speech. Park on
+        # Speech before rotating the others: removing the visible page
+        # segfaults the switcher. Then move each non-Speech page to the
+        # end in SECTIONS order so the tabs land as Speech | Hotkeys |
+        # Dictation | General. Speech stays put, so the stack never empties
+        # and the visible child is never the one being removed.
+        self._stack.set_visible_child_name("speech")
+        for section in settings_def.SECTIONS:
+            if section == "Speech":
+                continue
+            name = section.lower()
+            child = self._stack.get_child_by_name(name)
+            if child is None:
+                continue
+            self._stack.remove(child)
+            self._stack.add_titled_with_icon(
+                child, name, section, SECTION_ICONS[section])
+        if not focus and was and self._stack.get_child_by_name(was) is not None:
+            self._stack.set_visible_child_name(was)
         self._apply_values(keep)
 
     def _on_progress(self, stage: str, fraction: float):

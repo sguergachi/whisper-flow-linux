@@ -25,6 +25,12 @@ HALO_PIXELS = 5
 # is the one that looks soft.
 ICO_SIZES = (16, 24, 32, 48, 64, 128, 256)
 
+# What a window needs, which is far less: the title bar and the taskbar ask
+# for the small and large system icon sizes and nothing above 64 is ever
+# shown. Drawn at open, so the sizes nobody will see are worth skipping -
+# 256px alone is most of the cost, and it is Explorer's, not a window's.
+WINDOW_ICO_SIZES = (16, 20, 24, 32, 40, 48, 64)
+
 # The mark on its own, without the tray's halo, in a colour that reads on both
 # a light and a dark desktop.
 APP_COLOR = (236, 238, 242, 255)
@@ -90,16 +96,21 @@ def tray_icon(color: tuple[int, int, int, int]) -> Image.Image:
     return Image.alpha_composite(halo, image)
 
 
-def write_ico(path: str) -> str:
+def write_ico(path: str, sizes: tuple = ICO_SIZES) -> str:
     """Write the application icon, the same mark the tray shows.
 
     Every size is drawn at its own resolution rather than left to the .ico
     writer, which would resample one bitmap down to 16px and lose the stem
     and the base of the microphone entirely.
+
+    `sizes` is for the windows, which ask for a handful of small ones at open
+    and never for the largest: see WINDOW_ICO_SIZES. The build passes nothing
+    and gets the full set, which is what the executable and the shortcuts
+    need.
     """
-    frames = [draw_mic(size, APP_COLOR) for size in ICO_SIZES]
+    frames = [draw_mic(size, APP_COLOR) for size in sizes]
     largest = frames[-1]
     largest.save(path, format="ICO",
-                 sizes=[(s, s) for s in ICO_SIZES],
+                 sizes=[(s, s) for s in sizes],
                  append_images=frames[:-1])
     return path

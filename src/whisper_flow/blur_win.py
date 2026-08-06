@@ -100,6 +100,16 @@ MIN_BUILD = 22621
 
 DWMWA_COLOR_NONE = 0xFFFFFFFE  # sentinel: suppress the border entirely
 
+# WM_SETICON, and the metrics that say how big an icon each slot wants. A
+# window's own icon is what the taskbar and Alt-Tab draw; a GTK window has
+# none until it is given one. See set_window_icon.
+WM_SETICON = 0x0080
+ICON_SMALL, ICON_BIG = 0, 1
+IMAGE_ICON = 1
+LR_LOADFROMFILE = 0x0010
+SM_CXICON, SM_CYICON = 11, 12
+SM_CXSMICON, SM_CYSMICON = 49, 50
+
 
 class _OSVERSIONINFOEXW(ctypes.Structure):
     _fields_ = [
@@ -297,6 +307,57 @@ def _apply_accent_acrylic(hwnd: int, tint: int = ACCENT_TINT_DARK) -> bool:
         except Exception:
             return False
     return False
+
+
+def set_window_icon(hwnd: int, path: str) -> bool:
+    """Give a window the app's own icon, from an .ico file.
+
+    The taskbar button, Alt-Tab and the title bar all show the icon the
+    window carries, and a GTK window on Windows carries none: GTK sets it
+    from the icon *theme*, by name, and the theme bundled here is Adwaita's
+    symbolic set, which has never heard of this application. So the settings
+    window sat in the taskbar as a blank sheet while the tray beside it showed
+    a microphone.
+
+    Both sizes are loaded, because Windows asks for them separately and scales
+    whichever it is not given - the small one for the title bar, the large one
+    for the taskbar and Alt-Tab. Loaded at the metrics' own sizes rather than
+    LR_DEFAULTSIZE so a display at 150% gets the 24 or 48px frame drawn for
+    it instead of a stretched 16.
+
+    The file is only read here: LoadImage copies it into an icon handle, so
+    the caller is free to delete it as soon as this returns.
+    """
+    if not hwnd or not path:
+        return False
+    try:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.LoadImageW.restype = wintypes.HANDLE
+        user32.LoadImageW.argtypes = [
+            wintypes.HINSTANCE, wintypes.LPCWSTR, wintypes.UINT,
+            ctypes.c_int, ctypes.c_int, wintypes.UINT]
+        user32.SendMessageW.argtypes = [
+            wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+        user32.GetSystemMetrics.argtypes = [ctypes.c_int]
+        wanted = (
+            (ICON_BIG, SM_CXICON, SM_CYICON),
+            (ICON_SMALL, SM_CXSMICON, SM_CYSMICON),
+        )
+        done = False
+        for which, cx_metric, cy_metric in wanted:
+            handle = user32.LoadImageW(
+                None, path, IMAGE_ICON,
+                user32.GetSystemMetrics(cx_metric),
+                user32.GetSystemMetrics(cy_metric),
+                LR_LOADFROMFILE)
+            if not handle:
+                continue
+            user32.SendMessageW(wintypes.HWND(hwnd), WM_SETICON, which,
+                                ctypes.cast(handle, ctypes.c_void_p).value)
+            done = True
+        return done
+    except Exception:
+        return False
 
 
 def surface_handle(surface_pointer: int) -> int | None:

@@ -177,6 +177,22 @@ elif scenario == "unsaved_model_choice":
     assert w._current_model == "ggml-small.en-q8_0"
     assert w._model_checks[other].get_active(), (
         "a daemon restart took the model choice away from the user")
+elif scenario == "tab_order_after_rebuild":
+    # ViewStack.add_* appends. Replacing only Speech used to leave the tabs
+    # as Hotkeys | Dictation | General | Speech. That rebuild runs on every
+    # open (_reload_from_disk), so the order has to survive it.
+    def names():
+        pages = w._stack.get_pages()
+        return [pages.get_item(i).get_name()
+                for i in range(pages.get_n_items())]
+    expected = [s.lower() for s in settings_def.SECTIONS]
+    assert names() == expected, names()
+    w._rebuild_speech_page()
+    assert names() == expected, names()
+    # And again: open reloads, which rebuilds, which must not walk the tab
+    # further right each time.
+    w._rebuild_speech_page()
+    assert names() == expected, names()
 elif scenario == "nothing_to_see":
     # Nobody is looking, so nothing is read and nothing is rebuilt.
     called = []
@@ -580,6 +596,17 @@ def test_a_rebuilt_page_puts_its_values_back():
         assert "_rebuild_speech_page()" in called, (
             f"{caller} replaces rows without going through the rebuild, so "
             f"the values it captured are never put back")
+
+
+def test_rebuild_keeps_section_tab_order(tmp_path):
+    """Speech must stay the first tab after a rebuild, not the last.
+
+    add_titled_with_icon appends. Replacing Speech alone used to leave the
+    switcher as Hotkeys | Dictation | General | Speech - and every open
+    rebuilds Speech, so Windows always showed that wrong order.
+    """
+    result = _run(tmp_path, "tab_order_after_rebuild")
+    assert "OK" in result.stdout, result.stderr
 
 
 def test_the_recommended_badge_is_a_pill_beside_the_name(tmp_path):

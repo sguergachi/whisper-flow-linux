@@ -5,6 +5,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 
+from whisper_flow import daemon as daemon_module
 from whisper_flow.daemon import WhisperFlowDaemon
 
 
@@ -885,3 +886,48 @@ class TestDaemonStability:
 
         manager._last_notified.pop.assert_called_once_with("hello", None)
         manager.notify.assert_called_once_with("hello")
+
+
+class TestTrayMenu:
+    """What the menu says before anything is clicked."""
+
+    @staticmethod
+    def _items(daemon, monkeypatch):
+        """Build the menu against a stand-in for pystray.
+
+        The real one resolves a GTK backend during import and raises with no
+        display, which is exactly the machine CI runs on. Nothing here needs
+        a tray - only the titles the menu is built with.
+        """
+        import types
+
+        fake = types.SimpleNamespace(
+            Menu=lambda *items: list(items),
+            MenuItem=lambda title, action, **kwargs: title,
+        )
+        monkeypatch.setattr(daemon_module, "_pystray", lambda: fake)
+        return daemon.setup_tray_menu()
+
+    def test_the_menu_names_the_build_it_is_running(self, temp_config_dir,
+                                                    monkeypatch):
+        """Which version is running was answerable only by copying a failure
+        report. The tray menu is always one click away, so it says so."""
+        daemon = _stub_daemon(temp_config_dir)
+
+        items = self._items(daemon, monkeypatch)
+
+        assert items[0] == f"WhisperFlow {daemon_module.build_version()}"
+
+    def test_a_packaged_build_shows_its_stamp_not_the_source_version(
+            self, temp_config_dir, monkeypatch, tmp_path):
+        """The point of showing it is telling two builds apart; every build
+        of a commit series carries the same __version__."""
+        exe = tmp_path / "whisper-flow.exe"
+        exe.write_bytes(b"")
+        (tmp_path / "BUILD.txt").write_text("0.4.171", encoding="utf-8")
+        monkeypatch.setattr(daemon_module.sys, "executable", str(exe))
+        daemon = _stub_daemon(temp_config_dir)
+
+        items = self._items(daemon, monkeypatch)
+
+        assert items[0] == "WhisperFlow 0.4.171"

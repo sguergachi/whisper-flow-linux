@@ -14,7 +14,6 @@ from pathlib import Path
 
 from PIL import Image
 
-from . import __version__
 from . import backend as backend_module
 from . import icon
 from . import updater
@@ -26,6 +25,7 @@ from .hotkey_manager import HotkeyManager, HotkeyMode
 from .hud import HUD
 from .logging import log, recent_log, set_logging_enabled
 from .paths import pid_file as _pid_file
+from .version import build_version
 
 # Modes driven by holding a hotkey down; they cannot be deferred and replayed.
 PUSH_TO_TALK_MODES = ("transcribe", "command")
@@ -63,31 +63,6 @@ def _cached_icon(color: tuple[int, int, int, int]) -> Image.Image:
             log(f"[DAEMON] rendered tray icon in "
                 f"{(time.perf_counter() - started) * 1000:.0f}ms")
         return _icon_cache[color]
-
-
-def build_version() -> str:
-    """Which build this is, not which release it was branched from.
-
-    __version__ is 0.4.0 in every build ever made from this commit series,
-    so every log said 0.4.0 whether it was build 155 or build 170 - and a
-    log that cannot say which build it came from cannot say whether a fix is
-    in it. Three builds failed and published nothing while that was true,
-    and the answer to "none of the fixes worked" turned out to be that none
-    of them had shipped.
-
-    The packaged version is written beside the executable at package time,
-    where nothing but the build can invent it. A source checkout has no such
-    file and says so.
-    """
-    try:
-        stamp = Path(sys.executable).with_name("BUILD.txt")
-        if stamp.exists():
-            packaged = stamp.read_text(encoding="utf-8").strip()
-            if packaged:
-                return packaged
-    except OSError:
-        pass
-    return f"{__version__} (source)"
 
 
 def prerender_icons() -> None:
@@ -340,7 +315,11 @@ class WhisperFlowDaemon:
         """Setup the system tray menu."""
         pystray = _pystray()
         return pystray.Menu(
-            pystray.MenuItem("WhisperFlow Daemon", None, enabled=False),
+            # Named with its build. The tray menu is the one part of this app
+            # that is always a click away, and "which version am I running"
+            # was otherwise answerable only by copying a failure report.
+            pystray.MenuItem(f"WhisperFlow {build_version()}", None,
+                             enabled=False),
             pystray.MenuItem(
                 f"Transcribe (Push-to-Talk): {self.config.hotkey_transcribe}",
                 None,

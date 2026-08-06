@@ -48,6 +48,13 @@ for _n in range(1, 25):
 POLL_INTERVAL = 0.016   # ~60Hz; a tap shorter than this can be missed
 HELD_MASK = 0x8000      # high bit of GetAsyncKeyState means currently down
 
+# How often the Start menu is disarmed again while a Super hotkey is held.
+# Windows arms it on a Windows-key press and disarms it on any other key, so
+# one keystroke at the moment the combination fires covers the hold only for
+# as long as nothing presses Super again - and something does. See
+# _keep_start_menu_spoiled.
+SPOIL_INTERVAL = 0.1
+
 # While this app is injecting keystrokes of its own, the key state is not the
 # user's and must not be read as if it were.
 #
@@ -145,6 +152,7 @@ class WinHotkeyListener:
         # lone Escape could never fire while a push-to-talk combination is
         # held - which is the whole point of a cancel key. Set by the manager.
         self.escape_callback = None
+        self._spoil_due = 0.0
         self._user32 = ctypes.WinDLL("user32", use_last_error=True)
         self._user32.GetAsyncKeyState.restype = ctypes.c_short
         self._user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
@@ -238,6 +246,7 @@ class WinHotkeyListener:
                 if down != previous:
                     self._check_bindings(down, rising=len(down) > len(previous))
                     previous = down
+                self._keep_start_menu_spoiled(down)
                 # Escape is tracked beside the bindings, not among them: it
                 # must fire even while a push-to-talk combination is held.
                 esc_down = bool(get(esc) & HELD_MASK)
@@ -268,6 +277,39 @@ class WinHotkeyListener:
             system_win.spoil_start_menu()
         except Exception as e:
             log.debug("could not suppress the Start menu: %s", e)
+
+    def _keep_start_menu_spoiled(self, down: set) -> None:
+        """Disarm the Start menu again, and keep doing it while the key is held.
+
+        Windows arms Start on a Windows-key press and disarms it on any other
+        key, so the single keystroke sent when the combination fires holds
+        only until something presses Super again. Over a long dictation
+        something does: the key chatters, or a hand shifts its grip, and
+        neither is a release this listener can see - both are shorter than
+        the poll interval, so the recording carries on while Windows has
+        quietly armed the menu behind it. The next such blip opens Start,
+        which takes the foreground, and the rest of the dictation has nowhere
+        to go. Forty seconds of held key is forty seconds of that exposure,
+        which is why it looked like something that happened after a while.
+
+        Sending it again on a cadence bounds that to the cadence. It is a
+        keystroke Windows reserves as doing nothing, and it goes out only
+        while one of our own Super combinations is actually held - never
+        while the user is merely holding the Windows key themselves, whose
+        Start menu is theirs to open.
+
+        The poll loop skips this entirely while text is being injected, which
+        is where the typing path does its own disarming.
+        """
+        keys = self.triggered_keys()
+        super_vk = NAME_TO_VK["super"]
+        if super_vk not in keys or super_vk not in down:
+            return
+        now = time.monotonic()
+        if now < self._spoil_due:
+            return
+        self._spoil_due = now + SPOIL_INTERVAL
+        self._spoil_start_menu_if_needed(keys)
 
     def _check_bindings(self, down: set, rising: bool):
         satisfied = [

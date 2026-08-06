@@ -174,6 +174,111 @@ def test_a_hotkey_without_super_leaves_the_keyboard_alone(listener, monkeypatch)
     assert calls == []
 
 
+def test_the_start_menu_is_disarmed_again_while_the_key_is_held(
+        listener, monkeypatch):
+    """One keystroke at the press covers the press, not the forty seconds after.
+
+    Windows arms Start on a Windows-key press and disarms it on any other
+    key. Nothing presses Super deliberately during a dictation, but the key
+    chatters and hands shift their grip - blips shorter than the poll
+    interval, so the recording never notices - and each one arms the menu
+    again. The next blip opens it, which is the bug that only showed on long
+    holds.
+    """
+    module = listener._module
+    calls = []
+    _fake_system_win(monkeypatch, lambda: calls.append(1))
+    monkeypatch.setattr(module, "SPOIL_INTERVAL", 0.0)
+
+    listener.register_hotkey("transcribe", "super+alt", lambda: None)
+    down = {module.NAME_TO_VK["super"], module.NAME_TO_VK["alt"]}
+    listener._check_bindings(down, rising=True)
+    at_the_press = len(calls)
+
+    for _ in range(3):
+        listener._keep_start_menu_spoiled(down)
+    assert len(calls) == at_the_press + 3, (
+        "the menu was disarmed once and then left armed for the rest of the "
+        "hold")
+
+
+def test_it_is_not_disarmed_on_every_poll(listener, monkeypatch):
+    """The poll runs at 60Hz and this is a keystroke every application sees."""
+    module = listener._module
+    calls = []
+    _fake_system_win(monkeypatch, lambda: calls.append(1))
+
+    listener.register_hotkey("transcribe", "super+alt", lambda: None)
+    down = {module.NAME_TO_VK["super"], module.NAME_TO_VK["alt"]}
+    listener._press_triggered.add("transcribe")
+
+    for _ in range(10):
+        listener._keep_start_menu_spoiled(down)
+    assert len(calls) == 1, "one per cadence, not one per poll"
+
+
+def test_the_users_own_windows_key_is_left_alone(listener, monkeypatch):
+    """Nothing of ours is held, so their Start menu is theirs to open."""
+    module = listener._module
+    calls = []
+    _fake_system_win(monkeypatch, lambda: calls.append(1))
+
+    listener.register_hotkey("transcribe", "super+alt", lambda: None)
+    listener._keep_start_menu_spoiled({module.NAME_TO_VK["super"]})
+    assert calls == []
+
+
+def test_a_combination_without_super_sends_nothing(listener, monkeypatch):
+    module = listener._module
+    calls = []
+    _fake_system_win(monkeypatch, lambda: calls.append(1))
+
+    listener.register_hotkey("auto", "ctrl+alt+space", lambda: None)
+    listener._press_triggered.add("auto")
+    listener._keep_start_menu_spoiled(
+        {module.NAME_TO_VK[n] for n in ("ctrl", "alt", "space")})
+    assert calls == []
+
+
+def test_a_key_no_longer_down_stops_the_disarming(listener, monkeypatch):
+    """Belt and braces: the press is triggered but Super has gone."""
+    module = listener._module
+    calls = []
+    _fake_system_win(monkeypatch, lambda: calls.append(1))
+
+    listener.register_hotkey("transcribe", "super+alt", lambda: None)
+    listener._press_triggered.add("transcribe")
+    listener._keep_start_menu_spoiled({module.NAME_TO_VK["alt"]})
+    assert calls == []
+
+
+def test_the_poll_loop_keeps_disarming_it(listener, monkeypatch):
+    """The wiring, not the method: a held combination must reach it."""
+    import threading
+    import time
+
+    module = listener._module
+    calls = []
+    _fake_system_win(monkeypatch, lambda: calls.append(1))
+    monkeypatch.setattr(module, "SPOIL_INTERVAL", 0.0)
+    monkeypatch.setattr(module, "_typing_depth", 0)
+    monkeypatch.setattr(module, "_settled_at", 0.0)
+
+    listener.register_hotkey("transcribe", "super+alt", lambda: None)
+    listener._held_set.update({module.NAME_TO_VK["super"],
+                               module.NAME_TO_VK["alt"]})
+
+    listener._running = True
+    thread = threading.Thread(target=listener._poll_loop, daemon=True)
+    thread.start()
+    time.sleep(0.1)
+    listener._running = False
+    thread.join(timeout=2)
+
+    assert len(calls) > 1, (
+        "the hold was disarmed at the press and never again")
+
+
 def test_suppression_failing_does_not_stop_the_hotkey(listener, monkeypatch):
     module = listener._module
     def explode():

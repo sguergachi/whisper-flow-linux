@@ -26,6 +26,10 @@ class _FakeWin:
         self.typed = []
         self.centers = {}
         self.asked_center = []
+        # What the Start menu does when asked to close: False is "it was not
+        # there", which is the ordinary case.
+        self.start_menu = False
+        self.dismissals = 0
 
     def foreground_window(self):
         return self.foreground
@@ -36,6 +40,13 @@ class _FakeWin:
     def focus_window(self, hwnd):
         self.focused.append(hwnd)
         self.foreground = hwnd
+        return True
+
+    def dismiss_start_menu(self):
+        self.dismissals += 1
+        if not self.start_menu:
+            return False
+        self.start_menu = False
         return True
 
     def type_text(self, text):
@@ -127,6 +138,63 @@ def test_a_window_that_will_not_come_back_does_not_stop_the_typing(
 
     assert manager.type_text("hello") is True
     assert fake.typed == [("hello", 9999)]
+
+
+# ------------------------------------------------------- the Start menu
+def test_the_start_menu_is_closed_rather_than_dictated_into(windows_manager,
+                                                            monkeypatch):
+    """It holds the foreground, so the whole dictation had nowhere to go.
+
+    A stray Windows-key release opens Start mid-recording, and Start does not
+    give the foreground back for the asking: every live pass found it there,
+    held its words, and the user went on talking into a menu. Closing it is
+    one keystroke and the dictation carries on where it began.
+    """
+    manager, fake = windows_manager
+    fake.foreground = 4321
+    manager.save_active_window()
+
+    fake.foreground = 9999
+    fake.start_menu = True
+    def refuse_until_closed(hwnd):
+        if fake.start_menu:
+            return False
+        fake.focused.append(hwnd)
+        fake.foreground = hwnd
+        return True
+    monkeypatch.setattr(fake, "focus_window", refuse_until_closed)
+
+    assert manager.type_text("hello", only_where_it_started=True) is True
+    assert fake.typed == [("hello", 4321)], (
+        "the words belong in the window the dictation started in")
+
+
+def test_the_start_menu_is_only_asked_about_when_focus_is_refused(
+        windows_manager):
+    """This runs between the words of a live dictation; the ordinary pass
+    must not go poking at the shell."""
+    manager, fake = windows_manager
+    fake.foreground = 4321
+    manager.save_active_window()
+
+    manager.type_text("one")
+    manager.type_text("two")
+    assert fake.dismissals == 0
+
+
+def test_something_else_in_front_is_still_reported_rather_than_escaped(
+        windows_manager, monkeypatch):
+    """A window that refuses for its own reasons is not the Start menu, and
+    the live pass must still hold its words back."""
+    manager, fake = windows_manager
+    fake.foreground = 4321
+    manager.save_active_window()
+    fake.foreground = 9999
+    monkeypatch.setattr(fake, "focus_window", lambda hwnd: False)
+
+    assert manager.type_text("hello", only_where_it_started=True) is False
+    assert fake.dismissals == 1, "it never even looked"
+    assert fake.typed == []
 
 
 def test_the_modifiers_we_hold_are_released_through_the_manager(

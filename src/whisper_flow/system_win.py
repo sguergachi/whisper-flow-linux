@@ -27,11 +27,25 @@ INJECTED_TAG = 0x5748464C
 
 VK_CONTROL, VK_MENU, VK_SHIFT, VK_LWIN, VK_RWIN = 0x11, 0x12, 0x10, 0x5B, 0x5C
 VK_V = 0x56
+VK_ESCAPE = 0x1B
 # Reserved by Windows as a key that does nothing. Used to mark the
 # Windows key as having been combined with something, so releasing it
 # does not open the Start menu.
 VK_NONAME = 0xFC
 MODIFIERS = (VK_CONTROL, VK_MENU, VK_SHIFT, VK_LWIN, VK_RWIN)
+
+# The shell processes that own the Start menu and its search box. Matched by
+# executable rather than by window class or title: every UWP app is a
+# Windows.UI.Core.CoreWindow, and pressing Escape into one of those because it
+# happened to be in front is exactly the sort of thing this must never do.
+# Titles would be worse still - they are translated.
+START_MENU_PROCESSES = frozenset({
+    "startmenuexperiencehost.exe",      # Start, 1903 onwards
+    "searchhost.exe",                   # its search box on Windows 11
+    "searchapp.exe",                    # and on Windows 10
+    "searchui.exe",                     # and before that
+})
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 
 _user32 = ctypes.WinDLL("user32", use_last_error=True)
 _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -104,7 +118,16 @@ try:
     _user32.IsWindow.argtypes = [wintypes.HWND]
     _user32.SetForegroundWindow.argtypes = [wintypes.HWND]
     _user32.GetWindowThreadProcessId.restype = wintypes.DWORD
-    _user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.c_void_p]
+    _user32.GetWindowThreadProcessId.argtypes = [
+        wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    _kernel32.OpenProcess.restype = wintypes.HANDLE
+    _kernel32.OpenProcess.argtypes = [
+        wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    _kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+    _kernel32.QueryFullProcessImageNameW.argtypes = [
+        wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
+        ctypes.POINTER(wintypes.DWORD)]
+    _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
     _user32.GetWindowRect.argtypes = [wintypes.HWND,
                                       ctypes.POINTER(wintypes.RECT)]
     _user32.GetWindowRect.restype = wintypes.BOOL
@@ -164,6 +187,82 @@ def describe_foreground() -> str:
         return f"{name.value or '?'} {title.value!r} (hwnd {hwnd})"
     except Exception:
         return f"hwnd {hwnd}"
+
+
+def window_process_name(hwnd: int) -> str:
+    """Lowercased executable name of whoever owns a window, "" if unknown.
+
+    The only reliable way to tell the Start menu from an ordinary window: it
+    shares its class with every UWP application on the machine and its title
+    is whatever language the user runs Windows in.
+    """
+    if not hwnd:
+        return ""
+    try:
+        pid = wintypes.DWORD()
+        _user32.GetWindowThreadProcessId(wintypes.HWND(hwnd),
+                                         ctypes.byref(pid))
+        if not pid.value:
+            return ""
+        handle = _kernel32.OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value)
+        if not handle:
+            return ""
+        try:
+            path = ctypes.create_unicode_buffer(260)
+            size = wintypes.DWORD(len(path))
+            if not _kernel32.QueryFullProcessImageNameW(
+                    handle, 0, path, ctypes.byref(size)):
+                return ""
+            return path.value.rsplit("\\", 1)[-1].lower()
+        finally:
+            _kernel32.CloseHandle(handle)
+    except Exception:
+        return ""
+
+
+def start_menu_in_front() -> bool:
+    """Whether the Start menu, or its search box, currently has the foreground."""
+    return window_process_name(foreground_window()) in START_MENU_PROCESSES
+
+
+def dismiss_start_menu() -> bool:
+    """Close the Start menu, so the window under it can have focus back.
+
+    Everything else here tries to stop Start opening. This is what to do when
+    it has opened anyway, and it is worth having on its own terms: the menu
+    can be opened by a stray Windows-key release we never saw - a key that
+    chatters, a hand shifting its grip mid-sentence - and once it is up it
+    holds the foreground against SetForegroundWindow. The dictation then has
+    nowhere to go for as long as the user keeps talking, which is the whole
+    failure, and one Escape ends it.
+
+    Escape rather than another Windows key: a second Super tap would toggle
+    the menu shut, but it is also the key the recording is being held down
+    with, and pressing it is how this started.
+
+    The modifiers come off first for the same reason typing takes them off:
+    the user is still holding Alt, and Alt+Escape cycles windows. Blinded
+    throughout, or the listener reads our Escape as the user's and cancels
+    the dictation it is trying to rescue.
+    """
+    if not start_menu_in_front():
+        return False
+    log("[WIN] the Start menu has the foreground; closing it")
+    with _hotkeys_blinded():
+        held = release_modifiers()
+        try:
+            _send([_key_event(VK_ESCAPE, 0, 0),
+                   _key_event(VK_ESCAPE, 0, KEYEVENTF_KEYUP)])
+        finally:
+            restore_modifiers(held)
+    # It closes on its own schedule, and focus moves back a moment after that.
+    for _ in range(30):
+        if not start_menu_in_front():
+            return True
+        time.sleep(0.01)
+    log("[WIN] the Start menu did not close")
+    return False
 
 
 def window_center(hwnd: int) -> tuple[int, int] | None:

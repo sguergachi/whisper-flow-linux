@@ -193,6 +193,17 @@ class SystemManager:
             return True
         if system_win.focus_window(self._saved_window):
             return True
+        # The Start menu is the one refusal that can be undone. It holds the
+        # foreground against SetForegroundWindow for as long as it is open,
+        # so every pass of a live dictation found it there and held its words
+        # back - a whole utterance spoken into a menu the user did not ask
+        # for. Closing it costs one keystroke and gives the dictation its
+        # window back, so it is worth trying before reporting the refusal.
+        if (system_win.dismiss_start_menu()
+                and system_win.focus_window(self._saved_window)):
+            log("[PASTE] the Start menu had the foreground; closed it and "
+                "carried on where the dictation started")
+            return True
         # Name what is in front instead. "Would not come back" says a window
         # refused, not which one refused it, and the answer decides what this
         # is: the overlay taking focus is our own bug, the Start menu is

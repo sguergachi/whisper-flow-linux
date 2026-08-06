@@ -336,3 +336,42 @@ def test_the_log_copy_carries_more_history_than_a_failure_needs(daemon):
     daemon.copy_log()
     assert "line 149" in seen["text"]
     assert "line 30" in seen["text"]        # well beyond a 120-line window
+
+
+# ------------------------------------------------- which build is this
+def test_the_report_names_the_build_not_the_source_version(tmp_path,
+                                                           monkeypatch):
+    """A log that cannot say which build it is cannot say what is in it.
+
+    __version__ is the same in every build made from a commit series, so
+    every log said 0.4.0 - and three builds failed and published nothing
+    while we compared logs that all claimed the same version.
+    """
+    from whisper_flow import daemon as daemon_module
+
+    exe = tmp_path / "whisper-flow.exe"
+    exe.write_bytes(b"")
+    (tmp_path / "BUILD.txt").write_text("0.4.171", encoding="utf-8")
+    monkeypatch.setattr(daemon_module.sys, "executable", str(exe))
+
+    assert daemon_module.build_version() == "0.4.171"
+
+
+def test_a_source_checkout_says_so_rather_than_inventing_a_build(tmp_path,
+                                                                 monkeypatch):
+    from whisper_flow import daemon as daemon_module
+
+    exe = tmp_path / "python.exe"
+    exe.write_bytes(b"")
+    monkeypatch.setattr(daemon_module.sys, "executable", str(exe))
+
+    assert "source" in daemon_module.build_version()
+
+
+def test_an_unreadable_stamp_is_not_allowed_to_break_the_report(tmp_path,
+                                                                monkeypatch):
+    """This runs while building a failure report; raising here loses it."""
+    from whisper_flow import daemon as daemon_module
+
+    monkeypatch.setattr(daemon_module.sys, "executable", "\0not a path")
+    assert daemon_module.build_version()

@@ -356,6 +356,13 @@ jobs:
           Copy-Item packaging/windows/README-windows.md `
                     packaging/windows/dist/whisper-flow/README.md
 
+          # Beside the executable, for the log header to read back. The
+          # version in the source is the same in every build made from a
+          # commit series, so a log could not say which build it came from -
+          # and so could not say whether a fix was in it.
+          Set-Content -Path packaging/windows/dist/whisper-flow/BUILD.txt `
+                      -Value $version -NoNewline
+
           dotnet tool install -g vpk
           $env:PATH = "$env:USERPROFILE\.dotnet\tools;$env:PATH"
 

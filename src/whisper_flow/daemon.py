@@ -65,6 +65,31 @@ def _cached_icon(color: tuple[int, int, int, int]) -> Image.Image:
         return _icon_cache[color]
 
 
+def build_version() -> str:
+    """Which build this is, not which release it was branched from.
+
+    __version__ is 0.4.0 in every build ever made from this commit series,
+    so every log said 0.4.0 whether it was build 155 or build 170 - and a
+    log that cannot say which build it came from cannot say whether a fix is
+    in it. Three builds failed and published nothing while that was true,
+    and the answer to "none of the fixes worked" turned out to be that none
+    of them had shipped.
+
+    The packaged version is written beside the executable at package time,
+    where nothing but the build can invent it. A source checkout has no such
+    file and says so.
+    """
+    try:
+        stamp = Path(sys.executable).with_name("BUILD.txt")
+        if stamp.exists():
+            packaged = stamp.read_text(encoding="utf-8").strip()
+            if packaged:
+                return packaged
+    except OSError:
+        pass
+    return f"{__version__} (source)"
+
+
 def prerender_icons() -> None:
     """Draw both icons before they are needed, off the recording path."""
     for color in (ICON_IDLE, ICON_RECORDING):
@@ -1247,7 +1272,7 @@ class WhisperFlowDaemon:
     def _diagnostics(self, headline: str, detail: str | None = None) -> str:
         """Everything worth knowing about this run, as pasteable text."""
         report = [
-            f"whisper-flow {__version__} - {headline}",
+            f"whisper-flow {build_version()} - {headline}",
             f"{datetime.now():%Y-%m-%d %H:%M:%S}  {platform.platform()}",
             f"python {sys.version.split()[0]}  frozen={getattr(sys, 'frozen', False)}",
             "",

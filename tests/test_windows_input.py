@@ -148,8 +148,14 @@ def test_a_genuine_release_still_ends_the_recording(win, monkeypatch):
 
 # --------------------------------------------------- the Start menu
 def _order_of(batches, vk):
-    """Indices of the batches that carry an event for this key."""
-    return [i for i, batch in enumerate(batches) if _flags_for(batch, vk)]
+    """Positions of this key in the whole stream, batch then event.
+
+    Ordered across batches and within them, because a spoiler and the keys
+    it guards belong in one batch: SendInput takes a batch atomically, and
+    between two of them the user's own key-up can land.
+    """
+    return [(i, j) for i, batch in enumerate(batches)
+            for j, event in enumerate(batch) if event.union.ki.wVk == vk]
 
 
 def test_letting_go_of_the_injected_super_does_not_open_start(win):
@@ -174,6 +180,38 @@ def test_letting_go_of_the_injected_super_does_not_open_start(win):
     assert min(noop) < min(supers), (
         "the no-op key must be sent while Windows still believes Super is "
         "down; after the release it is too late and Start is already armed")
+
+
+def test_the_users_own_release_of_super_does_not_open_start(win, monkeypatch):
+    """The press we put back has to be spoiled too, not just our release.
+
+    restore_modifiers presses Super back down after every committed word.
+    Windows reads that as a fresh press with nothing after it, so the next
+    key-up completes a lone Super tap - and the next key-up is usually the
+    user's own, because they let go while the dictation is still typing.
+    Guarding only the release we send guards the one that rarely comes
+    first, which is why Start still opened mid-sentence.
+    """
+    system_win, batches = win
+    held = {system_win.VK_LWIN, system_win.VK_MENU}
+    monkeypatch.setattr(
+        system_win._user32, "GetAsyncKeyState",
+        lambda vk: -0x8000 if vk in held else 0)
+    monkeypatch.setattr(system_win, "_restorable", lambda h: tuple(h))
+    system_win._injected_down.clear()
+
+    system_win.restore_modifiers(tuple(held))
+
+    noop = _order_of(batches, system_win.VK_NONAME)
+    supers = _order_of(batches, system_win.VK_LWIN)
+    assert supers, "Super was never pressed back down"
+    assert noop, "nothing marked the restored Super press as used"
+    assert max(supers) < min(noop), (
+        "the no-op key must follow the press it marks as used; before it "
+        "there is no press to mark")
+    assert noop[0][0] == supers[0][0], (
+        "the spoiler must ride in the same SendInput batch as the press; a "
+        "second call is a gap the user's own release can land in")
 
 
 def test_nothing_is_sent_when_we_are_holding_nothing(win):

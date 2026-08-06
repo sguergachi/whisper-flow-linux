@@ -228,7 +228,21 @@ class SystemManager:
 
         Used to put the HUD on the screen the user is actually dictating into;
         a Wayland client cannot work that out for itself.
+
+        On Windows this went through kdotool like everything else here, which
+        does not exist there, so it always answered None - and the overlay,
+        given nothing to go on, showed on whichever monitor GDK happened to
+        list first for the whole session.
         """
+        if IS_WINDOWS:
+            # The saved window first, then whatever is in front. The saved
+            # one is from the last recording and may be closed by now, and a
+            # window that is gone has no rectangle - falling back keeps the
+            # pill on the right screen instead of on the first one GDK lists.
+            return (system_win.window_center(self._saved_window)
+                    or system_win.window_center(
+                        system_win.foreground_window()))
+
         window_id = self._saved_window or self._get_active_window()
         if not window_id or not self._kdotool_available():
             return None

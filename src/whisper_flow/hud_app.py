@@ -71,6 +71,30 @@ def _load_sibling(name):
 
 if IS_WINDOWS:
     _win_blur = _load_sibling("blur_win")
+
+    class _WINDOWPOS(ctypes.Structure):
+        """What a window is about to be moved to, while it is still a proposal.
+
+        WM_WINDOWPOSCHANGING carries one of these and the message may rewrite
+        it, which is how the overlay refuses a move it did not ask for. See
+        HudWindow._pin_position_win32.
+        """
+
+        _fields_ = [
+            ("hwnd", ctypes.c_void_p),
+            ("hwndInsertAfter", ctypes.c_void_p),
+            ("x", ctypes.c_int),
+            ("y", ctypes.c_int),
+            ("cx", ctypes.c_int),
+            ("cy", ctypes.c_int),
+            ("flags", ctypes.c_uint),
+        ]
+
+    # LRESULT is pointer-sized; ctypes would otherwise assume a C int and
+    # truncate every answer this window gives.
+    _WNDPROC = ctypes.WINFUNCTYPE(
+        ctypes.c_ssize_t, ctypes.c_void_p, ctypes.c_uint,
+        ctypes.c_void_p, ctypes.c_void_p)
 else:
     enable_blur = _load_sibling("wayland_blur").enable_blur
 # The processing sweep's arithmetic. Out here so it can be tested without a
@@ -361,6 +385,12 @@ class HudWindow(Gtk.Window):
         # hotkey and seeing anything.
         self._resident = resident
         self._hwnd = None
+        # Where this window is allowed to be, in physical pixels, and the
+        # machinery that holds it there. See _pin_position_win32.
+        self._pin = None
+        self._pin_proc = None
+        self._pin_previous = None
+        self._pin_hwnd = None
         # What Windows composition gave us; decides whether the window still
         # has to be cut to shape. See blur_win.apply_window_style.
         self._style = None
@@ -539,14 +569,30 @@ class HudWindow(Gtk.Window):
         if point:
             try:
                 px, py = (int(v) for v in point.split(",", 1))
-                for mon in candidates:
-                    g = mon.get_geometry()
-                    if g.x <= px < g.x + g.width and g.y <= py < g.y + g.height:
-                        return mon
             except ValueError:
-                pass
+                return candidates[0]
+            for mon in candidates:
+                x, y, w, h = self._monitor_bounds(mon)
+                if x <= px < x + w and y <= py < y + h:
+                    return mon
 
         return candidates[0]
+
+    def _monitor_bounds(self, monitor):
+        """A monitor's rectangle in the same units the point arrives in.
+
+        The compositor's own on Wayland, where the daemon reads the window
+        geometry from the same compositor. Physical pixels on Windows, where
+        it comes from GetWindowRect and GDK's geometry is logical - compared
+        untranslated, a point on a second screen fell inside the first one's
+        logical rectangle and the pill went to the wrong monitor, which is
+        the failure the point exists to prevent.
+        """
+        g = monitor.get_geometry()
+        if not IS_WINDOWS:
+            return (g.x, g.y, g.width, g.height)
+        scale = self._monitor_scale(monitor)
+        return (g.x * scale, g.y * scale, g.width * scale, g.height * scale)
 
     def _move_to_monitor(self, point: str) -> None:
         """Follow the window being dictated into, before showing again.
@@ -684,6 +730,9 @@ class HudWindow(Gtk.Window):
                 print("[HUD] no HWND yet", flush=True)
                 return
             self._raise_win32()
+            # Before the first position, and so before the map that follows:
+            # the map is the move this exists to overrule.
+            self._pin_position_win32()
             self._apply_position()
             if not os.environ.get("WHISPER_FLOW_HUD_NO_BLUR"):
                 self._style = _win_blur.apply_window_style(self._hwnd)
@@ -741,7 +790,7 @@ class HudWindow(Gtk.Window):
         except Exception as e:
             print(f"[HUD] could not shape the window: {e}", flush=True)
 
-    def _monitor_scale(self) -> float:
+    def _monitor_scale(self, monitor=None) -> float:
         """Logical-to-physical factor for the output the pill is on.
 
         GDK measures in logical units and SetWindowPos takes physical pixels,
@@ -753,11 +802,16 @@ class HudWindow(Gtk.Window):
         get_scale() before get_scale_factor(): the latter is an integer and
         reports 1 at 125% and 150%, where the real factor is fractional and
         the error is smaller but just as wrong.
+
+        Takes a monitor because choosing one needs this too, and the choice
+        happens before there is a monitor to have chosen. Defaults to the
+        one the pill is on.
         """
-        if self._monitor is None:
+        monitor = self._monitor if monitor is None else monitor
+        if monitor is None:
             return 1.0
         for name in ("get_scale", "get_scale_factor"):
-            getter = getattr(self._monitor, name, None)
+            getter = getattr(monitor, name, None)
             if getter is None:
                 continue
             try:
@@ -771,11 +825,104 @@ class HudWindow(Gtk.Window):
     def _apply_position_win32(self, x: int, y: int):
         if not self._hwnd:
             return
+        self._pin = (int(x), int(y))
         SWP_NOACTIVATE = 0x10
         SWP_NOZORDER = 0x4
         ctypes.windll.user32.SetWindowPos(
-            self._hwnd, None, int(x), int(y), 0, 0,
+            ctypes.c_void_p(self._hwnd), None, int(x), int(y), 0, 0,
             0x1 | SWP_NOZORDER | SWP_NOACTIVATE)          # NOSIZE
+
+    def _pin_position_win32(self):
+        """Refuse every move of this window that is not ours.
+
+        GTK places a toplevel itself when it maps it, and GDK keeps its own
+        record of where the surface is - a record SetWindowPos behind its
+        back does not update. So each show put the pill at GDK's remembered
+        spot first and our correction arrived afterwards, on an idle
+        callback a frame or more later.
+
+        Fading in only once the correction has landed was supposed to hide
+        that, and cannot: with acrylic the pill's whole silhouette is drawn
+        by DWM across the window's rectangle, not by us, so it is on screen
+        the instant the window is mapped no matter what our alpha says. The
+        pill appeared in the top-left corner and slid to the bottom of the
+        screen, every recording.
+
+        WM_WINDOWPOSCHANGING arrives before Windows commits a move and the
+        message is free to rewrite it, so nothing else can put this window
+        anywhere: GDK's placement is overwritten while it is still a
+        proposal, and there is no frame at the wrong position to hide.
+        """
+        # Against this window, not just any: a realize after an unrealize is
+        # a new HWND, and a pin recorded against the old one would leave the
+        # new window unguarded while looking installed.
+        if not self._hwnd or self._pin_hwnd == self._hwnd:
+            return
+        self._pin_proc = self._pin_previous = None
+        try:
+            user32 = ctypes.windll.user32
+            WM_WINDOWPOSCHANGING = 0x0046
+            SWP_NOMOVE = 0x2
+            GWLP_WNDPROC = -4
+
+            def hook(hwnd, msg, wparam, lparam):
+                # Never let this raise: the return value is the window's
+                # answer to every message it gets, and a broken one is a
+                # broken window rather than a mispositioned one.
+                try:
+                    if (msg == WM_WINDOWPOSCHANGING and self._pin is not None
+                            and lparam):
+                        # from_address, not cast: lparam arrives as a plain
+                        # integer and cast takes ctypes objects. This is a
+                        # view over the caller's own struct, so writing to
+                        # it is what changes the move.
+                        pos = _WINDOWPOS.from_address(lparam)
+                        if not pos.flags & SWP_NOMOVE:
+                            pos.x, pos.y = self._pin
+                except Exception:
+                    pass
+                previous = self._pin_previous
+                if not previous:
+                    return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+                return user32.CallWindowProcW(
+                    previous, hwnd, msg, wparam, lparam)
+
+            for name in ("CallWindowProcW", "DefWindowProcW"):
+                # Handles and message parameters are pointer-sized, and the
+                # answer to a message is too; left untyped, ctypes marshals
+                # all of them as 32-bit ints.
+                function = getattr(user32, name)
+                function.argtypes = (
+                    [ctypes.c_void_p] if name == "CallWindowProcW" else []) + [
+                    ctypes.c_void_p, ctypes.c_uint,
+                    ctypes.c_void_p, ctypes.c_void_p,
+                ]
+                function.restype = ctypes.c_ssize_t
+            # SetWindowLongPtrW is the 64-bit name and the only correct one
+            # here: a window procedure is a pointer, and the 32-bit call
+            # would hand back a truncated one to chain to.
+            setter = getattr(user32, "SetWindowLongPtrW", None) or \
+                user32.SetWindowLongW
+            setter.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
+            setter.restype = ctypes.c_void_p
+
+            # Held on the instance, not a local: ctypes keeps no reference to
+            # a callback, and a collected trampoline is a window whose
+            # procedure address points at freed memory.
+            self._pin_proc = _WNDPROC(hook)
+            previous = setter(
+                ctypes.c_void_p(self._hwnd), GWLP_WNDPROC,
+                ctypes.cast(self._pin_proc, ctypes.c_void_p))
+            if not previous:
+                self._pin_proc = None
+                print("[HUD] could not pin the window's position", flush=True)
+                return
+            self._pin_previous = previous
+            self._pin_hwnd = self._hwnd
+            print("[HUD] window position pinned", flush=True)
+        except Exception as e:
+            self._pin_proc = None
+            print(f"[HUD] could not pin the window's position: {e}", flush=True)
 
     def quit(self):
         """Take the overlay down and end the process.
@@ -836,8 +983,12 @@ class HudWindow(Gtk.Window):
         self._quitting = False
         self._apply_position()
         # A window already on screen gets no map event, so no correction is
-        # coming and the position applied just above is the final one.
-        self._placed = not IS_WINDOWS or self.get_mapped()
+        # coming and the position applied just above is the final one. Nor is
+        # one needed when the position is pinned: the map cannot move the
+        # window off it, so there is nothing to wait for and the fade starts
+        # on this frame rather than the one after next idle.
+        self._placed = (not IS_WINDOWS or self.get_mapped()
+                        or self._pin_proc is not None)
         self.present()
         print(f"[HUD] visible {time.time():.6f}", flush=True)
 

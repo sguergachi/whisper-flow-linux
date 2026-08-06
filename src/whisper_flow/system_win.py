@@ -105,6 +105,9 @@ try:
     _user32.SetForegroundWindow.argtypes = [wintypes.HWND]
     _user32.GetWindowThreadProcessId.restype = wintypes.DWORD
     _user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.c_void_p]
+    _user32.GetWindowRect.argtypes = [wintypes.HWND,
+                                      ctypes.POINTER(wintypes.RECT)]
+    _user32.GetWindowRect.restype = wintypes.BOOL
     _user32.AttachThreadInput.restype = wintypes.BOOL
     _user32.AttachThreadInput.argtypes = [
         wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
@@ -163,6 +166,32 @@ def describe_foreground() -> str:
         return f"hwnd {hwnd}"
 
 
+def window_center(hwnd: int) -> tuple[int, int] | None:
+    """Centre of a window, in physical desktop pixels. None if there is none.
+
+    This is what tells the overlay which screen to appear on. Without it the
+    overlay had no answer on Windows at all - the only implementation was
+    kdotool's, which does not exist here - so it fell back to the first
+    monitor GDK listed and stayed there. On one screen that is invisibly
+    correct; on two it put the pill on the other one, every time.
+
+    Physical, because GetWindowRect is: the caller converts.
+    """
+    if not hwnd:
+        return None
+    try:
+        if not _user32.IsWindow(wintypes.HWND(hwnd)):
+            return None
+        rect = wintypes.RECT()
+        if not _user32.GetWindowRect(wintypes.HWND(hwnd), ctypes.byref(rect)):
+            return None
+        if rect.right <= rect.left or rect.bottom <= rect.top:
+            return None
+        return ((rect.left + rect.right) // 2, (rect.top + rect.bottom) // 2)
+    except Exception:
+        return None
+
+
 def _window_thread(hwnd: int) -> int:
     return int(_user32.GetWindowThreadProcessId(wintypes.HWND(hwnd), None))
 
@@ -214,6 +243,24 @@ def focus_window(hwnd: int) -> bool:
         return False
 
 
+def _spoil_events() -> list:
+    """The keystroke that marks a held modifier as already used.
+
+    Returned rather than sent so callers can put it in the same batch as the
+    presses or releases it guards. SendInput takes a batch atomically, and
+    two calls are not: between them the user's own key-up can land, which is
+    precisely the event being guarded against.
+
+    Sent whatever is being held, not only Super. A lone Alt tap has the same
+    shape and opens the focused window's menu bar, and our own press-and-
+    release of the modifiers is exactly that shape.
+    """
+    return [
+        _key_event(VK_NONAME, 0, 0),
+        _key_event(VK_NONAME, 0, KEYEVENTF_KEYUP),
+    ]
+
+
 def spoil_start_menu() -> None:
     """Stop the Start menu opening when the user lets go of the Windows key.
 
@@ -226,10 +273,7 @@ def spoil_start_menu() -> None:
     the release is then ignored. VK_NONAME is reserved as a no-op precisely
     for this: it reaches no application and does nothing on its way past.
     """
-    _send([
-        _key_event(VK_NONAME, 0, 0),
-        _key_event(VK_NONAME, 0, KEYEVENTF_KEYUP),
-    ])
+    _send(_spoil_events())
 
 
 @contextlib.contextmanager
@@ -287,8 +331,8 @@ def release_modifiers() -> tuple:
     """
     held = tuple(vk for vk in MODIFIERS
                  if _user32.GetAsyncKeyState(vk) & HELD_MASK)
-    spoil_start_menu()
-    _send([_key_event(vk, 0, KEYEVENTF_KEYUP) for vk in MODIFIERS])
+    _send(_spoil_events()
+          + [_key_event(vk, 0, KEYEVENTF_KEYUP) for vk in MODIFIERS])
     return held
 
 
@@ -325,13 +369,23 @@ def restore_modifiers(held) -> None:
     So the daemon clears these at the end of every dictation through
     release_injected_modifiers(), and the window in which a stuck key can
     exist is bounded by the dictation rather than by the session.
+
+    Spoiled straight after the press, in the same batch. This press is a
+    fresh, unused Windows-key press as far as Windows is concerned, and the
+    next key-up completes it into a lone Super tap - whichever key-up that
+    is. release_injected_modifiers() already guards the one we send, but the
+    user's own release is the one that usually arrives first: they let go
+    mid-dictation, while we are still holding the key back down on their
+    behalf, and Start opened under the words still being typed. One batch
+    rather than two because a second SendInput is a gap their release can
+    land in, which is the very event this exists to disarm.
     """
     wanted = _restorable(held)
     if not wanted:
         return
     with _injected_lock:
         _injected_down.update(wanted)
-    _send([_key_event(vk, 0, 0) for vk in wanted])
+    _send([_key_event(vk, 0, 0) for vk in wanted] + _spoil_events())
 
 
 def release_injected_modifiers() -> tuple:
@@ -356,8 +410,8 @@ def release_injected_modifiers() -> tuple:
         _injected_down.clear()
     if ours:
         log(f"[WIN] releasing {len(ours)} modifier(s) we were holding down")
-        spoil_start_menu()
-        _send([_key_event(vk, 0, KEYEVENTF_KEYUP) for vk in ours])
+        _send(_spoil_events()
+              + [_key_event(vk, 0, KEYEVENTF_KEYUP) for vk in ours])
     return ours
 
 

@@ -186,6 +186,78 @@ def test_the_overlay_is_placed_after_it_is_mapped():
         "realize is overwritten by GTK's own placement")
 
 
+def test_the_overlay_is_never_shown_anywhere_but_its_own_position():
+    """Re-placing it after the map is a correction the user watches happen.
+
+    GDK keeps its own record of where the surface is, and SetWindowPos
+    behind its back does not update it - so every show put the pill at GDK's
+    remembered spot and our correction arrived an idle callback later.
+    Holding the fade until then was supposed to cover it and cannot: with
+    acrylic the pill's whole silhouette is drawn by DWM across the window
+    rectangle, not by us, so it is on screen the moment the window is mapped
+    whatever our alpha says. It appeared in the corner and slid down.
+
+    WM_WINDOWPOSCHANGING is the move while it is still a proposal, and a
+    proposal can be rewritten. Then there is no wrong position to hide.
+    """
+    source = _hud_app_source()
+    assert "WM_WINDOWPOSCHANGING" in source, (
+        "nothing refuses GDK's placement, so the pill is shown at it first")
+    realize = source.split("def _realize_win32(", 1)[1].split(
+        "\n    def ", 1)[0]
+    assert "_pin_position_win32" in realize, (
+        "the pin must be installed at realize; the map that follows is the "
+        "move it exists to overrule")
+    assert realize.index("_pin_position_win32") < realize.index(
+        "_apply_position"), (
+        "pinning after the first position leaves that position unguarded")
+    pin = source.split("def _pin_position_win32(", 1)[1].split(
+        "\n    def ", 1)[0]
+    assert "self._pin_proc = _WNDPROC(hook)" in pin, (
+        "ctypes keeps no reference to a callback; a collected trampoline "
+        "leaves the window's procedure pointing at freed memory")
+    assert "SetWindowLongPtrW" in pin, (
+        "a window procedure is pointer-sized, and the 32-bit call hands "
+        "back a truncated one to chain to")
+
+
+def test_the_pill_follows_the_window_across_screens_on_windows():
+    """The point comes from GetWindowRect and is physical; GDK's is logical.
+
+    Compared untranslated, a point on a second screen falls inside the
+    first one's logical rectangle - so the pill went to the wrong monitor,
+    which is the one failure the point exists to prevent.
+    """
+    source = _hud_app_source()
+    pick = source.split("def _pick_monitor(", 1)[1].split("\n    def ", 1)[0]
+    assert "_monitor_bounds" in pick, (
+        "the point must be tested against bounds in its own units")
+    bounds = source.split("def _monitor_bounds(", 1)[1].split(
+        "\n    def ", 1)[0]
+    assert "IS_WINDOWS" in bounds and "_monitor_scale" in bounds, (
+        "on Windows the monitor's logical geometry has to be scaled to "
+        "physical pixels before a physical point is tested against it")
+
+
+def test_windows_knows_where_the_dictation_is_happening():
+    """The overlay can only follow the window if the daemon tells it where.
+
+    active_window_center went through kdotool, which does not exist on
+    Windows, so it answered None on every recording and the overlay fell
+    back to the first monitor GDK listed.
+    """
+    source = (Path(__file__).resolve().parents[1]
+              / "src/whisper_flow/system.py").read_text(encoding="utf-8")
+    body = source.split("def active_window_center(", 1)[1].split(
+        "\n    def ", 1)[0]
+    assert "IS_WINDOWS" in body and "window_center" in body, (
+        "the Windows path must not fall through to kdotool, which is not "
+        "there - it returns None and the pill picks a screen at random")
+    win = (Path(__file__).resolve().parents[1]
+           / "src/whisper_flow/system_win.py").read_text(encoding="utf-8")
+    assert "def window_center(" in win and "GetWindowRect" in win
+
+
 def test_the_pill_keeps_its_proportions_at_any_height():
     """Windows draws a smaller pill, and it must be the same pill.
 

@@ -24,6 +24,8 @@ class _FakeWin:
         self.foreground = foreground
         self.focused = []
         self.typed = []
+        self.centers = {}
+        self.asked_center = []
 
     def foreground_window(self):
         return self.foreground
@@ -45,6 +47,10 @@ class _FakeWin:
 
     def send_paste(self, release_first=True):
         return True
+
+    def window_center(self, hwnd):
+        self.asked_center.append(hwnd)
+        return self.centers.get(hwnd)
 
 
 @pytest.fixture
@@ -132,6 +138,43 @@ def test_the_modifiers_we_hold_are_released_through_the_manager(
                         lambda: called.append(True), raising=False)
     manager.release_stuck_modifiers()
     assert called == [True]
+
+
+# ------------------------------------------ which screen the pill appears on
+def test_the_overlay_is_told_where_the_dictation_is_happening(windows_manager):
+    """This answered None on Windows, and the pill went to the wrong screen.
+
+    The only implementation was kdotool's, which does not exist here, so the
+    overlay was handed nothing to place itself by - and with nothing to go
+    on it takes the first monitor GDK lists and stays there for the session.
+    On one screen that is invisibly correct; on two it is the other one.
+    """
+    manager, fake = windows_manager
+    fake.foreground = 4321
+    fake.centers = {4321: (2800, 700)}
+    manager.save_active_window()
+
+    fake.foreground = 9999          # the user clicked elsewhere meanwhile
+    assert manager.active_window_center() == (2800, 700)
+    assert fake.asked_center == [4321], (
+        "the pill belongs on the screen the dictation started on, not "
+        "wherever the pointer wandered to during it")
+
+
+def test_the_screen_is_chosen_afresh_when_nothing_was_saved(windows_manager):
+    """A recording with no saved window still gets a screen, not the first."""
+    manager, fake = windows_manager
+    fake.foreground = 777
+    fake.centers = {777: (100, 200)}
+
+    assert manager.active_window_center() == (100, 200)
+
+
+def test_no_window_means_no_placement_hint(windows_manager):
+    """None, not a guess: the overlay falls back on its own from there."""
+    manager, fake = windows_manager
+    fake.foreground = 0
+    assert manager.active_window_center() is None
 
 
 def test_releasing_modifiers_off_windows_does_nothing(monkeypatch, mock_config):

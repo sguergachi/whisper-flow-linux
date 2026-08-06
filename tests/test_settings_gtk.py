@@ -55,6 +55,11 @@ def _devices():
     _gate.wait(10)
     return [(0, "Built-in mic")]
 
+# Kept, because one scenario is about the enumeration itself. Every other
+# scenario replaces it so that building the window cannot reach PortAudio,
+# and mic_host_api was reading its own stub back: it asserted on the names
+# the real function builds and got "Built-in mic".
+_real_list_input_devices = settings_gtk._list_input_devices
 settings_gtk._list_input_devices = _devices
 Gtk.init()
 w = settings_gtk.SettingsWindow()
@@ -258,7 +263,7 @@ elif scenario == "mic_host_api":
     fake.PyAudio = _PA
     sys.modules["pyaudio"] = fake
 
-    listed = settings_gtk._list_input_devices()
+    listed = _real_list_input_devices()
     assert listed == [(0, "Headset (MME)"), (1, "Headset (WASAPI)")], listed
     # Outputs are still left out, and "Windows " is not repeated on every row.
     assert all("Speakers" not in name for _, name in listed)

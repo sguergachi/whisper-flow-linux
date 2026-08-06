@@ -293,25 +293,55 @@ def _load_css(provider, css: bytes):
         provider.load_from_data(css)
 
 
-def _wide_list_factory() -> Gtk.SignalListItemFactory:
+def _wide_list_factory(row) -> Gtk.SignalListItemFactory:
     """Dropdown rows that keep their full text, however long it is.
 
     AdwComboRow's stock factory ellipsizes to the width of the closed row.
     A plain Gtk.Label does not ellipsize at all, and GtkDropDown's popover
     propagates its natural width, so the popup grows to fit the widest entry
     instead of truncating all of them to the same useless prefix.
+
+    The tick is the other half of what the stock factory does, and replacing
+    the factory is what lost it: an open list of twenty near-identical device
+    names with nothing marking the one in use. The row this list belongs to
+    is asked which that is, rather than the list's own selection model - the
+    popup builds a fresh one, so on the frame the list first appears its idea
+    of the selection is not yet the row's.
+
+    Hidden by opacity, not by visibility: an invisible tick takes no width,
+    so every row would shift sideways as the selection moved.
     """
     factory = Gtk.SignalListItemFactory()
+    shown = set()
+
+    def mark(item):
+        item.get_child().get_last_child().set_opacity(
+            1.0 if item.get_position() == row.get_selected() else 0.0)
 
     def setup(_factory, item):
-        item.set_child(Gtk.Label(xalign=0.0))
+        box = Gtk.Box(spacing=12)
+        box.append(Gtk.Label(xalign=0.0, hexpand=True))
+        box.append(Gtk.Image(icon_name="object-select-symbolic"))
+        item.set_child(box)
 
     def bind(_factory, item):
         value = item.get_item()
-        item.get_child().set_text(value.get_string() if value else "")
+        item.get_child().get_first_child().set_text(
+            value.get_string() if value else "")
+        shown.add(item)
+        mark(item)
+
+    def unbind(_factory, item):
+        shown.discard(item)
+
+    def selection_changed(*_args):
+        for item in shown:
+            mark(item)
 
     factory.connect("setup", setup)
     factory.connect("bind", bind)
+    factory.connect("unbind", unbind)
+    row.connect("notify::selected", selection_changed)
     return factory
 
 
@@ -880,7 +910,7 @@ class SettingsWindow(Adw.ApplicationWindow):
                 # do not ellipsize lets the popup take its natural width, and
                 # the CSS floor covers the case where the popover declines to
                 # grow past the row it hangs off.
-                row.set_list_factory(_wide_list_factory())
+                row.set_list_factory(_wide_list_factory(row))
                 row.add_css_class("mic-row")
             if field.help:
                 row.set_subtitle(field.help)

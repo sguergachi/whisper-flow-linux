@@ -372,3 +372,145 @@ def test_nothing_is_restored_while_no_hotkey_is_held(system_win, monkeypatch):
         assert system_win._injected_down == set()
     finally:
         system_win._injected_down.clear()
+
+
+# ------------------------------------------------------- the Start menu
+def _no_modifiers_held(system_win, monkeypatch):
+    """A keyboard with nothing on it, so the escape path can be read plainly."""
+    monkeypatch.setattr(system_win._user32, "GetAsyncKeyState", lambda vk: 0)
+
+
+def _batches(system_win, monkeypatch) -> list:
+    sent = []
+    monkeypatch.setattr(system_win, "_send",
+                        lambda events: (sent.append(list(events)), True)[1])
+    return sent
+
+
+def _in_front(system_win, monkeypatch, *answers):
+    """Successive answers from start_menu_in_front, the last one repeating."""
+    answers = list(answers)
+    monkeypatch.setattr(
+        system_win, "start_menu_in_front",
+        lambda: answers.pop(0) if len(answers) > 1 else answers[0])
+
+
+def test_the_start_menu_is_closed_with_escape(system_win, monkeypatch):
+    """Once it is up it holds the foreground, and the dictation has nowhere
+    to go for as long as the user keeps talking."""
+    _no_modifiers_held(system_win, monkeypatch)
+    sent = _batches(system_win, monkeypatch)
+    _in_front(system_win, monkeypatch, True, False)
+
+    assert system_win.dismiss_start_menu() is True
+
+    escapes = [event.union.ki.dwFlags for batch in sent for event in batch
+               if event.union.ki.wVk == system_win.VK_ESCAPE]
+    assert escapes == [0, system_win.KEYEVENTF_KEYUP]
+
+
+def test_a_menu_that_is_not_there_is_left_alone(system_win, monkeypatch):
+    """This is asked on every live pass; the ordinary one must send nothing."""
+    _no_modifiers_held(system_win, monkeypatch)
+    sent = _batches(system_win, monkeypatch)
+    _in_front(system_win, monkeypatch, False)
+
+    assert system_win.dismiss_start_menu() is False
+    assert sent == []
+
+
+def test_a_menu_that_will_not_close_says_so(system_win, monkeypatch):
+    """The caller reports what is in front instead, rather than typing into it."""
+    _no_modifiers_held(system_win, monkeypatch)
+    _batches(system_win, monkeypatch)
+    _in_front(system_win, monkeypatch, True)
+    monkeypatch.setattr(system_win.time, "sleep", lambda _s: None)
+
+    assert system_win.dismiss_start_menu() is False
+
+
+def test_the_modifiers_come_off_before_the_escape(system_win, monkeypatch):
+    """The user is still holding Alt, and Alt+Escape cycles windows."""
+    held = {system_win.VK_MENU, system_win.VK_LWIN}
+    monkeypatch.setattr(system_win._user32, "GetAsyncKeyState",
+                        lambda vk: -0x8000 if vk in held else 0)
+    sent = _batches(system_win, monkeypatch)
+    _in_front(system_win, monkeypatch, True, False)
+
+    system_win.dismiss_start_menu()
+
+    order = []
+    for index, batch in enumerate(sent):
+        for event in batch:
+            if (event.union.ki.wVk in held
+                    and event.union.ki.dwFlags & system_win.KEYEVENTF_KEYUP):
+                order.append(("released", index))
+            if event.union.ki.wVk == system_win.VK_ESCAPE:
+                order.append(("escape", index))
+    releases = [i for what, i in order if what == "released"]
+    escapes = [i for what, i in order if what == "escape"]
+    assert releases and escapes and max(releases) < min(escapes)
+
+
+def test_the_keys_the_user_holds_go_back_down_afterwards(system_win,
+                                                         monkeypatch):
+    """Leaving them up tells the listener the push-to-talk was let go."""
+    from whisper_flow import hotkey_win
+
+    held = {system_win.VK_MENU, system_win.VK_LWIN}
+    monkeypatch.setattr(system_win._user32, "GetAsyncKeyState",
+                        lambda vk: -0x8000 if vk in held else 0)
+    sent = _batches(system_win, monkeypatch)
+    _in_front(system_win, monkeypatch, True, False)
+
+    class Listener:
+        @staticmethod
+        def triggered_keys():
+            return frozenset(held)
+
+    monkeypatch.setattr(hotkey_win, "_active_listener", Listener,
+                        raising=False)
+    system_win._injected_down.clear()
+    try:
+        system_win.dismiss_start_menu()
+        assert system_win._injected_down == held
+        pressed = {event.union.ki.wVk for event in sent[-1]
+                   if event.union.ki.dwFlags == 0}
+        assert held <= pressed
+    finally:
+        system_win._injected_down.clear()
+
+
+def test_the_listener_is_blind_while_the_escape_is_sent(system_win,
+                                                        monkeypatch):
+    """It polls the same state table; our Escape would read as the user's,
+    and cancel the dictation this is trying to rescue."""
+    from whisper_flow import hotkey_win
+
+    _no_modifiers_held(system_win, monkeypatch)
+    _in_front(system_win, monkeypatch, True, False)
+    depths = []
+    monkeypatch.setattr(
+        system_win, "_send",
+        lambda events: (depths.append(hotkey_win._typing_depth), True)[1])
+
+    system_win.dismiss_start_menu()
+    assert depths and all(depth > 0 for depth in depths)
+
+
+def test_only_the_shell_is_ever_escaped(system_win):
+    """Every UWP application shares the Start menu's window class, and
+    pressing Escape into one of those because it happened to be in front is
+    exactly what this must never do."""
+    assert "startmenuexperiencehost.exe" in system_win.START_MENU_PROCESSES
+    assert "searchhost.exe" in system_win.START_MENU_PROCESSES
+    assert not any(name.endswith(".corewindow")
+                   for name in system_win.START_MENU_PROCESSES)
+
+
+def test_an_unreadable_window_is_not_the_start_menu(system_win, monkeypatch):
+    """window_process_name answers "" when Win32 will not say, and "" must
+    not match anything."""
+    monkeypatch.setattr(system_win, "foreground_window", lambda: 0)
+    assert system_win.start_menu_in_front() is False
+    assert "" not in system_win.START_MENU_PROCESSES

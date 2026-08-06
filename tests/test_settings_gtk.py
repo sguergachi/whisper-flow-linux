@@ -38,7 +38,7 @@ if scenario == "mic_race":
 import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import GLib, Gtk
+from gi.repository import GLib, Gtk, Pango
 
 from whisper_flow import settings_def, settings_gtk
 
@@ -228,6 +228,61 @@ elif scenario == "mic_race":
         f"the pending selection was reverted to {after!r} when the device "
         f"list arrived; the choice was taken from the saved baseline rather "
         f"than from the row")
+elif scenario == "mic_selected":
+    # Which device is in use, in the open list. Replacing the factory to stop
+    # it ellipsizing the names also dropped the tick the stock one draws, so
+    # the list showed twenty near-identical names and no sign of the one
+    # already chosen.
+    #
+    # Driven through a list view of our own rather than by opening the
+    # popover: the factory is what is under test, and it builds the same rows
+    # either way, while the popover's insides are libadwaita's business and
+    # change between versions.
+    assert pump(mics_listed), "the microphone list never arrived"
+    mic = mic_row()
+    view = Gtk.ListView(
+        model=Gtk.SingleSelection(model=mic.get_model()),
+        factory=settings_gtk._wide_list_factory(mic))
+    window = Gtk.Window(child=view, default_width=520, default_height=400)
+    window.present()
+
+    def rows():
+        def walk(widget):
+            yield widget
+            child = widget.get_first_child()
+            while child is not None:
+                yield from walk(child)
+                child = child.get_next_sibling()
+        found = []
+        for widget in walk(view):
+            if not isinstance(widget, Gtk.Box):
+                continue
+            label, tick = widget.get_first_child(), widget.get_last_child()
+            if isinstance(label, Gtk.Label) and isinstance(tick, Gtk.Image):
+                found.append((label, tick))
+        return found
+
+    assert pump(lambda: len(rows()) > 1), "the list never built its rows"
+    assert any(label.get_text() == "Default" for label, _ in rows())
+
+    def ticked():
+        return {label.get_text() for label, tick in rows()
+                if tick.get_opacity() > 0.5}
+
+    mic.set_selected(0)
+    assert ticked() == {"Default"}, (
+        f"the open list marks {ticked()}, not the selected device")
+
+    # And it follows the selection, rather than being drawn once.
+    mic.set_selected(1)
+    second = mic.get_model().get_string(1)
+    assert ticked() == {second}, (
+        f"the tick stayed on {ticked()} after {second!r} was chosen")
+
+    # And the names still keep their full width, which is what the factory
+    # was replaced for in the first place.
+    assert all(label.get_ellipsize() == Pango.EllipsizeMode.NONE
+               for label, _ in rows())
 elif scenario == "badge":
     # The recommended badge is a real widget beside the name, not markup in
     # the title. Markup did reach that spot, and could not be a pill there:
@@ -357,6 +412,18 @@ def test_a_choice_made_before_the_mic_list_arrives_survives_it(tmp_path):
     the enumeration was still running was silently undone.
     """
     result = _run(tmp_path, "mic_race")
+    assert "OK" in result.stdout, result.stderr
+
+
+def test_the_open_device_list_shows_which_one_is_selected(tmp_path):
+    """The factory that stops the names being ellipsized also dropped the tick.
+
+    AdwComboRow's stock list factory draws one beside the chosen row;
+    replacing it to keep the full device names replaced that too, leaving an
+    open list of twenty near-identical names with nothing saying which is in
+    use.
+    """
+    result = _run(tmp_path, "mic_selected")
     assert "OK" in result.stdout, result.stderr
 
 

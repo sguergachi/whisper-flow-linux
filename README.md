@@ -82,31 +82,31 @@ Download **`WhisperFlow-*-x86_64.AppImage`** from the
 [latest release](https://github.com/sguergachi/whisper-flow-linux/releases)
 and **double-click it**.
 
-- First run installs for your user (desktop dialogs only — no terminal)
-- Later runs start the tray app
-- Hold `Super+Alt` to dictate
-- It starts again at login on its own
+One portable file for **most x86_64 Linux desktops** (Ubuntu 22.04 and newer,
+Fedora, Arch, Mint, Debian bookworm+, Pop!_OS, …). It bundles the app, a GTK
+runtime, a speech engine and a starter model — no Python install, no package
+manager, no terminal.
+
+Hold `Super+Alt` to dictate. Look for the microphone in the notification area.
 
 If the file manager will not run it the first time: right-click → Properties →
 **Allow executing file as program**, then double-click again (browsers strip
 that flag on download).
 
-Needs GTK4 and `python3-gi` on the system. `ydotool` is recommended for typing
-on Wayland. Global hotkeys need the `input` group
-(`sudo usermod -aG input $USER`, then log out and back in).
+**Host bits that stay system-side** (the AppImage cannot own these):
+
+- `ydotool` — typing into other apps on Wayland  
+- membership in the `input` group — global hotkeys  
+  (`sudo usermod -aG input $USER`, then log out and back in)
 
 ```bash
 # Debian/Ubuntu
-sudo apt install python3-gi gir1.2-gtk-4.0 ydotool zenity
-
+sudo apt install ydotool
 # Arch
-sudo pacman -S python-gobject gtk4 gtk4-layer-shell ydotool zenity
-
+sudo pacman -S ydotool
 # Fedora
-sudo dnf install python3-gobject gtk4 gtk4-layer-shell ydotool zenity
+sudo dnf install ydotool
 ```
-
-Remove with `~/.local/share/whisper-flow/uninstall.sh`.
 
 ### From source (developers)
 

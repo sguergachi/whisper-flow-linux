@@ -18,6 +18,13 @@ from pathlib import Path
 import pytest
 
 SPEC = Path(__file__).resolve().parents[1] / "packaging/windows/whisper-flow.spec"
+LINUX_SPEC = (
+    Path(__file__).resolve().parents[1] / "packaging/linux/whisper-flow.spec"
+)
+LINUX_ENTRY = (
+    Path(__file__).resolve().parents[1]
+    / "src/whisper_flow/__main_linux__.py"
+)
 
 # Third-party modules the code imports lazily, and where it does it.
 LAZY_IMPORTS = {
@@ -113,6 +120,22 @@ def test_the_typelib_path_is_not_left_to_pyinstaller():
         "the bundled typelib directory must be assigned, and placed ahead of "
         "whatever PyInstaller's runtime hook set"
     )
+
+
+def test_the_linux_entry_also_assigns_the_typelib_path():
+    """Same trap as Windows: setdefault loses to PyInstaller's rthook."""
+    entry = LINUX_ENTRY.read_text(encoding="utf-8")
+    assert 'os.environ["GI_TYPELIB_PATH"] =' in entry
+    assert 'setdefault("GI_TYPELIB_PATH"' not in entry
+
+
+def test_the_linux_spec_declares_lazy_pystray():
+    """Linux freeze is a separate spec; it must hide the same lazy imports."""
+    text = LINUX_SPEC.read_text(encoding="utf-8")
+    assert '"pystray"' in text
+    assert "hotkey_evdev" in text
+    assert "hotkey_win" in text  # excluded, not included as a hiddenimport
+    assert "whisper_flow.hotkey_win" in text  # appears under EXCLUDES
 
 
 def test_the_cairo_foreign_struct_bridge_is_declared():

@@ -1,24 +1,24 @@
 #!/usr/bin/env bash
-# Build a WhisperFlow AppImage — one file, double-click to run.
+# Wrap a PyInstaller onedir tree as a portable AppImage.
 #
 # Usage:
-#   make-appimage.sh <stage-dir> <version> <output.AppImage>
+#   make-appimage.sh <pyinstaller-dist-dir> <version> <output.AppImage>
 #
-# stage-dir: wheel + install.sh + gui_install.py + desktop template + units
-#            (+ optional whisper-flow.png)
+# dist-dir is packaging/linux/dist/whisper-flow (the COLLECT output): it must
+# contain the whisper-flow binary. engine/ and models/ may sit beside it.
 #
-# First double-click installs for the current user (desktop dialogs, no
-# terminal). Later double-clicks start the tray app. No .deb, no archive.
+# The result is one ELF file that double-clicks on most x86_64 Linux desktops
+# whose glibc is at least as new as the build host (CI uses Ubuntu 22.04).
+# No pip, no system Python package for the app itself.
 set -euo pipefail
 
-STAGE="${1:?usage: make-appimage.sh <stage-dir> <version> <output.AppImage>}"
-VERSION="${2:?usage: make-appimage.sh <stage-dir> <version> <output.AppImage>}"
-OUT="${3:?usage: make-appimage.sh <stage-dir> <version> <output.AppImage>}"
+DIST="${1:?usage: make-appimage.sh <pyinstaller-dist-dir> <version> <output.AppImage>}"
+VERSION="${2:?usage: make-appimage.sh <pyinstaller-dist-dir> <version> <output.AppImage>}"
+OUT="${3:?usage: make-appimage.sh <pyinstaller-dist-dir> <version> <output.AppImage>}"
 
-[[ -d "$STAGE" ]] || { echo "error: stage dir not found: $STAGE" >&2; exit 1; }
-[[ -f "$STAGE/install.sh" ]] || { echo "error: install.sh missing" >&2; exit 1; }
-[[ -f "$STAGE/gui_install.py" ]] || {
-    echo "error: gui_install.py missing" >&2
+[[ -d "$DIST" ]] || { echo "error: dist dir not found: $DIST" >&2; exit 1; }
+[[ -x "$DIST/whisper-flow" || -f "$DIST/whisper-flow" ]] || {
+    echo "error: $DIST/whisper-flow binary missing — run PyInstaller first" >&2
     exit 1
 }
 
@@ -26,24 +26,33 @@ WORKDIR=$(mktemp -d)
 trap 'rm -rf "$WORKDIR"' EXIT
 
 APPDIR="$WORKDIR/WhisperFlow.AppDir"
-PAYLOAD="$APPDIR/usr/share/whisper-flow"
-mkdir -p "$PAYLOAD" "$APPDIR/usr/bin" "$APPDIR/usr/share/icons/hicolor/256x256/apps"
+mkdir -p "$APPDIR"
 
-cp -a "$STAGE"/. "$PAYLOAD"/
-chmod +x "$PAYLOAD/install.sh" "$PAYLOAD/uninstall.sh" "$PAYLOAD/gui_install.py"
+# The whole frozen tree lives at the AppDir root so sys.executable's parent
+# (engine/, models/, bundled .so) stays next to the binary.
+cp -a "$DIST"/. "$APPDIR"/
+chmod +x "$APPDIR/whisper-flow"
 
-# Icon at the AppDir root (required name for appimagetool) and hicolor.
-if [[ -f "$PAYLOAD/whisper-flow.png" ]]; then
-    cp "$PAYLOAD/whisper-flow.png" "$APPDIR/whisper-flow.png"
-    cp "$PAYLOAD/whisper-flow.png" \
-        "$APPDIR/usr/share/icons/hicolor/256x256/apps/whisper-flow.png"
+# AppImage metadata at the AppDir root.
+if [[ -f "$APPDIR/whisper-flow.png" ]]; then
+    :
+elif [[ -f "$DIST/whisper-flow.png" ]]; then
+    cp "$DIST/whisper-flow.png" "$APPDIR/whisper-flow.png"
 else
-    # 1x1 placeholder so appimagetool still accepts the tree.
-    printf '\x89PNG\r\n\x1a\n' > "$APPDIR/whisper-flow.png"
+    # Generate from the frozen tree if PIL is on the host; else placeholder.
+    python3 - <<'PY' "$APPDIR/whisper-flow.png" 2>/dev/null || printf '\x89PNG\r\n\x1a\n' > "$APPDIR/whisper-flow.png"
+import sys
+from pathlib import Path
+sys.path.insert(0, "src")
+try:
+    from whisper_flow.icon import APP_COLOR, draw_mic
+    draw_mic(256, APP_COLOR).save(Path(sys.argv[1]), format="PNG")
+except Exception:
+    Path(sys.argv[1]).write_bytes(b"\x89PNG\r\n\x1a\n")
+PY
 fi
 
-# Desktop entry at AppDir root. Terminal=false = no shell window on click.
-cat > "$APPDIR/whisper-flow.desktop" <<'EOF'
+cat > "$APPDIR/whisper-flow.desktop" <<EOF
 [Desktop Entry]
 Type=Application
 Name=WhisperFlow
@@ -55,92 +64,27 @@ Terminal=false
 Categories=Utility;Accessibility;
 Keywords=voice;dictation;speech;whisper;transcription;
 StartupNotify=false
-X-AppImage-Version=REPLACE_VERSION
+X-AppImage-Version=${VERSION}
 EOF
-sed -i "s/REPLACE_VERSION/${VERSION}/" "$APPDIR/whisper-flow.desktop"
 
-# AppRun: the thing that actually runs when you double-click the AppImage.
-# No terminal. First run → GUI install. After that → start the tray.
+# AppRun: double-click entry. No terminal. Hands off to the frozen binary.
 cat > "$APPDIR/AppRun" <<'APPRUN'
 #!/usr/bin/env bash
 set -euo pipefail
-
-# Resolve this AppImage's mounted AppDir (appimagetool sets APPDIR).
 HERE="${APPDIR:-}"
 if [[ -z "$HERE" ]]; then
     HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 fi
-PAYLOAD="$HERE/usr/share/whisper-flow"
-PREFIX="${WHISPER_FLOW_PREFIX:-$HOME/.local/share/whisper-flow}"
-REAL="$PREFIX/venv/bin/whisper-flow"
-
-# Desktop dialogs only when the file manager launched us (no TTY).
-gui_error() {
-    local text="$1"
-    if command -v zenity >/dev/null 2>&1; then
-        zenity --error --title=WhisperFlow --width=420 --text="$text" 2>/dev/null || true
-    elif command -v kdialog >/dev/null 2>&1; then
-        kdialog --title WhisperFlow --error "$text" 2>/dev/null || true
-    elif command -v notify-send >/dev/null 2>&1; then
-        notify-send "WhisperFlow" "$text" 2>/dev/null || true
-    else
-        printf '%s\n' "$text" >&2
-    fi
-}
-
-start_app() {
-    # Prefer the user service (starts at login too); fall back to a direct
-    # background daemon so a double-click never needs a terminal.
-    if command -v systemctl >/dev/null 2>&1; then
-        if systemctl --user is-active --quiet whisper-flow.service 2>/dev/null; then
-            # Already running — bring settings or just leave the tray alone.
-            if command -v notify-send >/dev/null 2>&1; then
-                notify-send "WhisperFlow" "Already running — look for the mic in the tray." 2>/dev/null || true
-            fi
-            exit 0
-        fi
-        if systemctl --user start whisper-flow.service 2>/dev/null; then
-            exit 0
-        fi
-    fi
-    # Direct start, detached from this AppImage mount.
-    if [[ -x "$REAL" ]]; then
-        nohup "$REAL" daemon >/dev/null 2>&1 &
-        exit 0
-    fi
-    gui_error "WhisperFlow is installed but the launcher is missing.\nTry running the AppImage again, or reinstall."
-    exit 1
-}
-
-if [[ -x "$REAL" ]]; then
-    start_app
+export APPDIR="$HERE"
+# Bundled libs first; glibc still comes from the host.
+if [[ -d "$HERE/lib" ]]; then
+    export LD_LIBRARY_PATH="$HERE/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 fi
-
-# --- first run: install via the GUI (no terminal) --------------------
-if [[ ! -f "$PAYLOAD/gui_install.py" ]]; then
-    gui_error "This AppImage is incomplete (installer missing)."
-    exit 1
-fi
-
-if ! command -v python3 >/dev/null 2>&1; then
-    gui_error "Python 3 is required.\nInstall python3 from your software centre, then double-click again."
-    exit 1
-fi
-
-# gui_install.py expects install.sh beside it (payload layout).
-cd "$PAYLOAD"
-if ! python3 "$PAYLOAD/gui_install.py"; then
-    exit 1
-fi
-
-if [[ -x "$REAL" ]]; then
-    start_app
-fi
-exit 0
+exec "$HERE/whisper-flow" "$@"
 APPRUN
 chmod +x "$APPDIR/AppRun"
 
-# Fetch appimagetool if needed (CI and developer machines).
+# appimagetool
 ARCH=$(uname -m)
 case "$ARCH" in
     x86_64|amd64) AI_ARCH=x86_64 ;;
@@ -151,44 +95,36 @@ esac
 TOOL="$WORKDIR/appimagetool"
 if [[ -n "${APPIMAGETOOL:-}" && -x "${APPIMAGETOOL}" ]]; then
     TOOL="$APPIMAGETOOL"
-elif ! command -v appimagetool >/dev/null 2>&1; then
+elif command -v appimagetool >/dev/null 2>&1; then
+    TOOL=$(command -v appimagetool)
+else
     URL="https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-${AI_ARCH}.AppImage"
     echo "Downloading appimagetool…"
     curl -fsSL -o "$TOOL" "$URL"
     chmod +x "$TOOL"
-    # appimagetool is itself an AppImage; on some CI hosts FUSE is missing,
-    # so extract and run the embedded binary.
     if ! "$TOOL" --appimage-help >/dev/null 2>&1; then
         (cd "$WORKDIR" && "$TOOL" --appimage-extract >/dev/null)
         TOOL="$WORKDIR/squashfs-root/AppRun"
     fi
-else
-    TOOL=$(command -v appimagetool)
 fi
 
-# Build into a known path; appimagetool names by desktop Name + arch by default.
 export ARCH="$AI_ARCH"
 export VERSION
-# No runtime download surprises in CI.
 export APPIMAGETOOL_APP_UPDATE=0
 
 OUT_ABS=$(mkdir -p "$(dirname "$OUT")" && cd "$(dirname "$OUT")" && pwd)/$(basename "$OUT")
-# appimagetool writes VERSION-arch.AppImage unless -n / absolute out given.
 if ! "$TOOL" -n "$APPDIR" "$OUT_ABS" 2>"$WORKDIR/appimagetool.err"; then
-    cat "$WORKDIR/appimagetool.err" >&2
-    # Older continuous builds used different flags; retry without -n.
+    cat "$WORKDIR/appimagetool.err" >&2 || true
     if ! "$TOOL" "$APPDIR" "$OUT_ABS" 2>>"$WORKDIR/appimagetool.err"; then
         cat "$WORKDIR/appimagetool.err" >&2
         exit 1
     fi
 fi
 
-chmod +x "$OUT_ABS"
-# If the tool ignored our path and wrote next to AppDir, move it.
 if [[ ! -f "$OUT_ABS" ]]; then
     found=$(find "$WORKDIR" -maxdepth 2 -name '*.AppImage' ! -name 'appimagetool*' | head -1 || true)
     [[ -n "$found" ]] || { echo "error: AppImage not produced" >&2; exit 1; }
     mv "$found" "$OUT_ABS"
 fi
-
+chmod +x "$OUT_ABS"
 printf 'wrote %s (%s)\n' "$OUT_ABS" "$(du -h "$OUT_ABS" | cut -f1)"

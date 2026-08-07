@@ -36,12 +36,29 @@ LAYER_SHELL_CANDIDATES = (
     "/usr/lib/libgtk4-layer-shell.so",
     "/usr/lib64/libgtk4-layer-shell.so",
     "/usr/lib/x86_64-linux-gnu/libgtk4-layer-shell.so",
+    # Soname variants some distros ship.
+    "/usr/lib/libgtk4-layer-shell.so.0",
+    "/usr/lib64/libgtk4-layer-shell.so.0",
+    "/usr/lib/x86_64-linux-gnu/libgtk4-layer-shell.so.0",
 )
 
 
 def _layer_shell_library() -> str | None:
-    """Path to libgtk4-layer-shell, or None if it is not installed."""
-    for path in LAYER_SHELL_CANDIDATES:
+    """Path to libgtk4-layer-shell, or None if it is not available.
+
+    A frozen / AppImage build ships the library next to the binary (and under
+    _MEIPASS/lib); prefer that so the HUD works on hosts that never installed
+    gtk4-layer-shell from their package manager.
+    """
+    candidates = list(LAYER_SHELL_CANDIDATES)
+    if getattr(sys, "frozen", False):
+        base = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
+        exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+        for root in (base, exe_dir, os.path.join(base, "lib"),
+                     os.path.join(exe_dir, "lib")):
+            for name in ("libgtk4-layer-shell.so.0", "libgtk4-layer-shell.so"):
+                candidates.insert(0, os.path.join(root, name))
+    for path in candidates:
         if os.path.exists(path):
             return path
     return None

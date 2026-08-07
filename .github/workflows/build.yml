@@ -168,73 +168,135 @@ jobs:
   linux:
     name: package (linux)
     needs: test
-    runs-on: ubuntu-latest
+    # 22.04, not latest: the AppImage inherits this glibc. Building on an
+    # older base is what makes one file run on Ubuntu, Fedora, Arch, Mint,
+    # Debian bookworm, Pop!_OS and most current desktops. A 24.04 build would
+    # refuse to start on 22.04.
+    runs-on: ubuntu-22.04
+    env:
+      PYSTRAY_BACKEND: xorg
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
 
-      - name: Build wheel and sdist
+      - name: Install system dependencies
         run: |
-          python -m pip install --upgrade pip build
-          python -m build
+          sudo apt-get update
+          # deadsnakes: 22.04's python3 is 3.10; the project needs >=3.11.
+          # Building on 22.04 still keeps glibc old enough for most desktops.
+          sudo apt-get install -y software-properties-common
+          sudo add-apt-repository -y ppa:deadsnakes/ppa
+          sudo apt-get update
+          sudo apt-get install -y \
+            python3.12 python3.12-venv python3.12-dev \
+            gir1.2-gtk-4.0 gir1.2-adw-1 \
+            libgtk-4-1 libgtk-4-dev libadwaita-1-0 libadwaita-1-dev \
+            libcairo2-dev libgirepository1.0-dev gobject-introspection \
+            portaudio19-dev libportaudio2 libevdev-dev \
+            pkg-config meson ninja-build cmake \
+            curl file fuse libfuse2 \
+            xvfb adwaita-icon-theme
+          # gtk4-layer-shell is not in 22.04; build it so the Wayland HUD
+          # ships inside the AppImage and works without a distro package.
+          git clone --depth 1 --branch v1.0.3 \
+            https://github.com/wmww/gtk4-layer-shell.git /tmp/gtk4-layer-shell
+          meson setup /tmp/gtk4-layer-shell/build /tmp/gtk4-layer-shell \
+            -Dexamples=false -Ddocs=false -Dtests=false \
+            --prefix=/usr
+          ninja -C /tmp/gtk4-layer-shell/build
+          sudo ninja -C /tmp/gtk4-layer-shell/build install
+          sudo ldconfig
 
-      - name: Assemble AppImage
-        # One AppImage, double-click to run — no .deb, no tarball, no
-        # terminal. First click GUI-installs for the user; later clicks
-        # start the tray app. Same idea as a Windows portable/setup exe.
+      - name: Install Python package and PyInstaller
         run: |
-          VERSION=$(python -c "import tomllib;print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          # 3.12 venv with pip PyGObject (apt's gi is for system 3.10 only).
+          # Typelibs and .so still come from apt / the layer-shell build.
+          python3.12 -m venv .venv
+          .venv/bin/python -m pip install --upgrade pip
+          .venv/bin/pip install PyGObject pycairo
+          .venv/bin/pip install -e .
+          .venv/bin/pip install "pyinstaller>=6.0"
+          .venv/bin/python -c "import gi; gi.require_version('Gtk','4.0'); from gi.repository import Gtk; print('gi OK', Gtk.get_major_version())"
+
+      - name: Freeze with PyInstaller
+        working-directory: packaging/linux
+        run: |
+          source "$GITHUB_WORKSPACE/.venv/bin/activate"
+          python -m PyInstaller --noconfirm --clean whisper-flow.spec
+          test -x dist/whisper-flow/whisper-flow
+          ls -la dist/whisper-flow | head
+
+      - name: Prove the frozen app imports GTK
+        # Under xvfb: no real desktop, but Gtk.init_check and typelib load
+        # still fail if the bundle is incomplete.
+        run: |
+          source .venv/bin/activate
+          export WHISPER_FLOW_SELFTEST_OUT="$PWD/selftest.txt"
+          xvfb-run -a packaging/linux/dist/whisper-flow/whisper-flow --selftest \
+            || true
+          cat selftest.txt || true
+          # Require at least a clean Gtk import; display init may vary.
+          grep -q "Gtk 4 + Adw import OK" selftest.txt
+
+      - name: Bundle the speech engine and a model
+        # Same idea as Windows: offline dictation from the first launch.
+        # base.en-q8_0 keeps up on any CPU and fits a release asset.
+        run: |
+          set -euo pipefail
+          DIST=packaging/linux/dist/whisper-flow
+          mkdir -p "$DIST/engine" "$DIST/models"
+          REL=https://github.com/ggml-org/whisper.cpp/releases/download/v1.9.1
+          curl -fsSL "$REL/whisper-bin-ubuntu-x64.tar.gz" -o /tmp/engine.tar.gz
+          mkdir -p /tmp/engine
+          tar -xzf /tmp/engine.tar.gz -C /tmp/engine
+          # Archive layout varies; find whisper-server and its sibling libs.
+          SERVER=$(find /tmp/engine -type f -name whisper-server | head -1)
+          test -n "$SERVER"
+          cp -a "$(dirname "$SERVER")"/. "$DIST/engine/"
+          curl -fsSL \
+            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en-q8_0.bin" \
+            -o "$DIST/models/ggml-base.en-q8_0.bin"
+          # App icon next to the binary for the AppImage.
+          python3 -c "
+          import sys
+          from pathlib import Path
+          sys.path.insert(0, 'src')
+          from whisper_flow.icon import APP_COLOR, draw_mic
+          draw_mic(256, APP_COLOR).save(Path('$DIST') / 'whisper-flow.png', format='PNG')
+          "
+          du -sh "$DIST" "$DIST/engine" "$DIST/models"
+
+      - name: Build AppImage
+        run: |
+          VERSION=$(python3 -c "import tomllib;print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
             PACK_VERSION="${GITHUB_REF#refs/tags/v}"
           else
             SERIES=$(echo "$VERSION" | cut -d. -f1-2)
             PACK_VERSION="${SERIES}.${GITHUB_RUN_NUMBER}"
           fi
-          STAGE="whisper-flow-${PACK_VERSION}-linux"
-          mkdir -p "$STAGE"
-          cp packaging/linux/install.sh \
-             packaging/linux/uninstall.sh \
-             packaging/linux/gui_install.py \
-             packaging/linux/whisper-flow.desktop.in \
-             packaging/linux/whisper-flow.service.in \
-             packaging/linux/whisper-server.service.in \
-             "$STAGE"/
-          cp dist/*.whl "$STAGE"/
-          # Menu / AppImage icon. icon.py only needs Pillow.
-          python3 -m pip install -q pillow
-          python3 -c "
-          import sys
-          from pathlib import Path
-          sys.path.insert(0, 'src')
-          from whisper_flow.icon import APP_COLOR, draw_mic
-          draw_mic(256, APP_COLOR).save(Path('$STAGE') / 'whisper-flow.png', format='PNG')
-          print('icon ok')
-          "
-
-          # appimagetool needs libfuse2 on older runners; extract mode works
-          # without FUSE (make-appimage.sh falls back to --appimage-extract).
-          sudo apt-get install -y -qq libfuse2 || true
+          # Stamp so the tray / about text can show which build this is.
+          echo "$PACK_VERSION" > packaging/linux/dist/whisper-flow/BUILD.txt
           chmod +x packaging/linux/make-appimage.sh
           APPIMAGE="WhisperFlow-${PACK_VERSION}-x86_64.AppImage"
           packaging/linux/make-appimage.sh \
-            "$STAGE" "$PACK_VERSION" "$APPIMAGE"
-
+            packaging/linux/dist/whisper-flow \
+            "$PACK_VERSION" \
+            "$APPIMAGE"
           test -x "$APPIMAGE"
           test -s "$APPIMAGE"
-          # ELF AppImage, not a shell script or archive.
           file "$APPIMAGE" | grep -qiE 'ELF|AppImage'
-
           echo "PACK_VERSION=${PACK_VERSION}" >> "$GITHUB_ENV"
           echo "APPIMAGE=${APPIMAGE}" >> "$GITHUB_ENV"
-          ls -la "$APPIMAGE"
+          ls -lah "$APPIMAGE"
 
       - uses: actions/upload-artifact@v4
         with:
           name: linux-installer
           path: |
             WhisperFlow-*-x86_64.AppImage
+          retention-days: >-
+            ${{ (github.ref == 'refs/heads/master' ||
+                 startsWith(github.ref, 'refs/tags/v')) && 30 || 5 }}
 
   windows:
     name: package (windows)
@@ -555,13 +617,16 @@ jobs:
 
           NOTES="Built from \`${GITHUB_SHA::7}\` on $(date -u +'%Y-%m-%d %H:%M UTC').
 
-          **Linux** — download \`WhisperFlow-*-x86_64.AppImage\`, double-click
-          it. First run installs (desktop dialogs only — no terminal); later
-          runs start the tray. Hold Super+Alt to dictate.
+          **Linux** — download \`WhisperFlow-*-x86_64.AppImage\` and
+          double-click it. One portable build for most x86_64 desktops
+          (Ubuntu 22.04+, Fedora, Arch, Mint, Debian bookworm+, Pop!_OS…).
+          Bundles the app, GTK runtime, speech engine and a starter model —
+          no Python install, no package manager. Hold Super+Alt to dictate.
 
-          Needs GTK4 and python3-gi on the system; ydotool is recommended for
-          Wayland typing. If the file manager will not run it, right-click →
-          Properties → Allow executing file as program (once).
+          If the file manager will not run it: right-click → Properties →
+          Allow executing file as program (browsers strip that once).
+          Wayland typing works best with \`ydotool\` installed from your
+          distro; hotkeys need membership in the \`input\` group.
 
           **Windows** — double-click \`WhisperFlow-*-Setup.exe\`. Installs
           per-user, no admin needed, starts at sign-in. Requires Windows 11

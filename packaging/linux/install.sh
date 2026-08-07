@@ -164,7 +164,7 @@ WHISPER_FLOW_LOCAL_WHISPER_URL=http://127.0.0.1:8082
 
 WHISPER_FLOW_HOTKEY_TRANSCRIBE=super+alt
 WHISPER_FLOW_HOTKEY_AUTO_TRANSCRIBE=ctrl+alt+space
-WHISPER_FLOW_HOTKEY_COMMAND=cmd+shift+alt
+WHISPER_FLOW_HOTKEY_COMMAND=ctrl+super+alt
 
 # Type words as you speak them rather than all at once on release.
 WHISPER_FLOW_LIVE_TRANSCRIPTION=true

@@ -28,7 +28,12 @@ from .paths import pid_file as _pid_file
 from .version import build_version
 
 # Modes driven by holding a hotkey down; they cannot be deferred and replayed.
-PUSH_TO_TALK_MODES = ("transcribe", "command")
+# Only plain push-to-talk. Auto-transcribe and command are single-press:
+# speak until silence. Command used to be a held chord of pure modifiers
+# (super+shift+alt); releasing them ended the recording in the same gesture
+# that started it, so every tap produced a clip too short to keep - which
+# looked exactly like "command does nothing".
+PUSH_TO_TALK_MODES = ("transcribe",)
 
 def _pystray():
     """Import pystray at the point of use.
@@ -331,7 +336,7 @@ class WhisperFlowDaemon:
                 enabled=False,
             ),
             pystray.MenuItem(
-                f"Command (Push-to-Talk): {self.config.hotkey_command}",
+                f"Command (Single Press): {self.config.hotkey_command}",
                 None,
                 enabled=False,
             ),
@@ -374,15 +379,14 @@ class WhisperFlowDaemon:
                 description="Auto-stop transcription",
             )
 
-            # Register command hotkey (push-to-talk)
+            # Register command hotkey (single press, stop on silence)
             self.hotkey_manager.register_hotkey(
                 name="command",
                 keys=self.config.hotkey_command,
-                mode=HotkeyMode.PUSH_TO_TALK,
+                mode=HotkeyMode.SINGLE_PRESS,
                 callback_press=lambda: self._handle_hotkey_press("command"),
-                callback_release=lambda: self._stop_recording_if_active("command"),
                 priority=2,  # Higher than transcribe since it has more keys
-                description="Push-to-talk command mode with AI",
+                description="Single-press command dictation (stop on silence)",
             )
 
             # Set up escape key handling for canceling recordings
@@ -674,25 +678,25 @@ class WhisperFlowDaemon:
             app = self._get_app_for_mode(mode)
             log(f"[DAEMON] Using app instance for mode: {mode}")
 
-            if mode == "auto_transcribe":
-                # Auto-stop mode: record until silence
+            if mode in ("auto_transcribe", "command"):
+                # Single-press: record until silence (or Escape / max duration).
+                # Must show the HUD via on_ready - without it the user has no
+                # "speak now" signal and the mode looks dead.
                 log(
-                    f"[DAEMON] Running auto-stop mode with silence duration: {self.config.auto_stop_silence_duration}",
+                    f"[DAEMON] Running {mode} auto-stop with silence duration: "
+                    f"{self.config.auto_stop_silence_duration}",
                 )
                 success = app.run_voice_flow_auto_stop(
                     silence_duration=self.config.auto_stop_silence_duration,
                     level_file=getattr(self, "_level_file", None),
+                    stop_event=self.stop_recording_event,
+                    on_ready=self._show_hud_now,
+                    max_duration=self.config.max_recording_duration,
                 )
-            elif mode in ["transcribe", "command"]:
-                # Push-to-talk mode: record until stop event is set
-                hotkey = (
-                    self.config.hotkey_transcribe
-                    if mode == "transcribe"
-                    else self.config.hotkey_command
-                )
-                # Command mode needs the whole utterance before the AI step, so
-                # only plain transcription can stream.
-                if mode == "transcribe" and self.config.live_transcription:
+            elif mode == "transcribe":
+                # Push-to-talk: hold to talk, release to stop.
+                hotkey = self.config.hotkey_transcribe
+                if self.config.live_transcription:
                     log(f"[DAEMON] Running LIVE push-to-talk with stop key: {hotkey}")
                     success = app.run_voice_flow_push_to_talk_live(
                         stop_key=hotkey,
@@ -713,6 +717,9 @@ class WhisperFlowDaemon:
                 log(f"[DAEMON] Unknown mode {mode}, falling back to auto-stop")
                 success = app.run_voice_flow_auto_stop(
                     silence_duration=self.config.auto_stop_silence_duration,
+                    stop_event=self.stop_recording_event,
+                    on_ready=self._show_hud_now,
+                    max_duration=self.config.max_recording_duration,
                 )
 
             if not success:

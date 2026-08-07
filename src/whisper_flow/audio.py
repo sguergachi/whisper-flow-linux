@@ -723,6 +723,8 @@ class AudioRecorder:
         silence_duration: float,
         stop_event=None,
         level_file: str | None = None,
+        on_ready=None,
+        max_duration: float | None = None,
     ) -> str | None:
         """Record audio until silence is detected for the specified duration.
 
@@ -730,6 +732,10 @@ class AudioRecorder:
             silence_duration: Duration of silence in seconds before stopping
             stop_event: Threading event to stop recording
             level_file: Path to write audio levels for HUD visualization
+            on_ready: Called once the microphone is actually capturing
+            max_duration: Hard cap on how long to listen (seconds). Without
+                this, a silent room never trips VAD and the loop never ends,
+                leaving the daemon "busy" so every later hotkey does nothing.
 
         Returns:
             Path to the recorded audio file, or None if cancelled
@@ -744,15 +750,26 @@ class AudioRecorder:
 
         frame_len = int(self.config.sample_rate * self.config.frame_ms / 1000)
         chunk = frame_len
+        # Fall back to the configured ceiling so a missing max never means
+        # "wait forever".
+        if max_duration is None:
+            max_duration = float(getattr(self.config, "max_recording_duration", 120.0)
+                                 or 120.0)
 
         try:
             stream = self._open_input_stream(chunk)
+            if on_ready:
+                try:
+                    on_ready()
+                except Exception as e:
+                    log(f"[AUDIO] on_ready failed: {e}")
 
             frames = []
             # Per recording, not per recorder: this one adapts to the room as
             # it listens, and the room it adapted to last time is not this one.
             vad = self._new_vad()
-            last_voice_time = time.time()
+            started_at = time.time()
+            last_voice_time = started_at
             stop_flag = {"stop": False}
             recording_started = False
 
@@ -760,6 +777,12 @@ class AudioRecorder:
                 while not stop_flag["stop"]:
                     # Check if stop event is set (for daemon control)
                     if stop_event and stop_event.is_set():
+                        stop_flag["stop"] = True
+                        break
+
+                    if time.time() - started_at > max_duration:
+                        log(f"[AUDIO] auto-stop hit max duration "
+                            f"({max_duration:g}s)")
                         stop_flag["stop"] = True
                         break
 
@@ -788,6 +811,17 @@ class AudioRecorder:
                         log(
                             f"Silence detected for {silence_duration}s, stopping...",
                         )
+                        stop_flag["stop"] = True
+                        break
+                    elif (
+                        not recording_started
+                        and time.time() - started_at > silence_duration + 1.0
+                    ):
+                        # No speech at all after a short wait: stop rather
+                        # than sit open until max_duration. Auto-transcribe
+                        # is a single tap; an empty room should not pin the
+                        # daemon for two minutes.
+                        log("[AUDIO] auto-stop: no voice heard, giving up")
                         stop_flag["stop"] = True
                         break
 

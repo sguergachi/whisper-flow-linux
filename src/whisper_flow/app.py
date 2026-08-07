@@ -187,12 +187,22 @@ class WhisperFlow:
                 except Exception:
                     pass
 
-    def run_voice_flow_auto_stop(self, silence_duration: float = 2.0, level_file: str | None = None) -> bool:
+    def run_voice_flow_auto_stop(
+        self,
+        silence_duration: float = 2.0,
+        level_file: str | None = None,
+        stop_event=None,
+        on_ready=None,
+        max_duration: float | None = None,
+    ) -> bool:
         """Run voice flow with auto-stop on silence.
 
         Args:
             silence_duration: Seconds of silence before stopping
             level_file: Path to write audio levels for HUD visualization
+            stop_event: Set by the daemon to cancel (Escape / force-stop)
+            on_ready: Called once the microphone is capturing (show the HUD)
+            max_duration: Hard cap so a silent room cannot hang forever
 
         Returns:
             True if successful, False otherwise
@@ -201,7 +211,13 @@ class WhisperFlow:
         try:
             # Record audio until silence detected
             log(f"Recording... Will auto-stop after {silence_duration}s of silence")
-            audio_file = self.audio_recorder.record_until_silence(silence_duration, level_file=level_file)
+            audio_file = self.audio_recorder.record_until_silence(
+                silence_duration,
+                stop_event=stop_event,
+                level_file=level_file,
+                on_ready=on_ready,
+                max_duration=max_duration,
+            )
 
             if not audio_file:
                 log("No audio recorded")

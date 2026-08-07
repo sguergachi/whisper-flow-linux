@@ -128,11 +128,10 @@ cd whisper-flow-linux
 
 ### Global Hotkeys
 
-- **🎤 Transcribe**: `Ctrl+Cmd` (push-to-talk)
-- **🔴 Auto-Transcribe**: `Ctrl+Cmd+Space` (single press)
-- **🤖 Command**: `Ctrl+Cmd+Alt` (single press)
+- **🎤 Transcribe**: `Super+Alt` (hold to talk)
+- **🔴 Auto-Transcribe**: `Ctrl+Alt+Space` (tap, speak, stops on silence)
+- **🤖 Command**: `Ctrl+Super+Alt` (tap, speak, stops on silence)
 - **🛑 Cancel**: `Escape`
-- **📋 Menu**: `F1`
 
 ### CLI Commands
 

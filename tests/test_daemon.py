@@ -77,20 +77,27 @@ class TestWhisperFlowDaemon:
             # Check that the correct hotkeys were registered
             register_calls = mock_hotkey_manager.register_hotkey.call_args_list
 
+            from whisper_flow.hotkey_manager import HotkeyMode
+
             # Verify transcribe hotkey
             transcribe_call = register_calls[0]
             assert transcribe_call[1]["name"] == "transcribe"
             assert transcribe_call[1]["keys"] == "ctrl+cmd"
+            assert transcribe_call[1]["mode"] == HotkeyMode.PUSH_TO_TALK
+            assert transcribe_call[1]["callback_release"] is not None
 
             # Verify auto_transcribe hotkey
             auto_transcribe_call = register_calls[1]
             assert auto_transcribe_call[1]["name"] == "auto_transcribe"
             assert auto_transcribe_call[1]["keys"] == "ctrl+cmd+space"
+            assert auto_transcribe_call[1]["mode"] == HotkeyMode.SINGLE_PRESS
 
-            # Verify command hotkey
+            # Verify command hotkey (single press, not a held pure-modifier chord)
             command_call = register_calls[2]
             assert command_call[1]["name"] == "command"
             assert command_call[1]["keys"] == "ctrl+cmd+alt"
+            assert command_call[1]["mode"] == HotkeyMode.SINGLE_PRESS
+            assert command_call[1].get("callback_release") in (None,)
 
     def test_test_configuration_success(self, temp_config_dir):
         """Test configuration testing with successful validation."""

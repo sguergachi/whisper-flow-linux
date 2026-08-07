@@ -30,8 +30,10 @@ def default_hotkeys() -> dict[str, str]:
     """
     return {
         "transcribe": "super+alt",
+        # Single-press modes (speak until silence). Space / a third modifier
+        # keeps them from nesting inside push-to-talk super+alt.
         "auto_transcribe": "ctrl+alt+space",
-        "command": "cmd+shift+alt",
+        "command": "ctrl+super+alt",
     }
 
 

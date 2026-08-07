@@ -84,11 +84,14 @@ FIELDS = (
 
     # --------------------------------------------------------------- Hotkeys
     Field("hotkey_transcribe", "WHISPER_FLOW_HOTKEY_TRANSCRIBE",
-          "Push to talk", "Hotkeys", group="Shortcuts"),
+          "Push to talk", "Hotkeys", group="Shortcuts",
+          help="Hold to talk, release to paste"),
     Field("hotkey_auto_transcribe", "WHISPER_FLOW_HOTKEY_AUTO_TRANSCRIBE",
-          "Auto-transcribe", "Hotkeys", group="Shortcuts"),
+          "Auto-transcribe", "Hotkeys", group="Shortcuts",
+          help="Tap once, speak, stops after silence"),
     Field("hotkey_command", "WHISPER_FLOW_HOTKEY_COMMAND",
-          "Command", "Hotkeys", group="Shortcuts"),
+          "Command", "Hotkeys", group="Shortcuts",
+          help="Tap once, speak, stops after silence"),
 
     # ------------------------------------------------------------- Dictation
     Field("mic_device_index", "MIC_DEVICE_INDEX", "Device",

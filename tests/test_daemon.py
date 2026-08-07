@@ -460,6 +460,36 @@ class TestWhisperFlowDaemon:
             assert daemon.is_recording is False
             assert daemon.current_mode is None
 
+    def test_second_auto_press_stops_instead_of_queuing(self, temp_config_dir):
+        """Tap auto again while listening must end the clip, not queue another."""
+        with (
+            patch("whisper_flow.daemon.Config") as mock_config_class,
+            patch("whisper_flow.daemon.WhisperFlow") as mock_app_class,
+            patch("whisper_flow.daemon.HotkeyManager") as mock_hotkey_manager_class,
+        ):
+            mock_config = Mock()
+            mock_config.hotkey_transcribe = "ctrl+cmd"
+            mock_config.hotkey_auto_transcribe = "ctrl+cmd+space"
+            mock_config.hotkey_command = "ctrl+cmd+alt"
+            mock_config_class.return_value = mock_config
+            mock_app_class.return_value = Mock()
+            mock_hotkey_manager_class.return_value = Mock()
+
+            daemon = WhisperFlowDaemon(temp_config_dir)
+            daemon.is_recording = True
+            daemon.is_processing = True
+            daemon.current_mode = "auto_transcribe"
+            daemon.stop_recording_event = Mock()
+            daemon.notify = Mock()
+            stopped = []
+            daemon._stop_recording_if_active = (
+                lambda mode: stopped.append(mode))
+
+            daemon._handle_hotkey_press("auto_transcribe")
+
+            assert stopped == ["auto_transcribe"]
+            assert daemon.request_queue.empty()
+
     def test_stop_recording_if_active(self, temp_config_dir):
         """Test stopping recording only if the specified mode is active."""
         with (

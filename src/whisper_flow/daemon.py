@@ -431,6 +431,19 @@ class WhisperFlowDaemon:
         self._ptl = PressToListen()
         log(f"[DAEMON] Hotkey press received for mode: {mode}")
 
+        # Second tap of the same auto-stop mode ends the recording. Queuing
+        # another pass looked like "it does nothing" - the first clip kept
+        # listening for silence while the second sat in the queue.
+        if (
+            self.is_recording
+            and mode == self.current_mode
+            and mode in ("auto_transcribe", "command")
+        ):
+            log(f"[DAEMON] Second {mode} press - stopping recording")
+            self.notify("Stopping…")
+            self._stop_recording_if_active(mode)
+            return
+
         if self.is_processing or self.is_recording:
             if mode in PUSH_TO_TALK_MODES:
                 # A held hotkey cannot be replayed later: by the time the queue
@@ -666,6 +679,14 @@ class WhisperFlowDaemon:
             if ptl is not None:
                 ptl.mark("overlay")
                 ptl.report()
+        # Auto-stop modes have no held key to remind you they are live. One
+        # toast at mic-open is the "it heard the hotkey" signal when the
+        # overlay is slow or missing.
+        if self.current_mode in ("auto_transcribe", "command"):
+            try:
+                self.notify("Listening — speak, pause to finish (or tap again)")
+            except Exception:
+                pass
 
     def _stop_recording_if_active(self, mode: str):
         """Stop recording if the specified mode is currently active."""

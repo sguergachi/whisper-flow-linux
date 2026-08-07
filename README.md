@@ -133,14 +133,14 @@ Two behaviours, three shortcuts (the third is a spare of the second):
 | Shortcut | Default | How it works |
 |---|---|---|
 | **Push to talk** | `Super+Alt` | Hold while speaking. Release to stop and paste. |
-| **Auto-transcribe** | `Ctrl+Alt+Space` | Tap once, then speak. Ends after silence and pastes. |
+| **Auto-transcribe** | `Ctrl+Alt+Space` | Tap once, then speak. Ends after silence and pastes. Tap again to stop early. |
 | **Auto-transcribe (2nd)** | `Ctrl+Super+Alt` | Same as Auto-transcribe — extra hands-free key. |
 | **Cancel** | `Escape` | Abort the current recording. |
 
-The mic overlay appears when capture actually starts — that is the “speak now”
-signal. Silence length and the hard recording cap are under **Settings →
-Dictation → Stopping**. Change chords under **Settings → Hotkeys** (click a
-row, press the keys, Save).
+Hold **all** keys of the auto chord together (not one after another). A
+notification says **Listening** when the mic is open; the overlay is the other
+“speak now” signal. Silence length is under **Settings → Dictation → Stopping**.
+Change chords under **Settings → Hotkeys** (click a row, press the keys, Save).
 
 ### CLI Commands
 

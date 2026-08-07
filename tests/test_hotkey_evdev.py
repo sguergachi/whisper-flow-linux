@@ -321,3 +321,56 @@ def test_escape_fires_even_during_a_held_combination(listener):
     assert [first[0], second[0]] == ["transcribe", "escape"]
     # The real key event is still forwarded, like any other.
     assert (ecodes.KEY_ESC, 1) in listener.forwarded
+
+
+def test_auto_chord_fires_when_kernel_state_spans_two_devices(listener):
+    """Dual-HID boards put modifiers on one node and Space on another.
+
+    Event-edge tracking alone missed the full chord in production; the
+    listener must merge EVIOCGKEY across grabbed devices.
+    """
+    fired = []
+    listener.register_hotkey(
+        "auto_transcribe", "ctrl+alt+space",
+        lambda: fired.append("press"), None,
+        release_modifiers=True,
+    )
+
+    class Dev:
+        def __init__(self, keys):
+            self._keys = keys
+        def active_keys(self):
+            return list(self._keys)
+
+    # input0: modifiers only; input1: space only (SONiX KN85 shape).
+    mods = Dev({ecodes.KEY_LEFTCTRL, ecodes.KEY_LEFTALT})
+    space = Dev({ecodes.KEY_SPACE})
+    listener._kbd_devices = [mods, space]
+
+    # Space edge arrives on the space-only interface; sync should see all three.
+    listener._handle_key(FakeEvent(ecodes.KEY_SPACE, 1))
+    while not listener._callbacks.empty():
+        _n, _k, cb = listener._callbacks.get()
+        cb()
+
+    assert fired == ["press"], f"auto did not fire; state={listener._key_state}"
+    assert listener._key_state == {
+        ecodes.KEY_LEFTCTRL, ecodes.KEY_LEFTALT, ecodes.KEY_SPACE,
+    }
+
+
+def test_near_miss_logs_when_one_key_short(listener, monkeypatch):
+    """A chord missing one key must not stay silent in the journal."""
+    logs = []
+    monkeypatch.setattr(
+        "whisper_flow.logging.log",
+        lambda *a, **k: logs.append(" ".join(str(x) for x in a)),
+    )
+    listener.register_hotkey(
+        "auto_transcribe", "ctrl+alt+space", lambda: None, None,
+    )
+    listener._handle_key(FakeEvent(ecodes.KEY_LEFTCTRL, 1))
+    listener._handle_key(FakeEvent(ecodes.KEY_LEFTALT, 1))
+    # Space never pressed: one short of the chord.
+    assert any("almost auto_transcribe" in line and "missing" in line
+               for line in logs), logs

@@ -67,6 +67,9 @@ class EvdevHotkeyListener:
         self._active_hotkey = None
         self._press_triggered = set()  # hotkeys whose press callback was already fired
         self._muted = set()  # codes whose auto-repeat is suppressed while held
+        # (binding_name, frozenset of held codes) already reported as almost
+        # matching - cleared when no binding key is held.
+        self._near_miss_logged: set = set()
         # Cancel is not a binding: bindings resolve most-specific-wins, so a
         # lone Escape could never fire while a push-to-talk combination is
         # held - which is the whole point of a cancel key. Set by the manager.
@@ -256,6 +259,7 @@ class EvdevHotkeyListener:
         self._active_hotkey = None
         self._key_state.clear()
         self._muted.clear()
+        self._near_miss_logged.clear()
 
     def _open_devices(self) -> bool:
         """Grab every keyboard currently present. True if any were grabbed."""
@@ -280,6 +284,34 @@ class EvdevHotkeyListener:
                 self._uinput.syn()
         except Exception:
             pass
+
+    def _sync_key_state_from_devices(self) -> bool:
+        """Rebuild held keys from the kernel across every grabbed device.
+
+        Dual-HID boards (SONiX KN85, many Apple-vendor keyboards) put
+        modifiers on one interface and other keys on another. Tracking only
+        the events we see can desync when interfaces disagree or a key-up is
+        lost; EVIOCGKEY is the kernel's combined truth per device, and
+        merging them is what makes ctrl+alt+space match when Space arrives
+        on a different node than Ctrl and Alt.
+
+        Returns True when at least one device answered (state was replaced).
+        Tests and the brief window before any grab keep event-tracked state.
+        """
+        if not self._kbd_devices:
+            return False
+        merged: set[int] = set()
+        any_ok = False
+        for dev in self._kbd_devices:
+            try:
+                for code in dev.active_keys():
+                    merged.add(CODE_ALIASES.get(code, code))
+                any_ok = True
+            except Exception:
+                continue
+        if any_ok:
+            self._key_state = merged
+        return any_ok
 
     def _handle_key(self, event):
         """Track state and forward.
@@ -306,8 +338,11 @@ class EvdevHotkeyListener:
             return
 
         if value == 1:
-            self._key_state.add(code)
             self._forward(event)
+            # Kernel state first (multi-device); fall back to edge tracking
+            # when nothing is grabbed yet (unit tests).
+            if not self._sync_key_state_from_devices():
+                self._key_state.add(code)
             if code == ecodes.KEY_ESC and self.escape_callback:
                 self._callbacks.put(("escape", "press", self.escape_callback))
             if DEBUG_KEYS and code in self._binding_codes:
@@ -320,7 +355,8 @@ class EvdevHotkeyListener:
 
         # Drop the key before re-evaluating, otherwise the combination still
         # looks held and the release callback never fires.
-        self._key_state.discard(code)
+        if not self._sync_key_state_from_devices():
+            self._key_state.discard(code)
         self._muted.discard(code)
         self._check_bindings(rising=False)
         # Forwarded even if we already sent a synthetic release: a duplicate
@@ -356,6 +392,9 @@ class EvdevHotkeyListener:
         if satisfied:
             winner = max(satisfied, key=lambda item: len(item[1]))[0]
 
+        if rising and winner is None:
+            self._log_near_miss()
+
         for name, (keys, cb_press, cb_release, release_mods) in self._bindings.items():
             if name == winner:
                 # Only arm on a key-down. Otherwise releasing shift out of
@@ -374,6 +413,38 @@ class EvdevHotkeyListener:
                     self._active_hotkey = None
                 if cb_release:
                     self._callbacks.put((name, "release", cb_release))
+
+    def _log_near_miss(self) -> None:
+        """When a chord is one key short, say so - once per incomplete hold.
+
+        Auto-transcribe looked dead when Ctrl+Alt+Space never all landed in
+        state at once (dual-HID boards, or the user releasing a modifier
+        early). Without this, the journal only showed isolated key downs and
+        no "why didn't it fire".
+        """
+        if not self._key_state or not self._bindings:
+            return
+        # Clear memory when nothing from any binding is held.
+        binding_keys = set()
+        for keys, *_ in self._bindings.values():
+            binding_keys |= set(keys)
+        if not (self._key_state & binding_keys):
+            self._near_miss_logged.clear()
+            return
+        from .logging import log as _log
+        for name, (keys, *_rest) in self._bindings.items():
+            if not keys or keys.issubset(self._key_state):
+                continue
+            held = frozenset(keys & self._key_state)
+            if not held or len(held) < len(keys) - 1:
+                continue
+            missing = sorted(keys - self._key_state)
+            tag = (name, held)
+            if tag in self._near_miss_logged:
+                continue
+            self._near_miss_logged.add(tag)
+            _log(f"[HOTKEY] almost {name}: held {sorted(held)} "
+                 f"missing {missing} (need {sorted(keys)})")
 
     def _ungrab_devices(self):
         """Let go of the keyboards, keeping the uinput proxy alive.

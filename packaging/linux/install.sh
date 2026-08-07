@@ -86,6 +86,11 @@ for cmd in whisper-flow whisper-flow-daemon; do
     ln -sf "$PREFIX/venv/bin/$cmd" "$BIN_DIR/$cmd"
 done
 
+# Keep uninstall next to the install so a future removal does not need the
+# original download.
+cp "$TEMPLATE_DIR/uninstall.sh" "$PREFIX/uninstall.sh"
+chmod +x "$PREFIX/uninstall.sh"
+
 # --------------------------------------------------------------- units ----
 say "Installing systemd user units into $UNIT_DIR"
 
@@ -140,11 +145,26 @@ fi
 
 systemctl --user daemon-reload
 
+# Start like an app install: enable at login and bring it up now, unless the
+# caller asks not to (reinstall scripts, packaging smoke tests).
+if [[ "${WHISPER_FLOW_NO_START:-}" != "1" ]]; then
+    say "Starting whisper-flow"
+    if systemctl --user enable --now whisper-flow.service; then
+        :
+    else
+        warn "could not start the user service; start it with:"
+        echo "         systemctl --user enable --now whisper-flow"
+    fi
+fi
+
 say "Done."
 echo
-echo "  Start it:   systemctl --user enable --now whisper-flow"
+echo "  whisper-flow is installed for $USER."
+echo "  Tray icon:  should appear in the notification area"
 echo "  Watch it:   journalctl --user -u whisper-flow -f"
 echo "  Configure:  $CONFIG_DIR/.env"
+echo "  Stop it:    systemctl --user disable --now whisper-flow"
+echo "  Remove it:  $PREFIX/uninstall.sh   (or the uninstall.sh next to this installer)"
 echo
 if ! printf '%s' "$PATH" | grep -q "$BIN_DIR"; then
     warn "$BIN_DIR is not on your PATH; add it to use the commands directly."

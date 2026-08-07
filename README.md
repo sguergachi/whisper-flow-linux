@@ -76,65 +76,49 @@ well short of the point where oversubscription collapses it.
 
 Nothing large is ever downloaded without being asked.
 
-## Linux: Quick Setup (One-Click Install)
+## Linux
 
-### Prerequisites
-
-- **Linux** (Ubuntu/Debian/Mint) with desktop environment
-- **Python 3.12** (required for system tray support)
-- **A [whisper.cpp](https://github.com/ggerganov/whisper.cpp) server** — the
-  app starts and manages one for you unless you point it at your own
-
-### 1. Install System Dependencies
+Download the single installer from the
+[latest release](https://github.com/sguergachi/whisper-flow-linux/releases)
+(`whisper-flow-*-linux-setup` — one file, not an archive), then:
 
 ```bash
-# Install required system packages for tray icon support
-sudo apt update && sudo apt install -y \
-    python3-gi \
-    gir1.2-gtk-3.0 \
-    gir1.2-appindicator3-0.1 \
-    libappindicator3-1 \
-    python3-venv \
-    python3-pip
+chmod +x whisper-flow-*-linux-setup
+./whisper-flow-*-linux-setup
 ```
 
-### 2. Clone and Setup
+That installs for the current user under `~/.local` (no root), enables the
+tray daemon at login, and starts it. Hold `Super+Alt` to dictate.
+
+The installer checks for system packages it needs (GTK4, gtk4-layer-shell,
+ydotool, Python 3.11+) and prints the distro commands if anything is missing.
+On a typical desktop:
 
 ```bash
-# Clone the repository
+# Arch
+sudo pacman -S python-gobject gtk4 gtk4-layer-shell ydotool
+
+# Fedora
+sudo dnf install python3-gobject gtk4 gtk4-layer-shell ydotool
+
+# Debian/Ubuntu
+sudo apt install python3-gi gir1.2-gtk-4.0 ydotool
+# gtk4-layer-shell may need building from source on Debian/Ubuntu
+```
+
+Global hotkeys also need membership in the `input` group
+(`sudo usermod -aG input $USER`, then log out and back in).
+
+Remove with `~/.local/share/whisper-flow/uninstall.sh`.
+
+### From source (developers)
+
+```bash
 git clone https://github.com/sguergachi/whisper-flow-linux.git
 cd whisper-flow-linux
-
-# Create virtual environment with system site packages
-python3.12 -m venv .venv --system-site-packages
-
-# Activate environment
-source .venv/bin/activate
-
-# Install dependencies
-pip install -e .
+./packaging/linux/install.sh
+# or: python3 -m venv --system-site-packages .venv && .venv/bin/pip install -e .
 ```
-
-### 3. Point at a Whisper Server (optional)
-
-The app starts and manages a local whisper.cpp server on its own. To use one
-you already run instead:
-
-```bash
-export WHISPER_FLOW_LOCAL_WHISPER_URL="http://127.0.0.1:8082"
-```
-
-### 4. Start the Daemon
-
-```bash
-# Start the daemon with tray icon (GTK backend configured by default)
-whisper-flow daemon --foreground
-
-# Or start in background
-whisper-flow daemon
-```
-
-You should see a microphone icon in your system tray. Right-click it to access the menu!
 
 ## Usage
 

@@ -180,27 +180,47 @@ jobs:
           python -m pip install --upgrade pip build
           python -m build
 
-      - name: Assemble the installer bundle
+      - name: Assemble the single-file installer
+        # One executable, not a tarball. Same idea as the Windows setup.exe:
+        # download, run, done. The payload is the wheel plus install scripts;
+        # make-installer.sh wraps them in a self-extracting bash header.
         run: |
           VERSION=$(python -c "import tomllib;print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
-          STAGE="whisper-flow-${VERSION}-linux"
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            PACK_VERSION="${GITHUB_REF#refs/tags/v}"
+          else
+            # Rolling builds need a distinct name so two artifacts do not
+            # collide when someone downloads both from Actions.
+            SERIES=$(echo "$VERSION" | cut -d. -f1-2)
+            PACK_VERSION="${SERIES}.${GITHUB_RUN_NUMBER}"
+          fi
+          STAGE="whisper-flow-${PACK_VERSION}-linux"
           mkdir -p "$STAGE"
-          cp -r packaging/linux/* "$STAGE"/
+          cp packaging/linux/install.sh \
+             packaging/linux/uninstall.sh \
+             packaging/linux/whisper-flow.service.in \
+             packaging/linux/whisper-server.service.in \
+             "$STAGE"/
           cp dist/*.whl "$STAGE"/
-          cp README.md "$STAGE"/
           # install.sh detects the bundled wheel itself, so nothing here has
           # to rewrite it - a sed against a script it cannot test is exactly
           # how the bundle shipped broken the first time.
-          tar czf "${STAGE}.tar.gz" "$STAGE"
-          echo "ARTIFACT=${STAGE}.tar.gz" >> "$GITHUB_ENV"
+          chmod +x packaging/linux/make-installer.sh
+          packaging/linux/make-installer.sh \
+            "$STAGE" "whisper-flow-${PACK_VERSION}-linux-setup"
+          # make-installer.sh already self-checks that install.sh is in the
+          # payload; just confirm the artifact is executable and non-empty.
+          test -x "whisper-flow-${PACK_VERSION}-linux-setup"
+          test -s "whisper-flow-${PACK_VERSION}-linux-setup"
+          echo "ARTIFACT=whisper-flow-${PACK_VERSION}-linux-setup" >> "$GITHUB_ENV"
+          echo "PACK_VERSION=${PACK_VERSION}" >> "$GITHUB_ENV"
+          ls -la "whisper-flow-${PACK_VERSION}-linux-setup"
 
       - uses: actions/upload-artifact@v4
         with:
           name: linux-installer
           path: |
             ${{ env.ARTIFACT }}
-            dist/*.whl
-            dist/*.tar.gz
 
   windows:
     name: package (windows)
@@ -521,11 +541,16 @@ jobs:
 
           NOTES="Built from \`${GITHUB_SHA::7}\` on $(date -u +'%Y-%m-%d %H:%M UTC').
 
-          **Linux** - unpack \`whisper-flow-*-linux.tar.gz\` and run \`install.sh\`.
-          Needs GTK4, gtk4-layer-shell and ydotool; the installer checks and
-          tells you what is missing.
+          **Linux** - download \`whisper-flow-*-linux-setup\`, then:
+          \`\`\`
+          chmod +x whisper-flow-*-linux-setup
+          ./whisper-flow-*-linux-setup
+          \`\`\`
+          Installs per-user (no root), enables the tray daemon at login, and
+          starts it. Needs GTK4, gtk4-layer-shell and ydotool; the installer
+          checks and tells you what is missing.
 
-          **Windows** - run \`whisper-flow-*-setup.exe\`. Installs per-user, no
+          **Windows** - run \`WhisperFlow-*-Setup.exe\`. Installs per-user, no
           admin needed, and can start with you at sign-in. Requires Windows 11
           22H2 or later. The portable zip is the same build without an
           installer."
@@ -535,8 +560,7 @@ jobs:
             --notes "$NOTES" \
             --target "$GITHUB_SHA" \
             ${{ steps.plan.outputs.prerelease == 'true' && '--prerelease' || '' }} \
-            artifacts/linux-installer/*.tar.gz \
-            artifacts/linux-installer/dist/*.whl \
+            artifacts/linux-installer/whisper-flow-*-linux-setup \
             release-files/*
 
   prune:

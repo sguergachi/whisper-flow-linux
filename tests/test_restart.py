@@ -58,6 +58,23 @@ def test_a_running_daemon_is_stopped_then_respawned(monkeypatch):
         sys.executable, "-m", "whisper_flow.cli", "daemon", "--foreground"]
 
 
+def test_respawn_hides_the_console_on_windows(monkeypatch):
+    """Save restarts the daemon; a console python.exe must not flash a prompt."""
+    import subprocess
+
+    monkeypatch.setattr(restart, "systemd_unit_active", lambda: False)
+    monkeypatch.setattr(restart, "daemon_pid", lambda: None)
+    monkeypatch.setattr(sys, "platform", "win32")
+    popen = Mock()
+    monkeypatch.setattr(restart.subprocess, "Popen", popen)
+
+    ok, _detail = restart.restart_daemon()
+
+    assert ok
+    expected = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    assert popen.call_args.kwargs.get("creationflags") == expected
+
+
 def test_no_running_daemon_just_starts_one(monkeypatch):
     monkeypatch.setattr(restart, "systemd_unit_active", lambda: False)
     monkeypatch.setattr(restart, "daemon_pid", lambda: None)

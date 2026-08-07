@@ -433,6 +433,27 @@ def test_prewarming_starts_the_overlay_before_any_press(hud, monkeypatch):
     assert started, "prewarm must start the overlay"
 
 
+def test_overlay_spawn_hides_the_console_on_windows(hud, monkeypatch):
+    """Source runs launch python.exe; without CREATE_NO_WINDOW it flashes."""
+    monkeypatch.setattr(hud_module, "IS_WINDOWS", True)
+    seen = {}
+
+    def fake_popen(*args, **kwargs):
+        seen.update(kwargs)
+        return FakeProcess()
+
+    monkeypatch.setattr(hud_module.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(hud_module.tempfile, "mkstemp",
+                        lambda **k: (-1, "/tmp/hud.log"))
+    monkeypatch.setattr(hud_module.os, "close", lambda fd: None)
+    monkeypatch.setattr("builtins.open", lambda *a, **k: Mock())
+
+    assert hud._resident_process() is not None
+    flags = seen.get("creationflags", 0)
+    assert flags & hud_module.CREATE_NO_WINDOW
+    assert flags & hud_module.CREATE_NEW_PROCESS_GROUP
+
+
 def test_prewarming_does_nothing_when_residency_is_off(monkeypatch):
     monkeypatch.setattr(hud_module, "RESIDENT", False)
     hud = hud_module.HUD()

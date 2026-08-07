@@ -962,9 +962,12 @@ def copy_to_clipboard(text: str) -> bool:
 def _copy_via_clip_exe(text: str) -> bool:
     """Fallback for a locked clipboard. utf-16 here carries its own BOM."""
     try:
+        # CREATE_NO_WINDOW: clip.exe is a console app; without this a
+        # windowed parent flashes a prompt on every clipboard fallback.
         proc = subprocess.run(
             ["clip.exe"], input=text.encode("utf-16"),
             capture_output=True, timeout=5, check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
         )
         return proc.returncode == 0
     except Exception:
@@ -997,7 +1000,7 @@ def notify(title: str, message: str) -> None:
     try:
         subprocess.Popen(
             ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", script],
-            creationflags=0x08000000,  # CREATE_NO_WINDOW
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
         )
     except Exception:
         print(f"[whisper-flow] {title}: {message}")

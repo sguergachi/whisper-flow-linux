@@ -306,6 +306,26 @@ def test_old_drivers_get_the_cuda_11_build(monkeypatch):
     assert backend_module.detect_accelerator() == "cuda11"
 
 
+def test_nvidia_smi_is_spawned_without_a_console_window(monkeypatch):
+    """The tray app is windowed; a console child flashes a black prompt.
+
+    CREATE_NO_WINDOW is what stops that. Without it every Windows login
+    shows a brief command-line window while the GPU is probed.
+    """
+    seen = {}
+
+    def fake_run(*args, **kwargs):
+        seen.update(kwargs)
+        return types.SimpleNamespace(returncode=0, stdout="560.01\n")
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(backend_module.shutil, "which", lambda _: "nvidia-smi")
+    monkeypatch.setattr(backend_module.subprocess, "run", fake_run)
+    assert backend_module.detect_accelerator() == "cuda12"
+    expected = getattr(backend_module.subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    assert seen.get("creationflags") == expected
+
+
 # -------------------------------------------------------------- engine choice
 def _bundled_cpu_engine(local_backend, config, monkeypatch):
     """A frozen build's payload: the CPU engine and a small model."""

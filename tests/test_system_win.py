@@ -67,6 +67,7 @@ def test_the_clip_exe_fallback_sends_a_byte_order_mark(system_win, monkeypatch):
 
     def fake_run(cmd, input=None, **kwargs):
         sent["cmd"], sent["input"] = cmd, input
+        sent["kwargs"] = kwargs
         return type("P", (), {"returncode": 0})()
 
     monkeypatch.setattr(system_win.subprocess, "run", fake_run)
@@ -74,6 +75,9 @@ def test_the_clip_exe_fallback_sends_a_byte_order_mark(system_win, monkeypatch):
     assert sent["cmd"] == ["clip.exe"]
     assert sent["input"].startswith(b"\xff\xfe")          # UTF-16 LE BOM
     assert sent["input"].decode("utf-16") == "héllo"
+    # clip.exe is a console app; without CREATE_NO_WINDOW it flashes a prompt.
+    expected = getattr(system_win.subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    assert sent["kwargs"].get("creationflags") == expected
 
 
 def test_the_fallback_reports_failure_rather_than_raising(system_win, monkeypatch):

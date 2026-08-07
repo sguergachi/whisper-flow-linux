@@ -4,6 +4,7 @@ The rule these pin down: the app never downloads gigabytes without being
 asked, and never asks twice about the same thing.
 """
 
+import subprocess
 import sys
 import time
 from unittest.mock import Mock, patch
@@ -315,6 +316,9 @@ def test_prewarming_builds_a_window_nobody_has_asked_for_yet(daemon, monkeypatch
     assert popen.call_args.kwargs["stdin"] is not None
     assert daemon._setup_waiting is True
     assert daemon._setup_shown is False
+    # Source runs launch python.exe (console); hide its prompt at login.
+    expected = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    assert popen.call_args.kwargs.get("creationflags") == expected
 
 
 def test_the_click_shows_the_waiting_window_rather_than_starting_a_process(

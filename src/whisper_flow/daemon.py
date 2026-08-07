@@ -1071,9 +1071,14 @@ class WhisperFlowDaemon:
             # stdin is a pipe whether or not this one is prewarmed: it is how
             # a waiting window is told to show itself, and closing it is how
             # any of them is told the daemon has gone.
+            #
+            # CREATE_NO_WINDOW: a source checkout launches python.exe (console
+            # subsystem). Without this the prewarmed settings process flashes
+            # a prompt at login. Harmless for the windowed frozen exe.
             process = self._setup_process = subprocess.Popen(
                 cmd, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT, text=True, errors="replace")
+                stderr=subprocess.STDOUT, text=True, errors="replace",
+                creationflags=backend_module.no_console_flags())
         except Exception as e:
             log(f"[DAEMON] could not open the setup window: {e}")
             self._setup_process = None

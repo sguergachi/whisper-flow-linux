@@ -119,13 +119,31 @@ def detect_accelerator() -> str:
     return _accelerator
 
 
+def no_console_flags() -> int:
+    """creationflags so a console-subsystem child does not flash a prompt.
+
+    The tray app is a windowed executable (console=False). Spawning a
+    console tool without CREATE_NO_WINDOW allocates a new console for it -
+    a black command-prompt window that appears and vanishes. nvidia-smi
+    and whisper-server are both console apps; this is what hides them.
+    Harmless on other platforms (returns 0).
+    """
+    if sys.platform != "win32":
+        return 0
+    return getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+
+
 def _probe_accelerator() -> str:
     try:
         if not shutil.which("nvidia-smi"):
             return "cpu"
+        # CREATE_NO_WINDOW: without it this flashes a console at every
+        # Windows login, because the tray process is windowed and
+        # nvidia-smi is a console app.
         out = subprocess.run(
             ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
             capture_output=True, text=True, timeout=10,
+            creationflags=no_console_flags(),
         )
         if out.returncode != 0 or not out.stdout.strip():
             return "cpu"
@@ -810,11 +828,10 @@ class LocalBackend:
                 # past it on a two-core laptop. See usable_cores().
                 cmd += ["-t", str(usable_cores())]
             # No console window for a background helper.
-            flags = 0x08000000 if sys.platform == "win32" else 0
             try:
                 self._process = subprocess.Popen(
                     cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                    creationflags=flags,
+                    creationflags=no_console_flags(),
                 )
             except Exception as e:
                 log(f"[BACKEND] could not start the server: {e}")

@@ -156,11 +156,17 @@ def _restart_daemon() -> tuple[bool, str]:
                 "starting a replacement anyway")
 
     try:
+        # CREATE_NO_WINDOW: a source checkout respawns python.exe; without
+        # this a Save-triggered restart flashes a console on Windows.
+        flags = 0
+        if sys.platform == "win32":
+            flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
         subprocess.Popen(
             respawn_command(),
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             stdin=subprocess.DEVNULL,
             start_new_session=sys.platform != "win32",
+            creationflags=flags,
         )
     except Exception as e:
         return False, f"could not start the daemon: {e}"

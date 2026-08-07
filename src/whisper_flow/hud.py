@@ -15,6 +15,10 @@ import threading
 from .logging import log
 
 IS_WINDOWS = sys.platform == "win32"
+# Raw values: these constants only exist on Windows, but the freeze-time
+# and unit-test paths still evaluate the Windows branch under Linux.
+CREATE_NEW_PROCESS_GROUP = 0x00000200
+CREATE_NO_WINDOW = 0x08000000
 
 # Kept in step with hud_app.PROCESSING_SUFFIX, and not imported from it: this
 # module supervises the overlay from the daemon's process, where importing
@@ -167,8 +171,13 @@ class HUD:
             self._log_file = open(self._log_path, "a")
             # setsid groups the child on POSIX so the whole overlay can be
             # signalled; Windows has no equivalent and no such argument.
-            extra = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
-                     if IS_WINDOWS else {"preexec_fn": os.setsid})
+            # CREATE_NO_WINDOW: source runs launch python.exe (console); the
+            # frozen exe is windowed and the flag is a no-op there.
+            if IS_WINDOWS:
+                extra = {"creationflags":
+                         CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW}
+            else:
+                extra = {"preexec_fn": os.setsid}
             self._process = subprocess.Popen(
                 argv,
                 stdout=self._log_file,
@@ -285,6 +294,8 @@ class HUD:
                 suffix=".log", prefix="whisper-flow-hud-")
             os.close(fd)
             self._log_file = open(self._log_path, "a")
+            flags = (CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
+                     if IS_WINDOWS else 0)
             self._process = subprocess.Popen(
                 self._overlay_command(),
                 stdin=subprocess.PIPE,
@@ -292,8 +303,7 @@ class HUD:
                 stderr=subprocess.STDOUT,
                 env=env,
                 text=True,
-                creationflags=(subprocess.CREATE_NEW_PROCESS_GROUP
-                               if IS_WINDOWS else 0),
+                creationflags=flags,
             )
         except Exception as e:
             log(f"[HUD] could not start the resident overlay: {e}")

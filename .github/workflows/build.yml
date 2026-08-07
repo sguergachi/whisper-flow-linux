@@ -213,9 +213,13 @@ jobs:
         run: |
           # 3.12 venv with pip PyGObject (apt's gi is for system 3.10 only).
           # Typelibs and .so still come from apt / the layer-shell build.
+          #
+          # Pin PyGObject < 3.50: 3.50+ needs girepository-2.0 (GLib 2.80),
+          # which Ubuntu 22.04 does not ship. 3.48 still builds against
+          # girepository-1.0 from apt.
           python3.12 -m venv .venv
           .venv/bin/python -m pip install --upgrade pip
-          .venv/bin/pip install PyGObject pycairo
+          .venv/bin/pip install 'PyGObject>=3.46,<3.50' 'pycairo>=1.21'
           .venv/bin/pip install -e .
           .venv/bin/pip install "pyinstaller>=6.0"
           .venv/bin/python -c "import gi; gi.require_version('Gtk','4.0'); from gi.repository import Gtk; print('gi OK', Gtk.get_major_version())"

@@ -109,13 +109,20 @@ def test_a_long_recording_sends_no_window_at_all(tmp_path, monkeypatch):
     assert "audio_ctx" not in posted["data"]
 
 
-def test_turning_the_setting_off_sends_the_audio_and_nothing_else(
+def test_turning_the_setting_off_sends_no_audio_ctx(
         tmp_path, monkeypatch):
+    """fast_encoder off must not shrink the encoder window.
+
+    Inference still carries temperature / no_speech / language knobs that
+    help noisy-room decoding; those are not gated on fast_encoder.
+    """
     config = FakeConfig()
     config.fast_encoder = False
     service, posted = _service_posting(monkeypatch, config)
     service.transcribe_audio(_wav(tmp_path / "a.wav", 3.0))
-    assert posted["data"] == {}
+    assert "audio_ctx" not in posted["data"]
+    assert posted["data"].get("temperature") == "0.0"
+    assert posted["data"].get("language") == "en"
 
 
 def test_the_shortened_window_is_off_unless_it_is_asked_for():

@@ -236,7 +236,6 @@ def save_capture(
 ) -> Path | None:
     """Write last/ capture folder. Returns the directory, or None on failure."""
     try:
-        root = debug_root(config_dir)
         dest = last_dir(config_dir)
         if dest.exists():
             shutil.rmtree(dest)

@@ -80,16 +80,36 @@ def _wait_for_exit(pid: int, timeout: float = 10.0) -> bool:
 
 
 def restart_daemon() -> tuple[bool, str]:
-    """Stop the daemon and start it again. Returns (ok, what happened)."""
+    """Stop the daemon and start it again. Returns (ok, what happened).
+
+    Must not take the settings window down with it. The settings process is
+    a child of the daemon (prewarmed at login), and systemd's default
+    KillMode=control-group would kill that child on ``systemctl restart`` -
+    the Save toast never appears and the window freezes mid-click. So under
+    systemd we signal only the main process, wait for it to exit, then start
+    the unit again.
+    """
     if systemd_unit_active():
+        # --kill-who=main: only the daemon, not its settings/HUD children.
         result = subprocess.run(
-            ["systemctl", "--user", "restart", UNIT],
+            ["systemctl", "--user", "kill", "-s", "SIGTERM",
+             "--kill-who=main", UNIT],
+            capture_output=True, check=False,
+        )
+        if result.returncode != 0:
+            return False, result.stderr.decode(errors="replace").strip() or \
+                "systemctl refused to stop the daemon"
+        pid = daemon_pid()
+        if pid and not _wait_for_exit(pid):
+            return False, "the old daemon would not stop"
+        result = subprocess.run(
+            ["systemctl", "--user", "start", UNIT],
             capture_output=True, check=False,
         )
         if result.returncode == 0:
             return True, "restarting via systemd"
         return False, result.stderr.decode(errors="replace").strip() or \
-            "systemctl refused the restart"
+            "systemctl refused to start the daemon"
 
     pid = daemon_pid()
     if pid:

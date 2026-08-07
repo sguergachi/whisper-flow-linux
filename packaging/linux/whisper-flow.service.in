@@ -9,6 +9,10 @@ Type=simple
 ExecStart=@VENV@/bin/whisper-flow daemon --foreground
 Environment=ALSA_SUPPRESS_WARNINGS=1
 Environment=PATH=@HOME@/.local/bin:/usr/local/bin:/usr/bin:/bin
+# process, not control-group: the settings window and HUD are child processes
+# of the daemon. Killing the whole cgroup on stop/restart takes settings
+# down mid-Save, so the toast never appears and the window freezes.
+KillMode=process
 Restart=on-failure
 RestartSec=3
 

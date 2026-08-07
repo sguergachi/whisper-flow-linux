@@ -439,7 +439,7 @@ elif scenario == "mic_meter":
     from gi.repository import Gtk as _Gtk
 
     assert w._mic_meter is not None, "no level bar on the Device row"
-    assert isinstance(w._mic_meter, _Gtk.LevelBar)
+    assert isinstance(w._mic_meter, _Gtk.ProgressBar)
     assert w._mic_test_button is not None, "no Test button on the Device row"
     assert w._mic_test_button.get_label() == "Test"
 
@@ -463,18 +463,20 @@ elif scenario == "mic_meter":
     w._start_mic_test()
     assert w._mic_test_button.get_label() == "Stop"
     assert w._mic_meter_tick_id != 0
-    with w._mic_meter_lock:
-        w._mic_drawn_level = 0.42
-    assert w._tick_mic_meter() is True
-    assert abs(w._mic_meter.get_value() - 0.42) < 1e-6, w._mic_meter.get_value()
+    # Device is published immediately, not on the first paint tick.
+    # None means platform default - still a real listen request, not OFF.
     with w._mic_meter_lock:
         assert w._mic_want_device != settings_gtk._MIC_METER_OFF, (
             "Test did not ask the meter thread to listen")
+        w._mic_drawn_level = 0.42
+    assert w._tick_mic_meter() is True
+    assert abs(w._mic_meter.get_fraction() - 0.42) < 1e-6, (
+        w._mic_meter.get_fraction())
 
     w._stop_mic_test()
     assert w._mic_test_button.get_label() == "Test"
     assert w._mic_meter_tick_id == 0
-    assert w._mic_meter.get_value() == 0.0
+    assert w._mic_meter.get_fraction() == 0.0
     with w._mic_meter_lock:
         assert w._mic_want_device == settings_gtk._MIC_METER_OFF
 
@@ -484,7 +486,7 @@ elif scenario == "mic_meter":
     # notify::visible calls _stop_mic_test; tick disarms if anything remains.
     assert not w._mic_meter_active
     assert w._mic_meter_tick_id == 0
-    assert w._mic_meter.get_value() == 0.0
+    assert w._mic_meter.get_fraction() == 0.0
     with w._mic_meter_lock:
         assert w._mic_want_device == settings_gtk._MIC_METER_OFF, (
             "hiding the window left the capture stream requested")

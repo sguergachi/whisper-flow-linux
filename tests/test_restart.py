@@ -15,8 +15,14 @@ from whisper_flow import restart
 
 
 def test_systemd_installations_restart_through_systemd(monkeypatch):
+    """Kill only the main process - not the settings child in the cgroup.
+
+    ``systemctl restart`` uses KillMode=control-group by default and took
+    the settings window down mid-Save, so the toast never appeared.
+    """
     monkeypatch.setattr(restart, "systemd_unit_active", lambda: True)
-    run = Mock(return_value=Mock(returncode=0))
+    monkeypatch.setattr(restart, "daemon_pid", lambda: None)
+    run = Mock(return_value=Mock(returncode=0, stderr=b""))
     monkeypatch.setattr(restart.subprocess, "run", run)
     kill = Mock()
     monkeypatch.setattr(restart.os, "kill", kill)
@@ -24,8 +30,12 @@ def test_systemd_installations_restart_through_systemd(monkeypatch):
     ok, _detail = restart.restart_daemon()
 
     assert ok
-    assert run.call_args[0][0] == [
-        "systemctl", "--user", "restart", restart.UNIT]
+    assert run.call_count == 2
+    assert run.call_args_list[0][0][0] == [
+        "systemctl", "--user", "kill", "-s", "SIGTERM",
+        "--kill-who=main", restart.UNIT]
+    assert run.call_args_list[1][0][0] == [
+        "systemctl", "--user", "start", restart.UNIT]
     kill.assert_not_called()
 
 

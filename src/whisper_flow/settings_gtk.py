@@ -158,12 +158,11 @@ CSS = b"""
    resolving a merge, leaving the factory without the floor it needs for the
    case where the popover declines to grow past the row. */
 .mic-row popover listview { min-width: 520px; }
-/* Live input level next to the Device combo. Narrow enough that the
-   dropdown still has room for a device name; tall enough to read at a
-   glance while speaking into the mic. */
+/* Live input level under Device. ProgressBar, not LevelBar: continuous
+   LevelBar is easy to miss in Adwaita dark, and this needs to read while
+   the user is speaking. */
 .mic-meter {
-    min-width: 96px;
-    min-height: 8px;
+    min-width: 140px;
 }
 .daemon-ok { color: #4ade80; }
 .daemon-bad { color: #f87171; }
@@ -463,21 +462,25 @@ def _open_meter_stream(pa, device):
 
     Uses the device's own rate so WASAPI shared mode accepts the open - the
     same trap the recorder already documents. Levels are rate-agnostic RMS,
-    so conversion is unnecessary here.
+    so conversion is unnecessary here. The platform default (device is None)
+    also has a native rate; hardcoding 16 kHz there fails or returns silence
+    on arrays that only run at 44.1/48 kHz.
 
     Returns ``(stream, frames_per_read)`` or ``(None, 0)``.
     """
     import pyaudio
 
     rate = 16000
-    if device is not None:
-        try:
+    try:
+        if device is not None:
             info = pa.get_device_info_by_index(device)
-            native = int(info.get("defaultSampleRate") or 0)
-            if native > 0:
-                rate = native
-        except Exception:
-            pass
+        else:
+            info = pa.get_default_input_device_info()
+        native = int(info.get("defaultSampleRate") or 0)
+        if native > 0:
+            rate = native
+    except Exception:
+        pass
     # ~20 ms of audio per read: short enough that closing the window
     # releases the microphone within a frame, long enough that RMS is stable.
     chunk = max(256, rate // 50)
@@ -592,19 +595,19 @@ class SettingsWindow(Adw.ApplicationWindow):
         # path access-violates on Windows once those pages have been shown).
         self._page_hosts: dict[str, Gtk.Box] = {}
         self._mic_display: dict[str, str] = {}
-        self._mic_meter: Gtk.LevelBar | None = None
+        self._mic_meter: Gtk.ProgressBar | None = None
         self._mic_test_button: Gtk.Button | None = None
         # Only True while the user has pressed Test. The meter never opens
         # the microphone just because settings is on screen.
         self._mic_meter_active = False
-        # GLib source id for the LevelBar paint timer; only armed during Test.
-        # An always-on 50ms timer was racing ViewStack page reparent on
-        # Windows and access-violating during Speech rebuilds.
+        # GLib source id for the meter paint timer; only armed during Test.
         self._mic_meter_tick_id = 0
         # Shared with the capture thread. Main thread writes the wanted
         # device; the thread opens/closes and publishes the drawn level.
         self._mic_want_device = _MIC_METER_OFF   # int | None | "off"
         self._mic_drawn_level = 0.0
+        # One-shot error from the capture thread (open failed), shown as toast.
+        self._mic_meter_error: str | None = None
         self._mic_meter_lock = threading.Lock()
         self._mic_meter_stop = threading.Event()
         self._mic_meter_thread: threading.Thread | None = None
@@ -1324,16 +1327,14 @@ class SettingsWindow(Adw.ApplicationWindow):
         """
         row = Adw.ActionRow(title="Level")
         row.set_subtitle("Press Test and speak to check this device")
-        meter = Gtk.LevelBar(
-            mode=Gtk.LevelBarMode.CONTINUOUS,
-            min_value=0.0, max_value=1.0, value=0.0,
-            valign=Gtk.Align.CENTER)
+        meter = Gtk.ProgressBar(
+            fraction=0.0, show_text=False, valign=Gtk.Align.CENTER)
         meter.add_css_class("mic-meter")
         meter.set_tooltip_text("Microphone activity")
         row.add_suffix(meter)
         self._mic_meter = meter
         test = Gtk.Button(label="Test", valign=Gtk.Align.CENTER)
-        test.add_css_class("flat")
+        test.add_css_class("suggested-action")
         test.set_tooltip_text(
             "Listen to this device and show activity on the meter")
         test.connect("clicked", self._on_mic_test_toggle)
@@ -1357,6 +1358,12 @@ class SettingsWindow(Adw.ApplicationWindow):
         self._mic_meter_active = True
         if self._mic_test_button is not None:
             self._mic_test_button.set_label("Stop")
+        # Publish the device immediately - waiting for the first paint tick
+        # left the capture thread idle for a frame and made Test look dead.
+        with self._mic_meter_lock:
+            self._mic_want_device = self._selected_mic_device()
+            self._mic_drawn_level = 0.0
+            self._mic_meter_error = None
         self._ensure_mic_meter_thread()
         if not self._mic_meter_tick_id:
             self._mic_meter_tick_id = GLib.timeout_add(
@@ -1370,8 +1377,9 @@ class SettingsWindow(Adw.ApplicationWindow):
         with self._mic_meter_lock:
             self._mic_want_device = _MIC_METER_OFF
             self._mic_drawn_level = 0.0
+            self._mic_meter_error = None
         if self._mic_meter is not None:
-            self._mic_meter.set_value(0.0)
+            self._mic_meter.set_fraction(0.0)
         if self._mic_test_button is not None:
             self._mic_test_button.set_label("Test")
 
@@ -1417,7 +1425,7 @@ class SettingsWindow(Adw.ApplicationWindow):
         capture stream can take hundreds of milliseconds on Windows.
 
         Returns False to disarm the GLib source when Test is no longer
-        running, so a stale tick cannot paint a LevelBar mid-rebuild.
+        running, so a stale tick cannot paint a ProgressBar mid-rebuild.
         """
         if (self._mic_meter is None
                 or not self._mic_meter_active
@@ -1430,7 +1438,13 @@ class SettingsWindow(Adw.ApplicationWindow):
         with self._mic_meter_lock:
             self._mic_want_device = want
             level = self._mic_drawn_level
-        self._mic_meter.set_value(level)
+            error = self._mic_meter_error
+            self._mic_meter_error = None
+        self._mic_meter.set_fraction(max(0.0, min(1.0, level)))
+        if error:
+            self._toast(error)
+            self._stop_mic_test()
+            return False
         return True
 
     def _mic_meter_loop(self) -> None:
@@ -1445,6 +1459,9 @@ class SettingsWindow(Adw.ApplicationWindow):
             import pyaudio
             import numpy as np
         except ImportError:
+            with self._mic_meter_lock:
+                self._mic_meter_error = (
+                    "Microphone test needs PyAudio - it is not installed.")
             return
 
         pa = None
@@ -1452,12 +1469,16 @@ class SettingsWindow(Adw.ApplicationWindow):
         chunk = 0
         open_device = _MIC_METER_OFF
         peak = _MIC_METER_PEAK_FLOOR
+        open_failures = 0
         try:
             try:
                 with _suppress_alsa_for_meter():
                     pa = pyaudio.PyAudio()
             except Exception as e:
                 log(f"[SETTINGS] mic meter could not open audio: {e}")
+                with self._mic_meter_lock:
+                    self._mic_meter_error = (
+                        "Could not open the audio system for a mic test.")
                 return
 
             while not self._mic_meter_stop.is_set():
@@ -1473,7 +1494,8 @@ class SettingsWindow(Adw.ApplicationWindow):
                     with self._mic_meter_lock:
                         self._mic_drawn_level = 0.0
                     peak = _MIC_METER_PEAK_FLOOR
-                    # Idle wait: no capture while the window is hidden.
+                    open_failures = 0
+                    # Idle wait: no capture while Test is off.
                     self._mic_meter_stop.wait(0.1)
                     continue
 
@@ -1485,11 +1507,17 @@ class SettingsWindow(Adw.ApplicationWindow):
                     open_device = want if stream is not None else _MIC_METER_OFF
                     peak = _MIC_METER_PEAK_FLOOR
                     if stream is None:
+                        open_failures += 1
                         with self._mic_meter_lock:
                             self._mic_drawn_level = 0.0
+                            if open_failures >= 2:
+                                self._mic_meter_error = (
+                                    "Could not open this microphone - it may "
+                                    "be in use or unavailable.")
                         # Back off so a missing device does not spin the CPU.
                         self._mic_meter_stop.wait(0.4)
                         continue
+                    open_failures = 0
 
                 try:
                     data = stream.read(chunk, exception_on_overflow=False)
@@ -1707,12 +1735,26 @@ class SettingsWindow(Adw.ApplicationWindow):
 
     def _restart_daemon(self, toast_start: str, toast_ok: str,
                         toast_fail_prefix: str) -> None:
-        """Stop and start the daemon; report progress via toasts."""
+        """Stop and start the daemon; report progress via toasts.
+
+        The toast is drawn first, then the restart is deferred a frame so
+        the user sees "Saved. Restarting..." before any work that can block
+        the pipe to the daemon. The restart itself runs off the main thread.
+        """
         if self._working:
             return
         self._working = True
+        # Mic test holds a capture stream; release it before the daemon
+        # comes back up and wants the same device.
+        if self._mic_meter_active:
+            self._stop_mic_test()
         self._toast(toast_start)
+        # One frame for the toast to map, then hand off to a worker.
+        GLib.timeout_add(80, self._restart_daemon_begin,
+                         toast_ok, toast_fail_prefix)
 
+    def _restart_daemon_begin(self, toast_ok: str,
+                              toast_fail_prefix: str) -> bool:
         def work():
             ok, detail = restart.restart_daemon()
 
@@ -1727,6 +1769,7 @@ class SettingsWindow(Adw.ApplicationWindow):
 
         threading.Thread(target=work, daemon=True,
                          name="whisper-flow-restart").start()
+        return False                    # timeout_add: run once
 
     def _start_download(self, model: str):
         if self._working:

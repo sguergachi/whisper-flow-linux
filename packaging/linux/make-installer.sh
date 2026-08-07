@@ -8,9 +8,8 @@
 # launches gui_install.py so every message is a desktop dialog — no shell
 # window. From a terminal it runs install.sh directly for a normal log.
 #
-# Note: browsers download files without the executable bit. On GNOME you may
-# need right-click → Properties → "Allow executing file as program" once, or
-# use the .deb (Software app handles that for you).
+# Prefer make-appimage.sh for releases (ELF AppImage, double-click). This
+# script remains for a plain self-extracting setup without appimagetool.
 set -euo pipefail
 
 STAGE="${1:?usage: make-installer.sh <stage-dir> <output-path>}"

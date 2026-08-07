@@ -429,6 +429,41 @@ elif scenario == "version":
     # showing it: a version nobody can copy gets retyped wrongly.
     w._copy_version()
     assert version in w._last_toast_title
+elif scenario == "mic_meter":
+    # Device row carries a live level bar so a wrong mic is obvious without
+    # saving and dictating. The capture thread is not under test here - only
+    # that the bar exists, that scaling is sane, and that the main-thread
+    # tick paints what the thread publishes and releases the mic when the
+    # window is hidden.
+    from gi.repository import Gtk as _Gtk
+
+    assert w._mic_meter is not None, "no level bar on the Device row"
+    assert isinstance(w._mic_meter, _Gtk.LevelBar)
+
+    quiet, peak = settings_gtk._mic_level_from_rms(0.0, 150.0)
+    assert quiet == 0.0
+    # Floor holds the peak open so room noise does not dance the bar.
+    assert peak == settings_gtk._MIC_METER_PEAK_FLOOR
+    loud, peak = settings_gtk._mic_level_from_rms(3000.0, 150.0)
+    assert 0.5 < loud <= 1.0, loud
+    assert peak >= 3000.0
+
+    w.present()
+    assert pump(lambda: w.get_visible()), "window never became visible"
+    with w._mic_meter_lock:
+        w._mic_drawn_level = 0.42
+    assert w._tick_mic_meter() is True
+    assert abs(w._mic_meter.get_value() - 0.42) < 1e-6, w._mic_meter.get_value()
+    with w._mic_meter_lock:
+        assert w._mic_want_device != settings_gtk._MIC_METER_OFF, (
+            "a visible window never asked the meter thread to listen")
+
+    w.set_visible(False)
+    assert w._tick_mic_meter() is True
+    assert w._mic_meter.get_value() == 0.0
+    with w._mic_meter_lock:
+        assert w._mic_want_device == settings_gtk._MIC_METER_OFF, (
+            "hiding the window left the capture stream requested")
 print("OK")
 """
 
@@ -529,6 +564,17 @@ def test_the_open_device_list_shows_which_one_is_selected(tmp_path):
     use.
     """
     result = _run(tmp_path, "mic_selected")
+    assert "OK" in result.stdout, result.stderr
+
+
+def test_the_device_row_has_a_live_mic_meter(tmp_path):
+    """Picking a microphone without hearing it needs a level bar on the row.
+
+    The bar paints what a background capture thread publishes, and must stop
+    asking for the microphone the moment the window is hidden - a prewarmed
+    settings process otherwise holds the input open for the whole session.
+    """
+    result = _run(tmp_path, "mic_meter")
     assert "OK" in result.stdout, result.stderr
 
 

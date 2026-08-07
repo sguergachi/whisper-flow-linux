@@ -17,6 +17,7 @@ models directory, not the running config - and everything else takes effect
 on the restart the toast offers afterwards.
 """
 
+import contextlib
 import ctypes
 import os
 import subprocess
@@ -158,6 +159,13 @@ CSS = b"""
    resolving a merge, leaving the factory without the floor it needs for the
    case where the popover declines to grow past the row. */
 .mic-row popover listview { min-width: 520px; }
+/* Live input level next to the Device combo. Narrow enough that the
+   dropdown still has room for a device name; tall enough to read at a
+   glance while speaking into the mic. */
+.mic-meter {
+    min-width: 96px;
+    min-height: 8px;
+}
 .daemon-ok { color: #4ade80; }
 .daemon-bad { color: #f87171; }
 """
@@ -434,6 +442,75 @@ def _list_input_devices() -> list[tuple[int, str]]:
         return []
 
 
+@contextlib.contextmanager
+def _suppress_alsa_for_meter():
+    """Quiet ALSA chatter while the Device meter opens a capture stream.
+
+    Same problem the recorder has: PortAudio's ALSA backend prints probe
+    noise on stderr for every device it walks, and that lands in the
+    settings process log while nobody is diagnosing the audio stack.
+    """
+    with open(os.devnull, "w") as devnull:
+        old_stderr = sys.stderr
+        sys.stderr = devnull
+        try:
+            yield
+        finally:
+            sys.stderr = old_stderr
+
+
+def _open_meter_stream(pa, device):
+    """Open a short capture stream for the Device-row level meter.
+
+    Uses the device's own rate so WASAPI shared mode accepts the open - the
+    same trap the recorder already documents. Levels are rate-agnostic RMS,
+    so conversion is unnecessary here.
+
+    Returns ``(stream, frames_per_read)`` or ``(None, 0)``.
+    """
+    import pyaudio
+
+    rate = 16000
+    if device is not None:
+        try:
+            info = pa.get_device_info_by_index(device)
+            native = int(info.get("defaultSampleRate") or 0)
+            if native > 0:
+                rate = native
+        except Exception:
+            pass
+    # ~20 ms of audio per read: short enough that closing the window
+    # releases the microphone within a frame, long enough that RMS is stable.
+    chunk = max(256, rate // 50)
+    try:
+        with _suppress_alsa_for_meter():
+            stream = pa.open(
+                format=pyaudio.paInt16,
+                channels=1,
+                rate=rate,
+                input=True,
+                input_device_index=device,
+                frames_per_buffer=chunk,
+            )
+        return stream, chunk
+    except Exception as e:
+        log(f"[SETTINGS] mic meter could not open device {device}: {e}")
+        return None, 0
+
+
+def _close_meter_stream(stream) -> None:
+    if stream is None:
+        return
+    try:
+        stream.stop_stream()
+    except Exception:
+        pass
+    try:
+        stream.close()
+    except Exception:
+        pass
+
+
 def _host_api_name(pa, info) -> str:
     """Which Windows audio API serves a device, "" if it cannot be read.
 
@@ -465,6 +542,30 @@ _SPIN = {
     "queue_request_timeout": (0, 5),
 }
 
+# Live Device-row meter. Same adaptive gain as the HUD waveform so a quiet
+# room mic still moves and a loud one does not peg the bar permanently.
+_MIC_METER_PEAK_FLOOR = 150.0
+_MIC_METER_PEAK_DECAY = 0.95
+_MIC_METER_LEVEL_GAMMA = 0.65
+_MIC_METER_LEVEL_CEILING = 32767.0
+_MIC_METER_POLL_MS = 50
+# "off" means close the stream; None means the platform default input.
+_MIC_METER_OFF = "off"
+
+
+def _mic_level_from_rms(rms: float, peak: float) -> tuple[float, float]:
+    """Map a frame RMS onto 0..1 and the peak used for adaptive gain.
+
+    Pure so the test can pin the scaling without opening a microphone.
+    """
+    if rms <= 0:
+        return 0.0, max(peak * _MIC_METER_PEAK_DECAY, _MIC_METER_PEAK_FLOOR)
+    if rms > _MIC_METER_LEVEL_CEILING:
+        rms = _MIC_METER_LEVEL_CEILING
+    peak = max(peak * _MIC_METER_PEAK_DECAY, float(rms), _MIC_METER_PEAK_FLOOR)
+    level = min(1.0, (rms / peak) ** _MIC_METER_LEVEL_GAMMA)
+    return level, peak
+
 
 class SettingsWindow(Adw.ApplicationWindow):
     """The preferences window itself."""
@@ -487,6 +588,14 @@ class SettingsWindow(Adw.ApplicationWindow):
         self._working = False
         self._rows: dict[str, Gtk.Widget] = {}
         self._mic_display: dict[str, str] = {}
+        self._mic_meter: Gtk.LevelBar | None = None
+        # Shared with the capture thread. Main thread writes the wanted
+        # device; the thread opens/closes and publishes the drawn level.
+        self._mic_want_device = _MIC_METER_OFF   # int | None | "off"
+        self._mic_drawn_level = 0.0
+        self._mic_meter_lock = threading.Lock()
+        self._mic_meter_stop = threading.Event()
+        self._mic_meter_thread: threading.Thread | None = None
         self._model_checks: dict[str, Gtk.CheckButton] = {}
         self._download_buttons: list[Gtk.Button] = []
         self._progress_bars: dict[str, Gtk.ProgressBar] = {}
@@ -520,6 +629,10 @@ class SettingsWindow(Adw.ApplicationWindow):
         self._load_mics_in_background()
         GLib.timeout_add(400, self._refresh_dirty)
         GLib.timeout_add(2000, self._watch_the_daemon)
+        # The Device meter only listens while this window is on screen: a
+        # prewarmed process must not hold the microphone open for hours.
+        GLib.timeout_add(_MIC_METER_POLL_MS, self._tick_mic_meter)
+        self.connect("notify::visible", self._on_visible_for_mic_meter)
         if sys.platform == "win32":
             # Undecorated, and before realize. GTK's client-side decoration
             # carries a shadow the surface is sized to include; DWM knows
@@ -1028,6 +1141,17 @@ class SettingsWindow(Adw.ApplicationWindow):
                 # grow past the row it hangs off.
                 row.set_list_factory(_wide_list_factory(row))
                 row.add_css_class("mic-row")
+                # Live level so the user can hear (see) which entry is the
+                # right mic without saving and restarting a dictation. The
+                # bar rides the suffix slot next to the closed combo.
+                meter = Gtk.LevelBar(
+                    mode=Gtk.LevelBarMode.CONTINUOUS,
+                    min_value=0.0, max_value=1.0, value=0.0,
+                    valign=Gtk.Align.CENTER)
+                meter.add_css_class("mic-meter")
+                meter.set_tooltip_text("Microphone activity")
+                row.add_suffix(meter)
+                self._mic_meter = meter
             if field.help:
                 row.set_subtitle(field.help)
             self._rows[field.key] = row
@@ -1052,7 +1176,13 @@ class SettingsWindow(Adw.ApplicationWindow):
             # combination, and the row shows what the daemon will bind.
             row = Adw.EntryRow(title=field.label)
             row.set_editable(False)
-            row.set_subtitle("Click, then press the keys")
+            # EntryRow gained set_subtitle in later libadwaita; older builds
+            # (Ubuntu 22.04's package) only have title, so the hint has to
+            # live on the tooltip there.
+            if hasattr(row, "set_subtitle"):
+                row.set_subtitle("Click, then press the keys")
+            else:
+                row.set_tooltip_text("Click, then press the keys")
             self._wire_hotkey_capture(row)
             self._rows[field.key] = row
             return row
@@ -1160,6 +1290,167 @@ class SettingsWindow(Adw.ApplicationWindow):
                 row.set_selected(i)
                 break
         return False
+
+    # -------------------------------------------------------- mic meter
+    def _on_visible_for_mic_meter(self, *_args) -> None:
+        """Start or stop capture as the window comes and goes."""
+        if self.get_visible():
+            self._ensure_mic_meter_thread()
+        else:
+            with self._mic_meter_lock:
+                self._mic_want_device = _MIC_METER_OFF
+                self._mic_drawn_level = 0.0
+            if self._mic_meter is not None:
+                self._mic_meter.set_value(0.0)
+
+    def _ensure_mic_meter_thread(self) -> None:
+        """One capture thread for the life of the window."""
+        thread = self._mic_meter_thread
+        if thread is not None and thread.is_alive():
+            return
+        self._mic_meter_stop.clear()
+        self._mic_meter_thread = threading.Thread(
+            target=self._mic_meter_loop, daemon=True,
+            name="whisper-flow-mic-meter")
+        self._mic_meter_thread.start()
+
+    def _selected_mic_device(self):
+        """Index the Device row is showing, or None for the platform default.
+
+        Main-thread only: it reads the ComboRow. The capture thread never
+        calls this; it reads the copy `_mic_want_device` that `_tick_mic_meter`
+        publishes.
+        """
+        row = self._rows.get("mic_device_index")
+        if row is None:
+            return None
+        position = row.get_selected()
+        model = row.get_model()
+        if model is None or position >= model.get_n_items():
+            return None
+        display = model.get_string(position)
+        raw = self._mic_display.get(display, "") if display else ""
+        if not raw:
+            return None
+        try:
+            return int(raw)
+        except ValueError:
+            return None
+
+    def _tick_mic_meter(self) -> bool:
+        """Publish the selected device and paint the latest level.
+
+        Two jobs, both main-thread only. The capture thread must not touch
+        GTK, and GTK must not open PortAudio on this loop - opening a
+        capture stream can take hundreds of milliseconds on Windows.
+        """
+        if self._mic_meter is None:
+            return True
+        if not self.get_visible():
+            with self._mic_meter_lock:
+                self._mic_want_device = _MIC_METER_OFF
+                level = 0.0
+                self._mic_drawn_level = 0.0
+            self._mic_meter.set_value(level)
+            return True
+
+        self._ensure_mic_meter_thread()
+        want = self._selected_mic_device()
+        with self._mic_meter_lock:
+            self._mic_want_device = want
+            level = self._mic_drawn_level
+        self._mic_meter.set_value(level)
+        return True
+
+    def _mic_meter_loop(self) -> None:
+        """Open the chosen input and publish RMS levels until asked to stop.
+
+        Holds the stream only while the window is visible. Changing the
+        Device dropdown swaps streams on the next iteration so the bar
+        follows the selection, not the saved config - which is the whole
+        point of listening before you save.
+        """
+        try:
+            import pyaudio
+            import numpy as np
+        except ImportError:
+            return
+
+        pa = None
+        stream = None
+        chunk = 0
+        open_device = _MIC_METER_OFF
+        peak = _MIC_METER_PEAK_FLOOR
+        try:
+            try:
+                with _suppress_alsa_for_meter():
+                    pa = pyaudio.PyAudio()
+            except Exception as e:
+                log(f"[SETTINGS] mic meter could not open audio: {e}")
+                return
+
+            while not self._mic_meter_stop.is_set():
+                with self._mic_meter_lock:
+                    want = self._mic_want_device
+
+                if want == _MIC_METER_OFF:
+                    if stream is not None:
+                        _close_meter_stream(stream)
+                        stream = None
+                        open_device = _MIC_METER_OFF
+                        chunk = 0
+                    with self._mic_meter_lock:
+                        self._mic_drawn_level = 0.0
+                    peak = _MIC_METER_PEAK_FLOOR
+                    # Idle wait: no capture while the window is hidden.
+                    self._mic_meter_stop.wait(0.1)
+                    continue
+
+                if stream is None or open_device != want:
+                    if stream is not None:
+                        _close_meter_stream(stream)
+                        stream = None
+                    stream, chunk = _open_meter_stream(pa, want)
+                    open_device = want if stream is not None else _MIC_METER_OFF
+                    peak = _MIC_METER_PEAK_FLOOR
+                    if stream is None:
+                        with self._mic_meter_lock:
+                            self._mic_drawn_level = 0.0
+                        # Back off so a missing device does not spin the CPU.
+                        self._mic_meter_stop.wait(0.4)
+                        continue
+
+                try:
+                    data = stream.read(chunk, exception_on_overflow=False)
+                except Exception:
+                    _close_meter_stream(stream)
+                    stream = None
+                    open_device = _MIC_METER_OFF
+                    chunk = 0
+                    with self._mic_meter_lock:
+                        self._mic_drawn_level = 0.0
+                    continue
+
+                try:
+                    samples = np.frombuffer(data, dtype=np.int16)
+                    if samples.size < 1:
+                        continue
+                    rms = float(np.sqrt(
+                        np.mean(samples.astype(np.float32) ** 2)))
+                except Exception:
+                    continue
+
+                level, peak = _mic_level_from_rms(rms, peak)
+                with self._mic_meter_lock:
+                    self._mic_drawn_level = level
+        finally:
+            if stream is not None:
+                _close_meter_stream(stream)
+            if pa is not None:
+                try:
+                    pa.terminate()
+                except Exception:
+                    pass
 
     # -------------------------------------------------------------- values
     def _load(self):

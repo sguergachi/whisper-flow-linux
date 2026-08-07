@@ -205,6 +205,7 @@ INNER_SHADOW_RGB = (0.13, 0.13, 0.15)
 FADE_MS = 200.0      # fade in and out duration
 FADE_SCALE = 0.1     # shrink by this much at zero opacity, growing to full
 LEVEL_EASE = 0.30    # how fast a bar chases its target height
+RISK_EASE = 0.12     # how fast the wave colour chases noise risk (slower = less flicker)
 PEAK_DECAY = 0.95    # adaptive gain, so quiet speech still reads
 PEAK_FLOOR = 150.0   # below this the gain stops opening up, or idle noise dances
 # The levels are the RMS of 16-bit audio, so nothing above this is a level at
@@ -463,6 +464,10 @@ class HudWindow(Gtk.Window):
         self.peak = PEAK_FLOOR
         self.targets = deque([0.0] * BARS, maxlen=BARS)
         self.shown = [0.0] * BARS
+        # Recent int16 RMS values → live noise / transcription-risk tint.
+        self._rms_history = deque(maxlen=_anim.RMS_HISTORY)
+        self.noise_risk = 0.0       # target, written by the level thread
+        self.shown_risk = 0.0       # eased, used when drawing
         self.level_pos = 0
         self.start = time.monotonic()
         self._blur = None
@@ -976,6 +981,10 @@ class HudWindow(Gtk.Window):
         self.peak = PEAK_FLOOR
         self.targets = deque([0.0] * BARS, maxlen=BARS)
         self.shown = [0.0] * BARS
+        with self._levels_lock:
+            self._rms_history.clear()
+            self.noise_risk = 0.0
+        self.shown_risk = 0.0
         self.start = time.monotonic()
         self.alpha = 0.0
         self._fade_in_t0 = time.monotonic()
@@ -1108,6 +1117,9 @@ class HudWindow(Gtk.Window):
                 targets = list(self.targets)
         for i, target in enumerate(targets):
             self.shown[i] += (target - self.shown[i]) * LEVEL_EASE
+        with self._levels_lock:
+            risk_target = self.noise_risk
+        self.shown_risk += (risk_target - self.shown_risk) * RISK_EASE
         self.area.queue_draw()
         return True
 
@@ -1171,6 +1183,9 @@ class HudWindow(Gtk.Window):
                                     PEAK_FLOOR)
                     self.targets.append(
                         min(1.0, (value / self.peak) ** LEVEL_GAMMA))
+                    self._rms_history.append(float(value))
+                if self._rms_history:
+                    self.noise_risk = _anim.noise_risk(self._rms_history)
 
     def _watchdog(self):
         """The lifetime cap, which no longer has a level timer to live on."""
@@ -1330,16 +1345,27 @@ class HudWindow(Gtk.Window):
         else:
             self._paint_chrome(cr, w, h, a)
 
+        # Live recording: wave + dot tint by noise / transcription risk
+        # (white → yellow → red). Processing keeps the blue spinner path.
+        if self.processing:
+            wave_rgb = (
+                1.0 + (channel - 1.0) * PROCESS_TINT for channel in PROCESS_RGB)
+            wave_rgb = tuple(wave_rgb)
+        else:
+            wave_rgb = _anim.risk_rgb(self.shown_risk)
+
         if self.processing:
             self._draw_spinner(cr, mid, a)
         else:
             elapsed = time.monotonic() - self.start
             breathe = 0.62 + 0.38 * (0.5 + 0.5 * math.sin(elapsed * 3.0))
-
-            cr.set_source_rgba(1.0, 0.25, 0.28, 0.16 * breathe * a)
+            # Dot follows the same risk colour so the whole pill reads one
+            # status, not white bars next to a forever-red mic.
+            dr, dg, db = wave_rgb
+            cr.set_source_rgba(dr, dg, db, 0.18 * breathe * a)
             cr.arc(DOT_X, mid, DOT_R * 2.4, 0, 2 * math.pi)
             cr.fill()
-            cr.set_source_rgba(1.0, 0.27, 0.30, breathe * a)
+            cr.set_source_rgba(dr, dg, db, breathe * a)
             cr.arc(DOT_X, mid, DOT_R, 0, 2 * math.pi)
             cr.fill()
 
@@ -1374,15 +1400,8 @@ class HudWindow(Gtk.Window):
             cr.line_to(x, mid + reach)
         cr.stroke()
 
-        # The bars themselves carry a per-bar alpha, so these stay separate.
-        # Processing tints them towards the spinner's blue: the sweep alone
-        # reads as a quiet moment in the recording rather than as a different
-        # state, and the colour is what makes it unmistakable.
-        if self.processing:
-            red, green, blue = (
-                1.0 + (channel - 1.0) * PROCESS_TINT for channel in PROCESS_RGB)
-        else:
-            red = green = blue = 1.0
+        # Per-bar alpha; colour is risk (or processing blue) for the whole row.
+        red, green, blue = wave_rgb
         cr.set_line_width(BAR_W)
         for x, reach, level in ends:
             cr.set_source_rgba(red, green, blue,

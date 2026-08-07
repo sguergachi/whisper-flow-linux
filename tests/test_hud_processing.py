@@ -47,6 +47,43 @@ def test_the_bump_actually_travels():
     assert len(set(where)) >= 5, f"the bump barely moved: {where}"
 
 
+def test_quiet_room_is_low_risk():
+    """Clean speech over a soft floor should stay near white."""
+    # Quiet floor ~80, speech peaks ~2000 → high SNR.
+    history = [80.0] * 40 + [1800.0, 2200.0, 1500.0, 900.0] * 5
+    risk = hud_anim.noise_risk(history)
+    assert risk < hud_anim.RISK_YELLOW_AT, f"clean room risk too high: {risk}"
+
+
+def test_cafe_bed_is_high_risk():
+    """Loud continuous bed with little dynamic range → red zone."""
+    history = [900.0 + (i % 5) * 30 for i in range(60)]
+    risk = hud_anim.noise_risk(history)
+    assert risk >= hud_anim.RISK_YELLOW_AT, f"café bed not risky enough: {risk}"
+
+
+def test_low_snr_whisper_is_risky():
+    """Whisper barely above room tone maps toward yellow/red."""
+    # Floor ~500, peaks ~700 → ~3 dB SNR.
+    history = [500.0] * 30 + [650.0, 700.0, 680.0, 620.0] * 8
+    risk = hud_anim.noise_risk(history)
+    assert risk >= hud_anim.RISK_YELLOW_AT * 0.8, f"low SNR risk low: {risk}"
+
+
+def test_risk_rgb_moves_white_to_yellow_to_red():
+    r0, g0, b0 = hud_anim.risk_rgb(0.0)
+    ry, gy, by = hud_anim.risk_rgb(hud_anim.RISK_YELLOW_AT)
+    rr, gr, br = hud_anim.risk_rgb(1.0)
+    assert g0 > gy >= gr  # green falls white → yellow → red
+    assert rr > r0 * 0.9
+    assert br < b0
+
+
+def test_short_history_does_not_flash_red():
+    assert hud_anim.noise_risk([]) == 0.0
+    assert hud_anim.noise_risk([100.0, 200.0]) == 0.0
+
+
 def test_the_sweep_comes_round_again():
     """It runs for as long as the transcription does, so it has to loop.
 

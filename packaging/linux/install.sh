@@ -91,6 +91,34 @@ done
 cp "$TEMPLATE_DIR/uninstall.sh" "$PREFIX/uninstall.sh"
 chmod +x "$PREFIX/uninstall.sh"
 
+# App menu entry so it launches like any other app (Terminal=false — no shell).
+# Login start is the systemd user unit below, not a second XDG autostart, so
+# two copies do not fight over the tray.
+APP_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+ICON_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/256x256/apps"
+mkdir -p "$APP_DIR" "$ICON_DIR"
+
+if [[ -f "$TEMPLATE_DIR/whisper-flow.desktop.in" ]]; then
+    say "Installing app menu entry"
+    sed "s|@BIN@|$BIN_DIR|g" "$TEMPLATE_DIR/whisper-flow.desktop.in" \
+        > "$APP_DIR/whisper-flow.desktop"
+    chmod 644 "$APP_DIR/whisper-flow.desktop"
+fi
+
+# PNG for the app menu. Drawn from the same mark the tray uses when PIL is
+# already available (it is, after the pip install above).
+if "$PREFIX/venv/bin/python" - <<PY 2>/dev/null
+from pathlib import Path
+from whisper_flow.icon import APP_COLOR, draw_mic
+draw_mic(256, APP_COLOR).save(Path("$ICON_DIR") / "whisper-flow.png", format="PNG")
+print("ok")
+PY
+then
+    :
+else
+    warn "could not write app icon; the menu entry will use a generic one"
+fi
+
 # --------------------------------------------------------------- units ----
 say "Installing systemd user units into $UNIT_DIR"
 

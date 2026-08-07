@@ -78,38 +78,39 @@ Nothing large is ever downloaded without being asked.
 
 ## Linux
 
-Download the single installer from the
-[latest release](https://github.com/sguergachi/whisper-flow-linux/releases)
-(`whisper-flow-*-linux-setup` — one file, not an archive), then:
+### Double-click install (like Windows)
 
-```bash
-chmod +x whisper-flow-*-linux-setup
-./whisper-flow-*-linux-setup
-```
+Download **`WhisperFlow-*-Setup.deb`** from the
+[latest release](https://github.com/sguergachi/whisper-flow-linux/releases),
+then **double-click it**. The Software app opens — click Install. No terminal.
 
-That installs for the current user under `~/.local` (no root), enables the
-tray daemon at login, and starts it. Hold `Super+Alt` to dictate.
+When it finishes, look for the microphone in the notification area (or open
+**WhisperFlow** from the app menu). Hold `Super+Alt` to dictate. It starts
+again at login on its own.
 
-The installer checks for system packages it needs (GTK4, gtk4-layer-shell,
-ydotool, Python 3.11+) and prints the distro commands if anything is missing.
-On a typical desktop:
+On Arch, Fedora, or if you prefer not to use a `.deb`: download
+**`WhisperFlow-*-Setup`**, right-click → **Allow executing file as program**,
+then double-click. A desktop dialog installs it — still no terminal.
 
-```bash
-# Arch
-sudo pacman -S python-gobject gtk4 gtk4-layer-shell ydotool
+### If something is missing
 
-# Fedora
-sudo dnf install python3-gobject gtk4 gtk4-layer-shell ydotool
-
-# Debian/Ubuntu
-sudo apt install python3-gi gir1.2-gtk-4.0 ydotool
-# gtk4-layer-shell may need building from source on Debian/Ubuntu
-```
-
-Global hotkeys also need membership in the `input` group
+The installer needs GTK4 and `python3-gi`. `ydotool` is recommended for typing
+on Wayland. Global hotkeys need the `input` group
 (`sudo usermod -aG input $USER`, then log out and back in).
 
-Remove with `~/.local/share/whisper-flow/uninstall.sh`.
+```bash
+# Debian/Ubuntu (usually pulled in by the .deb)
+sudo apt install python3-gi gir1.2-gtk-4.0 ydotool zenity
+
+# Arch
+sudo pacman -S python-gobject gtk4 gtk4-layer-shell ydotool zenity
+
+# Fedora
+sudo dnf install python3-gobject gtk4 gtk4-layer-shell ydotool zenity
+```
+
+Remove with `~/.local/share/whisper-flow/uninstall.sh`, or uninstall the
+`.deb` from Software.
 
 ### From source (developers)
 

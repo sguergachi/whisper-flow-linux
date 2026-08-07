@@ -180,10 +180,11 @@ jobs:
           python -m pip install --upgrade pip build
           python -m build
 
-      - name: Assemble the single-file installer
-        # One executable, not a tarball. Same idea as the Windows setup.exe:
-        # download, run, done. The payload is the wheel plus install scripts;
-        # make-installer.sh wraps them in a self-extracting bash header.
+      - name: Assemble double-click installers
+        # Primary: a .deb — double-click in the file manager opens Software
+        # and installs like a normal app (no chmod, no terminal). Secondary:
+        # a self-extracting setup for non-Debian distros; when double-clicked
+        # it runs the GUI installer (desktop dialogs, no shell window).
         run: |
           VERSION=$(python -c "import tomllib;print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
@@ -198,29 +199,45 @@ jobs:
           mkdir -p "$STAGE"
           cp packaging/linux/install.sh \
              packaging/linux/uninstall.sh \
+             packaging/linux/gui_install.py \
+             packaging/linux/whisper-flow.desktop.in \
              packaging/linux/whisper-flow.service.in \
              packaging/linux/whisper-server.service.in \
              "$STAGE"/
           cp dist/*.whl "$STAGE"/
-          # install.sh detects the bundled wheel itself, so nothing here has
-          # to rewrite it - a sed against a script it cannot test is exactly
-          # how the bundle shipped broken the first time.
-          chmod +x packaging/linux/make-installer.sh
+          # Pre-render the menu icon so the .deb does not need the package
+          # importable at pack time. icon.py only needs Pillow.
+          python3 -m pip install -q pillow
+          python3 -c "
+          import sys
+          from pathlib import Path
+          sys.path.insert(0, 'src')
+          from whisper_flow.icon import APP_COLOR, draw_mic
+          draw_mic(256, APP_COLOR).save(Path('$STAGE') / 'whisper-flow.png', format='PNG')
+          print('icon ok')
+          "
+
+          chmod +x packaging/linux/make-installer.sh packaging/linux/make-deb.sh
           packaging/linux/make-installer.sh \
-            "$STAGE" "whisper-flow-${PACK_VERSION}-linux-setup"
-          # make-installer.sh already self-checks that install.sh is in the
-          # payload; just confirm the artifact is executable and non-empty.
-          test -x "whisper-flow-${PACK_VERSION}-linux-setup"
-          test -s "whisper-flow-${PACK_VERSION}-linux-setup"
-          echo "ARTIFACT=whisper-flow-${PACK_VERSION}-linux-setup" >> "$GITHUB_ENV"
+            "$STAGE" "WhisperFlow-${PACK_VERSION}-Setup"
+          packaging/linux/make-deb.sh \
+            "$STAGE" "$PACK_VERSION" "WhisperFlow-${PACK_VERSION}-Setup.deb"
+
+          test -x "WhisperFlow-${PACK_VERSION}-Setup"
+          test -s "WhisperFlow-${PACK_VERSION}-Setup.deb"
+          # dpkg can read its own output.
+          dpkg-deb -I "WhisperFlow-${PACK_VERSION}-Setup.deb" | grep -q whisper-flow
+
           echo "PACK_VERSION=${PACK_VERSION}" >> "$GITHUB_ENV"
-          ls -la "whisper-flow-${PACK_VERSION}-linux-setup"
+          ls -la "WhisperFlow-${PACK_VERSION}-Setup" \
+                 "WhisperFlow-${PACK_VERSION}-Setup.deb"
 
       - uses: actions/upload-artifact@v4
         with:
           name: linux-installer
           path: |
-            ${{ env.ARTIFACT }}
+            WhisperFlow-*-Setup
+            WhisperFlow-*-Setup.deb
 
   windows:
     name: package (windows)
@@ -541,17 +558,19 @@ jobs:
 
           NOTES="Built from \`${GITHUB_SHA::7}\` on $(date -u +'%Y-%m-%d %H:%M UTC').
 
-          **Linux** - download \`whisper-flow-*-linux-setup\`, then:
-          \`\`\`
-          chmod +x whisper-flow-*-linux-setup
-          ./whisper-flow-*-linux-setup
-          \`\`\`
-          Installs per-user (no root), enables the tray daemon at login, and
-          starts it. Needs GTK4, gtk4-layer-shell and ydotool; the installer
-          checks and tells you what is missing.
+          **Linux (double-click)** — download \`WhisperFlow-*-Setup.deb\`,
+          double-click it, and install in Software. No terminal. The tray
+          mic appears after install; hold Super+Alt to dictate. Also available
+          from the app menu as WhisperFlow.
 
-          **Windows** - run \`WhisperFlow-*-Setup.exe\`. Installs per-user, no
-          admin needed, and can start with you at sign-in. Requires Windows 11
+          On Arch/Fedora (or without Software): download \`WhisperFlow-*-Setup\`,
+          right-click → Allow executing, then double-click. A desktop dialog
+          runs the install — still no terminal.
+
+          Needs GTK4 and python3-gi; ydotool is recommended for Wayland typing.
+
+          **Windows** - double-click \`WhisperFlow-*-Setup.exe\`. Installs
+          per-user, no admin needed, starts at sign-in. Requires Windows 11
           22H2 or later. The portable zip is the same build without an
           installer."
 
@@ -560,7 +579,8 @@ jobs:
             --notes "$NOTES" \
             --target "$GITHUB_SHA" \
             ${{ steps.plan.outputs.prerelease == 'true' && '--prerelease' || '' }} \
-            artifacts/linux-installer/whisper-flow-*-linux-setup \
+            artifacts/linux-installer/WhisperFlow-*-Setup \
+            artifacts/linux-installer/WhisperFlow-*-Setup.deb \
             release-files/*
 
   prune:

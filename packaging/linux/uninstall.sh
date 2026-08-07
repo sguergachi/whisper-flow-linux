@@ -12,5 +12,7 @@ rm -f "$HOME/.config/systemd/user/whisper-server.service"
 systemctl --user daemon-reload 2>/dev/null || true
 
 rm -f "$BIN_DIR/whisper-flow" "$BIN_DIR/whisper-flow-daemon"
+rm -f "${XDG_DATA_HOME:-$HOME/.local/share}/applications/whisper-flow.desktop"
+rm -f "${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/256x256/apps/whisper-flow.png"
 rm -rf "$PREFIX"
 echo "Removed. Config kept at ~/.config/whisper-flow"

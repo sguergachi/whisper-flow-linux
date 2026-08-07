@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=WhisperFlow
+GenericName=Voice typing
+Comment=Hold a key, talk, and the words appear where you type
+Exec=@BIN@/whisper-flow daemon
+Icon=whisper-flow
+Terminal=false
+Categories=Utility;Audio;Accessibility;
+Keywords=voice;dictation;speech;whisper;transcription;
+StartupNotify=false

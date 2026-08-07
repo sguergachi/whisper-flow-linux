@@ -43,7 +43,11 @@ def test_typing_puts_back_the_modifiers_the_user_is_holding(win, monkeypatch):
     monkeypatch.setattr(
         system_win._user32, "GetAsyncKeyState",
         lambda vk: -0x8000 if vk in held else 0)
-    monkeypatch.setattr(system_win, "_restorable", lambda h: tuple(h))
+    # Super is never restorable; only Alt comes back.
+    monkeypatch.setattr(
+        system_win, "_restorable",
+        lambda h: tuple(vk for vk in h if vk not in system_win.WIN_KEYS))
+    monkeypatch.setattr(system_win, "raise_overlay", lambda: None)
 
     assert system_win.type_text("hello")
 
@@ -54,13 +58,15 @@ def test_typing_puts_back_the_modifiers_the_user_is_holding(win, monkeypatch):
         f"typing split into {len(batches)} SendInput calls; the gap is "
         f"what ends a live dictation at the first word")
     restored = batches[-1]
-    for vk in held:
-        flags = _flags_for(restored, vk)
-        # KEYUP first (clear), then KEYDOWN (restore). Flags == [up, down].
-        assert flags[-1] == 0, (
-            f"key {vk:#x} was not pressed back down after typing; the "
-            f"listener will read it as released and stop the recording")
-        assert system_win.KEYEVENTF_KEYUP in flags
+    # Alt must be released then pressed back.
+    alt_flags = _flags_for(restored, system_win.VK_MENU)
+    assert system_win.KEYEVENTF_KEYUP in alt_flags
+    assert alt_flags[-1] == 0, (
+        "Alt was not pressed back down after typing; the listener will "
+        "read the hotkey as released and stop the recording")
+    # Super must never be touched - KEYUP/KEYDOWN of Win is what arms Start.
+    assert _flags_for(restored, system_win.VK_LWIN) == [], (
+        "Super was injected during typing; that re-arms the Start menu")
 
 
 def test_release_type_and_restore_share_one_batch(win, monkeypatch):
@@ -77,6 +83,7 @@ def test_release_type_and_restore_share_one_batch(win, monkeypatch):
         system_win._user32, "GetAsyncKeyState",
         lambda vk: -0x8000 if vk in held else 0)
     monkeypatch.setattr(system_win, "_restorable", lambda h: tuple(h))
+    monkeypatch.setattr(system_win, "raise_overlay", lambda: None)
 
     assert system_win.type_text("ab")
     assert len(batches) == 1
@@ -112,6 +119,7 @@ def test_nothing_is_pressed_that_was_not_already_held(win, monkeypatch):
     """
     system_win, batches = win
     monkeypatch.setattr(system_win._user32, "GetAsyncKeyState", lambda vk: 0)
+    monkeypatch.setattr(system_win, "raise_overlay", lambda: None)
 
     assert system_win.type_text("hello")
 
@@ -152,6 +160,7 @@ def test_typing_blinds_the_listener_while_it_types(win, monkeypatch):
     hotkey_win = _unsuppressed(monkeypatch)
     system_win, _ = win
     monkeypatch.setattr(system_win._user32, "GetAsyncKeyState", lambda vk: 0)
+    monkeypatch.setattr(system_win, "raise_overlay", lambda: None)
 
     seen = []
     monkeypatch.setattr(
@@ -173,6 +182,7 @@ def test_the_listener_is_looking_again_once_typing_is_over(win, monkeypatch):
     hotkey_win = _unsuppressed(monkeypatch)
     system_win, _ = win
     monkeypatch.setattr(system_win._user32, "GetAsyncKeyState", lambda vk: 0)
+    monkeypatch.setattr(system_win, "raise_overlay", lambda: None)
 
     system_win.type_text("hello")
     assert hotkey_win._typing_depth == 0, "the injection did not release it"
@@ -189,6 +199,7 @@ def test_a_genuine_release_still_ends_the_recording(win, monkeypatch):
     """
     system_win, batches = win
     monkeypatch.setattr(system_win._user32, "GetAsyncKeyState", lambda vk: 0)
+    monkeypatch.setattr(system_win, "raise_overlay", lambda: None)
 
     system_win.type_text("hello")
     restored = [event for batch in batches for event in batch
@@ -197,6 +208,24 @@ def test_a_genuine_release_still_ends_the_recording(win, monkeypatch):
     assert not restored, (
         "nothing was held, so nothing may be restored - otherwise the "
         "hotkey can never be released")
+
+
+def test_super_is_never_released_or_repressed_while_typing(win, monkeypatch):
+    """KEYUP/KEYDOWN of Win mid-hold is what opens Start under live words."""
+    system_win, batches = win
+    held = {system_win.VK_MENU, system_win.VK_LWIN}
+    monkeypatch.setattr(
+        system_win._user32, "GetAsyncKeyState",
+        lambda vk: -0x8000 if vk in held else 0)
+    monkeypatch.setattr(system_win, "raise_overlay", lambda: None)
+
+    system_win.type_text("hello")
+    super_events = [
+        event for batch in batches for event in batch
+        if event.union.ki.wVk in system_win.WIN_KEYS
+    ]
+    assert super_events == [], (
+        "Super was in the typing batch; Start will arm on the next release")
 
 
 # --------------------------------------------------- the Start menu
@@ -235,36 +264,24 @@ def test_letting_go_of_the_injected_super_does_not_open_start(win):
         "down; after the release it is too late and Start is already armed")
 
 
-def test_the_users_own_release_of_super_does_not_open_start(win, monkeypatch):
-    """The press we put back has to be spoiled too, not just our release.
+def test_restore_never_presses_super_back_down(win, monkeypatch):
+    """A synthetic Super press is a fresh press; the next release opens Start.
 
-    restore_modifiers presses Super back down after every committed word.
-    Windows reads that as a fresh press with nothing after it, so the next
-    key-up completes a lone Super tap - and the next key-up is usually the
-    user's own, because they let go while the dictation is still typing.
-    Guarding only the release we send guards the one that rarely comes
-    first, which is why Start still opened mid-sentence.
+    That is why restore used to spoil after re-pressing Super and still lost:
+    the user's own release usually arrived first. The fix is not a better
+    spoiler - it is to leave Super alone for the whole hold.
     """
     system_win, batches = win
     held = {system_win.VK_LWIN, system_win.VK_MENU}
-    monkeypatch.setattr(
-        system_win._user32, "GetAsyncKeyState",
-        lambda vk: -0x8000 if vk in held else 0)
-    monkeypatch.setattr(system_win, "_restorable", lambda h: tuple(h))
     system_win._injected_down.clear()
 
     system_win.restore_modifiers(tuple(held))
 
-    noop = _order_of(batches, system_win.VK_NONAME)
     supers = _order_of(batches, system_win.VK_LWIN)
-    assert supers, "Super was never pressed back down"
-    assert noop, "nothing marked the restored Super press as used"
-    assert max(supers) < min(noop), (
-        "the no-op key must follow the press it marks as used; before it "
-        "there is no press to mark")
-    assert noop[0][0] == supers[0][0], (
-        "the spoiler must ride in the same SendInput batch as the press; a "
-        "second call is a gap the user's own release can land in")
+    assert supers == [], "Super was re-pressed; Start will open on release"
+    # Alt still comes back so the listener keeps seeing the hotkey.
+    alts = _order_of(batches, system_win.VK_MENU)
+    assert alts, "Alt was not restored"
 
 
 def test_nothing_is_sent_when_we_are_holding_nothing(win):

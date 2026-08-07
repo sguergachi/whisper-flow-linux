@@ -41,6 +41,12 @@ VK_ESCAPE = 0x1B
 # does not open the Start menu.
 VK_NONAME = 0xFC
 MODIFIERS = (VK_CONTROL, VK_MENU, VK_SHIFT, VK_LWIN, VK_RWIN)
+# Cleared for typing. Super is deliberately excluded: KEYUP+KEYDOWN of the
+# Windows key mid-hold is what arms the Start menu for the next release
+# (ours or the user's), which then steals the foreground and the topmost
+# band from the recording overlay. KEYEVENTF_UNICODE does not need Super up.
+CLEAR_FOR_TYPE = (VK_CONTROL, VK_MENU, VK_SHIFT)
+WIN_KEYS = (VK_LWIN, VK_RWIN)
 
 # Window messages used to put text in without synthesizing keystrokes.
 EM_REPLACESEL = 0x00C2
@@ -301,6 +307,58 @@ def start_menu_in_front() -> bool:
     return window_process_name(foreground_window()) in START_MENU_PROCESSES
 
 
+def raise_overlay() -> None:
+    """Put the recording pill back on the topmost band.
+
+    The Start menu is itself topmost. The moment it appears - even if we
+    close it immediately - it takes the band from whoever held it, and the
+    overlay sits behind the taskbar for the rest of the dictation. WS_EX_TOPMOST
+    is sticky in theory and not in practice: the band is ordered by whoever
+    claimed it last. Reclaiming after any brush with the shell is the fix.
+
+    Found by title rather than through the HUD command pipe so the typing
+    path can call this without knowing whether a resident overlay is up.
+    """
+    try:
+        user32 = _user32
+        found = []
+
+        @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        def each(hwnd, _lparam):
+            length = user32.GetWindowTextLengthW(hwnd)
+            if not length:
+                return True
+            buf = ctypes.create_unicode_buffer(length + 1)
+            user32.GetWindowTextW(hwnd, buf, length + 1)
+            if buf.value == "whisper-flow-hud":
+                found.append(int(hwnd))
+            return True
+
+        # Signatures: without them EnumWindows and friends truncate HWNDs
+        # on 64-bit and the raise becomes a silent no-op.
+        user32.EnumWindows.argtypes = [ctypes.c_void_p, wintypes.LPARAM]
+        user32.EnumWindows.restype = wintypes.BOOL
+        user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+        user32.GetWindowTextLengthW.restype = ctypes.c_int
+        user32.GetWindowTextW.argtypes = [
+            wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+        user32.SetWindowPos.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+        user32.SetWindowPos.restype = wintypes.BOOL
+        user32.EnumWindows(each, 0)
+        if not found:
+            return
+        HWND_TOPMOST = -1
+        SWP_NOSIZE, SWP_NOMOVE, SWP_NOACTIVATE = 0x1, 0x2, 0x10
+        for hwnd in found:
+            user32.SetWindowPos(
+                ctypes.c_void_p(hwnd), ctypes.c_void_p(HWND_TOPMOST),
+                0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE)
+    except Exception as e:
+        log(f"[WIN] could not raise the overlay: {e}")
+
+
 def dismiss_start_menu() -> bool:
     """Close the Start menu, so the window under it can have focus back.
 
@@ -341,6 +399,8 @@ def dismiss_start_menu() -> bool:
         # It closes on its own schedule, and focus moves back a moment later.
         for _ in range(30):
             if not start_menu_in_front():
+                # Start took the topmost band; put the pill back on it.
+                raise_overlay()
                 return True
             time.sleep(0.01)
     log("[WIN] the Start menu did not close")
@@ -513,9 +573,12 @@ def release_modifiers() -> tuple:
     """
     held = tuple(vk for vk in MODIFIERS
                  if _user32.GetAsyncKeyState(vk) & HELD_MASK)
-    _note("released every modifier, to type")
+    # Spoil first while Super is still considered down, then clear only the
+    # modifiers that poison Unicode (Alt → SYSCHAR menus; Ctrl → shortcuts).
+    # Super stays down for the whole hold so nothing here can arm Start.
+    _note("released typing modifiers (not Super)")
     _send(_spoil_events()
-          + [_key_event(vk, 0, KEYEVENTF_KEYUP) for vk in MODIFIERS])
+          + [_key_event(vk, 0, KEYEVENTF_KEYUP) for vk in CLEAR_FOR_TYPE])
     return held
 
 
@@ -534,9 +597,15 @@ def _restorable(held) -> tuple:
     except Exception:
         return tuple(held)
     if combination is None:
-        return tuple(held)          # no listener to protect; as before
-    aliases = getattr(hotkey_win, "VK_ALIASES", {})
-    return tuple(vk for vk in held if aliases.get(vk, vk) in combination)
+        candidates = tuple(held)    # no listener to protect; as before
+    else:
+        aliases = getattr(hotkey_win, "VK_ALIASES", {})
+        candidates = tuple(
+            vk for vk in held if aliases.get(vk, vk) in combination)
+    # Never re-inject Super. A synthetic Windows-key press is a fresh press
+    # as far as the shell is concerned; the next Super release - usually the
+    # user's - then opens Start under the live words and buries the HUD.
+    return tuple(vk for vk in candidates if vk not in WIN_KEYS)
 
 
 def restore_modifiers(held) -> None:
@@ -717,17 +786,19 @@ def _paste_key_events() -> list:
 
 
 def _atomic_type_events(text: str, held: tuple, *, paste: bool = False) -> list:
-    """One SendInput batch: clear modifiers, deliver text, put the hotkey back.
+    """One SendInput batch: clear typing modifiers, deliver text, restore them.
 
     A single batch is the whole point. Three separate SendInput calls - release,
     type, restore - leave gaps the physical keys and the hotkey poll can both
     fall into. SendInput serialises its array as a block, so the Unicode (or
-    Ctrl+V) events in the middle see the modifiers as up, and the listener
-    never observes a frame where the push-to-talk keys are missing.
+    Ctrl+V) events in the middle see Alt/Ctrl as up.
+
+    Super is never released or re-pressed here. Doing either mid-hold is what
+    armed the Start menu between live words.
     """
     wanted = _restorable(held)
     events = list(_spoil_events())
-    events += [_key_event(vk, 0, KEYEVENTF_KEYUP) for vk in MODIFIERS]
+    events += [_key_event(vk, 0, KEYEVENTF_KEYUP) for vk in CLEAR_FOR_TYPE]
     if paste:
         events += _paste_key_events()
     else:
@@ -780,8 +851,13 @@ def type_text(text: str) -> bool:
     if start_menu_in_front():
         dismiss_start_menu()
     if _insert_via_messages(text):
+        # Message path never touches Super, but something else may still
+        # have opened Start between words; keep the pill on top either way.
+        raise_overlay()
         return True
-    return _type_via_sendinput(text)
+    ok = _type_via_sendinput(text)
+    raise_overlay()
+    return ok
 
 
 def _utf16_units(ch: str):

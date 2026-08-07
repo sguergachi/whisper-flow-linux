@@ -258,25 +258,24 @@ def system_win_modifiers():
 
 
 def test_a_restored_modifier_is_released_again_at_the_end(held_keys):
-    """The stuck Super key, and why the desktop started minimising itself.
+    """The stuck Alt key, and why shortcuts would fire after a dictation.
 
-    Typing releases the push-to-talk modifiers, then presses back the ones
-    the user is still holding. If they let go mid-injection their own key-up
-    lands on a key already released, and our press has no release coming -
-    so Windows believes Super is down and the next Shift is Win+Shift.
+    Typing releases Alt/Ctrl, then presses back the ones the user is still
+    holding. If they let go mid-injection their own key-up lands on a key
+    already released, and our press has no release coming - so Windows
+    believes Alt is still down. Super is never re-pressed (that opens Start).
     """
     system_win, batches = held_keys
     system_win.restore_modifiers((system_win.VK_LWIN, system_win.VK_MENU))
-    assert system_win._injected_down == {system_win.VK_LWIN,
-                                         system_win.VK_MENU}
-    assert _events(batches, 0) == [system_win.VK_LWIN, system_win.VK_MENU]
+    assert system_win._injected_down == {system_win.VK_MENU}
+    assert _events(batches, 0) == [system_win.VK_MENU]
 
     batches.clear()
     released = system_win.release_injected_modifiers()
 
-    assert set(released) == {system_win.VK_LWIN, system_win.VK_MENU}
+    assert set(released) == {system_win.VK_MENU}
     assert set(_events(batches, system_win.KEYEVENTF_KEYUP)) == {
-        system_win.VK_LWIN, system_win.VK_MENU}, (
+        system_win.VK_MENU}, (
         "a key we pressed was never released; it stays down system-wide")
     assert system_win._injected_down == set()
 
@@ -323,32 +322,42 @@ def test_only_the_hotkeys_own_modifiers_are_pressed_back(system_win, monkeypatch
     try:
         system_win.restore_modifiers(
             (system_win.VK_LWIN, system_win.VK_MENU, system_win.VK_SHIFT))
-        assert system_win._injected_down == {system_win.VK_LWIN,
-                                             system_win.VK_MENU}
+        # Super is never re-pressed (Start menu); Shift is not part of the
+        # hotkey; only Alt comes back.
+        assert system_win._injected_down == {system_win.VK_MENU}
         assert system_win.VK_SHIFT not in _events(batches, 0)
+        assert system_win.VK_LWIN not in _events(batches, 0)
     finally:
         system_win._injected_down.clear()
 
 
-def test_the_right_windows_key_counts_as_super(system_win, monkeypatch):
-    """The binding names 0x5B; the key the user held may be 0x5C."""
+def test_super_is_never_restored(system_win, monkeypatch):
+    """Re-pressing Super mid-hold is what opens Start under live words."""
     from whisper_flow import hotkey_win
 
     system_win._injected_down.clear()
-    monkeypatch.setattr(system_win, "_send", lambda events: True)
+    batches = []
+    monkeypatch.setattr(system_win, "_send",
+                        lambda events: (batches.append(list(events)), True)[1])
 
     class Listener:
         @staticmethod
         def triggered_keys():
-            return frozenset({hotkey_win.NAME_TO_VK["super"]})
+            return frozenset({hotkey_win.NAME_TO_VK["super"],
+                              hotkey_win.NAME_TO_VK["alt"]})
 
     monkeypatch.setattr(hotkey_win, "_active_listener", Listener,
                         raising=False)
     try:
-        system_win.restore_modifiers((system_win.VK_RWIN,))
-        assert system_win._injected_down == {system_win.VK_RWIN}, (
-            "the right-hand Windows key was not recognised as the one the "
-            "hotkey names, so the recording would end at the first word")
+        system_win.restore_modifiers(
+            (system_win.VK_LWIN, system_win.VK_RWIN, system_win.VK_MENU))
+        assert system_win.VK_LWIN not in system_win._injected_down
+        assert system_win.VK_RWIN not in system_win._injected_down
+        assert system_win._injected_down == {system_win.VK_MENU}
+        assert not any(
+            e.union.ki.wVk in system_win.WIN_KEYS
+            for batch in batches for e in batch), (
+            "Super was re-injected; the next release opens Start")
     finally:
         system_win._injected_down.clear()
 
@@ -454,7 +463,11 @@ def test_the_modifiers_come_off_before_the_escape(system_win, monkeypatch):
 
 def test_the_keys_the_user_holds_go_back_down_afterwards(system_win,
                                                          monkeypatch):
-    """Leaving them up tells the listener the push-to-talk was let go."""
+    """Leaving Alt up tells the listener the push-to-talk was let go.
+
+    Super is never re-pressed: that is what opens Start. Super was also never
+    released for typing, so it is still down from the user's hold.
+    """
     from whisper_flow import hotkey_win
 
     held = {system_win.VK_MENU, system_win.VK_LWIN}
@@ -462,6 +475,7 @@ def test_the_keys_the_user_holds_go_back_down_afterwards(system_win,
                         lambda vk: -0x8000 if vk in held else 0)
     sent = _batches(system_win, monkeypatch)
     _in_front(system_win, monkeypatch, True, False)
+    monkeypatch.setattr(system_win, "raise_overlay", lambda: None)
 
     class Listener:
         @staticmethod
@@ -473,10 +487,11 @@ def test_the_keys_the_user_holds_go_back_down_afterwards(system_win,
     system_win._injected_down.clear()
     try:
         system_win.dismiss_start_menu()
-        assert system_win._injected_down == held
+        assert system_win._injected_down == {system_win.VK_MENU}
         pressed = {event.union.ki.wVk for event in sent[-1]
                    if event.union.ki.dwFlags == 0}
-        assert held <= pressed
+        assert system_win.VK_MENU in pressed
+        assert system_win.VK_LWIN not in pressed
     finally:
         system_win._injected_down.clear()
 
@@ -636,9 +651,14 @@ def test_atomic_batch_restores_only_the_hotkey(system_win, monkeypatch):
         downs = [e.union.ki.wVk for e in events
                  if e.union.ki.wVk in system_win.MODIFIERS
                  and e.union.ki.dwFlags == 0]
-        assert system_win.VK_LWIN in downs
+        assert system_win.VK_LWIN not in downs   # Super never re-pressed
         assert system_win.VK_MENU in downs
         assert system_win.VK_SHIFT not in downs
+        ups = [e.union.ki.wVk for e in events
+               if e.union.ki.wVk in system_win.MODIFIERS
+               and e.union.ki.dwFlags & system_win.KEYEVENTF_KEYUP]
+        assert system_win.VK_LWIN not in ups     # Super never released
+        assert system_win.VK_MENU in ups
     finally:
         system_win._injected_down.clear()
 

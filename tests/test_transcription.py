@@ -11,8 +11,16 @@ from whisper_flow.transcription import (
     AUDIO_CTX_MIN,
     TranscriptionService,
     audio_context,
+    is_hallucination,
     wav_duration,
 )
+
+
+def test_hallucination_tags_are_rejected():
+    assert is_hallucination("*sad music*")
+    assert is_hallucination("[Music]")
+    assert is_hallucination("BLANK_AUDIO")
+    assert not is_hallucination("How are random errors detected?")
 
 
 class FakeConfig:

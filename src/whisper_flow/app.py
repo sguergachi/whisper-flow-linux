@@ -54,6 +54,14 @@ class WhisperFlow:
             self._finalize_audio_debug(transcript=text)
             return text
 
+        # First decode blank or hallucination (*sad music*, etc.). Prefer a
+        # milder re-send of raw audio before heavy boost/rescue — over-gain
+        # is what produced those tags on quiet Windows clips.
+        mild = self._retry_mild_raw(audio_file)
+        if mild:
+            self._finalize_audio_debug(transcript=text, boost_transcript=mild)
+            return mild
+
         boost_gain = None
         boost_text = None
         louder = f"{audio_file}.louder.wav"
@@ -80,9 +88,7 @@ class WhisperFlow:
                 except Exception:
                     pass
 
-        # Café / music path: reprocess raw_trimmed (pre-denoise) with the
-        # forced whisper-rescue pipeline. Peak boost often skips here because
-        # the music already hits full scale.
+        # Café / music path: reprocess raw_trimmed with forced rescue.
         rescued_text = self._retry_cafe_rescue(audio_file)
         if rescued_text:
             self._finalize_audio_debug(
@@ -98,6 +104,65 @@ class WhisperFlow:
             boost_transcript=boost_text or rescued_text,
         )
         return boost_text
+
+    def _retry_mild_raw(self, audio_file: str) -> str | None:
+        """Re-transcribe lightly processed (or raw) audio after a bad decode.
+
+        Uses raw_trimmed from audio-debug with only rumble HPF + modest
+        peak lift — no speech-band, no heavy gate, no 20× gain.
+        """
+        config = getattr(self, "config", None)
+        if config is None:
+            return None
+        try:
+            import numpy as np
+            import wave as _wave
+            from . import denoise as denoise_mod
+
+            last = audio_debug.last_dir(config.config_dir)
+            source = last / "raw_trimmed.wav"
+            if not source.is_file():
+                source = Path(audio_file)
+            with _wave.open(str(source), "rb") as wf:
+                rate = wf.getframerate()
+                pcm = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16)
+            if pcm.size == 0:
+                return None
+            # Light plan only: rumble HPF + optional tiny peak lift.
+            mild = denoise_mod.apply_plan(
+                pcm, rate,
+                denoise_mod.VoicePlan(
+                    hpf_hz=denoise_mod.HIGHPASS_HZ,
+                    spectral=False,
+                    gate=False,
+                    whisper_gate=False,
+                    preemph=False,
+                    speech_norm=False,
+                    normalize=True,
+                    pass_index=1,
+                    reason="mild-retry",
+                ),
+            )
+            out = f"{audio_file}.mild.wav"
+            with _wave.open(out, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(rate)
+                wf.writeframes(mild.tobytes())
+            try:
+                text = self.transcription_service.transcribe_audio(out)
+                self._copy_debug_wav(out, "mild.wav")
+                if text:
+                    log(f"[VOICE] mild retry recovered {len(text)} chars")
+                return text
+            finally:
+                try:
+                    Path(out).unlink()
+                except Exception:
+                    pass
+        except Exception as e:
+            log(f"[VOICE] mild retry failed: {e}")
+            return None
 
     def _copy_debug_wav(self, src: str, name: str) -> None:
         try:

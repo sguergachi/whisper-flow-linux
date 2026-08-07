@@ -23,6 +23,37 @@ def _normalize(text: str | None) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+# Non-speech tags Whisper invents on over-amplified room noise / music beds.
+# Treat as blank so the caller can retry milder processing.
+_HALLUCINATION = re.compile(
+    r"^[\s\*\[\(\{\"']*"
+    r"(blank[_\s-]?audio|music|sad music|upbeat music|applause|laughter|"
+    r"silence|inaudible|inaudible\.|coughing|breathing|background noise|"
+    r"speaking in foreign language|foreign language|thank you\.?|thanks for watching\.?|"
+    r"subscribe|you$)"
+    r"[\s\*\]\)\}\"']*$",
+    re.IGNORECASE,
+)
+
+
+def is_hallucination(text: str | None) -> bool:
+    """True when the transcript is a non-speech / junk decode, not dictation."""
+    if not text:
+        return True
+    t = text.strip()
+    if not t:
+        return True
+    if _HALLUCINATION.match(t):
+        return True
+    # Entirely bracketed/starred tags: *music*, [Music], (applause)
+    if re.fullmatch(r"[\*\[\(\s]*[A-Za-z ._-]+[\*\]\)\s]*", t) and len(t) < 40:
+        if re.search(
+                r"music|applause|laughter|silence|blank|inaudible|cough",
+                t, re.I):
+            return True
+    return False
+
+
 # A recording can run to the configured maximum, and a CPU-only machine
 # transcribes it slower than real time, so the closing pass gets room.
 FINAL_TIMEOUT = 300.0
@@ -129,8 +160,11 @@ class TranscriptionService:
                 text = self._transcribe_local(audio_path, timeout)
 
                 text = _normalize(text)
-                if text and text != "[BLANK_AUDIO]":
+                if text and text != "[BLANK_AUDIO]" and not is_hallucination(text):
                     return text
+                if text and is_hallucination(text):
+                    log(f"Hallucination transcript discarded: {text!r}")
+                    return None
 
                 log("Blank audio detected, skipping paste")
                 return None

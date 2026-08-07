@@ -262,14 +262,17 @@ jobs:
           curl -fsSL \
             "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en-q8_0.bin" \
             -o "$DIST/models/ggml-base.en-q8_0.bin"
-          # App icon next to the binary for the AppImage.
-          python3 -c "
-          import sys
+          # App icon next to the binary for the AppImage. Use the venv —
+          # system python3 has no Pillow (and on 22.04 is 3.10).
+          .venv/bin/python -c "
           from pathlib import Path
-          sys.path.insert(0, 'src')
           from whisper_flow.icon import APP_COLOR, draw_mic
           draw_mic(256, APP_COLOR).save(Path('$DIST') / 'whisper-flow.png', format='PNG')
+          print('icon ok')
           "
+          test -s "$DIST/engine/whisper-server" || test -s "$DIST/engine/whisper-server.exe" \
+            || find "$DIST/engine" -name 'whisper-server*' | grep -q .
+          test -s "$DIST/models/ggml-base.en-q8_0.bin"
           du -sh "$DIST" "$DIST/engine" "$DIST/models"
 
       - name: Build AppImage

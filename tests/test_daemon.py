@@ -910,7 +910,7 @@ class TestTrayMenu:
 
         fake = types.SimpleNamespace(
             Menu=lambda *items: list(items),
-            MenuItem=lambda title, action, **kwargs: title,
+            MenuItem=lambda title, action, **kwargs: (title, kwargs),
         )
         monkeypatch.setattr(daemon_module, "_pystray", lambda: fake)
         return daemon.setup_tray_menu()
@@ -923,7 +923,7 @@ class TestTrayMenu:
 
         items = self._items(daemon, monkeypatch)
 
-        assert items[0] == f"WhisperFlow {daemon_module.build_version()}"
+        assert items[0][0] == f"WhisperFlow {daemon_module.build_version()}"
 
     def test_a_packaged_build_shows_its_stamp_not_the_source_version(
             self, temp_config_dir, monkeypatch, tmp_path):
@@ -937,4 +937,23 @@ class TestTrayMenu:
 
         items = self._items(daemon, monkeypatch)
 
-        assert items[0] == "WhisperFlow 0.4.171"
+        assert items[0][0] == "WhisperFlow 0.4.171"
+
+    def test_settings_is_the_default_tray_action(self, temp_config_dir,
+                                                 monkeypatch):
+        """Left-click on the tray icon must open Settings.
+
+        pystray only activates a menu item on icon click when that item is
+        marked default. Without it, a plain click does nothing on Windows
+        (and on GTK StatusIcon), so the tray looks dead unless the user
+        finds Settings in the right-click menu.
+        """
+        daemon = _stub_daemon(temp_config_dir)
+
+        items = self._items(daemon, monkeypatch)
+
+        settings = [item for item in items if item[0] == "Settings"]
+        assert len(settings) == 1
+        assert settings[0][1].get("default") is True
+        defaults = [item for item in items if item[1].get("default")]
+        assert defaults == settings

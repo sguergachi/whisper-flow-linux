@@ -340,7 +340,11 @@ class WhisperFlowDaemon:
                 None,
                 enabled=False,
             ),
-            pystray.MenuItem("Settings", self.open_settings),
+            # default=True: left-click (or platform "activate") opens
+            # Settings. Right-click still shows the full menu. Without this
+            # the tray looked inert unless the user found Settings in the
+            # menu - which is the opposite of how every other tray app works.
+            pystray.MenuItem("Settings", self.open_settings, default=True),
             pystray.MenuItem("Test setup", self.test_configuration),
             pystray.MenuItem("Copy last error", self.copy_last_error),
             pystray.MenuItem("Copy log", self.copy_log),

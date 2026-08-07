@@ -60,6 +60,18 @@ def test_the_room_gets_quieter_and_the_voice_does_not(recording):
         f"the voice came out at {heard:.0f} against {spoken:.0f} clean")
 
 
+def test_a_higher_noise_floor_ignores_more_of_the_room(recording):
+    """Settings 'Noise floor' is the gate multiplier; higher = stricter."""
+    noisy, voiced, _ = recording
+    mild = denoise.clean(noisy, RATE, gate_threshold=1.5)
+    strict = denoise.clean(noisy, RATE, gate_threshold=4.0)
+    quiet_mild = _rms(mild, ~voiced)
+    quiet_strict = _rms(strict, ~voiced)
+    assert quiet_strict <= quiet_mild * 1.05, (
+        f"stricter floor left pauses louder: {quiet_mild:.0f} -> "
+        f"{quiet_strict:.0f}")
+
+
 def test_the_offset_and_the_rumble_go(recording):
     """A converter's DC offset is not sound, and it eats the boost's headroom."""
     noisy, _, _ = recording

@@ -895,7 +895,10 @@ class AudioRecorder:
             try:
                 samples = np.frombuffer(audio, dtype=np.int16)
                 audio = denoise.clean(
-                    samples, self.config.sample_rate).tobytes()
+                    samples, self.config.sample_rate,
+                    gate_threshold=getattr(
+                        self.config, "noise_floor", None),
+                ).tobytes()
             except Exception as e:
                 log(f"[AUDIO] noise filter skipped: {e}")
 

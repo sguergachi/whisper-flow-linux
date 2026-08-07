@@ -78,13 +78,17 @@ def _frame_levels(samples: np.ndarray, rate: int, frame: int):
     return np.sqrt((blocks ** 2).mean(axis=1)), usable
 
 
-def gate(samples: np.ndarray, rate: int) -> np.ndarray:
+def gate(samples: np.ndarray, rate: int,
+         threshold: float | None = None) -> np.ndarray:
     """Turn down the stretches where nobody is speaking.
 
     The floor is the level of the quietest fifth of the recording, so it
     adapts to the room. A recording that is all speech has a high floor and
     is left alone; one that is all noise has nothing above the threshold and
     is turned down throughout, which is the honest answer for it.
+
+    `threshold` is how many times the measured floor a frame must exceed to
+    count as speech (settings "Noise floor"). Default is GATE_THRESHOLD.
     """
     frame = max(1, int(rate * GATE_FRAME_MS / 1000))
     levels, usable = _frame_levels(samples, rate, frame)
@@ -94,7 +98,10 @@ def gate(samples: np.ndarray, rate: int) -> np.ndarray:
     floor = float(np.percentile(levels, NOISE_PERCENTILE))
     if floor <= 0:
         return samples
-    speaking = levels > floor * GATE_THRESHOLD
+    mult = float(threshold) if threshold is not None else GATE_THRESHOLD
+    if mult < 1.0:
+        mult = 1.0
+    speaking = levels > floor * mult
     if not speaking.any():
         speaking = levels > floor * 1.5      # nothing loud; keep the loudest
 
@@ -124,11 +131,16 @@ def gate(samples: np.ndarray, rate: int) -> np.ndarray:
     return samples.astype(np.float32) * per_sample
 
 
-def clean(samples: np.ndarray, rate: int, gated: bool = True) -> np.ndarray:
-    """High-pass, then optionally gate. Returns int16, ready to write."""
+def clean(samples: np.ndarray, rate: int, gated: bool = True,
+          gate_threshold: float | None = None) -> np.ndarray:
+    """High-pass, then optionally gate. Returns int16, ready to write.
+
+    `gate_threshold` is the settings noise-floor multiplier passed through
+    to ``gate``; None keeps the built-in default.
+    """
     if samples.size == 0:
         return samples
     filtered, _ = high_pass(samples, rate)
     if gated:
-        filtered = gate(filtered, rate)
+        filtered = gate(filtered, rate, threshold=gate_threshold)
     return np.clip(filtered, -32768, 32767).astype(np.int16)

@@ -49,7 +49,15 @@ def test_every_schema_env_name_actually_feeds_config(field, monkeypatch):
     elif field.key in _PROBE:
         raw, expected = _PROBE[field.key]
     elif field.kind in ("int", "float"):
-        raw, expected = "42", 42.0
+        # Stay inside any min/max the field declares (noise floor is 1.2–5).
+        number = 42.0
+        if field.maximum is not None:
+            number = min(number, float(field.maximum))
+        if field.minimum is not None:
+            number = max(number, float(field.minimum))
+        if field.kind == "int":
+            number = int(number)
+        raw, expected = str(number), float(number) if field.kind == "float" else number
     else:
         raw, expected = "probe-value", "probe-value"
     monkeypatch.setenv(field.env, raw)

@@ -250,6 +250,15 @@ class Config(BaseSettings):
                      "before transcribing"),
         env="WHISPER_FLOW_NOISE_FILTER",
     )
+    noise_floor: float = Field(
+        default=2.2,
+        description=("How many times louder than the measured room tone a "
+                     "frame must be to count as speech. Higher ignores more "
+                     "background; lower keeps more of a quiet voice."),
+        ge=1.2,
+        le=5.0,
+        env="WHISPER_FLOW_NOISE_FLOOR",
+    )
     fast_encoder: bool = Field(
         # Whisper encodes a full 30 seconds whatever it was given, so a short
         # dictation spends most of its time on silence. Cutting the window to

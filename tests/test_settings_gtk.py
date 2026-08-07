@@ -469,7 +469,9 @@ print("OK")
 
 
 def _gtk_available() -> bool:
-    if sys.platform != "win32" and not os.environ.get("DISPLAY"):
+    # Wayland desktops often have no DISPLAY; Gtk.init still works there.
+    if sys.platform != "win32" and not (
+            os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
         return False
     result = subprocess.run(
         [sys.executable, "-c", _PROBE], capture_output=True, check=False,
@@ -695,3 +697,21 @@ def test_the_window_says_which_build_it_is(tmp_path):
     """
     result = _run(tmp_path, "version")
     assert "OK" in result.stdout, result.stderr
+
+
+def test_hotkey_rows_guard_set_subtitle_on_entryrow():
+    """EntryRow often has no set_subtitle; ActionRow does.
+
+    An unguarded call raised AttributeError during window construction, so
+    tray → Settings never showed a window. Prefer subtitle when present,
+    tooltip otherwise.
+    """
+    source = (Path(__file__).resolve().parents[1]
+              / "src/whisper_flow/settings_gtk.py").read_text(encoding="utf-8")
+    body = source.split('if field.key.startswith("hotkey_"):', 1)[1]
+    body = body.split("\n        row = (", 1)[0]
+    assert "Adw.EntryRow" in body
+    assert 'hasattr(row, "set_subtitle")' in body, (
+        "EntryRow must not call set_subtitle without checking; that crash "
+        "kept the settings window from opening at all")
+    assert "set_tooltip_text" in body

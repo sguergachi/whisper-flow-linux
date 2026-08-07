@@ -1174,11 +1174,16 @@ class SettingsWindow(Adw.ApplicationWindow):
             # Capture, do not type: free text never recorded a chord as the
             # user pressed it, so the field looked broken. Click, hold the
             # combination, and the row shows what the daemon will bind.
+            #
+            # EntryRow has no subtitle (ActionRow/ComboRow do) - calling
+            # set_subtitle here raised AttributeError and the whole settings
+            # window never opened, so tray → Settings looked dead.
             row = Adw.EntryRow(title=field.label)
             row.set_editable(False)
-            # EntryRow gained set_subtitle in later libadwaita; older builds
-            # (Ubuntu 22.04's package) only have title, so the hint has to
-            # live on the tooltip there.
+            # EntryRow has no set_subtitle on many libadwaita builds
+            # (ActionRow/ComboRow do). A bare call raised AttributeError and
+            # the whole settings window never opened — tray → Settings looked
+            # dead. Prefer subtitle when present; otherwise a tooltip.
             if hasattr(row, "set_subtitle"):
                 row.set_subtitle("Click, then press the keys")
             else:

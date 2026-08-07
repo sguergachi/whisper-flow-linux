@@ -559,7 +559,107 @@ def test_typing_counts_as_the_last_thing_we_did(system_win, monkeypatch):
     be one of the answers this can give."""
     _no_modifiers_held(system_win, monkeypatch)
     _batches(system_win, monkeypatch)
+    monkeypatch.setattr(system_win, "_insert_via_messages", lambda text: False)
+    monkeypatch.setattr(system_win, "start_menu_in_front", lambda: False)
 
     system_win.type_text("hello")
     _ago, what = system_win.last_injection()
     assert "modifier" in what or "character" in what, what
+
+
+# ----------------------------------------------------- message-based insert
+def test_edit_classes_cover_the_common_hosts(system_win):
+    """Notepad, dialogs, and Office all need to hit EM_REPLACESEL."""
+    assert "edit" in system_win.EDIT_CLASSES
+    assert "richedit50w" in system_win.EDIT_CLASSES
+    assert "richeditd2dpt" in system_win.EDIT_CLASSES
+
+
+def test_is_edit_control_accepts_richedit_prefixes(system_win, monkeypatch):
+    monkeypatch.setattr(system_win, "window_class_name",
+                        lambda hwnd: "richeditd2dpt")
+    assert system_win._is_edit_control(1) is True
+    monkeypatch.setattr(system_win, "window_class_name",
+                        lambda hwnd: "chrome_widgetwin_1")
+    assert system_win._is_edit_control(1) is False
+    monkeypatch.setattr(system_win, "window_class_name", lambda hwnd: "")
+    assert system_win._is_edit_control(1) is False
+
+
+def test_type_text_prefers_the_message_path(system_win, monkeypatch):
+    """No keystrokes when the focused control can take EM_REPLACESEL.
+
+    That is the only path that is safe with Alt and Ctrl still physically
+    down: it never writes the key state table the hotkey listener polls,
+    and never produces the Alt KEYUP/KEYDOWN churn that opens menus.
+    """
+    sent = _batches(system_win, monkeypatch)
+    monkeypatch.setattr(system_win, "start_menu_in_front", lambda: False)
+    monkeypatch.setattr(system_win, "_insert_via_messages",
+                        lambda text: text == "hello")
+
+    assert system_win.type_text("hello") is True
+    assert sent == [], "SendInput ran even though the message path took it"
+
+
+def test_type_text_falls_back_to_sendinput(system_win, monkeypatch):
+    _no_modifiers_held(system_win, monkeypatch)
+    sent = _batches(system_win, monkeypatch)
+    monkeypatch.setattr(system_win, "start_menu_in_front", lambda: False)
+    monkeypatch.setattr(system_win, "_insert_via_messages", lambda text: False)
+
+    assert system_win.type_text("hi") is True
+    assert sent, "SendInput fallback never ran"
+    unicode_events = [
+        event for batch in sent for event in batch
+        if event.union.ki.dwFlags & system_win.KEYEVENTF_UNICODE
+    ]
+    assert unicode_events, "the fallback did not type any characters"
+
+
+def test_atomic_batch_restores_only_the_hotkey(system_win, monkeypatch):
+    from whisper_flow import hotkey_win
+
+    held = (system_win.VK_LWIN, system_win.VK_MENU, system_win.VK_SHIFT)
+
+    class Listener:
+        @staticmethod
+        def triggered_keys():
+            return frozenset({hotkey_win.NAME_TO_VK["super"],
+                              hotkey_win.NAME_TO_VK["alt"]})
+
+    monkeypatch.setattr(hotkey_win, "_active_listener", Listener,
+                        raising=False)
+    system_win._injected_down.clear()
+    try:
+        events = system_win._atomic_type_events("x", held)
+        downs = [e.union.ki.wVk for e in events
+                 if e.union.ki.wVk in system_win.MODIFIERS
+                 and e.union.ki.dwFlags == 0]
+        assert system_win.VK_LWIN in downs
+        assert system_win.VK_MENU in downs
+        assert system_win.VK_SHIFT not in downs
+    finally:
+        system_win._injected_down.clear()
+
+
+def test_insert_via_messages_skips_non_edit_focus(system_win, monkeypatch):
+    monkeypatch.setattr(system_win, "focused_control", lambda: 42)
+    monkeypatch.setattr(system_win, "_is_edit_control", lambda hwnd: False)
+    called = []
+    monkeypatch.setattr(
+        system_win, "_insert_via_replace_sel",
+        lambda hwnd, text: called.append(text) or True)
+    assert system_win._insert_via_messages("hello") is False
+    assert called == []
+
+
+def test_insert_via_messages_uses_replace_sel_on_edit(system_win, monkeypatch):
+    monkeypatch.setattr(system_win, "focused_control", lambda: 42)
+    monkeypatch.setattr(system_win, "_is_edit_control", lambda hwnd: True)
+    monkeypatch.setattr(
+        system_win, "_insert_via_replace_sel",
+        lambda hwnd, text: hwnd == 42 and text == "hello")
+    assert system_win._insert_via_messages("hello") is True
+    _ago, what = system_win.last_injection()
+    assert "EM_REPLACESEL" in what

@@ -1,8 +1,16 @@
 """Typing, clipboard and notifications on Windows.
 
-Text goes in through SendInput with KEYEVENTF_UNICODE, which delivers a
-character rather than a keystroke, so it needs no keyboard layout mapping and
-is unaffected by which modifiers happen to be held.
+Live dictation types while the push-to-talk modifiers are still held. The
+old path released those modifiers, typed with SendInput, and pressed them
+back - three separate injections that Windows could interleave with the
+physical keys still down. Alt-up/down churn became menu accelerators, the
+Start menu, and closed windows.
+
+Text is inserted without the keyboard when the focused control allows it
+(EM_REPLACESEL on Edit/RichEdit). Everything else goes through one atomic
+SendInput batch: spoil, release modifiers, Unicode characters, restore the
+hotkey keys, spoil again. One batch means nothing can land between those
+steps.
 """
 
 import contextlib
@@ -33,6 +41,23 @@ VK_ESCAPE = 0x1B
 # does not open the Start menu.
 VK_NONAME = 0xFC
 MODIFIERS = (VK_CONTROL, VK_MENU, VK_SHIFT, VK_LWIN, VK_RWIN)
+
+# Window messages used to put text in without synthesizing keystrokes.
+EM_REPLACESEL = 0x00C2
+WM_CHAR = 0x0102
+WM_PASTE = 0x0302
+
+# Native edit controls that honour EM_REPLACESEL. Matched case-insensitively;
+# any class whose name starts with "richedit" is accepted too (Office, the
+# Win11 Notepad host, etc.).
+EDIT_CLASSES = frozenset({
+    "edit",
+    "richedit",
+    "richedit20a",
+    "richedit20w",
+    "richedit50w",
+    "richeditd2dpt",
+})
 
 # The shell processes that own the Start menu and its search box. Matched by
 # executable rather than by window class or title: every UWP app is a
@@ -105,6 +130,22 @@ class INPUT(ctypes.Structure):
     _fields_ = [("type", wintypes.DWORD), ("union", _INPUTunion)]
 
 
+class GUITHREADINFO(ctypes.Structure):
+    """What GetGUIThreadInfo fills in; hwndFocus is the control that types."""
+
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("flags", wintypes.DWORD),
+        ("hwndActive", wintypes.HWND),
+        ("hwndFocus", wintypes.HWND),
+        ("hwndCapture", wintypes.HWND),
+        ("hwndMenuOwner", wintypes.HWND),
+        ("hwndMoveSize", wintypes.HWND),
+        ("hwndCaret", wintypes.HWND),
+        ("rcCaret", wintypes.RECT),
+    ]
+
+
 _user32.SendInput.restype = wintypes.UINT
 _user32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int]
 
@@ -136,6 +177,22 @@ try:
         wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
     _kernel32.GetCurrentThreadId.restype = wintypes.DWORD
     _kernel32.GetCurrentThreadId.argtypes = []
+    _user32.GetGUIThreadInfo.restype = wintypes.BOOL
+    _user32.GetGUIThreadInfo.argtypes = [
+        wintypes.DWORD, ctypes.POINTER(GUITHREADINFO)]
+    _user32.GetFocus.restype = wintypes.HWND
+    _user32.GetFocus.argtypes = []
+    _user32.GetClassNameW.restype = ctypes.c_int
+    _user32.GetClassNameW.argtypes = [
+        wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    _user32.GetWindowTextW.restype = ctypes.c_int
+    _user32.GetWindowTextW.argtypes = [
+        wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    # LPARAM left as ssize so both integer codes and pointer-sized values
+    # can be passed; string payloads are cast explicitly at the call site.
+    _user32.SendMessageW.restype = ctypes.c_ssize_t
+    _user32.SendMessageW.argtypes = [
+        wintypes.HWND, wintypes.UINT, wintypes.WPARAM, ctypes.c_ssize_t]
 except Exception:                       # a stubbed loader off Windows
     pass
 
@@ -543,45 +600,188 @@ def release_injected_modifiers() -> tuple:
     return ours
 
 
-def type_text(text: str) -> bool:
-    """Type text as characters, not keystrokes.
+def focused_control() -> int:
+    """The HWND that will receive typed text, or 0 if there is none.
 
-    Falls back to the clipboard when SendInput is refused. It is refused
-    whenever the focused window belongs to a more privileged process - an
-    elevated editor or terminal - because UIPI blocks synthetic input from
-    a lower integrity level. Returning False there meant a dictation that
-    recorded, animated, and typed nothing.
+    The foreground window is not enough: focus usually sits on a child edit
+    control inside it, and that is the window EM_REPLACESEL has to address.
+    """
+    try:
+        fg = foreground_window()
+        if not fg:
+            return 0
+        tid = _window_thread(fg)
+        info = GUITHREADINFO()
+        info.cbSize = ctypes.sizeof(GUITHREADINFO)
+        if tid and _user32.GetGUIThreadInfo(tid, ctypes.byref(info)):
+            focus = int(info.hwndFocus or 0)
+            if focus:
+                return focus
+        # Older hosts and some elevated windows refuse GetGUIThreadInfo.
+        # Attaching to their input queue is the documented way to read focus.
+        ours = int(_kernel32.GetCurrentThreadId())
+        attached = bool(
+            tid and tid != ours
+            and _user32.AttachThreadInput(ours, tid, True))
+        try:
+            focus = int(_user32.GetFocus() or 0)
+            return focus or fg
+        finally:
+            if attached:
+                _user32.AttachThreadInput(ours, tid, False)
+    except Exception:
+        return 0
+
+
+def window_class_name(hwnd: int) -> str:
+    """Lowercased Win32 class of a window, or "" if it cannot be read."""
+    if not hwnd:
+        return ""
+    try:
+        name = ctypes.create_unicode_buffer(256)
+        if not _user32.GetClassNameW(wintypes.HWND(hwnd), name, 256):
+            return ""
+        return (name.value or "").lower()
+    except Exception:
+        return ""
+
+
+def _is_edit_control(hwnd: int) -> bool:
+    """Whether this HWND is a native edit control that accepts EM_REPLACESEL."""
+    cls = window_class_name(hwnd)
+    if not cls:
+        return False
+    return cls in EDIT_CLASSES or cls.startswith("richedit")
+
+
+def _send_message(hwnd: int, msg: int, wparam: int, lparam) -> int:
+    """SendMessageW with an LPARAM that may be an int or a Unicode string."""
+    if isinstance(lparam, str):
+        # The edit control reads lParam as LPCWSTR; cast the wchar pointer
+        # to an integer-sized value for the declared argtype.
+        ptr = ctypes.cast(ctypes.c_wchar_p(lparam), ctypes.c_void_p).value or 0
+        return int(_user32.SendMessageW(
+            wintypes.HWND(hwnd), msg, wparam, ptr))
+    return int(_user32.SendMessageW(
+        wintypes.HWND(hwnd), msg, wparam, int(lparam)))
+
+
+def _insert_via_replace_sel(hwnd: int, text: str) -> bool:
+    """Insert at the caret of a native edit control. No keystrokes."""
+    try:
+        if not _user32.IsWindow(wintypes.HWND(hwnd)):
+            return False
+        # wParam TRUE: the insertion can be undone by the target app.
+        _send_message(hwnd, EM_REPLACESEL, 1, text)
+        return True
+    except Exception as e:
+        log(f"[WIN] EM_REPLACESEL failed: {e}")
+        return False
+
+
+def _insert_via_messages(text: str) -> bool:
+    """Put text in without synthesizing key state. True when it landed.
+
+    Only claims success for controls we know honour the message. WM_CHAR to
+    an arbitrary HWND always "succeeds" at the SendMessage level even when
+    the app ignores it (browsers, Electron), and a false success would skip
+    the SendInput path that those apps actually need.
+    """
+    hwnd = focused_control()
+    if not hwnd or not _is_edit_control(hwnd):
+        return False
+    if not _insert_via_replace_sel(hwnd, text):
+        return False
+    _note(f"inserted {len(text)} character(s) via EM_REPLACESEL")
+    return True
+
+
+def _unicode_events(text: str) -> list:
+    """KEYEVENTF_UNICODE down/up pairs for every code unit in text."""
+    events = []
+    for ch in text:
+        for code in _utf16_units(ch):
+            events.append(_key_event(0, code, KEYEVENTF_UNICODE))
+            events.append(
+                _key_event(0, code, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP))
+    return events
+
+
+def _paste_key_events() -> list:
+    return [
+        _key_event(VK_CONTROL, 0, 0),
+        _key_event(VK_V, 0, 0),
+        _key_event(VK_V, 0, KEYEVENTF_KEYUP),
+        _key_event(VK_CONTROL, 0, KEYEVENTF_KEYUP),
+    ]
+
+
+def _atomic_type_events(text: str, held: tuple, *, paste: bool = False) -> list:
+    """One SendInput batch: clear modifiers, deliver text, put the hotkey back.
+
+    A single batch is the whole point. Three separate SendInput calls - release,
+    type, restore - leave gaps the physical keys and the hotkey poll can both
+    fall into. SendInput serialises its array as a block, so the Unicode (or
+    Ctrl+V) events in the middle see the modifiers as up, and the listener
+    never observes a frame where the push-to-talk keys are missing.
+    """
+    wanted = _restorable(held)
+    events = list(_spoil_events())
+    events += [_key_event(vk, 0, KEYEVENTF_KEYUP) for vk in MODIFIERS]
+    if paste:
+        events += _paste_key_events()
+    else:
+        events += _unicode_events(text)
+    if wanted:
+        with _injected_lock:
+            _injected_down.update(wanted)
+        events += [_key_event(vk, 0, 0) for vk in wanted]
+        events += _spoil_events()
+    return events
+
+
+def _type_via_sendinput(text: str) -> bool:
+    """Last-resort typing through the synthetic keyboard.
+
+    Blind the hotkey listener for the whole of this. Even though the batch is
+    atomic, GetAsyncKeyState can still lag the events we just queued, and a
+    16ms poll landing on a stale "keys up" reading ends the recording.
+    """
+    with _hotkeys_blinded():
+        held = tuple(vk for vk in MODIFIERS
+                     if _user32.GetAsyncKeyState(vk) & HELD_MASK)
+        events = _atomic_type_events(text, held)
+        _note(f"typed {len(text)} character(s) via SendInput")
+        if _send(events):
+            return True
+
+        error = ctypes.get_last_error()
+        log(f"[WIN] SendInput refused {len(text)} chars (error {error}); "
+            f"falling back to the clipboard")
+        if not copy_to_clipboard(text):
+            return False
+        paste_events = _atomic_type_events(text, held, paste=True)
+        _note(f"pasted {len(text)} character(s) via SendInput")
+        return _send(paste_events)
+
+
+def type_text(text: str) -> bool:
+    """Type text into whatever is focused right now.
+
+    Prefers a message to the focused edit control so held push-to-talk keys
+    never touch the input stream. Falls back to one atomic SendInput batch,
+    and to the clipboard when UIPI refuses synthetic input from a lower
+    integrity level (an elevated editor or terminal).
     """
     if not text:
         return True
-    # Blind the hotkey listener for the whole of this. Everything below writes
-    # to the key state table it polls, and the gap between releasing the
-    # modifiers and putting them back reads as the user letting go of the
-    # hotkey. Putting them back is not enough by itself - a 16ms poll can land
-    # inside any gap - so the listener is told not to look at all.
-    with _hotkeys_blinded():
-        held = release_modifiers()
-        try:
-            events = []
-            for ch in text:
-                for code in _utf16_units(ch):
-                    events.append(_key_event(0, code, KEYEVENTF_UNICODE))
-                    events.append(
-                        _key_event(0, code, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP))
-            # SendInput takes the whole batch atomically, so nothing can
-            # interleave.
-            _note(f"typed {len(text)} character(s)")
-            if _send(events):
-                return True
-
-            error = ctypes.get_last_error()
-            log(f"[WIN] SendInput refused {len(text)} chars (error {error}); "
-                f"falling back to the clipboard")
-            return copy_to_clipboard(text) and send_paste(release_first=False)
-        finally:
-            # Whatever happened above, the user is still holding the hotkey and
-            # the state table has to say so again.
-            restore_modifiers(held)
+    # The Start menu holds the foreground against ordinary typing; close it
+    # before either path so the words land where the user was speaking.
+    if start_menu_in_front():
+        dismiss_start_menu()
+    if _insert_via_messages(text):
+        return True
+    return _type_via_sendinput(text)
 
 
 def _utf16_units(ch: str):
@@ -594,18 +794,17 @@ def _utf16_units(ch: str):
 def send_paste(release_first: bool = True) -> bool:
     """Ctrl+V, for the clipboard fallback path.
 
-    release_first is False when type_text calls this: it has already
-    released the modifiers and holds the list to restore afterwards, and a
-    second release would lose the record of what the user was holding.
+    release_first is True for the stand-alone paste used when the whole
+    transcript is delivered at once. The live type_text path builds its own
+    atomic batch and does not call this.
     """
     if release_first:
-        release_modifiers()
-    return _send([
-        _key_event(VK_CONTROL, 0, 0),
-        _key_event(VK_V, 0, 0),
-        _key_event(VK_V, 0, KEYEVENTF_KEYUP),
-        _key_event(VK_CONTROL, 0, KEYEVENTF_KEYUP),
-    ])
+        held = release_modifiers()
+        try:
+            return _send(_paste_key_events())
+        finally:
+            restore_modifiers(held)
+    return _send(_paste_key_events())
 
 
 CF_UNICODETEXT = 13

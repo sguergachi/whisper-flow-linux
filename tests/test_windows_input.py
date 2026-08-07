@@ -1,11 +1,12 @@
 """Typing must not tell Windows the user let go of the hotkey.
 
 Live transcription types committed words while the push-to-talk keys are
-still physically down. Typing releases every modifier first, so a held Alt
-cannot turn the text into shortcuts - and the hotkey listener reads the very
-state table those releases write to. It concluded the key had been let go and
-ended the recording at the first committed word, every time, with the key
-still held. The overlay disappearing mid-sentence was this.
+still physically down. The SendInput path releases every modifier, types,
+and presses the hotkey keys back - all in one atomic batch - so a held Alt
+cannot turn the text into shortcuts and the hotkey listener never sees a
+frame where the combination is missing. Three separate injections used to
+leave exactly that gap: the listener ended the recording at the first
+committed word, every time, with the key still held.
 """
 
 import sys
@@ -23,6 +24,10 @@ def win(monkeypatch):
     batches = []
     monkeypatch.setattr(system_win, "_send",
                         lambda events: (batches.append(list(events)), True)[1])
+    # These tests cover the SendInput fallback. Keep the message path off so
+    # a focused Notepad on the runner does not swallow the injection under
+    # test and leave batches empty.
+    monkeypatch.setattr(system_win, "_insert_via_messages", lambda text: False)
     return system_win, batches
 
 
@@ -38,17 +43,65 @@ def test_typing_puts_back_the_modifiers_the_user_is_holding(win, monkeypatch):
     monkeypatch.setattr(
         system_win._user32, "GetAsyncKeyState",
         lambda vk: -0x8000 if vk in held else 0)
+    monkeypatch.setattr(system_win, "_restorable", lambda h: tuple(h))
 
     assert system_win.type_text("hello")
 
-    # The last thing sent has to be the two keys going back down, or the
-    # listener polls a moment later and sees a push-to-talk that ended.
+    # One batch only: release, type, and restore must not be three calls.
+    # Between two SendInputs the poll can see the keys as up and end the
+    # recording mid-sentence.
+    assert len(batches) == 1, (
+        f"typing split into {len(batches)} SendInput calls; the gap is "
+        f"what ends a live dictation at the first word")
     restored = batches[-1]
     for vk in held:
         flags = _flags_for(restored, vk)
-        assert flags == [0], (
+        # KEYUP first (clear), then KEYDOWN (restore). Flags == [up, down].
+        assert flags[-1] == 0, (
             f"key {vk:#x} was not pressed back down after typing; the "
             f"listener will read it as released and stop the recording")
+        assert system_win.KEYEVENTF_KEYUP in flags
+
+
+def test_release_type_and_restore_share_one_batch(win, monkeypatch):
+    """The bug that closed apps and opened Start during live typing.
+
+    Separate release / type / restore injections let Alt flap while Unicode
+    characters were landing, which Windows delivered as WM_SYSCHAR menu
+    accelerators. One atomic batch keeps the modifiers up for the whole
+    character sequence from the input stream's point of view.
+    """
+    system_win, batches = win
+    held = {system_win.VK_MENU, system_win.VK_CONTROL}
+    monkeypatch.setattr(
+        system_win._user32, "GetAsyncKeyState",
+        lambda vk: -0x8000 if vk in held else 0)
+    monkeypatch.setattr(system_win, "_restorable", lambda h: tuple(h))
+
+    assert system_win.type_text("ab")
+    assert len(batches) == 1
+    batch = batches[0]
+
+    def first_index(pred):
+        for i, event in enumerate(batch):
+            if pred(event):
+                return i
+        return None
+
+    alt_up = first_index(
+        lambda e: e.union.ki.wVk == system_win.VK_MENU
+        and e.union.ki.dwFlags & system_win.KEYEVENTF_KEYUP)
+    unicode_down = first_index(
+        lambda e: e.union.ki.dwFlags & system_win.KEYEVENTF_UNICODE
+        and not (e.union.ki.dwFlags & system_win.KEYEVENTF_KEYUP))
+    alt_down = first_index(
+        lambda e: e.union.ki.wVk == system_win.VK_MENU
+        and e.union.ki.dwFlags == 0)
+
+    assert alt_up is not None and unicode_down is not None and alt_down is not None
+    assert alt_up < unicode_down < alt_down, (
+        f"order was up={alt_up} type={unicode_down} down={alt_down}; "
+        f"modifiers must be clear for every character and restored after")
 
 
 def test_nothing_is_pressed_that_was_not_already_held(win, monkeypatch):

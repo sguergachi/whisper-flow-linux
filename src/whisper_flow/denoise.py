@@ -1,22 +1,16 @@
 """Taking the room out of a recording, without taking the voice with it.
 
 Whisper is trained on noisy audio and copes with a great deal of it; what it
-copes badly with is processing that removes or smears speech. So nothing here
-tries to be clever beyond what pays for itself in a real room:
+copes badly with is processing that removes or smears speech - and with a
+whisper in a café, where the room is louder than the voice. So this module
+does two jobs:
 
-  * A high-pass at 80Hz. Below that is mains hum, desk rumble, fan bearings
-    and DC offset from the converter, none of which is voice.
-
-  * An adaptive soft gate. The noise floor is measured from a short pre-roll
-    at the start of the clip (room tone before speech), not from the whole
-    recording - continuous café noise no longer inflates the floor and ducks
-    the voice. Quiet stretches are turned down rather than silenced.
-
-  * Mild peak normalisation so a quiet mic still reaches Whisper at a usable
-    level without waiting for a blank transcript and a 300x boost retry.
-
-  * Optional stationary spectral subtraction ("strong" mode) for fans, AC and
-    other steady mid-band noise that sits on top of the speech itself.
+  * Mild cleanup for ordinary dictation: high-pass, soft gate, peak normalise.
+  * A low-SNR "whisper rescue" path that auto-engages when the room masks the
+    voice: softer gate (so the whisper is not ducked), speech-band emphasis
+    (cut music bass, lift consonants), mild spectral subtract of pre-roll
+    noise, and normalise against speech-frame energy rather than the music's
+    peak.
 
 All of it is cheap, causal where live passes need determinism, and reversible
 from settings if a particular machine is worse with it on.
@@ -55,15 +49,34 @@ NORM_MAX_GAIN = 40.0
 # Below this after filtering there is nothing to lift (muted / dead device).
 NORM_DEAD_PEAK = 30.0
 
-# Spectral subtraction (strong mode). Frame size is a power of two so the
-# FFT is cheap; hop is half for 50% overlap-add.
+# Spectral subtraction (strong mode / rescue). Frame size is a power of two
+# so the FFT is cheap; hop is half for 50% overlap-add.
 SPECTRAL_FRAME_MS = 32
 SPECTRAL_OVERSUB = 1.0     # how aggressively to remove the noise spectrum
 SPECTRAL_FLOOR = 0.08      # leave this fraction of each bin (avoid musical noise)
 SPECTRAL_MAX_ATTEN_DB = 18.0  # never carve a bin quieter than this below input
 
+# --- Whisper-in-café rescue -------------------------------------------------
+# Estimated SNR (max frame vs pre-roll floor) below this engages rescue.
+# Café music + whisper typically lands 0–10 dB; normal speech is 15–30+.
+LOW_SNR_DB = 11.0
+# Gate that will not bury a whisper under music (configured 2.2× would).
+WHISPER_GATE_MULT = 1.2
+WHISPER_GATE_FLOOR_DB = -8.0
+# Cut more bass than the ordinary 80 Hz path: music energy and HVAC sit
+# below here, while whispered consonants live above.
+SPEECH_BAND_HPF_HZ = 180.0
+# Classic pre-emphasis for unvoiced speech / sibilants.
+PREEMPH_COEFF = 0.95
+# Milder spectral cut when music is non-stationary (less "musical noise").
+RESCUE_SPECTRAL_OVERSUB = 0.75
+RESCUE_SPECTRAL_MAX_ATTEN_DB = 12.0
+# Normalise so speech-frame energy reaches this, even if music peaks higher.
+SPEECH_NORM_TARGET = 0.78
+SPEECH_NORM_MAX_GAIN = 90.0
 
-def high_pass(samples: np.ndarray, rate: int, state=None):
+
+def high_pass(samples: np.ndarray, rate: int, state=None, cutoff_hz: float = HIGHPASS_HZ):
     """One-pole high-pass that can be run over a stream in pieces.
 
     Returns the filtered samples and the state to pass to the next call.
@@ -75,7 +88,7 @@ def high_pass(samples: np.ndarray, rate: int, state=None):
         return samples, state
 
     dt = 1.0 / rate
-    rc = 1.0 / (2 * np.pi * HIGHPASS_HZ)
+    rc = 1.0 / (2 * np.pi * cutoff_hz)
     alpha = np.float32(rc / (rc + dt))
 
     x = samples.astype(np.float32)
@@ -95,6 +108,17 @@ def high_pass(samples: np.ndarray, rate: int, state=None):
     y[:decay.size] += decay[:y.size]
 
     return y, (x[-1], y[-1] if y.size else previous_y)
+
+
+def pre_emphasize(samples: np.ndarray, coeff: float = PREEMPH_COEFF) -> np.ndarray:
+    """Lift consonants / sibilants; whispered speech lives in the tilt."""
+    if samples.size < 2:
+        return samples.astype(np.float32)
+    x = samples.astype(np.float32)
+    y = np.empty_like(x)
+    y[0] = x[0]
+    y[1:] = x[1:] - np.float32(coeff) * x[:-1]
+    return y
 
 
 def _frame_levels(samples: np.ndarray, rate: int, frame: int):
@@ -124,13 +148,63 @@ def measure_floor(samples: np.ndarray, rate: int) -> float:
     return float(np.percentile(levels, NOISE_PERCENTILE))
 
 
-def gate_floor_db(threshold: float | None) -> float:
+def estimate_snr_db(samples: np.ndarray, rate: int,
+                    floor: float | None = None) -> float:
+    """Rough SNR: loudest frame vs pre-roll floor, in dB.
+
+    Negative or low values mean the room is as loud as (or louder than) the
+    voice - the café + whisper case. Returns a high number when there is no
+    measurable floor so ordinary clean path is used.
+    """
+    if samples.size == 0:
+        return 99.0
+    x = samples.astype(np.float32)
+    if floor is None or floor <= 0:
+        floor = measure_floor(x, rate)
+    if floor <= 1e-6:
+        return 99.0
+    frame = max(1, int(rate * GATE_FRAME_MS / 1000))
+    levels, _ = _frame_levels(x, rate, frame)
+    if levels.size == 0:
+        return 99.0
+    return float(20.0 * np.log10(max(float(levels.max()), 1e-6) / floor))
+
+
+def is_low_snr(samples: np.ndarray, rate: int,
+               floor: float | None = None,
+               gate_threshold: float | None = None) -> bool:
+    """Whether the clip looks like a whisper under continuous background."""
+    if samples.size == 0:
+        return False
+    x = samples.astype(np.float32)
+    if floor is None or floor <= 0:
+        floor = measure_floor(x, rate)
+    snr = estimate_snr_db(x, rate, floor=floor)
+    if snr < LOW_SNR_DB:
+        return True
+    # Configured gate line above every frame → ordinary gate would bury voice.
+    mult = float(gate_threshold) if gate_threshold is not None else GATE_THRESHOLD
+    if mult < 1.0:
+        mult = 1.0
+    if floor > 0:
+        frame = max(1, int(rate * GATE_FRAME_MS / 1000))
+        levels, _ = _frame_levels(x, rate, frame)
+        if levels.size and float(levels.max()) < floor * mult:
+            return True
+    return False
+
+
+def gate_floor_db(threshold: float | None,
+                  whisper_mode: bool = False) -> float:
     """How far quiet parts are turned down, scaled by the noise_floor setting.
 
     Higher threshold (stricter "Noise floor" knob) also digs the pauses
     deeper: someone who asked to ignore more of the room gets quieter
-    pauses, not just a harder open decision.
+    pauses, not just a harder open decision. Whisper-mode keeps a shallow
+    floor so a buried voice is not crushed between words.
     """
+    if whisper_mode:
+        return WHISPER_GATE_FLOOR_DB
     mult = float(threshold) if threshold is not None else GATE_THRESHOLD
     # Settings clamp noise_floor to [1.2, 5.0]; map that onto gate depth.
     lo, hi = 1.2, 5.0
@@ -141,7 +215,8 @@ def gate_floor_db(threshold: float | None) -> float:
 
 def gate(samples: np.ndarray, rate: int,
          threshold: float | None = None,
-         floor: float | None = None) -> np.ndarray:
+         floor: float | None = None,
+         whisper_mode: bool = False) -> np.ndarray:
     """Turn down the stretches where nobody is speaking.
 
     The floor is measured from the pre-roll (or supplied by the caller) so
@@ -151,6 +226,8 @@ def gate(samples: np.ndarray, rate: int,
 
     `threshold` is how many times the measured floor a frame must exceed to
     count as speech (settings "Noise floor"). Default is GATE_THRESHOLD.
+    In whisper_mode the mult is capped so café music does not keep the gate
+    closed over a soft voice.
     """
     frame = max(1, int(rate * GATE_FRAME_MS / 1000))
     levels, usable = _frame_levels(samples, rate, frame)
@@ -169,9 +246,20 @@ def gate(samples: np.ndarray, rate: int,
     mult = float(threshold) if threshold is not None else GATE_THRESHOLD
     if mult < 1.0:
         mult = 1.0
+    if whisper_mode:
+        mult = min(mult, WHISPER_GATE_MULT)
     speaking = levels > floor * mult
     if not speaking.any():
-        speaking = levels > floor * 1.5      # nothing loud; keep the loudest
+        # Keep the loudest third rather than only 1.5×floor: under music the
+        # whisper may never clear 1.5×, and turning the whole clip down is
+        # how we used to erase it.
+        if whisper_mode:
+            cut = float(np.percentile(levels, 65))
+            speaking = levels >= cut
+        else:
+            speaking = levels > floor * 1.5
+        if not speaking.any():
+            speaking = levels >= float(levels.max()) * 0.85
 
     # Smooth the decision in time: instant gating sounds like chopping and
     # removes the first consonant of a word as reliably as it removes noise.
@@ -185,7 +273,7 @@ def gate(samples: np.ndarray, rate: int,
         current += np.clip(target - current, -step, step)
         envelope[i] = current
 
-    quiet = float(10.0 ** (gate_floor_db(threshold) / 20.0))
+    quiet = float(10.0 ** (gate_floor_db(threshold, whisper_mode=whisper_mode) / 20.0))
     gains = quiet + (1.0 - quiet) * envelope
 
     # Interpolated across the samples, not held per frame. A gain that steps
@@ -229,8 +317,46 @@ def normalize_peak(samples: np.ndarray,
     return np.clip(x * gain, -32768, 32767).astype(np.int16)
 
 
+def normalize_speech(samples: np.ndarray, rate: int,
+                     floor: float | None = None,
+                     target: float = SPEECH_NORM_TARGET,
+                     max_gain: float = SPEECH_NORM_MAX_GAIN) -> np.ndarray:
+    """Lift speech-frame energy toward target, ignoring music peaks.
+
+    Global peak normalise fails in a café: a bass hit or cymbal sets the
+    peak so the whisper never gets gain. Using the 90th percentile of
+    frames above the floor tracks the voice instead.
+    """
+    if samples.size == 0:
+        return samples
+    x = samples.astype(np.float32)
+    frame = max(1, int(rate * GATE_FRAME_MS / 1000))
+    levels, _ = _frame_levels(x, rate, frame)
+    if levels.size == 0:
+        return normalize_peak(samples, target=target, max_gain=max_gain)
+
+    use_floor = float(floor) if floor is not None and floor > 0 else 0.0
+    if use_floor > 0:
+        speechish = levels[levels > use_floor * 1.05]
+    else:
+        speechish = levels
+    if speechish.size < 2:
+        speechish = levels
+    ref = float(np.percentile(speechish, 90))
+    if ref < NORM_DEAD_PEAK:
+        return np.clip(x, -32768, 32767).astype(np.int16)
+
+    target_amp = target * 32767.0
+    gain = min(max_gain, target_amp / ref)
+    if gain <= 1.05:
+        return np.clip(x, -32768, 32767).astype(np.int16)
+    return np.clip(x * gain, -32768, 32767).astype(np.int16)
+
+
 def spectral_subtract(samples: np.ndarray, rate: int,
-                      noise_ref: np.ndarray | None = None) -> np.ndarray:
+                      noise_ref: np.ndarray | None = None,
+                      oversub: float = SPECTRAL_OVERSUB,
+                      max_atten_db: float = SPECTRAL_MAX_ATTEN_DB) -> np.ndarray:
     """Stationary spectral subtraction using a pre-roll noise estimate.
 
     Aimed at fans, AC and other steady mid-band noise that rides on the
@@ -276,7 +402,7 @@ def spectral_subtract(samples: np.ndarray, rate: int,
     if float(noise_mag.mean()) < 1e-3:
         return samples
 
-    min_gain = float(10.0 ** (-SPECTRAL_MAX_ATTEN_DB / 20.0))
+    min_gain = float(10.0 ** (-max_atten_db / 20.0))
     out = np.zeros(x.size, dtype=np.float32)
     weight = np.zeros(x.size, dtype=np.float32)
 
@@ -285,7 +411,7 @@ def spectral_subtract(samples: np.ndarray, rate: int,
         spec = np.fft.rfft(frame_s)
         mag = np.abs(spec)
         # Power-style subtraction with a floor so bins never go fully empty.
-        cleaned = mag - SPECTRAL_OVERSUB * noise_mag
+        cleaned = mag - float(oversub) * noise_mag
         floor_mag = SPECTRAL_FLOOR * mag
         cleaned = np.maximum(cleaned, floor_mag)
         # Relative attenuation cap.
@@ -308,7 +434,8 @@ def clean(samples: np.ndarray, rate: int, gated: bool = True,
           spectral: bool = False,
           normalize: bool = True,
           floor: float | None = None,
-          noise_ref: np.ndarray | None = None) -> np.ndarray:
+          noise_ref: np.ndarray | None = None,
+          whisper_rescue: bool | None = None) -> np.ndarray:
     """High-pass, optional spectral subtract, gate, optional peak normalise.
 
     Returns int16, ready to write.
@@ -317,18 +444,64 @@ def clean(samples: np.ndarray, rate: int, gated: bool = True,
     to ``gate``; None keeps the built-in default.
     `spectral` enables stationary spectral subtraction (settings "Strong
     noise filter"). Off for live passes: STFT is fine for a closing clip,
-    but live agreement needs a cheap causal path.
+    but live agreement needs a cheap causal path - except low-SNR rescue
+    which uses a milder subtract when a noise_ref is available.
     `floor` / `noise_ref` are pre-measured from untrimmed room tone. When
     silence has already been trimmed off the start, the pre-roll is speech
     and measuring again would duck or subtract the voice - pass them in.
+    `whisper_rescue`: True force / False forbid / None auto-detect low SNR.
     """
     if samples.size == 0:
         return samples
-    filtered, _ = high_pass(samples, rate)
-    # Floor once from the high-passed pre-roll so gate and spectral agree,
-    # unless the caller already measured it on the untrimmed capture.
-    if floor is None and (gated or spectral):
-        floor = measure_floor(filtered, rate)
+
+    # Floor from high-passed audio so gate/spectral/SNR agree, unless caller
+    # already measured on the untrimmed capture.
+    base, _ = high_pass(samples, rate)
+    if floor is None:
+        floor = measure_floor(base, rate)
+
+    rescue = whisper_rescue
+    if rescue is None:
+        rescue = is_low_snr(base, rate, floor=floor,
+                            gate_threshold=gate_threshold)
+
+    if rescue:
+        try:
+            from .logging import log
+            snr = estimate_snr_db(base, rate, floor=floor)
+            log(f"[DENOISE] low-SNR rescue on "
+                f"(snr≈{snr:.0f}dB, floor={floor:.0f})")
+        except Exception:
+            pass
+        # Speech-band: cut café bass/music low end harder than 80 Hz alone.
+        filtered, _ = high_pass(samples, rate, cutoff_hz=SPEECH_BAND_HPF_HZ)
+        # Mild pre-roll subtract even without Strong mode - music is not
+        # stationary but the average spectrum still pulls some energy down.
+        if noise_ref is not None and noise_ref.size:
+            ref = noise_ref
+            # Match the speech-band high-pass on the reference.
+            ref, _ = high_pass(ref, rate, cutoff_hz=SPEECH_BAND_HPF_HZ)
+            filtered = spectral_subtract(
+                filtered, rate, noise_ref=ref,
+                oversub=RESCUE_SPECTRAL_OVERSUB,
+                max_atten_db=RESCUE_SPECTRAL_MAX_ATTEN_DB,
+            )
+        elif spectral:
+            filtered = spectral_subtract(
+                filtered, rate, noise_ref=noise_ref,
+                oversub=RESCUE_SPECTRAL_OVERSUB,
+                max_atten_db=RESCUE_SPECTRAL_MAX_ATTEN_DB,
+            )
+        if gated:
+            filtered = gate(filtered, rate, threshold=gate_threshold,
+                            floor=floor, whisper_mode=True)
+        filtered = pre_emphasize(filtered)
+        if normalize:
+            return normalize_speech(filtered, rate, floor=floor)
+        return np.clip(filtered, -32768, 32767).astype(np.int16)
+
+    # Ordinary path: mild HPF, optional full spectral, standard gate.
+    filtered = base
     if spectral:
         filtered = spectral_subtract(filtered, rate, noise_ref=noise_ref)
     if gated:
@@ -336,3 +509,20 @@ def clean(samples: np.ndarray, rate: int, gated: bool = True,
     if normalize:
         return normalize_peak(filtered)
     return np.clip(filtered, -32768, 32767).astype(np.int16)
+
+
+def rescue_samples(samples: np.ndarray, rate: int,
+                   floor: float | None = None,
+                   noise_ref: np.ndarray | None = None,
+                   gate_threshold: float | None = None) -> np.ndarray:
+    """Force the café/whisper path on a clip (blank-retry and offline tools)."""
+    return clean(
+        samples, rate,
+        gated=True,
+        gate_threshold=gate_threshold,
+        spectral=True,
+        normalize=True,
+        floor=floor,
+        noise_ref=noise_ref,
+        whisper_rescue=True,
+    )

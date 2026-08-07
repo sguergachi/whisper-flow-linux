@@ -13,7 +13,13 @@ import wave
 import numpy as np
 import pytest
 
-from whisper_flow.boost import DEAD_PEAK, MAX_GAIN, boost_wav, needs_boost
+from whisper_flow.boost import (
+    DEAD_PEAK,
+    MAX_GAIN,
+    boost_wav,
+    needs_boost,
+    rescue_wav,
+)
 
 
 def _wav(peak, seconds=1.0, dc=0, rate=16000, width=2):
@@ -88,6 +94,31 @@ def test_a_loud_recording_is_left_alone(out_path):
     src = _wav(30000)
     try:
         assert boost_wav(src, out_path) is None
+    finally:
+        os.unlink(src)
+
+
+def test_cafe_music_peak_still_gets_speech_rescue(out_path):
+    """Music can make the peak high so boost_wav refuses; rescue must run."""
+    rate = 16000
+    n = rate * 2
+    t = np.linspace(0, 2, n, False)
+    music = np.sin(2 * np.pi * 100 * t) * 8000
+    speech = np.zeros(n)
+    speech[int(0.5 * rate):int(1.5 * rate)] = (
+        np.sin(2 * np.pi * 1500 * t[int(0.5 * rate):int(1.5 * rate)]) * 200)
+    samples = np.clip(music + speech, -32768, 32767).astype(np.int16)
+    src = tempfile.mktemp(suffix=".wav")
+    with wave.open(src, "wb") as f:
+        f.setnchannels(1)
+        f.setsampwidth(2)
+        f.setframerate(rate)
+        f.writeframes(samples.tobytes())
+    try:
+        assert boost_wav(src, out_path) is None  # peak already loud
+        assert rescue_wav(src, out_path) is not None
+        assert os.path.exists(out_path)
+        assert _peak_of(out_path) > 1000
     finally:
         os.unlink(src)
 

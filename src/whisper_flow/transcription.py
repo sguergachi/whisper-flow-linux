@@ -163,7 +163,19 @@ class TranscriptionService:
         # Sized per request rather than once at startup: the server takes
         # these as form fields, so every clip gets a window cut to its own
         # length without the engine being restarted or even told in advance.
-        data = {}
+        data = {
+            # Quiet café whispers often score as "no speech" at the default
+            # threshold; a lower bar makes the decoder try harder instead of
+            # returning blank. Temperature 0 keeps the first pass deterministic.
+            "temperature": "0.0",
+            "temperature_inc": "0.2",
+            "no_speech_thold": "0.4",
+        }
+        # English-locked installs (common) stay stable under noise; a free
+        # language id on café music hallucinates other languages.
+        language = getattr(self.config, "language", None) or "en"
+        if language and language != "auto":
+            data["language"] = str(language)
         if self.config.fast_encoder:
             context = audio_context(wav_duration(audio_path))
             if context:

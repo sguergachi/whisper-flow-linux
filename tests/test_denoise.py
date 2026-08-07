@@ -258,3 +258,80 @@ def test_live_prefixes_share_a_stable_floor():
     floor_4s = denoise.measure_floor(samples, RATE)
     assert abs(floor_1s - floor_4s) < 5.0, (
         f"floor drifted as the clip grew: {floor_1s:.1f} -> {floor_4s:.1f}")
+
+
+def _cafe_whisper(seconds=2.5, speech_peak=180, music_rms=900):
+    """Whisper under continuous mid/low music (café-like)."""
+    rng = np.random.default_rng(42)
+    n = int(RATE * seconds)
+    t = np.arange(n) / RATE
+    # Continuous music bed (bass + mid).
+    music = (np.sin(2 * np.pi * 90 * t) * music_rms * 0.6
+             + np.sin(2 * np.pi * 220 * t) * music_rms * 0.3
+             + rng.normal(0, music_rms * 0.25, n))
+    speech = np.zeros(n)
+    span = (t >= 0.45) & (t < 2.0)
+    # Whisper-ish: weaker, more mid/high formants than bass.
+    speech[span] = (
+        np.sin(2 * np.pi * 500 * t[span]) * 0.4
+        + np.sin(2 * np.pi * 1400 * t[span]) * 0.4
+        + np.sin(2 * np.pi * 2400 * t[span]) * 0.2
+    ) * speech_peak * np.hanning(span.sum())
+    return np.clip(music + speech, -32768, 32767).astype(np.int16), span
+
+
+def test_cafe_whisper_triggers_low_snr_rescue():
+    noisy, _ = _cafe_whisper()
+    filtered, _ = denoise.high_pass(noisy, RATE)
+    floor = denoise.measure_floor(filtered, RATE)
+    assert denoise.is_low_snr(filtered, RATE, floor=floor, gate_threshold=2.2)
+
+
+def _band_rms(samples, rate, lo_hz, hi_hz, mask=None):
+    """Energy in a frequency band, optionally restricted to a time mask."""
+    x = samples.astype(float)
+    if mask is not None:
+        # Zero outside the mask so the FFT still matches length.
+        x = x.copy()
+        x[~mask] = 0.0
+    spec = np.abs(np.fft.rfft(x))
+    freqs = np.fft.rfftfreq(x.size, 1 / rate)
+    band = (freqs >= lo_hz) & (freqs <= hi_hz)
+    return float(np.sqrt((spec[band] ** 2).mean())) if band.any() else 0.0
+
+
+def test_cafe_whisper_rescue_lifts_speech_band():
+    """Rescue should raise mid-band (whisper) energy vs ordinary gate+peak."""
+    noisy, span = _cafe_whisper(speech_peak=200, music_rms=1200)
+    filtered, _ = denoise.high_pass(noisy, RATE)
+    floor = denoise.measure_floor(filtered, RATE)
+
+    ordinary = denoise.clean(
+        noisy, RATE, gate_threshold=2.2, normalize=True,
+        floor=floor, whisper_rescue=False)
+    rescued = denoise.clean(
+        noisy, RATE, gate_threshold=2.2, normalize=True,
+        floor=floor, whisper_rescue=True)
+
+    # Whisper formants sit ~500–2500 Hz; bass music is lower.
+    mid_ord = _band_rms(ordinary, RATE, 500, 2500, span)
+    mid_res = _band_rms(rescued, RATE, 500, 2500, span)
+    assert mid_res > mid_ord * 1.2, (
+        f"rescue did not lift speech band: ordinary {mid_ord:.0f} "
+        f"vs rescue {mid_res:.0f}")
+
+
+def test_normalize_speech_lifts_under_music_peak():
+    """Global peak norm skips when music is loud; speech norm must still lift."""
+    noisy, span = _cafe_whisper(speech_peak=120, music_rms=4000)
+    # Peak is music-dominated so normalize_peak is a no-op.
+    after_peak = denoise.normalize_peak(noisy)
+    assert int(np.abs(after_peak).max()) >= int(np.abs(noisy).max()) * 0.9
+
+    floor = denoise.measure_floor(noisy.astype(np.float32), RATE)
+    after_speech = denoise.normalize_speech(noisy, RATE, floor=floor)
+    speech_before = _rms(noisy, span)
+    speech_after = _rms(after_speech, span)
+    assert speech_after > speech_before * 1.5, (
+        f"speech norm failed under music: {speech_before:.0f} -> "
+        f"{speech_after:.0f}")

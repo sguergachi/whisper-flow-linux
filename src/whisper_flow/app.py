@@ -5,7 +5,7 @@ from pathlib import Path
 
 from . import audio_debug
 from .audio import AudioRecorder
-from .boost import boost_wav
+from .boost import boost_wav, rescue_wav
 from .config import Config
 from .logging import log, set_logging_enabled
 from .streaming import LiveTranscriber
@@ -38,51 +38,123 @@ class WhisperFlow:
         self.transcription_service = TranscriptionService(self.config)
 
     def _transcribe_allowing_for_a_whisper(self, audio_file: str) -> str | None:
-        """Transcribe, and if nothing comes back, try again louder.
+        """Transcribe, and if nothing comes back, retry louder / café-rescued.
 
-        A whisper reaches the microphone at a peak around 100 out of 32767,
-        and whisper.cpp returns nothing at all rather than a poor guess - so
-        a recording that plainly contains speech transcribes to silence. The
-        audio is there; it is just small.
+        Two blank-transcript causes share this path:
 
-        The retry costs one extra pass, so it happens only here, on the
-        closing transcription, and only when the first attempt produced
-        nothing. A recording with no signal in it is not retried at all.
+        1. Quiet-room whisper (peak ~100): amplify the whole clip.
+        2. Café music + whisper (peak can be high): speech-band rescue on the
+           raw trimmed capture so music peaks no longer starve the voice.
+
+        Retries cost one extra pass each and only run on the closing
+        transcription.
         """
         text = self.transcription_service.transcribe_audio(audio_file)
         if text:
             self._finalize_audio_debug(transcript=text)
             return text
 
+        boost_gain = None
+        boost_text = None
         louder = f"{audio_file}.louder.wav"
         gain = boost_wav(audio_file, louder)
-        if not gain:
-            self._finalize_audio_debug(transcript=text)
-            return text
-        try:
-            retried = self.transcription_service.transcribe_audio(louder)
-            if retried:
-                log(f"[BOOST] {len(retried)} characters recovered at {gain:.0f}x")
-            else:
-                log(f"[BOOST] still nothing after {gain:.0f}x")
+        if gain:
             try:
-                import shutil
-                dest = audio_debug.last_dir(self.config.config_dir)
-                dest.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(louder, dest / "boosted.wav")
-            except Exception:
-                pass
+                boost_text = self.transcription_service.transcribe_audio(louder)
+                boost_gain = gain
+                if boost_text:
+                    log(f"[BOOST] {len(boost_text)} characters recovered "
+                        f"at {gain:.0f}x")
+                    self._copy_debug_wav(louder, "boosted.wav")
+                    self._finalize_audio_debug(
+                        transcript=text,
+                        boost_gain=gain,
+                        boost_transcript=boost_text,
+                    )
+                    return boost_text
+                log(f"[BOOST] still nothing after {gain:.0f}x")
+                self._copy_debug_wav(louder, "boosted.wav")
+            finally:
+                try:
+                    Path(louder).unlink()
+                except Exception:
+                    pass
+
+        # Café / music path: reprocess raw_trimmed (pre-denoise) with the
+        # forced whisper-rescue pipeline. Peak boost often skips here because
+        # the music already hits full scale.
+        rescued_text = self._retry_cafe_rescue(audio_file)
+        if rescued_text:
             self._finalize_audio_debug(
                 transcript=text,
-                boost_gain=gain,
-                boost_transcript=retried,
+                boost_gain=boost_gain,
+                boost_transcript=rescued_text,
             )
-            return retried
-        finally:
+            return rescued_text
+
+        self._finalize_audio_debug(
+            transcript=text,
+            boost_gain=boost_gain,
+            boost_transcript=boost_text or rescued_text,
+        )
+        return boost_text
+
+    def _copy_debug_wav(self, src: str, name: str) -> None:
+        try:
+            import shutil
+            dest = audio_debug.last_dir(self.config.config_dir)
+            dest.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dest / name)
+        except Exception:
+            pass
+
+    def _retry_cafe_rescue(self, audio_file: str) -> str | None:
+        """Blank-retry with speech-band rescue on the raw trimmed capture."""
+        config = getattr(self, "config", None)
+        if config is None:
+            return None
+        try:
+            last = audio_debug.last_dir(config.config_dir)
+            # Prefer raw_trimmed (voice + room, no prior gate). Fall back to
+            # the file Whisper already rejected.
+            source = last / "raw_trimmed.wav"
+            if not source.is_file():
+                source = Path(audio_file)
+            untrimmed = last / "raw_untrimmed.wav"
+            out = f"{audio_file}.rescue.wav"
+            floor = None
             try:
-                Path(louder).unlink()
+                import json
+                meta = json.loads((last / "report.json").read_text(
+                    encoding="utf-8"))
+                floor = (meta.get("raw_untrimmed") or {}).get("floor_rms")
             except Exception:
                 pass
+            gain = rescue_wav(
+                str(source), out,
+                noise_ref_path=str(untrimmed) if untrimmed.is_file() else None,
+                floor=float(floor) if floor else None,
+                gate_threshold=getattr(config, "noise_floor", None),
+            )
+            if not gain:
+                return None
+            try:
+                text = self.transcription_service.transcribe_audio(out)
+                self._copy_debug_wav(out, "rescued.wav")
+                if text:
+                    log(f"[RESCUE] {len(text)} characters recovered "
+                        f"(café/whisper path)")
+                else:
+                    log("[RESCUE] still nothing after speech-band path")
+                return text
+            finally:
+                try:
+                    Path(out).unlink()
+                except Exception:
+                    pass
+        except Exception as e:
+            log(f"[RESCUE] retry failed: {e}")
+            return None
 
     def _finalize_audio_debug(self, **kwargs) -> None:
         """Attach transcript outcome to the last capture folder, if any."""

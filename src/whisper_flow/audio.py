@@ -40,7 +40,7 @@ try:
 except ImportError:
     pyaudio = None
 
-from . import denoise
+from . import audio_debug, denoise
 from .boost import DEAD_PEAK, needs_boost
 from .config import Config
 from .logging import log
@@ -935,6 +935,7 @@ class AudioRecorder:
         # Room tone lives in the leading silence. Capture it before trim.
         floor = None
         noise_ref = None
+        raw_untrimmed = b"".join(frames) if frames else b""
         if self.config.noise_filter and frames:
             floor, noise_ref = self._room_tone_from_frames(frames)
 
@@ -946,6 +947,7 @@ class AudioRecorder:
             frames = self._speedup_audio_frames(frames, self.config.speedup_audio)
 
         audio = b"".join(frames)
+        raw_trimmed = audio
         if self.config.noise_filter and audio:
             # Whole clip, not per chunk. Live passes use prepare_frames with
             # the same light path (no spectral) so they stay in agreement.
@@ -962,6 +964,32 @@ class AudioRecorder:
                 ).tobytes()
             except Exception as e:
                 log(f"[AUDIO] noise filter skipped: {e}")
+
+        # Always snapshot last capture for whisper/noise diagnosis. Bounded:
+        # overwrites audio-debug/last/; blank transcripts also go to fail-*.
+        try:
+            audio_debug.save_capture(
+                self.config.config_dir,
+                rate=self.config.sample_rate,
+                raw_untrimmed=raw_untrimmed,
+                raw_trimmed=raw_trimmed,
+                sent=audio,
+                floor=floor,
+                gate_threshold=getattr(self.config, "noise_floor", None),
+                settings={
+                    "noise_filter": bool(self.config.noise_filter),
+                    "noise_floor": getattr(self.config, "noise_floor", None),
+                    "spectral_denoise": bool(getattr(
+                        self.config, "spectral_denoise", False)),
+                    "trim_silence": bool(self.config.trim_silence),
+                    "vad_mode": getattr(self.config, "vad_mode", None),
+                    "mic_device_index": getattr(
+                        self.config, "mic_device_index", None),
+                },
+                mode=getattr(self, "_debug_mode", "") or "",
+            )
+        except Exception as e:
+            log(f"[AUDIO] audio debug capture skipped: {e}")
 
         with wave.open(output_path, "wb") as wf:
             wf.setnchannels(1)

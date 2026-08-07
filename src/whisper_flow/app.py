@@ -3,6 +3,7 @@
 import os
 from pathlib import Path
 
+from . import audio_debug
 from .audio import AudioRecorder
 from .boost import boost_wav
 from .config import Config
@@ -32,6 +33,8 @@ class WhisperFlow:
         # Initialize components
         self.system_manager = SystemManager(self.config)
         self.audio_recorder = AudioRecorder(self.config, self.system_manager)
+        # Tag captures so audio-debug reports show which mode produced them.
+        self.audio_recorder._debug_mode = mode
         self.transcription_service = TranscriptionService(self.config)
 
     def _transcribe_allowing_for_a_whisper(self, audio_file: str) -> str | None:
@@ -48,11 +51,13 @@ class WhisperFlow:
         """
         text = self.transcription_service.transcribe_audio(audio_file)
         if text:
+            self._finalize_audio_debug(transcript=text)
             return text
 
         louder = f"{audio_file}.louder.wav"
         gain = boost_wav(audio_file, louder)
         if not gain:
+            self._finalize_audio_debug(transcript=text)
             return text
         try:
             retried = self.transcription_service.transcribe_audio(louder)
@@ -60,12 +65,38 @@ class WhisperFlow:
                 log(f"[BOOST] {len(retried)} characters recovered at {gain:.0f}x")
             else:
                 log(f"[BOOST] still nothing after {gain:.0f}x")
+            try:
+                import shutil
+                dest = audio_debug.last_dir(self.config.config_dir)
+                dest.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(louder, dest / "boosted.wav")
+            except Exception:
+                pass
+            self._finalize_audio_debug(
+                transcript=text,
+                boost_gain=gain,
+                boost_transcript=retried,
+            )
             return retried
         finally:
             try:
                 Path(louder).unlink()
             except Exception:
                 pass
+
+    def _finalize_audio_debug(self, **kwargs) -> None:
+        """Attach transcript outcome to the last capture folder, if any."""
+        config = getattr(self, "config", None)
+        if config is None:
+            return
+        try:
+            audio_debug.finalize_capture(
+                config.config_dir,
+                rate=getattr(config, "sample_rate", 16000),
+                **kwargs,
+            )
+        except Exception as e:
+            log(f"[AUDIO-DEBUG] finalize skipped: {e}")
 
     def run_voice_flow_push_to_talk_daemon(self, stop_key: str, stop_event,
                                            level_file: str | None = None,

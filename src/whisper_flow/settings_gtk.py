@@ -1496,19 +1496,22 @@ class SettingsWindow(Adw.ApplicationWindow):
             # user pressed it, so the field looked broken. Click, hold the
             # combination, and the row shows what the daemon will bind.
             #
-            # EntryRow has no subtitle (ActionRow/ComboRow do) - calling
-            # set_subtitle here raised AttributeError and the whole settings
-            # window never opened, so tray → Settings looked dead.
-            row = Adw.EntryRow(title=field.label)
-            row.set_editable(False)
-            # EntryRow has no set_subtitle on many libadwaita builds
+            # The mode description (hold vs tap) lives in field.help; without
+            # it, Auto-transcribe and the spare key looked like empty labels.
+            # Capture hint comes second so the behaviour is what you read first.
+            #
+            # EntryRow has no subtitle on many libadwaita builds
             # (ActionRow/ComboRow do). A bare call raised AttributeError and
             # the whole settings window never opened — tray → Settings looked
             # dead. Prefer subtitle when present; otherwise a tooltip.
+            capture = "Click, then press the keys"
+            hint = (f"{field.help}. {capture}" if field.help else capture)
+            row = Adw.EntryRow(title=field.label)
+            row.set_editable(False)
             if hasattr(row, "set_subtitle"):
-                row.set_subtitle("Click, then press the keys")
+                row.set_subtitle(hint)
             else:
-                row.set_tooltip_text("Click, then press the keys")
+                row.set_tooltip_text(hint)
             self._wire_hotkey_capture(row)
             self._rows[field.key] = row
             return row

@@ -786,7 +786,8 @@ def test_hotkey_rows_guard_set_subtitle_on_entryrow():
 
     An unguarded call raised AttributeError during window construction, so
     tray → Settings never showed a window. Prefer subtitle when present,
-    tooltip otherwise.
+    tooltip otherwise. Mode help (hold vs tap) must ride that path too —
+    without field.help the rows only said "Click, then press the keys".
     """
     source = (Path(__file__).resolve().parents[1]
               / "src/whisper_flow/settings_gtk.py").read_text(encoding="utf-8")
@@ -797,6 +798,7 @@ def test_hotkey_rows_guard_set_subtitle_on_entryrow():
         "EntryRow must not call set_subtitle without checking; that crash "
         "kept the settings window from opening at all")
     assert "set_tooltip_text" in body
+    assert "field.help" in body
 
 
 def test_windows_frost_clears_the_slab_that_hides_acrylic():

@@ -325,18 +325,21 @@ class WhisperFlowDaemon:
             # was otherwise answerable only by copying a failure report.
             pystray.MenuItem(f"WhisperFlow {build_version()}", None,
                              enabled=False),
+            # Labels spell out how each key works: hold vs tap-then-silence.
+            # The spare auto key is not a third mode (command used to call a
+            # cloud model; now it is just a second hands-free binding).
             pystray.MenuItem(
-                f"Transcribe (Push-to-Talk): {self.config.hotkey_transcribe}",
+                f"Push to talk (hold): {self.config.hotkey_transcribe}",
                 None,
                 enabled=False,
             ),
             pystray.MenuItem(
-                f"Auto-Transcribe (Single Press): {self.config.hotkey_auto_transcribe}",
+                f"Auto-transcribe (tap): {self.config.hotkey_auto_transcribe}",
                 None,
                 enabled=False,
             ),
             pystray.MenuItem(
-                f"Command (Single Press): {self.config.hotkey_command}",
+                f"Auto-transcribe 2nd (tap): {self.config.hotkey_command}",
                 None,
                 enabled=False,
             ),
@@ -1494,9 +1497,9 @@ class WhisperFlowDaemon:
 🎤 WhisperFlow Daemon Menu
 
 Hotkeys:
-• {self.config.hotkey_transcribe} - Transcribe (push-to-talk)
-• {self.config.hotkey_auto_transcribe} - Auto-transcribe
-• {self.config.hotkey_command} - Command mode
+• {self.config.hotkey_transcribe} - Push to talk (hold, release to paste)
+• {self.config.hotkey_auto_transcribe} - Auto-transcribe (tap, stop on silence)
+• {self.config.hotkey_command} - Auto-transcribe 2nd (same as auto)
 • Escape - Cancel recording
 
 Status: {"Recording" if self.is_recording else "Idle"}

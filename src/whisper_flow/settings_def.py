@@ -46,13 +46,17 @@ GROUP_HELP = {
     ("Speech", "Engine"):
         "All on this machine.",
     ("Hotkeys", "Shortcuts"):
-        "Join with '+'. Applies on restart.",
+        "Two ways to dictate. Push to talk: hold, speak, release — words paste. "
+        "Auto-transcribe: tap once, speak; recording ends after silence and pastes. "
+        "The second auto key is the same flow (spare shortcut). "
+        "Escape cancels. Click a row, then press the keys. Applies after Save.",
     ("Dictation", "Microphone"):
         "What is recorded.",
     ("Dictation", "While you speak"):
         "As you talk, or at the end.",
     ("Dictation", "Stopping"):
-        "When recording ends itself.",
+        "For Auto-transcribe only: how long quiet must last before it ends, "
+        "and the hard cap so a silent room cannot hang forever.",
     ("General", "Notifications"): "",
     ("General", "Daemon"):
         "Owns hotkeys and tray.",
@@ -79,15 +83,20 @@ FIELDS = (
           group="Engine", advanced=True),
 
     # --------------------------------------------------------------- Hotkeys
+    # Three bindings, two behaviours. Push-to-talk is hold-to-speak.
+    # Auto-transcribe and the spare "command" binding are both single-press
+    # hands-free: tap → speak → silence ends → paste. "Command" used to call
+    # a cloud model; that path is gone, so the second key is an extra auto
+    # shortcut — the label says so rather than inventing a third mode.
     Field("hotkey_transcribe", "WHISPER_FLOW_HOTKEY_TRANSCRIBE",
           "Push to talk", "Hotkeys", group="Shortcuts",
-          help="Hold to talk, release to paste"),
+          help="Hold while speaking, release to paste"),
     Field("hotkey_auto_transcribe", "WHISPER_FLOW_HOTKEY_AUTO_TRANSCRIBE",
           "Auto-transcribe", "Hotkeys", group="Shortcuts",
-          help="Tap once, speak, stops after silence"),
+          help="Tap once, then speak — stops after silence and pastes"),
     Field("hotkey_command", "WHISPER_FLOW_HOTKEY_COMMAND",
-          "Command", "Hotkeys", group="Shortcuts",
-          help="Tap once, speak, stops after silence"),
+          "Auto-transcribe (2nd)", "Hotkeys", group="Shortcuts",
+          help="Same as Auto-transcribe — spare hands-free key"),
 
     # ------------------------------------------------------------- Dictation
     Field("mic_device_index", "MIC_DEVICE_INDEX", "Device",
@@ -131,12 +140,16 @@ FIELDS = (
           group="While you speak", advanced=True),
 
     Field("auto_stop_silence_duration", "WHISPER_FLOW_AUTO_STOP_SILENCE",
-          "Silence stop (s)", "Dictation", "float", 0.5, 10.0,
+          "Silence before stop (s)", "Dictation", "float", 0.5, 10.0,
+          help="Quiet time before Auto-transcribe ends and pastes",
           group="Stopping"),
     Field("silence_timeout", "SILENCE_TIMEOUT", "Silence timeout (s)",
-          "Dictation", "float", 0.1, 30.0, group="Stopping"),
+          "Dictation", "float", 0.1, 30.0,
+          help="Legacy; Auto-transcribe uses Silence before stop",
+          group="Stopping", advanced=True),
     Field("max_recording_duration", "WHISPER_FLOW_MAX_RECORDING_DURATION",
           "Max recording (s)", "Dictation", "float", 60.0, 1800.0,
+          help="Hard cap for any recording (Auto-transcribe included)",
           group="Stopping"),
 
     # --------------------------------------------------------------- General

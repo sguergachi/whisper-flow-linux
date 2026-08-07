@@ -16,7 +16,7 @@ Hold a key, talk, and the words appear in whatever you were typing into.
   machine, through a local whisper.cpp server
 - 🔧 **System Tray**: Background daemon with tray icon and global hotkeys
 - ⌨️ **Global Hotkeys**: Push-to-talk and single-press voice activation
-- 📝 **Multiple Modes**: Transcribe, Auto-Transcribe, and Command modes
+- 📝 **Two dictate styles**: hold (push-to-talk) or tap-and-speak (auto-stop)
 - ⚙️ **Configurable**: Customizable models and settings
 
 ## Windows 11
@@ -128,10 +128,19 @@ cd whisper-flow-linux
 
 ### Global Hotkeys
 
-- **🎤 Transcribe**: `Super+Alt` (hold to talk)
-- **🔴 Auto-Transcribe**: `Ctrl+Alt+Space` (tap, speak, stops on silence)
-- **🤖 Command**: `Ctrl+Super+Alt` (tap, speak, stops on silence)
-- **🛑 Cancel**: `Escape`
+Two behaviours, three shortcuts (the third is a spare of the second):
+
+| Shortcut | Default | How it works |
+|---|---|---|
+| **Push to talk** | `Super+Alt` | Hold while speaking. Release to stop and paste. |
+| **Auto-transcribe** | `Ctrl+Alt+Space` | Tap once, then speak. Ends after silence and pastes. |
+| **Auto-transcribe (2nd)** | `Ctrl+Super+Alt` | Same as Auto-transcribe — extra hands-free key. |
+| **Cancel** | `Escape` | Abort the current recording. |
+
+The mic overlay appears when capture actually starts — that is the “speak now”
+signal. Silence length and the hard recording cap are under **Settings →
+Dictation → Stopping**. Change chords under **Settings → Hotkeys** (click a
+row, press the keys, Save).
 
 ### CLI Commands
 

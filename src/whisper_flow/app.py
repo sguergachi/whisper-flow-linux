@@ -446,9 +446,9 @@ class WhisperFlow:
 
         tests = []
         combos = {
-            "Transcribe": self.config.hotkey_transcribe,
-            "Auto-transcribe": self.config.hotkey_auto_transcribe,
-            "Command": self.config.hotkey_command,
+            "Push to talk (hold)": self.config.hotkey_transcribe,
+            "Auto-transcribe (tap)": self.config.hotkey_auto_transcribe,
+            "Auto-transcribe 2nd (tap)": self.config.hotkey_command,
         }
         for label, combo in combos.items():
             status, message = "pass", combo

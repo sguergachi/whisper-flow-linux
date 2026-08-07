@@ -204,11 +204,16 @@ def status(config_dir: ConfigDirOption = None):
     typer.echo(f"  Auto-stop Silence: {flow_app.config.auto_stop_silence_duration}s")
     typer.echo()
 
-    # Hotkeys
+    # Hotkeys — hold vs tap; spare auto key is not a third mode
     typer.echo("Hotkeys:")
-    typer.echo(f"  🎤 Transcribe: {flow_app.config.hotkey_transcribe}")
-    typer.echo(f"  🔴 Auto-Transcribe: {flow_app.config.hotkey_auto_transcribe}")
-    typer.echo(f"  🤖 Command: {flow_app.config.hotkey_command}")
+    typer.echo(f"  🎤 Push to talk (hold): {flow_app.config.hotkey_transcribe}")
+    typer.echo(
+        f"  🔴 Auto-transcribe (tap, silence): "
+        f"{flow_app.config.hotkey_auto_transcribe}",
+    )
+    typer.echo(
+        f"  🔴 Auto-transcribe 2nd (same): {flow_app.config.hotkey_command}",
+    )
     typer.echo()
 
     # Audio configuration
@@ -242,13 +247,22 @@ def status(config_dir: ConfigDirOption = None):
     typer.echo("  1. Run 'whisper-flow daemon' to start background service")
     typer.echo("  2. Use hotkeys for voice input:")
     typer.echo(
-        f"     • {flow_app.config.hotkey_transcribe}: Push-to-talk transcription",
+        f"     • {flow_app.config.hotkey_transcribe}: "
+        f"Hold while speaking, release to paste",
     )
     typer.echo(
-        f"     • {flow_app.config.hotkey_auto_transcribe}: Auto-stop transcription",
+        f"     • {flow_app.config.hotkey_auto_transcribe}: "
+        f"Tap once, speak; silence ends and pastes",
     )
-    typer.echo(f"     • {flow_app.config.hotkey_command}: Command mode")
+    typer.echo(
+        f"     • {flow_app.config.hotkey_command}: "
+        f"Same as auto-transcribe (spare key)",
+    )
     typer.echo("  3. Press Escape to cancel any recording")
+    typer.echo(
+        "  4. Silence length: Settings → Dictation → Stopping "
+        f"({flow_app.config.auto_stop_silence_duration:g}s)",
+    )
 
 
 @app.command()

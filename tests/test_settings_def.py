@@ -170,3 +170,27 @@ def test_group_help_refers_to_groups_that_exist():
     real = {(f.section, f.group) for f in settings_def.FIELDS}
     assert set(settings_def.GROUP_HELP) <= real
 
+
+def test_hotkey_fields_explain_hold_vs_tap():
+    """Settings used to list Auto-transcribe and Command with the same blank help.
+
+    The labels and help must say how each mode works: hold-to-speak vs
+    tap-then-silence, and that the second auto key is not a third behaviour.
+    """
+    by_key = {f.key: f for f in settings_def.FIELDS}
+    ptt = by_key["hotkey_transcribe"]
+    auto = by_key["hotkey_auto_transcribe"]
+    spare = by_key["hotkey_command"]
+
+    assert "hold" in ptt.help.lower()
+    assert "release" in ptt.help.lower() or "paste" in ptt.help.lower()
+
+    assert "tap" in auto.help.lower()
+    assert "silence" in auto.help.lower()
+
+    assert "same" in spare.help.lower() or "spare" in spare.help.lower()
+    assert "2nd" in spare.label.lower() or "second" in spare.label.lower()
+
+    hotkeys_help = settings_def.GROUP_HELP[("Hotkeys", "Shortcuts")].lower()
+    assert "hold" in hotkeys_help and "tap" in hotkeys_help
+

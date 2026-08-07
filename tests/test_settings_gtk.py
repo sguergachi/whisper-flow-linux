@@ -220,6 +220,9 @@ elif scenario == "prewarm_shows":
     assert not w.get_visible()
     w.show_for_click()
     assert pump(lambda: w.get_visible()), "the window never came up"
+    # Tray click must raise even when the window was already open.
+    w.show_for_click()
+    assert w.get_visible()
 elif scenario == "prewarm_rereads":
     # The .env is written after this window was built, which is the ordinary
     # case for one built at login: the daemon downloads a model or writes a

@@ -426,6 +426,19 @@ def test_the_daemon_takes_the_waiting_window_with_it(daemon):
     assert daemon._setup_process is None
 
 
+def test_tray_exit_tells_settings_to_quit(daemon):
+    """A visible settings window must not outlive tray Exit.
+
+    EOF alone keeps an open window (Save restarts the daemon from it).
+    Exit is intentional app shutdown, so the child gets an explicit quit.
+    """
+    window = _waiting(daemon)
+    daemon.shutdown_settings(quit=True)
+    assert any("quit" in str(chunk) for chunk in window.written), window.written
+    window.stdin.close.assert_called_once()
+    assert daemon._setup_process is None
+
+
 def test_a_headless_machine_builds_nothing_in_advance(daemon, monkeypatch):
     monkeypatch.setattr(sys, "platform", "linux")
     monkeypatch.delenv("DISPLAY", raising=False)

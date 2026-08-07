@@ -907,13 +907,15 @@ class WhisperFlowDaemon:
 
             return self._start_tool_window(flag, module, resident=False)
 
-    def shutdown_settings(self) -> None:
+    def shutdown_settings(self, *, quit: bool = False) -> None:
         """Retire the settings window process when the daemon exits.
 
         Closing stdin is the ordinary path: the child reads end of stream and
-        leaves. It is also the safety net if this is never reached, because
-        the pipe closes when this process dies either way - which is what
-        stops a window built at login from outliving the app it belongs to.
+        leaves if nobody is looking at it. A window that is already open is
+        deliberately kept across a restart (Save restarts the daemon; the
+        settings toast must stay put). Tray Exit is different - the whole app
+        is going away - so ``quit=True`` tells the child to exit even when
+        visible.
         """
         with self._setup_lock:
             process, self._setup_process = self._setup_process, None
@@ -923,12 +925,26 @@ class WhisperFlowDaemon:
             return
         try:
             if process.stdin:
+                if quit:
+                    # Explicit: leave even when the window is on screen.
+                    # Resident children read this; a non-resident has no
+                    # command loop and is killed below if it ignores it.
+                    try:
+                        process.stdin.write("quit\n")
+                        process.stdin.flush()
+                    except Exception:
+                        pass
                 process.stdin.close()
         except Exception:
             pass
         try:
-            process.wait(timeout=3)
+            process.wait(timeout=2 if quit else 3)
         except Exception:
+            try:
+                process.kill()
+            except Exception:
+                pass
+        if quit and process.poll() is None:
             try:
                 process.kill()
             except Exception:
@@ -1401,12 +1417,18 @@ class WhisperFlowDaemon:
         return "\n".join(lines)
 
     def stop_daemon(self, icon=None, item=None):
-        """Stop the daemon."""
+        """Stop the daemon and take the settings window with it."""
         log("[DAEMON] Stop daemon requested")
         try:
             self.notify("👋 WhisperFlow daemon stopping...")
         except Exception:
             pass
+        # Before the tray loop ends: a visible settings window would otherwise
+        # outlive Exit (EOF on its pipe is treated as "restart, stay put").
+        try:
+            self.shutdown_settings(quit=True)
+        except Exception as e:
+            log(f"[DAEMON] could not close settings on Exit: {e}")
         self.is_running = False
         if self.tray_icon:
             self.tray_icon.stop()

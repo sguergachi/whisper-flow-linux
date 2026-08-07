@@ -685,8 +685,55 @@ class SettingsWindow(Adw.ApplicationWindow):
         self._show_t0 = at or time.time()
         if not self.get_visible() and not self._working:
             self._reload_from_disk()
-        self.present()
+        self._raise_to_front()
         return False                    # idle_add: run once
+
+    def _raise_to_front(self) -> None:
+        """Map, unminimize and take focus after a tray click.
+
+        ``present()`` alone maps a hidden window but does not reliably pull
+        an already-open one forward when the click came from another process
+        (the tray). A second present after the surface exists, plus a
+        platform raise on Windows, is what makes Settings come to the front.
+        """
+        try:
+            if bool(self.get_property("minimized")):
+                self.unminimize()
+        except Exception:
+            pass
+        self.set_visible(True)
+        self.present()
+        GLib.idle_add(self._finish_raise)
+
+    def _finish_raise(self) -> bool:
+        try:
+            self.present()
+            if sys.platform == "win32":
+                self._raise_win32_foreground()
+        except Exception as e:
+            log(f"[SETTINGS] could not raise the window: {e}")
+        return False
+
+    def _raise_win32_foreground(self) -> None:
+        """Ask Windows to put this HWND in front after a tray click."""
+        try:
+            from . import blur_win
+            surface = self.get_surface()
+            if surface is None:
+                return
+            hwnd = blur_win.surface_handle(_gobject_pointer(surface))
+            if not hwnd:
+                return
+            import ctypes
+            from ctypes import wintypes
+            user32 = ctypes.windll.user32
+            user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+            user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+            SW_RESTORE = 9
+            user32.ShowWindow(wintypes.HWND(hwnd), SW_RESTORE)
+            user32.SetForegroundWindow(wintypes.HWND(hwnd))
+        except Exception as e:
+            log(f"[SETTINGS] Win32 raise failed: {e}")
 
     def _watch_the_daemon(self) -> bool:
         """Follow what the daemon does while this window is open.
@@ -2006,16 +2053,26 @@ def _retire_if_unseen(window: "SettingsWindow") -> bool:
     icon and nothing on screen, from being stranded as an invisible process
     after the app it belongs to has quit.
 
-    A window that is up is a different thing entirely. The commonest way for
-    the daemon to go is the Restart button on this very window, and taking
-    the window away as the button is pressed is not a restart, it is the
-    settings vanishing mid-sentence. So it stops being the daemon's and
-    becomes an ordinary window: no more orders, and it exits when it is
-    closed, exactly as one opened before any of this existed did.
+    A window that is up is a different thing entirely. Save restarts the
+    daemon from this very window; taking the window away mid-toast would
+    look like a freeze. So EOF alone keeps a visible window until the user
+    closes it. Tray Exit is not EOF: it writes the ``quit`` command first.
     """
     if window.get_visible():
         log("[SETTINGS] the daemon has gone; this window stays until closed")
         return False
+    os._exit(0)
+
+
+def _quit_settings(window: "SettingsWindow") -> bool:
+    """Exit because the tray (or parent) asked, even if the window is open."""
+    log("[SETTINGS] quit requested")
+    try:
+        app = window.get_application()
+        if app is not None:
+            app.quit()
+    except Exception:
+        pass
     os._exit(0)
 
 
@@ -2030,7 +2087,8 @@ def _command_loop(window: "SettingsWindow") -> None:
                 at = time.time()
                 GLib.idle_add(window.show_for_click, at)
             elif command == "quit":
-                os._exit(0)
+                GLib.idle_add(_quit_settings, window)
+                return
     except Exception:
         pass
     # Asked on the main loop, because that is the thread that knows whether

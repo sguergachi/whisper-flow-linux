@@ -77,12 +77,12 @@ def test_stricter_gate_multiplier_quiets_pauses_more(recording):
         f"{quiet_strict:.0f}")
 
 
-def test_whisper_mode_uses_shallower_gate_floor():
-    """Rescue path ducks pauses less hard so soft speech survives."""
+def test_whisper_mode_ducks_pauses_harder():
+    """Whisper path ducks the room more so speech-lift does not raise the bed."""
     assert denoise.gate_floor_db(False) == pytest.approx(denoise.GATE_FLOOR_DB)
     assert denoise.gate_floor_db(True) == pytest.approx(
         denoise.WHISPER_GATE_FLOOR_DB)
-    assert denoise.gate_floor_db(True) > denoise.gate_floor_db(False)
+    assert denoise.gate_floor_db(True) < denoise.gate_floor_db(False)
 
 
 def test_the_offset_and_the_rumble_go(recording):
@@ -306,6 +306,27 @@ def test_cafe_whisper_triggers_low_snr_rescue():
     filtered, _ = denoise.high_pass(noisy, RATE)
     floor = denoise.measure_floor(filtered, RATE)
     assert denoise.is_low_snr(filtered, RATE, floor=floor, gate_threshold=2.2)
+
+
+def test_quiet_whisper_detected_by_speech_p90_not_peak_spike():
+    """Windows log case: peak SNR high, speech p90 tiny — is_whisper True."""
+    rng = np.random.default_rng(9)
+    n = RATE * 3
+    # Quiet room + soft speech bursts + one loud click (fake peak).
+    audio = rng.normal(0, 40, n)
+    t = np.arange(n) / RATE
+    for start in (0.5, 1.4, 2.2):
+        span = (t >= start) & (t < start + 0.35)
+        audio[span] += np.sin(2 * np.pi * 1800 * t[span]) * 120  # whisper-ish
+    audio[int(0.1 * RATE)] = 5000  # spike → high peak SNR
+    samples = np.clip(audio, -32768, 32767).astype(np.int16)
+    prof = denoise.profile_signal(samples, RATE)
+    assert prof.is_whisper, (
+        f"expected whisper: p90={prof.speech_p90:.0f} peak_snr={prof.snr_db:.0f} "
+        f"speech_snr={prof.speech_snr_db:.0f}")
+    plan = denoise.plan_filters(prof, live=False)
+    assert plan.speech_norm and plan.gate
+    assert plan.speech_norm_max_gain >= denoise.WHISPER_SPEECH_NORM_MAX_GAIN * 0.9
 
 
 def test_plan_enables_filters_from_signal():

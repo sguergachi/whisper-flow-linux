@@ -56,8 +56,8 @@ SPECTRAL_MAX_ATTEN_DB = 18.0  # never carve a bin quieter than this below input
 # Café music + whisper typically lands 0–10 dB; normal speech is 15–30+.
 LOW_SNR_DB = 11.0
 # Gate that will not bury a whisper under music (configured 2.2× would).
-WHISPER_GATE_MULT = 1.2
-WHISPER_GATE_FLOOR_DB = -8.0
+WHISPER_GATE_MULT = 1.15     # open on soft speech (2.2× misses whispers)
+WHISPER_GATE_FLOOR_DB = -18.0  # duck room hard between syllables before lift
 # Cut more bass than the ordinary 80 Hz path: music energy and HVAC sit
 # below here, while whispered consonants live above.
 SPEECH_BAND_HPF_HZ = 180.0
@@ -66,11 +66,14 @@ PREEMPH_COEFF = 0.95
 # Milder spectral cut when music is non-stationary (less "musical noise").
 RESCUE_SPECTRAL_OVERSUB = 0.75
 RESCUE_SPECTRAL_MAX_ATTEN_DB = 12.0
-# Normalise targets. Gains are deliberately modest: real Windows logs showed
-# peak-norm 5–20× on quiet clips turning room noise into full-scale audio
-# that Whisper labels ``*sad music*`` or invents words for.
+# Normalise targets. Global peak-norm stays modest. Whisper path may lift
+# *speech frames* harder after a soft gate (see WHISPER_* gains).
 SPEECH_NORM_TARGET = 0.65
 SPEECH_NORM_MAX_GAIN = 8.0
+# Quiet-whisper: gate ducks room first, then lift voiced frames so Whisper
+# hears consonants instead of inventing ``*sad music*`` on the bed.
+WHISPER_SPEECH_NORM_TARGET = 0.55
+WHISPER_SPEECH_NORM_MAX_GAIN = 40.0
 NORM_TARGET_PEAK = 0.70
 NORM_MAX_GAIN = 6.0
 # Leave headroom so speech-norm never rails int16 (clipping → garbage decode).
@@ -85,12 +88,17 @@ FLOOR_SPEECH_BAND = 400.0
 FLOOR_SPECTRAL = 350.0          # room energy worth peeling
 FLOOR_GATE = 80.0               # skip gate in near-silent rooms
 SNR_MILD_DB = 14.0              # below this, prefer speech-aware path
-SNR_CLEAN_DB = 20.0             # high SNR + quiet floor → light plan
-PEAK_USABLE = 1500.0            # already loud enough; do not peak-norm
-PEAK_QUIET = 800.0              # only below this consider gain
+SNR_CLEAN_DB = 20.0             # high speech-p90 SNR + usable level → light plan
+# Speech level (p90 of frames above a soft line), not abs peak — a single
+# spike made Windows logs report snr≈31dB while speech p90 was ~130 (whisper).
+SPEECH_P90_USABLE = 1200.0      # normal talking
+SPEECH_P90_WHISPER = 500.0      # quiet / whispered speech
+PEAK_USABLE = 1500.0
+PEAK_QUIET = 800.0
 # Second pass: first output still not good enough for Whisper.
 SECOND_PASS_SNR_DB = 12.0
 SECOND_PASS_PEAK = 1200.0
+SECOND_PASS_SPEECH_P90 = 800.0
 
 
 @dataclass(frozen=True)
@@ -106,6 +114,8 @@ class VoicePlan:
     preemph: bool = False
     speech_norm: bool = False       # else peak_norm when normalize
     normalize: bool = True
+    speech_norm_target: float = SPEECH_NORM_TARGET
+    speech_norm_max_gain: float = SPEECH_NORM_MAX_GAIN
     pass_index: int = 1
     # Why this plan (for logs / debug).
     reason: str = ""
@@ -114,10 +124,14 @@ class VoicePlan:
 @dataclass(frozen=True)
 class SignalProfile:
     floor: float
-    snr_db: float
+    snr_db: float           # peak-frame SNR (can be spiky)
+    speech_snr_db: float    # p90-of-voiced vs floor — real speech loudness
     peak: float
+    speech_p90: float       # RMS of voiced-ish frames
+    voiced_frac: float      # fraction of frames above soft speech line
     bass_ratio: float
     low_snr: bool
+    is_whisper: bool        # quiet voice that needs gate-then-lift
 
 
 def high_pass(samples: np.ndarray, rate: int, state=None, cutoff_hz: float = HIGHPASS_HZ):
@@ -537,22 +551,69 @@ def bass_ratio(samples: np.ndarray, rate: int) -> float:
 
 def profile_signal(samples: np.ndarray, rate: int,
                    floor: float | None = None) -> SignalProfile:
-    """Measure what the clip needs before choosing filters."""
+    """Measure what the clip needs before choosing filters.
+
+    Uses speech-frame p90 (not abs peak) so a single spike cannot make a
+    whisper look like loud clean speech (Windows log: peak SNR 31 dB while
+    speech p90 was ~130 — Whisper returned ``*sad music*``).
+    """
+    empty = SignalProfile(0.0, 99.0, 99.0, 0.0, 0.0, 0.0, 0.0, False, False)
     if samples.size == 0:
-        return SignalProfile(0.0, 99.0, 0.0, 0.0, False)
+        return empty
     base, _ = high_pass(samples, rate)
     use_floor = float(floor) if floor is not None and floor > 0 else measure_floor(
         base, rate)
     snr = estimate_snr_db(base, rate, floor=use_floor)
     peak = float(np.abs(samples.astype(np.float32)).max())
     bass = bass_ratio(base, rate)
-    low = is_low_snr(base, rate, floor=use_floor) or snr < LOW_SNR_DB
+
+    frame = max(1, int(rate * GATE_FRAME_MS / 1000))
+    levels, _ = _frame_levels(base, rate, frame)
+    if levels.size == 0:
+        return SignalProfile(
+            use_floor, snr, snr, peak, 0.0, 0.0, bass, snr < LOW_SNR_DB, False)
+
+    # Soft line for "maybe voice" — below hard GATE_THRESHOLD so whispers count.
+    soft_line = max(use_floor * 1.25, use_floor + 8.0) if use_floor > 0 else 30.0
+    voiced = levels > soft_line
+    voiced_frac = float(voiced.mean())
+    if voiced.any():
+        speech_p90 = float(np.percentile(levels[voiced], 90))
+    else:
+        speech_p90 = float(np.percentile(levels, 90))
+    if use_floor > 1e-6:
+        speech_snr = float(20.0 * np.log10(max(speech_p90, 1e-3) / use_floor))
+    else:
+        speech_snr = 99.0
+
+    low = (is_low_snr(base, rate, floor=use_floor)
+           or snr < LOW_SNR_DB
+           or speech_snr < LOW_SNR_DB)
+
+    # Quiet voice with real activity — needs gate-then-lift, not "clean/no-gain".
+    is_whisper = (
+        peak > NORM_DEAD_PEAK * 2
+        and voiced_frac >= 0.06
+        and speech_p90 < SPEECH_P90_WHISPER
+        and speech_p90 > NORM_DEAD_PEAK
+    ) or (
+        # Whisper under elevated floor: speech barely clears room.
+        use_floor >= 80
+        and speech_p90 < max(SPEECH_P90_WHISPER, use_floor * 2.5)
+        and voiced_frac >= 0.05
+        and peak > NORM_DEAD_PEAK * 2
+    )
+
     return SignalProfile(
         floor=use_floor,
         snr_db=snr,
+        speech_snr_db=speech_snr,
         peak=peak,
+        speech_p90=speech_p90,
+        voiced_frac=voiced_frac,
         bass_ratio=bass,
         low_snr=low,
+        is_whisper=is_whisper,
     )
 
 
@@ -561,24 +622,25 @@ def plan_filters(profile: SignalProfile, *, live: bool = False,
                  pass_index: int = 1) -> VoicePlan:
     """Turn a signal profile into which filters to enable.
 
-    Conservative by default: a clean quiet room with usable peak gets rumble
-    HPF only. Aggressive steps need *evidence* (low SNR and/or loud floor),
-    not a high bass% alone — that misfired on quiet Windows captures and
-    peak-norm then invented ``*sad music*``.
+    Quiet-whisper (low speech_p90, some voiced frames) always gets gate +
+    speech-frame lift — that is the path that makes Whisper hear the voice
+    instead of tagging the room as music.
     """
     rescue = force_rescue if force_rescue is not None else profile.low_snr
-    clean = (not rescue
-             and profile.snr_db >= SNR_CLEAN_DB
+    whisper = profile.is_whisper or (force_rescue is True and profile.speech_p90 < SPEECH_P90_USABLE)
+    # Truly clean: normal speech level, good speech-SNR, not a whisper.
+    clean = (not rescue and not whisper
+             and profile.speech_snr_db >= SNR_CLEAN_DB
+             and profile.speech_p90 >= SPEECH_P90_USABLE
              and profile.floor < FLOOR_SPECTRAL)
     reasons = []
 
-    # Speech-band only with loud room bass or confirmed low-SNR rescue.
-    want_speech_band = rescue or (
-        profile.bass_ratio >= BASS_RATIO_SPEECH_BAND
-        and profile.floor >= FLOOR_SPEECH_BAND
-    ) or (
-        profile.bass_ratio >= BASS_RATIO_STRONG
-        and profile.snr_db < SNR_MILD_DB
+    want_speech_band = (
+        whisper or rescue
+        or (profile.bass_ratio >= BASS_RATIO_SPEECH_BAND
+            and profile.floor >= FLOOR_SPEECH_BAND)
+        or (profile.bass_ratio >= BASS_RATIO_STRONG
+            and profile.speech_snr_db < SNR_MILD_DB)
     )
     hpf = SPEECH_BAND_HPF_HZ if want_speech_band else HIGHPASS_HZ
     reasons.append(
@@ -598,40 +660,50 @@ def plan_filters(profile: SignalProfile, *, live: bool = False,
             oversub = min(1.05, oversub + 0.15)
             atten = min(16.0, atten + 2.0)
             reasons.append("spectral+")
-    # Live ordinary path: skip spectral unless rescue — keeps LocalAgreement cheap.
-    if live and not rescue:
+    if live and not rescue and not whisper:
         spectral = False
         reasons = [r for r in reasons if not r.startswith("spectral")]
 
-    # Gate only when there is measurable room or we are rescuing. Clean
-    # quiet rooms: leave the waveform alone.
-    gate_on = (not clean) and (
-        profile.floor >= FLOOR_GATE or rescue or profile.snr_db < SNR_MILD_DB)
-    whisper_gate = bool(rescue or profile.snr_db < LOW_SNR_DB + 2)
+    # Whisper always gates (duck room between syllables) then lifts speech.
+    gate_on = whisper or rescue or (
+        not clean and (
+            profile.floor >= FLOOR_GATE
+            or profile.speech_snr_db < SNR_MILD_DB))
+    whisper_gate = bool(whisper or rescue or profile.speech_snr_db < LOW_SNR_DB + 2)
     if gate_on:
         reasons.append("soft-gate" if whisper_gate else "gate")
 
-    preemph = bool(rescue)
+    preemph = bool(whisper or rescue)
     if preemph:
         reasons.append("preemph")
 
-    # Gain: never on a clean usable peak. Quiet peaks get modest peak-norm;
-    # low-SNR / loud-floor get speech-norm (capped).
-    speech_norm = bool(rescue or (
-        profile.snr_db < SNR_MILD_DB and profile.floor >= FLOOR_SPECTRAL * 0.5))
+    speech_norm = bool(whisper or rescue or (
+        profile.speech_snr_db < SNR_MILD_DB
+        and profile.floor >= FLOOR_SPECTRAL * 0.5))
     need_norm = False
-    if profile.peak < PEAK_QUIET and not clean:
+    norm_target = SPEECH_NORM_TARGET
+    norm_gain = SPEECH_NORM_MAX_GAIN
+    if whisper:
         need_norm = True
-    elif speech_norm and profile.peak < PEAK_USABLE * 4:
+        speech_norm = True
+        norm_target = WHISPER_SPEECH_NORM_TARGET
+        norm_gain = WHISPER_SPEECH_NORM_MAX_GAIN
+        reasons.append(f"whisper-lift (p90={profile.speech_p90:.0f})")
+    elif speech_norm and profile.speech_p90 < SPEECH_P90_USABLE * 2:
         need_norm = True
-    elif profile.peak < PEAK_USABLE and profile.snr_db < SNR_CLEAN_DB:
+        reasons.append("speech-norm")
+    elif profile.speech_p90 < PEAK_QUIET and not clean:
         need_norm = True
-    if need_norm:
-        reasons.append("speech-norm" if speech_norm else "peak-norm")
+        reasons.append("peak-norm")
+    elif profile.peak < PEAK_USABLE and profile.speech_snr_db < SNR_CLEAN_DB:
+        need_norm = True
+        reasons.append("peak-norm")
     else:
         reasons.append("no-gain")
 
-    if rescue:
+    if whisper:
+        reasons.insert(0, "quiet-whisper")
+    elif rescue:
         reasons.insert(0, "low-SNR")
     if clean:
         reasons.insert(0, "clean")
@@ -646,54 +718,59 @@ def plan_filters(profile: SignalProfile, *, live: bool = False,
         preemph=preemph,
         speech_norm=speech_norm,
         normalize=need_norm,
+        speech_norm_target=norm_target,
+        speech_norm_max_gain=norm_gain,
         pass_index=pass_index,
         reason=", ".join(reasons) or "passthrough",
     )
 
 
 def escalate_plan(plan: VoicePlan, profile: SignalProfile) -> VoicePlan:
-    """Stronger plan for an audio-domain second pass."""
+    """Stronger plan for an audio-domain second pass (usually quiet-whisper)."""
     return replace(
         plan,
         hpf_hz=max(plan.hpf_hz, SPEECH_BAND_HPF_HZ),
-        spectral=True,
-        spectral_oversub=min(1.2, max(plan.spectral_oversub, RESCUE_SPECTRAL_OVERSUB) + 0.15),
-        spectral_max_atten_db=min(20.0, max(plan.spectral_max_atten_db,
-                                            RESCUE_SPECTRAL_MAX_ATTEN_DB) + 4.0),
+        spectral=plan.spectral or profile.floor >= FLOOR_SPECTRAL * 0.5,
+        spectral_oversub=min(1.1, max(plan.spectral_oversub, RESCUE_SPECTRAL_OVERSUB) + 0.1),
+        spectral_max_atten_db=min(18.0, max(plan.spectral_max_atten_db,
+                                            RESCUE_SPECTRAL_MAX_ATTEN_DB) + 2.0),
         gate=True,
         whisper_gate=True,
         preemph=True,
         speech_norm=True,
         normalize=True,
+        speech_norm_target=WHISPER_SPEECH_NORM_TARGET,
+        speech_norm_max_gain=WHISPER_SPEECH_NORM_MAX_GAIN,
         pass_index=2,
-        reason=(plan.reason + " → 2nd: full rescue"),
+        reason=(plan.reason + " → 2nd: whisper-lift"),
     )
 
 
 def needs_second_pass(original: np.ndarray, first: np.ndarray, rate: int,
                       first_plan: VoicePlan,
                       floor: float | None) -> bool:
-    """Whether the first enhance left a clip still risky for Whisper.
-
-    Does *not* second-pass clean high-SNR quiet rooms — that path used to
-    escalate into over-gain. Only escalate when input was actually hard.
-    """
+    """Escalate when pass 1 left speech too quiet for Whisper."""
     if first_plan.pass_index >= 2:
         return False
     if first.size == 0:
         return True
     in_prof = profile_signal(original, rate, floor=floor)
-    # Clean usable input: trust pass 1 (usually near-passthrough).
-    if (in_prof.snr_db >= SNR_CLEAN_DB and in_prof.floor < FLOOR_SPECTRAL
-            and not in_prof.low_snr):
-        return False
     out_prof = profile_signal(first, rate, floor=floor)
-    # Still buried after pass 1 on a hard clip.
-    if in_prof.low_snr and out_prof.snr_db < SECOND_PASS_SNR_DB:
+
+    # Normal talking already loud enough — stop.
+    if (not in_prof.is_whisper and not in_prof.low_snr
+            and in_prof.speech_p90 >= SPEECH_P90_USABLE
+            and in_prof.speech_snr_db >= SNR_CLEAN_DB):
+        return False
+
+    # Whisper still too quiet after pass 1 (or pass 1 never lifted).
+    if in_prof.is_whisper and out_prof.speech_p90 < SECOND_PASS_SPEECH_P90:
         return True
-    if in_prof.floor >= FLOOR_SPECTRAL and out_prof.peak < SECOND_PASS_PEAK:
+    if in_prof.is_whisper and not first_plan.speech_norm:
         return True
-    if in_prof.low_snr and not first_plan.whisper_gate:
+    if in_prof.low_snr and out_prof.speech_snr_db < SECOND_PASS_SNR_DB:
+        return True
+    if in_prof.floor >= FLOOR_SPECTRAL and out_prof.speech_p90 < SECOND_PASS_SPEECH_P90:
         return True
     return False
 
@@ -701,7 +778,11 @@ def needs_second_pass(original: np.ndarray, first: np.ndarray, rate: int,
 def apply_plan(samples: np.ndarray, rate: int, plan: VoicePlan, *,
                floor: float | None = None,
                noise_ref: np.ndarray | None = None) -> np.ndarray:
-    """Run only the filters the plan enabled."""
+    """Run only the filters the plan enabled.
+
+    Order matters for whisper: gate ducks the room *before* speech-frame
+    gain so we amplify voice, not the bed Whisper called music.
+    """
     if samples.size == 0:
         return samples
 
@@ -731,7 +812,11 @@ def apply_plan(samples: np.ndarray, rate: int, plan: VoicePlan, *,
 
     if plan.normalize:
         if plan.speech_norm:
-            return normalize_speech(filtered, rate, floor=use_floor)
+            return normalize_speech(
+                filtered, rate, floor=use_floor,
+                target=plan.speech_norm_target,
+                max_gain=plan.speech_norm_max_gain,
+            )
         return normalize_peak(filtered)
     return np.clip(filtered, -32768, 32767).astype(np.int16)
 
@@ -754,8 +839,10 @@ def enhance(samples: np.ndarray, rate: int, *,
                         pass_index=1)
     try:
         from .logging import log
-        log(f"[VOICE] pass1 snr≈{profile.snr_db:.0f}dB floor={profile.floor:.0f} "
-            f"bass={profile.bass_ratio:.0%} → {plan.reason}")
+        log(f"[VOICE] pass1 peak_snr≈{profile.snr_db:.0f}dB "
+            f"speech_snr≈{profile.speech_snr_db:.0f}dB "
+            f"p90={profile.speech_p90:.0f} voiced={profile.voiced_frac:.0%} "
+            f"floor={profile.floor:.0f} → {plan.reason}")
     except Exception:
         pass
 
@@ -775,6 +862,23 @@ def enhance(samples: np.ndarray, rate: int, *,
         out = apply_plan(samples, rate, plan2, floor=profile.floor,
                          noise_ref=noise_ref)
     return out
+
+
+def whisper_lift_plan() -> VoicePlan:
+    """Fixed plan for blank/*music* retry: gate room, lift quiet voice hard."""
+    return VoicePlan(
+        hpf_hz=SPEECH_BAND_HPF_HZ,
+        spectral=False,
+        gate=True,
+        whisper_gate=True,
+        preemph=True,
+        speech_norm=True,
+        normalize=True,
+        speech_norm_target=WHISPER_SPEECH_NORM_TARGET,
+        speech_norm_max_gain=WHISPER_SPEECH_NORM_MAX_GAIN,
+        pass_index=1,
+        reason="whisper-lift-retry",
+    )
 
 
 def clean(samples: np.ndarray, rate: int, gated: bool = True,

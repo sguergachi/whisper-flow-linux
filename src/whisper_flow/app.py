@@ -54,13 +54,12 @@ class WhisperFlow:
             self._finalize_audio_debug(transcript=text)
             return text
 
-        # First decode blank or hallucination (*sad music*, etc.). Prefer a
-        # milder re-send of raw audio before heavy boost/rescue — over-gain
-        # is what produced those tags on quiet Windows clips.
-        mild = self._retry_mild_raw(audio_file)
-        if mild:
-            self._finalize_audio_debug(transcript=text, boost_transcript=mild)
-            return mild
+        # Blank / *sad music* means Whisper never heard the voice. Lift the
+        # quiet speech (gate room → amplify voiced frames) before raw boost.
+        lifted = self._retry_whisper_lift(audio_file)
+        if lifted:
+            self._finalize_audio_debug(transcript=text, boost_transcript=lifted)
+            return lifted
 
         boost_gain = None
         boost_text = None
@@ -88,7 +87,6 @@ class WhisperFlow:
                 except Exception:
                     pass
 
-        # Café / music path: reprocess raw_trimmed with forced rescue.
         rescued_text = self._retry_cafe_rescue(audio_file)
         if rescued_text:
             self._finalize_audio_debug(
@@ -105,14 +103,17 @@ class WhisperFlow:
         )
         return boost_text
 
-    def _retry_mild_raw(self, audio_file: str) -> str | None:
-        """Re-transcribe lightly processed (or raw) audio after a bad decode.
+    def _retry_whisper_lift(self, audio_file: str) -> str | None:
+        """Gate the room, then lift quiet speech — for missed whispers.
 
-        Uses raw_trimmed from audio-debug with only rumble HPF + modest
-        peak lift — no speech-band, no heavy gate, no 20× gain.
+        ``*sad music*`` is Whisper labelling the bed because the voice never
+        reached a usable level. Raw peak-boost makes that worse; this path
+        ducks non-speech first so gain hits the whisper, not the room.
         """
         config = getattr(self, "config", None)
         if config is None:
+            return None
+        if not bool(getattr(config, "smart_voice_amplification", True)):
             return None
         try:
             import numpy as np
@@ -123,37 +124,39 @@ class WhisperFlow:
             source = last / "raw_trimmed.wav"
             if not source.is_file():
                 source = Path(audio_file)
+            untrimmed = last / "raw_untrimmed.wav"
             with _wave.open(str(source), "rb") as wf:
                 rate = wf.getframerate()
                 pcm = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16)
             if pcm.size == 0:
                 return None
-            # Light plan only: rumble HPF + optional tiny peak lift.
-            mild = denoise_mod.apply_plan(
-                pcm, rate,
-                denoise_mod.VoicePlan(
-                    hpf_hz=denoise_mod.HIGHPASS_HZ,
-                    spectral=False,
-                    gate=False,
-                    whisper_gate=False,
-                    preemph=False,
-                    speech_norm=False,
-                    normalize=True,
-                    pass_index=1,
-                    reason="mild-retry",
-                ),
+            floor = None
+            noise_ref = None
+            try:
+                raw_path = untrimmed if untrimmed.is_file() else source
+                with _wave.open(str(raw_path), "rb") as wf:
+                    raw = np.frombuffer(wf.readframes(wf.getnframes()),
+                                        dtype=np.int16)
+                hp, _ = denoise_mod.high_pass(raw, rate)
+                floor = denoise_mod.measure_floor(hp, rate)
+                noise_ref = denoise_mod.noise_reference(hp, rate, floor=floor)
+            except Exception:
+                pass
+            lifted = denoise_mod.apply_plan(
+                pcm, rate, denoise_mod.whisper_lift_plan(),
+                floor=floor, noise_ref=noise_ref,
             )
-            out = f"{audio_file}.mild.wav"
+            out = f"{audio_file}.whisper.wav"
             with _wave.open(out, "wb") as wf:
                 wf.setnchannels(1)
                 wf.setsampwidth(2)
                 wf.setframerate(rate)
-                wf.writeframes(mild.tobytes())
+                wf.writeframes(lifted.tobytes())
             try:
                 text = self.transcription_service.transcribe_audio(out)
-                self._copy_debug_wav(out, "mild.wav")
+                self._copy_debug_wav(out, "whisper_lift.wav")
                 if text:
-                    log(f"[VOICE] mild retry recovered {len(text)} chars")
+                    log(f"[VOICE] whisper-lift recovered {len(text)} chars")
                 return text
             finally:
                 try:
@@ -161,7 +164,7 @@ class WhisperFlow:
                 except Exception:
                     pass
         except Exception as e:
-            log(f"[VOICE] mild retry failed: {e}")
+            log(f"[VOICE] whisper-lift retry failed: {e}")
             return None
 
     def _copy_debug_wav(self, src: str, name: str) -> None:

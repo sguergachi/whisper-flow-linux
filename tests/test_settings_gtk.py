@@ -453,17 +453,16 @@ elif scenario == "mic_meter":
 
     w.present()
     assert pump(lambda: w.get_visible()), "window never became visible"
-    # Visible alone must not open the microphone.
-    with w._mic_meter_lock:
-        w._mic_drawn_level = 0.42
-    assert w._tick_mic_meter() is True
-    assert w._mic_meter.get_value() == 0.0
+    # Visible alone must not open the microphone or arm the paint timer.
+    assert not w._mic_meter_active
+    assert w._mic_meter_tick_id == 0
     with w._mic_meter_lock:
         assert w._mic_want_device == settings_gtk._MIC_METER_OFF, (
             "opening settings listened without pressing Test")
 
     w._start_mic_test()
     assert w._mic_test_button.get_label() == "Stop"
+    assert w._mic_meter_tick_id != 0
     with w._mic_meter_lock:
         w._mic_drawn_level = 0.42
     assert w._tick_mic_meter() is True
@@ -474,6 +473,7 @@ elif scenario == "mic_meter":
 
     w._stop_mic_test()
     assert w._mic_test_button.get_label() == "Test"
+    assert w._mic_meter_tick_id == 0
     assert w._mic_meter.get_value() == 0.0
     with w._mic_meter_lock:
         assert w._mic_want_device == settings_gtk._MIC_METER_OFF
@@ -481,9 +481,10 @@ elif scenario == "mic_meter":
     # A Test left running is cancelled when the window goes away.
     w._start_mic_test()
     w.set_visible(False)
-    assert w._tick_mic_meter() is True
-    assert w._mic_meter.get_value() == 0.0
+    # notify::visible calls _stop_mic_test; tick disarms if anything remains.
     assert not w._mic_meter_active
+    assert w._mic_meter_tick_id == 0
+    assert w._mic_meter.get_value() == 0.0
     with w._mic_meter_lock:
         assert w._mic_want_device == settings_gtk._MIC_METER_OFF, (
             "hiding the window left the capture stream requested")

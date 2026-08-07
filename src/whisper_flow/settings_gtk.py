@@ -586,12 +586,21 @@ class SettingsWindow(Adw.ApplicationWindow):
         _mark("config and backend read")
         self._working = False
         self._rows: dict[str, Gtk.Widget] = {}
+        # Stable ViewStack children that hold each PreferencesPage. Speech is
+        # rebuilt in place inside its host so tab order never changes and the
+        # stack never reparents Hotkeys/Dictation/General mid-session (that
+        # path access-violates on Windows once those pages have been shown).
+        self._page_hosts: dict[str, Gtk.Box] = {}
         self._mic_display: dict[str, str] = {}
         self._mic_meter: Gtk.LevelBar | None = None
         self._mic_test_button: Gtk.Button | None = None
         # Only True while the user has pressed Test. The meter never opens
         # the microphone just because settings is on screen.
         self._mic_meter_active = False
+        # GLib source id for the LevelBar paint timer; only armed during Test.
+        # An always-on 50ms timer was racing ViewStack page reparent on
+        # Windows and access-violating during Speech rebuilds.
+        self._mic_meter_tick_id = 0
         # Shared with the capture thread. Main thread writes the wanted
         # device; the thread opens/closes and publishes the drawn level.
         self._mic_want_device = _MIC_METER_OFF   # int | None | "off"
@@ -632,9 +641,9 @@ class SettingsWindow(Adw.ApplicationWindow):
         self._load_mics_in_background()
         GLib.timeout_add(400, self._refresh_dirty)
         GLib.timeout_add(2000, self._watch_the_daemon)
-        # Paints the LevelBar while a Test is running. Capture itself only
-        # starts when the user presses Test, never on open.
-        GLib.timeout_add(_MIC_METER_POLL_MS, self._tick_mic_meter)
+        # LevelBar paint timer is armed only for an active Test (see
+        # _start_mic_test). Leaving it idle here keeps rebuilds free of
+        # widget traffic on the Device row.
         self.connect("notify::visible", self._on_visible_for_mic_meter)
         if sys.platform == "win32":
             # Undecorated, and before realize. GTK's client-side decoration
@@ -799,10 +808,18 @@ class SettingsWindow(Adw.ApplicationWindow):
             "General": self._build_general_page,
         }
         for section in settings_def.SECTIONS:
+            name = section.lower()
+            # Box stays in the stack for the life of the window; only its
+            # child PreferencesPage is swapped when Speech is rebuilt.
+            host = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            host.set_hexpand(True)
+            host.set_vexpand(True)
             page = builders[section](section)
+            host.append(page)
+            self._page_hosts[name] = host
             # Without an icon the view switcher draws the broken-image glyph.
             self._stack.add_titled_with_icon(
-                page, section.lower(), section, SECTION_ICONS[section])
+                host, name, section, SECTION_ICONS[section])
 
     def _add_field_groups(self, page, section: str, lead_rows=None):
         """Render a section as titled groups, expert rows behind an expander.
@@ -831,6 +848,13 @@ class SettingsWindow(Adw.ApplicationWindow):
             for field in fields:
                 if not field.advanced:
                     group.add(self._build_row(field))
+                    # Level + Test sit on their own row under Device, not as
+                    # ComboRow suffixes. Reparenting a ComboRow that held a
+                    # LevelBar and a Button through ViewStack rebuilds was
+                    # access-violating on Windows (and SIGSEGV here) when the
+                    # Speech page rotated the stack.
+                    if field.key == "mic_device_index":
+                        group.add(self._build_mic_meter_row())
 
             # Per group rather than one bin at the foot of the page: sample
             # rate belongs with the microphone, not with a watchdog timer.
@@ -1146,25 +1170,6 @@ class SettingsWindow(Adw.ApplicationWindow):
                 # grow past the row it hangs off.
                 row.set_list_factory(_wide_list_factory(row))
                 row.add_css_class("mic-row")
-                # Live level so the user can see which entry is the right
-                # mic. Off until Test is pressed - holding the input open
-                # for the whole settings session lights the in-use
-                # indicator and can fight a live dictation.
-                meter = Gtk.LevelBar(
-                    mode=Gtk.LevelBarMode.CONTINUOUS,
-                    min_value=0.0, max_value=1.0, value=0.0,
-                    valign=Gtk.Align.CENTER)
-                meter.add_css_class("mic-meter")
-                meter.set_tooltip_text("Microphone activity")
-                row.add_suffix(meter)
-                self._mic_meter = meter
-                test = Gtk.Button(label="Test", valign=Gtk.Align.CENTER)
-                test.add_css_class("flat")
-                test.set_tooltip_text(
-                    "Listen to this device and show activity on the meter")
-                test.connect("clicked", self._on_mic_test_toggle)
-                row.add_suffix(test)
-                self._mic_test_button = test
             if field.help:
                 row.set_subtitle(field.help)
             self._rows[field.key] = row
@@ -1310,6 +1315,32 @@ class SettingsWindow(Adw.ApplicationWindow):
         return False
 
     # -------------------------------------------------------- mic meter
+    def _build_mic_meter_row(self) -> Gtk.Widget:
+        """Level bar + Test/Stop, under the Device combo.
+
+        Built as its own ActionRow so the Device ComboRow stays a plain
+        dropdown. Suffix widgets on ComboRow did not survive ViewStack
+        page rotation on Windows.
+        """
+        row = Adw.ActionRow(title="Level")
+        row.set_subtitle("Press Test and speak to check this device")
+        meter = Gtk.LevelBar(
+            mode=Gtk.LevelBarMode.CONTINUOUS,
+            min_value=0.0, max_value=1.0, value=0.0,
+            valign=Gtk.Align.CENTER)
+        meter.add_css_class("mic-meter")
+        meter.set_tooltip_text("Microphone activity")
+        row.add_suffix(meter)
+        self._mic_meter = meter
+        test = Gtk.Button(label="Test", valign=Gtk.Align.CENTER)
+        test.add_css_class("flat")
+        test.set_tooltip_text(
+            "Listen to this device and show activity on the meter")
+        test.connect("clicked", self._on_mic_test_toggle)
+        row.add_suffix(test)
+        self._mic_test_button = test
+        return row
+
     def _on_visible_for_mic_meter(self, *_args) -> None:
         """Drop an in-progress Test when the window is hidden."""
         if not self.get_visible() and self._mic_meter_active:
@@ -1327,9 +1358,15 @@ class SettingsWindow(Adw.ApplicationWindow):
         if self._mic_test_button is not None:
             self._mic_test_button.set_label("Stop")
         self._ensure_mic_meter_thread()
+        if not self._mic_meter_tick_id:
+            self._mic_meter_tick_id = GLib.timeout_add(
+                _MIC_METER_POLL_MS, self._tick_mic_meter)
 
     def _stop_mic_test(self) -> None:
         self._mic_meter_active = False
+        if self._mic_meter_tick_id:
+            GLib.source_remove(self._mic_meter_tick_id)
+            self._mic_meter_tick_id = 0
         with self._mic_meter_lock:
             self._mic_want_device = _MIC_METER_OFF
             self._mic_drawn_level = 0.0
@@ -1378,16 +1415,15 @@ class SettingsWindow(Adw.ApplicationWindow):
         Two jobs, both main-thread only. The capture thread must not touch
         GTK, and GTK must not open PortAudio on this loop - opening a
         capture stream can take hundreds of milliseconds on Windows.
+
+        Returns False to disarm the GLib source when Test is no longer
+        running, so a stale tick cannot paint a LevelBar mid-rebuild.
         """
-        if self._mic_meter is None:
-            return True
-        if not self.get_visible() or not self._mic_meter_active:
-            with self._mic_meter_lock:
-                self._mic_want_device = _MIC_METER_OFF
-                level = 0.0
-                self._mic_drawn_level = 0.0
-            self._mic_meter.set_value(level)
-            return True
+        if (self._mic_meter is None
+                or not self._mic_meter_active
+                or not self.get_visible()):
+            self._mic_meter_tick_id = 0
+            return False
 
         self._ensure_mic_meter_thread()
         want = self._selected_mic_device()
@@ -1746,12 +1782,11 @@ class SettingsWindow(Adw.ApplicationWindow):
         is not a click, and yanking someone off the Hotkeys page to show them
         a pill they did not ask about is not an improvement.
 
-        ViewStack.add_* always appends, so replacing Speech alone shoved it
-        to the far right of the switcher (Hotkeys | Dictation | General |
-        Speech). That path runs on every open via _reload_from_disk, not only
-        after a download. After Speech is re-appended, rotate the other pages
-        to the end so SECTIONS order is restored without emptying the stack
-        (an empty ViewStack crashes the switcher).
+        Speech lives inside a host box that never leaves the ViewStack, so
+        rebuilding swaps only that page's contents. The old approach removed
+        and re-added stack pages to fix tab order (add_* always appends), and
+        reparenting pages that had already been shown access-violated the
+        view switcher on Windows.
         """
         keep = self._values()
         # The old page's widgets are about to be dropped; holding references
@@ -1760,32 +1795,17 @@ class SettingsWindow(Adw.ApplicationWindow):
         self._download_buttons = []
         self._progress_bars = {}
         self._model_checks = {}
-        was = None if focus else self._stack.get_visible_child_name()
-        self._stack.remove(self._stack.get_child_by_name("speech"))
-        page = self._build_speech_page("Speech")
-        # With the icon, as _build adds it: the view switcher draws the
-        # broken-image glyph for a page that has none.
-        self._stack.add_titled_with_icon(
-            page, "speech", "Speech", SECTION_ICONS["Speech"])
-        # Stack is now Hotkeys | Dictation | General | Speech. Park on
-        # Speech before rotating the others: removing the visible page
-        # segfaults the switcher. Then move each non-Speech page to the
-        # end in SECTIONS order so the tabs land as Speech | Hotkeys |
-        # Dictation | General. Speech stays put, so the stack never empties
-        # and the visible child is never the one being removed.
-        self._stack.set_visible_child_name("speech")
-        for section in settings_def.SECTIONS:
-            if section == "Speech":
-                continue
-            name = section.lower()
-            child = self._stack.get_child_by_name(name)
-            if child is None:
-                continue
-            self._stack.remove(child)
-            self._stack.add_titled_with_icon(
-                child, name, section, SECTION_ICONS[section])
-        if not focus and was and self._stack.get_child_by_name(was) is not None:
-            self._stack.set_visible_child_name(was)
+
+        host = self._page_hosts.get("speech")
+        if host is None:
+            return
+        old = host.get_first_child()
+        if old is not None:
+            host.remove(old)
+        host.append(self._build_speech_page("Speech"))
+
+        if focus:
+            self._stack.set_visible_child_name("speech")
         self._apply_values(keep)
 
     def _on_progress(self, stage: str, fraction: float):

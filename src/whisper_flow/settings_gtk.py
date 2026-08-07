@@ -167,6 +167,12 @@ CSS = b"""
 }
 .daemon-ok { color: #4ade80; }
 .daemon-bad { color: #f87171; }
+/* Unsaved-changes strip: Save + Cancel, only while something is dirty. */
+.dirty-bar {
+    padding: 8px 16px;
+    background-color: alpha(#ffffff, 0.06);
+    border-bottom: 1px solid alpha(#ffffff, 0.08);
+}
 """
 
 
@@ -531,6 +537,28 @@ def _host_api_name(pa, info) -> str:
         return ""
     prefix = "Windows "
     return name[len(prefix):] if name.startswith(prefix) else name
+
+
+class _DirtyBanner:
+    """Adw.Banner-shaped handle over the custom Save/Cancel strip.
+
+    The dirty poll and tests already speak in set_title / set_revealed;
+    the strip underneath is a Revealer because Adw.Banner only has one button
+    and we need Cancel as well as Save.
+    """
+
+    def __init__(self, revealer: Gtk.Revealer, label: Gtk.Label):
+        self._revealer = revealer
+        self._label = label
+
+    def set_title(self, title: str) -> None:
+        self._label.set_text(title)
+
+    def set_revealed(self, revealed: bool) -> None:
+        self._revealer.set_reveal_child(bool(revealed))
+
+    def get_revealed(self) -> bool:
+        return bool(self._revealer.get_reveal_child())
 
 
 # Spin adjustment (digits, step) per numeric field; anything not listed is a
@@ -930,29 +958,44 @@ class SettingsWindow(Adw.ApplicationWindow):
         #
         # A footer meant a rule across the window with a mostly empty strip
         # under it and one small button adrift at the right end - furniture
-        # that was there on every page, most of the time with nothing to do,
-        # and a separator inset from both edges so it spanned neither the
-        # window nor the content column. The header was no better: beside the
-        # view switcher the button read as a fifth tab.
-        #
-        # So it appears where it is relevant and not before: a banner under
-        # the header, the moment there is something to save, saying what is
-        # pending and offering the one action. Nothing changed means nothing
-        # on screen, and the page runs clean to the bottom edge.
-        self._banner = Adw.Banner()
-        self._banner.set_button_label("Save")
-        self._banner.connect("button-clicked", lambda *_: self._on_save())
-        self._banner.set_revealed(False)
-        toolbar.add_top_bar(self._banner)
+        # that was there on every page, most of the time with nothing to do.
+        # So it appears only while something is dirty: how many changes,
+        # Cancel to discard them, Save to write and restart. Adw.Banner only
+        # has one button, so this is a small custom strip instead.
+        self._dirty_revealer = Gtk.Revealer(
+            transition_type=Gtk.RevealerTransitionType.SLIDE_DOWN,
+            reveal_child=False)
+        dirty = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        dirty.add_css_class("dirty-bar")
+        self._dirty_label = Gtk.Label(xalign=0.0)
+        self._dirty_label.set_hexpand(True)
+        dirty.append(self._dirty_label)
+        cancel = Gtk.Button(label="Cancel")
+        cancel.set_tooltip_text("Discard unsaved changes")
+        cancel.connect("clicked", lambda *_: self._on_cancel())
+        dirty.append(cancel)
+        save = Gtk.Button(label="Save")
+        save.add_css_class("suggested-action")
+        save.set_tooltip_text("Save and restart so changes take effect")
+        save.connect("clicked", lambda *_: self._on_save())
+        dirty.append(save)
+        self._dirty_revealer.set_child(dirty)
+        toolbar.add_top_bar(self._dirty_revealer)
+        # Same surface the dirty poll and tests already talk to.
+        self._banner = _DirtyBanner(self._dirty_revealer, self._dirty_label)
 
-        # Ctrl+S regardless, because the banner is only reachable by mouse
-        # and this is a window people close by keyboard.
+        # Ctrl+S regardless, because the strip is only reachable by mouse
+        # and this is a window people close by keyboard. Escape discards.
         save_action = Gio.SimpleAction.new("save", None)
         save_action.connect("activate", lambda *_: self._on_save())
         self.add_action(save_action)
+        cancel_action = Gio.SimpleAction.new("cancel", None)
+        cancel_action.connect("activate", lambda *_: self._on_cancel())
+        self.add_action(cancel_action)
         app = self.get_application()
         if app is not None:
             app.set_accels_for_action("win.save", ["<Control>s"])
+            app.set_accels_for_action("win.cancel", ["Escape"])
 
         builders = {
             "Speech": self._build_speech_page,
@@ -1847,6 +1890,32 @@ class SettingsWindow(Adw.ApplicationWindow):
             toast.connect("button-clicked", lambda *_: on_button())
         self._last_toast_title = message
         self._toasts.add_toast(toast)
+
+    def _on_cancel(self):
+        """Throw away unsaved edits and put the rows back to the last save.
+
+        Does not write the .env and does not restart. Escape does the same.
+        """
+        if self._working:
+            return
+        try:
+            changed = dict(settings_def.updates_from(self._values(),
+                                                     self._current))
+            model = self._selected_model()
+            if model and model != self._current_model:
+                changed["WHISPER_FLOW_MODEL_NAME"] = model
+        except Exception:
+            changed = {"_": True}
+        if not changed:
+            self._banner.set_revealed(False)
+            return
+
+        self._apply_values(self._current)
+        # Model radios are not in _current; restore the saved choice.
+        if self._current_model and self._current_model in self._model_checks:
+            self._model_checks[self._current_model].set_active(True)
+        self._banner.set_revealed(False)
+        self._toast("Changes discarded")
 
     def _on_save(self):
         if self._working:

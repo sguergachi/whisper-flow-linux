@@ -116,6 +116,21 @@ elif scenario == "save":
     # Save restarts on its own - no "Restart now" button to click.
     assert "Saved" in w._last_toast_title
     assert "Restart" in w._last_toast_title
+elif scenario == "cancel":
+    # Discard unsaved edits without writing .env or restarting.
+    w.present()
+    assert pump(lambda: w.get_visible())
+    before = w._rows["live_interval"].get_value()
+    w._rows["live_interval"].set_value(1.4)
+    w._refresh_dirty()
+    assert w._banner.get_revealed(), "dirty strip never appeared"
+    w._on_cancel()
+    assert abs(w._rows["live_interval"].get_value() - before) < 1e-6, (
+        "Cancel left the edited value in place")
+    assert not w._banner.get_revealed(), "dirty strip stayed after Cancel"
+    assert "discard" in w._last_toast_title.lower()
+    assert not (config_dir + "/.env" and __import__("os").path.exists(
+        config_dir + "/.env")), "Cancel wrote the .env"
 elif scenario == "invalid":
     w._rows["hotkey_transcribe"].set_text("super++alt")
     w._on_save()
@@ -553,6 +568,13 @@ def test_saving_a_change_writes_the_env_file(tmp_path):
     from whisper_flow import envfile
     assert envfile.get(tmp_path / ".env",
                        "WHISPER_FLOW_LIVE_INTERVAL") == "1.4"
+
+
+def test_cancel_discards_unsaved_changes(tmp_path):
+    """Cancel restores the last-saved values and does not write the .env."""
+    result = _run(tmp_path, "cancel")
+    assert "OK" in result.stdout, result.stderr
+    assert not (tmp_path / ".env").exists()
 
 
 def test_an_invalid_value_is_not_saved(tmp_path):

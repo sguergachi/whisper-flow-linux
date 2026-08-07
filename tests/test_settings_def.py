@@ -109,6 +109,17 @@ def test_validate_rejects_a_hotkey_with_an_empty_part():
     assert "empty key name" in problem
 
 
+def test_format_hotkey_orders_modifiers_then_keys():
+    assert settings_def.format_hotkey({"k", "alt", "ctrl"}) == "ctrl+alt+k"
+    assert settings_def.format_hotkey(["super", "alt"]) == "super+alt"
+    assert settings_def.format_hotkey([]) == ""
+
+
+def test_format_hotkey_normalises_cmd_and_control_aliases():
+    assert settings_def.format_hotkey({"cmd", "alt"}) == "super+alt"
+    assert settings_def.format_hotkey({"control", "shift", "a"}) == "ctrl+shift+a"
+
+
 # ------------------------------------------------------------------- layout
 def test_every_field_names_a_group():
     """A field with no group renders in an untitled block above the rest.

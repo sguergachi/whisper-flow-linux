@@ -296,6 +296,54 @@ def _load_css(provider, css: bytes):
         provider.load_from_data(css)
 
 
+def _gdk_key_to_hotkey_part(keyval: int) -> str | None:
+    """Map a GDK keyval to the config name the hotkey listeners understand.
+
+    Returns None for keys that cannot be part of a binding (unknown, pure
+    dead keys, etc.). Modifiers and a-z / 0-9 / F-keys / a few named keys
+    match what hotkey_evdev and hotkey_win parse.
+    """
+    keyval = Gdk.keyval_to_lower(keyval)
+    if keyval in (Gdk.KEY_Control_L, Gdk.KEY_Control_R):
+        return "ctrl"
+    if keyval in (Gdk.KEY_Alt_L, Gdk.KEY_Alt_R):
+        return "alt"
+    if keyval in (Gdk.KEY_Shift_L, Gdk.KEY_Shift_R):
+        return "shift"
+    if keyval in (Gdk.KEY_Super_L, Gdk.KEY_Super_R,
+                  Gdk.KEY_Hyper_L, Gdk.KEY_Hyper_R):
+        return "super"
+    # Meta is Super on many layouts; keep it out of the Alt bucket.
+    if keyval in (Gdk.KEY_Meta_L, Gdk.KEY_Meta_R):
+        return "super"
+    if keyval == Gdk.KEY_space:
+        return "space"
+    if keyval in (Gdk.KEY_Escape,):
+        return "escape"
+    if keyval in (Gdk.KEY_BackSpace,):
+        return "backspace"
+    if keyval in (Gdk.KEY_Tab, Gdk.KEY_ISO_Left_Tab):
+        return "tab"
+    if keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
+        return "enter"
+    if keyval == Gdk.KEY_Caps_Lock:
+        return "capslock"
+    # a-z
+    if Gdk.KEY_a <= keyval <= Gdk.KEY_z:
+        return chr(ord("a") + (keyval - Gdk.KEY_a))
+    # 0-9 (top row and keypad)
+    if Gdk.KEY_0 <= keyval <= Gdk.KEY_9:
+        return chr(ord("0") + (keyval - Gdk.KEY_0))
+    if Gdk.KEY_KP_0 <= keyval <= Gdk.KEY_KP_9:
+        return chr(ord("0") + (keyval - Gdk.KEY_KP_0))
+    # F1–F24
+    if Gdk.KEY_F1 <= keyval <= Gdk.KEY_F12:
+        return f"f{1 + (keyval - Gdk.KEY_F1)}"
+    if Gdk.KEY_F13 <= keyval <= Gdk.KEY_F24:
+        return f"f{13 + (keyval - Gdk.KEY_F13)}"
+    return None
+
+
 def _wide_list_factory(row) -> Gtk.SignalListItemFactory:
     """Dropdown rows that keep their full text, however long it is.
 
@@ -998,11 +1046,55 @@ class SettingsWindow(Adw.ApplicationWindow):
             self._rows[field.key] = row
             return row
 
+        if field.key.startswith("hotkey_"):
+            # Capture, do not type: free text never recorded a chord as the
+            # user pressed it, so the field looked broken. Click, hold the
+            # combination, and the row shows what the daemon will bind.
+            row = Adw.EntryRow(title=field.label)
+            row.set_editable(False)
+            row.set_subtitle("Click, then press the keys")
+            self._wire_hotkey_capture(row)
+            self._rows[field.key] = row
+            return row
+
         row = (Adw.PasswordEntryRow(title=field.label)
                if field.kind == "password"
                else Adw.EntryRow(title=field.label))
         self._rows[field.key] = row
         return row
+
+    def _wire_hotkey_capture(self, row: Adw.EntryRow) -> None:
+        """Record a chord into the row as keys go down, not as typed text."""
+        held: set[str] = set()
+
+        def pressed(_controller, keyval, _keycode, _state):
+            part = _gdk_key_to_hotkey_part(keyval)
+            if part is None:
+                return True             # swallow unknowns; do not type junk
+            if part in ("escape", "backspace"):
+                held.clear()
+                row.set_text("")
+                return True
+            # First key after a full release starts a new combination.
+            if not held:
+                held.clear()
+            held.add(part)
+            row.set_text(settings_def.format_hotkey(held))
+            return True                 # do not let EntryRow insert a letter
+
+        def released(_controller, keyval, _keycode, _state):
+            part = _gdk_key_to_hotkey_part(keyval)
+            if part is not None:
+                held.discard(part)
+            # Text stays at the last full chord so modifiers-only shortcuts
+            # (super+alt) survive letting go of every key.
+            return True
+
+        controller = Gtk.EventControllerKey()
+        controller.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        controller.connect("key-pressed", pressed)
+        controller.connect("key-released", released)
+        row.add_controller(controller)
 
     def _mic_choices(self) -> list[str]:
         """Display strings for the microphone dropdown, default first.

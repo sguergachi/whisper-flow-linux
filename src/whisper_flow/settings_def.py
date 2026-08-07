@@ -203,6 +203,35 @@ def updates_from(values: dict, current: dict) -> dict[str, str | None]:
     return updates
 
 
+# Canonical order for modifiers in a saved hotkey string. Parsing treats the
+# combination as a set, but the UI and the .env file stay readable if every
+# capture writes them in the same order.
+# Super before alt so a Linux default chord still reads "super+alt", not
+# "alt+super", when re-recorded from the settings window.
+_HOTKEY_MOD_ORDER = ("ctrl", "super", "alt", "shift")
+
+
+def format_hotkey(parts) -> str:
+    """Join key names into the config form: ``ctrl+alt+k``, ``super+alt``.
+
+    Modifiers first in a fixed order, then the rest alphabetically. Empty
+    input becomes an empty string (cleared shortcut).
+    """
+    names = {str(p).strip().lower() for p in parts if str(p).strip()}
+    # Config and both platform listeners treat these as the same key.
+    if "cmd" in names or "win" in names or "meta" in names:
+        names.discard("cmd")
+        names.discard("win")
+        names.discard("meta")
+        names.add("super")
+    if "control" in names:
+        names.discard("control")
+        names.add("ctrl")
+    mods = [m for m in _HOTKEY_MOD_ORDER if m in names]
+    rest = sorted(names - set(_HOTKEY_MOD_ORDER))
+    return "+".join(mods + rest)
+
+
 def validate_hotkey(value: str) -> str | None:
     """Why a hotkey combination is not usable, or None if it is."""
     for part in value.split("+"):

@@ -132,7 +132,9 @@ class WhisperFlow:
                 text, only_where_it_started=True),
             sample_rate=self.config.sample_rate,
             interval=self.config.live_interval,
-            prepare=self.audio_recorder.trim_frames,
+            # Trim + light denoise (HPF, pre-roll gate, peak normalise).
+            # Spectral strong-mode is final-pass only; see prepare_frames.
+            prepare=self.audio_recorder.prepare_frames,
         )
         live.start()
 

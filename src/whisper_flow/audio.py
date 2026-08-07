@@ -871,6 +871,59 @@ class AudioRecorder:
                 f"({(len(frames) - len(trimmed)) * self.config.frame_ms / 1000:.2f}s)")
         return trimmed
 
+    def _room_tone_from_frames(self, frames: list):
+        """High-passed room tone and RMS floor from the start of a capture.
+
+        Trim drops the leading silence the gate and spectral estimate need;
+        measuring first keeps both stable for live prefixes and the closing
+        WAV. Returns ``(floor, noise_ref)`` or ``(None, None)``.
+        """
+        if not frames:
+            return None, None
+        try:
+            samples = np.frombuffer(b"".join(frames), dtype=np.int16)
+            if samples.size == 0:
+                return None, None
+            filtered, _ = denoise.high_pass(samples, self.config.sample_rate)
+            floor = denoise.measure_floor(filtered, self.config.sample_rate)
+            pre_n = min(filtered.size,
+                        max(1, int(self.config.sample_rate
+                                   * denoise.PRE_ROLL_MS / 1000)))
+            return floor, filtered[:pre_n].copy()
+        except Exception as e:
+            log(f"[AUDIO] could not measure noise floor: {e}")
+            return None, None
+
+    def prepare_frames(self, frames: list) -> list:
+        """Condition frames for a live transcription pass.
+
+        Measure room tone on the raw prefix, trim, then the light noise path
+        (high-pass + gate + peak normalise). Spectral subtraction stays off
+        here: it is for the final WAV only. The floor comes from the first
+        PRE_ROLL_MS of the untrimmed capture, which does not move as the
+        clip grows - so LocalAgreement still sees a deterministic prepare.
+        """
+        if not frames:
+            return frames
+        floor = None
+        if self.config.noise_filter:
+            floor, _ = self._room_tone_from_frames(frames)
+        frames = self.trim_frames(frames)
+        if not frames or not self.config.noise_filter:
+            return frames
+        try:
+            samples = np.frombuffer(b"".join(frames), dtype=np.int16)
+            cleaned = denoise.clean(
+                samples, self.config.sample_rate,
+                gate_threshold=getattr(self.config, "noise_floor", None),
+                spectral=False,
+                floor=floor,
+            )
+            return [cleaned.tobytes()]
+        except Exception as e:
+            log(f"[AUDIO] live noise filter skipped: {e}")
+            return frames
+
     def _save_wav_file(self, output_path: str, frames: list):
         """Save recorded frames to a WAV file.
 
@@ -879,6 +932,12 @@ class AudioRecorder:
             frames: List of audio frames to save
 
         """
+        # Room tone lives in the leading silence. Capture it before trim.
+        floor = None
+        noise_ref = None
+        if self.config.noise_filter and frames:
+            floor, noise_ref = self._room_tone_from_frames(frames)
+
         frames = self.trim_frames(frames)
 
         # Apply speedup if enabled (not 1.0). After the trim, which counts on
@@ -888,16 +947,18 @@ class AudioRecorder:
 
         audio = b"".join(frames)
         if self.config.noise_filter and audio:
-            # Here rather than per chunk: the gate measures the room from the
-            # recording it is given, and a 30ms chunk has no idea whether it
-            # is quiet because nobody is speaking or because the whole room
-            # is quiet.
+            # Whole clip, not per chunk. Live passes use prepare_frames with
+            # the same light path (no spectral) so they stay in agreement.
             try:
                 samples = np.frombuffer(audio, dtype=np.int16)
                 audio = denoise.clean(
                     samples, self.config.sample_rate,
                     gate_threshold=getattr(
                         self.config, "noise_floor", None),
+                    spectral=bool(getattr(
+                        self.config, "spectral_denoise", False)),
+                    floor=floor,
+                    noise_ref=noise_ref,
                 ).tobytes()
             except Exception as e:
                 log(f"[AUDIO] noise filter skipped: {e}")

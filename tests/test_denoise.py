@@ -17,11 +17,16 @@ RATE = 16000
 
 @pytest.fixture()
 def recording():
-    """Three bursts of voiced-sounding audio, over hum, rumble and hiss."""
+    """Three bursts of voiced-sounding audio, over hum, rumble and hiss.
+
+    Opens with 400ms of room tone so the pre-roll floor is the noise, not
+    the first speech burst (which is what whole-clip percentiles used to
+    confuse with continuous café noise).
+    """
     rng = np.random.default_rng(7)
     moment = np.arange(int(RATE * 4.0)) / RATE
     speech = np.zeros_like(moment)
-    for start, length in ((0.4, 0.7), (1.6, 0.9), (3.0, 0.6)):
+    for start, length in ((0.5, 0.7), (1.6, 0.9), (3.0, 0.6)):
         span = (moment >= start) & (moment < start + length)
         formants = sum(np.sin(2 * np.pi * hz * moment[span])
                        for hz in (140, 420, 900, 1800)) / 4
@@ -44,7 +49,7 @@ def _rms(samples, mask):
 
 def test_the_room_gets_quieter_and_the_voice_does_not(recording):
     noisy, voiced, voice_only = recording
-    cleaned = denoise.clean(noisy, RATE)
+    cleaned = denoise.clean(noisy, RATE, normalize=False)
 
     quiet_before, quiet_after = _rms(noisy, ~voiced), _rms(cleaned, ~voiced)
     assert quiet_after < quiet_before * 0.7, (
@@ -63,13 +68,21 @@ def test_the_room_gets_quieter_and_the_voice_does_not(recording):
 def test_a_higher_noise_floor_ignores_more_of_the_room(recording):
     """Settings 'Noise floor' is the gate multiplier; higher = stricter."""
     noisy, voiced, _ = recording
-    mild = denoise.clean(noisy, RATE, gate_threshold=1.5)
-    strict = denoise.clean(noisy, RATE, gate_threshold=4.0)
+    mild = denoise.clean(noisy, RATE, gate_threshold=1.5, normalize=False)
+    strict = denoise.clean(noisy, RATE, gate_threshold=4.0, normalize=False)
     quiet_mild = _rms(mild, ~voiced)
     quiet_strict = _rms(strict, ~voiced)
     assert quiet_strict <= quiet_mild * 1.05, (
         f"stricter floor left pauses louder: {quiet_mild:.0f} -> "
         f"{quiet_strict:.0f}")
+
+
+def test_stricter_noise_floor_digs_pauses_deeper():
+    """Higher threshold also lowers GATE_FLOOR_DB (not only the open line)."""
+    assert denoise.gate_floor_db(1.2) == pytest.approx(denoise.GATE_FLOOR_DB)
+    assert denoise.gate_floor_db(5.0) == pytest.approx(
+        denoise.GATE_FLOOR_DB_STRICT)
+    assert denoise.gate_floor_db(5.0) < denoise.gate_floor_db(2.2)
 
 
 def test_the_offset_and_the_rumble_go(recording):
@@ -143,3 +156,105 @@ def test_the_shortened_kernel_still_is_the_filter():
     got, _ = denoise.high_pass(samples, RATE)
     assert np.abs(got - exact).max() < 0.5, (
         "the truncated kernel no longer matches the one-pole it stands for")
+
+
+def test_floor_comes_from_the_pre_roll_not_the_whole_clip():
+    """Continuous mid-clip noise must not redefine the room floor.
+
+    A whole-clip 20th percentile on a busy recording sits near speech energy.
+    Pre-roll uses only the opening room tone, so a café bed after speech
+    starts cannot raise the gate line.
+    """
+    rng = np.random.default_rng(11)
+    n = RATE * 3
+    # 300ms of soft hiss, then loud continuous noise mixed with speech.
+    audio = rng.normal(0, 80, n).astype(np.float64)
+    audio[int(0.3 * RATE):] += rng.normal(0, 2000, n - int(0.3 * RATE))
+    samples = np.clip(audio, -32768, 32767).astype(np.int16)
+
+    floor = denoise.measure_floor(samples, RATE)
+    whole = float(np.percentile(
+        denoise._frame_levels(samples, RATE,
+                              max(1, int(RATE * denoise.GATE_FRAME_MS / 1000)))[0],
+        denoise.NOISE_PERCENTILE))
+    assert floor < whole * 0.5, (
+        f"pre-roll floor {floor:.0f} should be well below whole-clip "
+        f"{whole:.0f}")
+
+
+def test_peak_normalise_lifts_a_quiet_recording():
+    """Always-on mild AGC: a quiet mic should not arrive near digital zero."""
+    t = np.arange(RATE) / RATE
+    quiet = (np.sin(2 * np.pi * 220 * t) * 200).astype(np.int16)
+    out = denoise.normalize_peak(quiet)
+    # Cap is NORM_MAX_GAIN (40x) → peak ~8000, still far above the input.
+    assert int(np.abs(out).max()) > 5000
+    assert int(np.abs(out).max()) > int(np.abs(quiet).max()) * 10
+    # Dead signal is left alone (boost territory / nothing to lift).
+    dead = (np.sin(2 * np.pi * 220 * t) * 5).astype(np.int16)
+    assert int(np.abs(denoise.normalize_peak(dead)).max()) <= 30
+
+
+def test_peak_normalise_does_not_blow_up_loud_speech():
+    t = np.arange(RATE) / RATE
+    loud = (np.sin(2 * np.pi * 220 * t) * 20000).astype(np.int16)
+    out = denoise.normalize_peak(loud)
+    assert int(np.abs(out).max()) <= 32767
+    # Already loud enough: left alone (no push toward full scale).
+    assert abs(int(np.abs(out).max()) - int(np.abs(loud).max())) < 500
+
+
+def test_spectral_subtract_cuts_steady_midband_noise():
+    """Strong mode: stationary tone under speech should lose energy."""
+    rng = np.random.default_rng(3)
+    t = np.arange(int(RATE * 2.0)) / RATE
+    # Room tone first, then speech + 1kHz fan whine throughout.
+    speech = np.zeros_like(t)
+    span = (t >= 0.4) & (t < 1.6)
+    speech[span] = (np.sin(2 * np.pi * 180 * t[span]) * 0.5
+                    + np.sin(2 * np.pi * 900 * t[span]) * 0.5) * 5000
+    whine = np.sin(2 * np.pi * 1000 * t) * 1500
+    hiss = rng.normal(0, 100, t.size)
+    noisy = np.clip(speech + whine + hiss, -32768, 32767).astype(np.int16)
+
+    # noise_ref = opening room tone (whine + hiss, no speech)
+    ref = noisy[:int(0.35 * RATE)]
+    cleaned = denoise.spectral_subtract(noisy.astype(np.float32), RATE,
+                                        noise_ref=ref.astype(np.float32))
+
+    freqs = np.fft.rfftfreq(noisy.size, 1 / RATE)
+    before = np.abs(np.fft.rfft(noisy.astype(float)))
+    after = np.abs(np.fft.rfft(cleaned.astype(float)))
+    band = (freqs > 950) & (freqs < 1050)
+    assert after[band].sum() < before[band].sum() * 0.7, (
+        "1kHz stationary noise should be reduced by spectral subtraction")
+
+
+def test_clean_with_spectral_still_preserves_speech(recording):
+    noisy, voiced, voice_only = recording
+    # Untrimmed pre-roll for the noise profile.
+    filtered, _ = denoise.high_pass(noisy, RATE)
+    ref = filtered[:int(RATE * denoise.PRE_ROLL_MS / 1000)]
+    cleaned = denoise.clean(
+        noisy, RATE, spectral=True, normalize=False, noise_ref=ref)
+    spoken = _rms(voice_only, voiced)
+    heard = _rms(cleaned, voiced)
+    assert heard > 0.5 * spoken, (
+        f"strong mode wiped the voice: {heard:.0f} vs {spoken:.0f}")
+
+
+def test_live_prefixes_share_a_stable_floor():
+    """As the capture grows, the pre-roll floor must not drift.
+
+    Live LocalAgreement only works if prepare is deterministic on a shared
+    prefix; a floor recomputed from the whole clip would move every pass.
+    """
+    rng = np.random.default_rng(5)
+    full = rng.normal(0, 100, RATE * 4).astype(np.float64)
+    full[RATE:] += rng.normal(0, 3000, RATE * 3)  # loud later
+    samples = np.clip(full, -32768, 32767).astype(np.int16)
+
+    floor_1s = denoise.measure_floor(samples[:RATE], RATE)
+    floor_4s = denoise.measure_floor(samples, RATE)
+    assert abs(floor_1s - floor_4s) < 5.0, (
+        f"floor drifted as the clip grew: {floor_1s:.1f} -> {floor_4s:.1f}")

@@ -334,6 +334,9 @@ def test_the_live_flow_really_does_shorten_its_passes(monkeypatch):
         def trim_frames(self, frames):
             return frames
 
+        def prepare_frames(self, frames):
+            return frames
+
     class Service:
         def transcribe_audio(self, path, max_retries=3, timeout=None):
             seen["max_retries"] = max_retries
@@ -380,6 +383,9 @@ def test_the_overlay_is_shown_only_once_capture_has_started(monkeypatch):
             return None
 
         def trim_frames(self, frames):
+            return frames
+
+        def prepare_frames(self, frames):
             return frames
 
     class FakeLive:

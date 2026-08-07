@@ -259,6 +259,13 @@ class Config(BaseSettings):
         le=5.0,
         env="WHISPER_FLOW_NOISE_FLOOR",
     )
+    spectral_denoise: bool = Field(
+        default=False,
+        description=("Stationary spectral subtraction for fans/AC and other "
+                     "steady mid-band noise on top of speech. Heavier; only "
+                     "on the final pass."),
+        env="WHISPER_FLOW_SPECTRAL_DENOISE",
+    )
     fast_encoder: bool = Field(
         # Whisper encodes a full 30 seconds whatever it was given, so a short
         # dictation spends most of its time on silence. Cutting the window to

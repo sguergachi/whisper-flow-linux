@@ -904,9 +904,10 @@ class WhisperFlowDaemon:
                 # had missed.
                 if self._show_prewarmed():
                     return True
-                # It could not be told, so there is no window coming from it.
-                # Fall through and build one the slow way rather than report a
-                # window that is not going to appear.
+                # Pipe is dead but the process may still be running. Kill it
+                # before starting a replacement - otherwise two settings
+                # processes stack on the desktop.
+                self._kill_setup_process_unlocked(process)
 
             return self._start_tool_window(flag, module, resident=False)
 
@@ -970,6 +971,26 @@ class WhisperFlowDaemon:
         self._setup_waiting = False
         self._setup_shown = True
         return True
+
+    @staticmethod
+    def _kill_setup_process_unlocked(process) -> None:
+        """Drop a settings process that can no longer be commanded.
+
+        Caller holds ``_setup_lock`` and has already cleared or will clear
+        ``_setup_process``. Without this, a second Settings click after a
+        broken pipe left the old process on screen and started another.
+        """
+        if process is None:
+            return
+        try:
+            if process.poll() is None:
+                process.kill()
+        except Exception:
+            pass
+        try:
+            process.wait(timeout=1)
+        except Exception:
+            pass
 
     def _start_tool_window(self, flag: str, module: str,
                            resident: bool) -> bool:

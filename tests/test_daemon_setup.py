@@ -355,6 +355,25 @@ def test_a_window_that_cannot_be_told_is_replaced_by_one_that_can(
         popen.assert_called_once()
     # And the replacement is one that shows itself, not another that waits.
     assert "WHISPER_FLOW_SETTINGS_RESIDENT" not in popen.call_args.kwargs["env"]
+    # The broken process must be killed or two windows stack on screen.
+    assert window.killed is True
+
+
+def test_a_dead_pipe_kills_the_old_process_before_starting_another(
+        daemon, monkeypatch):
+    """Regression: second Settings click left the first process running."""
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(sys, "frozen", False, raising=False)
+    window = _waiting(daemon)
+    window.returncode = None  # still "running" as far as poll() is concerned
+    window.stdin.write.side_effect = OSError("broken pipe")
+
+    with patch("whisper_flow.daemon.subprocess.Popen") as popen:
+        popen.return_value.poll.return_value = None
+        daemon._open_settings_window()
+
+    assert window.killed is True
+    popen.assert_called_once()
 
 
 def test_a_window_lost_before_anyone_wanted_it_is_not_announced(daemon):

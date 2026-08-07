@@ -2413,6 +2413,15 @@ def main() -> int:
 
     def build(app):
         try:
+            # One window only. activate runs again when a second process
+            # (or a second tray click via D-Bus / app unique name) reaches
+            # this one - building another SettingsWindow each time stacked
+            # copies on the desktop. Raise the existing one instead.
+            for existing in app.get_windows():
+                if isinstance(existing, SettingsWindow):
+                    GLib.idle_add(existing.show_for_click, time.time())
+                    return
+
             window = SettingsWindow(application=app, config=config)
             _mark("window constructed")
             # present() only queues the window. The frame clock is what says

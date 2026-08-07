@@ -437,20 +437,18 @@ elif scenario == "version":
     w._copy_version()
     assert version in w._last_toast_title
 elif scenario == "mic_meter":
-    # Device row has a level bar and a Test button. Capture is off until
+    # Device row has a level strip and a Test button. Capture is off until
     # Test is pressed, and Stop / hiding the window releases the mic.
-    from gi.repository import Gtk as _Gtk
-
-    assert w._mic_meter is not None, "no level bar on the Device row"
-    assert isinstance(w._mic_meter, _Gtk.ProgressBar)
+    assert w._mic_meter is not None, "no level strip on the Device row"
+    assert isinstance(w._mic_meter, settings_gtk._MicLevelStrip)
     assert w._mic_test_button is not None, "no Test button on the Device row"
     assert w._mic_test_button.get_label() == "Test"
 
-    quiet, peak = settings_gtk._mic_level_from_rms(0.0, 150.0)
+    quiet, peak = settings_gtk._mic_level_from_rms(0.0, 40.0)
     assert quiet == 0.0
     # Floor holds the peak open so room noise does not dance the bar.
     assert peak == settings_gtk._MIC_METER_PEAK_FLOOR
-    loud, peak = settings_gtk._mic_level_from_rms(3000.0, 150.0)
+    loud, peak = settings_gtk._mic_level_from_rms(3000.0, 40.0)
     assert 0.5 < loud <= 1.0, loud
     assert peak >= 3000.0
 
@@ -473,13 +471,20 @@ elif scenario == "mic_meter":
             "Test did not ask the meter thread to listen")
         w._mic_drawn_level = 0.42
     assert w._tick_mic_meter() is True
-    assert abs(w._mic_meter.get_fraction() - 0.42) < 1e-6, (
-        w._mic_meter.get_fraction())
+    assert abs(w._mic_meter.get_level() - 0.42) < 1e-6, (
+        w._mic_meter.get_level())
+    # Paint tick must not re-read the ComboRow (that freezes the popover).
+    # Changing the published device only happens via selection-changed.
+    with w._mic_meter_lock:
+        w._mic_want_device = 99
+    assert w._tick_mic_meter() is True
+    with w._mic_meter_lock:
+        assert w._mic_want_device == 99, "paint tick rewrote the wanted device"
 
     w._stop_mic_test()
     assert w._mic_test_button.get_label() == "Test"
     assert w._mic_meter_tick_id == 0
-    assert w._mic_meter.get_fraction() == 0.0
+    assert w._mic_meter.get_level() == 0.0
     with w._mic_meter_lock:
         assert w._mic_want_device == settings_gtk._MIC_METER_OFF
 
@@ -489,7 +494,7 @@ elif scenario == "mic_meter":
     # notify::visible calls _stop_mic_test; tick disarms if anything remains.
     assert not w._mic_meter_active
     assert w._mic_meter_tick_id == 0
-    assert w._mic_meter.get_fraction() == 0.0
+    assert w._mic_meter.get_level() == 0.0
     with w._mic_meter_lock:
         assert w._mic_want_device == settings_gtk._MIC_METER_OFF, (
             "hiding the window left the capture stream requested")

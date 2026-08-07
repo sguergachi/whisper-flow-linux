@@ -158,11 +158,12 @@ CSS = b"""
    resolving a merge, leaving the factory without the floor it needs for the
    case where the popover declines to grow past the row. */
 .mic-row popover listview { min-width: 520px; }
-/* Live input level under Device. ProgressBar, not LevelBar: continuous
-   LevelBar is easy to miss in Adwaita dark, and this needs to read while
-   the user is speaking. */
+/* Drawn level strip under Device (DrawingArea, not ProgressBar). */
 .mic-meter {
-    min-width: 140px;
+    min-width: 160px;
+    min-height: 14px;
+    margin-left: 8px;
+    margin-right: 8px;
 }
 .daemon-ok { color: #4ade80; }
 .daemon-bad { color: #f87171; }
@@ -544,11 +545,12 @@ _SPIN = {
     "queue_request_timeout": (0, 5),
 }
 
-# Live Device-row meter. Same adaptive gain as the HUD waveform so a quiet
-# room mic still moves and a loud one does not peg the bar permanently.
-_MIC_METER_PEAK_FLOOR = 150.0
-_MIC_METER_PEAK_DECAY = 0.95
-_MIC_METER_LEVEL_GAMMA = 0.65
+# Live Device-row meter. Floor is low enough that a quiet laptop mic still
+# moves the bar; the HUD uses 150 because it has many bars and noise would
+# dance - here one strip has to prove "this is the right device".
+_MIC_METER_PEAK_FLOOR = 40.0
+_MIC_METER_PEAK_DECAY = 0.92
+_MIC_METER_LEVEL_GAMMA = 0.55
 _MIC_METER_LEVEL_CEILING = 32767.0
 _MIC_METER_POLL_MS = 50
 # "off" means close the stream; None means the platform default input.
@@ -556,9 +558,10 @@ _MIC_METER_OFF = "off"
 
 
 def _mic_level_from_rms(rms: float, peak: float) -> tuple[float, float]:
-    """Map a frame RMS onto 0..1 and the peak used for adaptive gain.
+    """Map a frame level onto 0..1 and the peak used for adaptive gain.
 
     Pure so the test can pin the scaling without opening a microphone.
+    `rms` may be peak-abs or true RMS; either is fine for a preview meter.
     """
     if rms <= 0:
         return 0.0, max(peak * _MIC_METER_PEAK_DECAY, _MIC_METER_PEAK_FLOOR)
@@ -567,6 +570,44 @@ def _mic_level_from_rms(rms: float, peak: float) -> tuple[float, float]:
     peak = max(peak * _MIC_METER_PEAK_DECAY, float(rms), _MIC_METER_PEAK_FLOOR)
     level = min(1.0, (rms / peak) ** _MIC_METER_LEVEL_GAMMA)
     return level, peak
+
+
+class _MicLevelStrip(Gtk.DrawingArea):
+    """A single green fill bar. ProgressBar/LevelBar both fought Adwaita CSS
+    and read as empty even when the fraction was non-zero."""
+
+    def __init__(self):
+        super().__init__()
+        self._level = 0.0
+        self.set_content_width(160)
+        self.set_content_height(14)
+        self.set_hexpand(False)
+        self.set_valign(Gtk.Align.CENTER)
+        self.add_css_class("mic-meter")
+        self.set_draw_func(self._draw)
+
+    def set_level(self, level: float) -> None:
+        level = max(0.0, min(1.0, float(level)))
+        if abs(level - self._level) < 0.005:
+            return
+        self._level = level
+        self.queue_draw()
+
+    def get_level(self) -> float:
+        return self._level
+
+    @staticmethod
+    def _draw(area, cr, width: int, height: int) -> None:
+        # Trough
+        cr.set_source_rgba(1.0, 1.0, 1.0, 0.12)
+        cr.rectangle(0, 0, width, height)
+        cr.fill()
+        # Fill - bright green so speech is obvious on the dark theme
+        fill = max(0.0, min(1.0, area._level)) * width
+        if fill > 0.5:
+            cr.set_source_rgb(0.29, 0.87, 0.50)
+            cr.rectangle(0, 0, fill, height)
+            cr.fill()
 
 
 class SettingsWindow(Adw.ApplicationWindow):
@@ -595,7 +636,7 @@ class SettingsWindow(Adw.ApplicationWindow):
         # path access-violates on Windows once those pages have been shown).
         self._page_hosts: dict[str, Gtk.Box] = {}
         self._mic_display: dict[str, str] = {}
-        self._mic_meter: Gtk.ProgressBar | None = None
+        self._mic_meter: _MicLevelStrip | None = None
         self._mic_test_button: Gtk.Button | None = None
         # Only True while the user has pressed Test. The meter never opens
         # the microphone just because settings is on screen.
@@ -604,6 +645,9 @@ class SettingsWindow(Adw.ApplicationWindow):
         self._mic_meter_tick_id = 0
         # Shared with the capture thread. Main thread writes the wanted
         # device; the thread opens/closes and publishes the drawn level.
+        # The ComboRow is NOT read from the paint tick - doing that every
+        # 50ms while the device popover is open re-enters GTK and freezes
+        # the window. Device is published on Test and on selection-changed.
         self._mic_want_device = _MIC_METER_OFF   # int | None | "off"
         self._mic_drawn_level = 0.0
         # One-shot error from the capture thread (open failed), shown as toast.
@@ -691,10 +735,11 @@ class SettingsWindow(Adw.ApplicationWindow):
     def _raise_to_front(self) -> None:
         """Map, unminimize and take focus after a tray click.
 
-        ``present()`` alone maps a hidden window but does not reliably pull
-        an already-open one forward when the click came from another process
-        (the tray). A second present after the surface exists, plus a
-        platform raise on Windows, is what makes Settings come to the front.
+        ``present()`` alone maps a hidden window but does not take focus when
+        the click came from another process. On Wayland the compositor
+        refuses focus-steal without an xdg-activation token the tray cannot
+        hand us, so after present we ask the window manager (kdotool on KDE,
+        wmctrl/xdotool elsewhere) to activate us by title.
         """
         try:
             if bool(self.get_property("minimized")):
@@ -703,16 +748,20 @@ class SettingsWindow(Adw.ApplicationWindow):
             pass
         self.set_visible(True)
         self.present()
+        # Once the surface is mapped (and again a moment later for slow WMs).
         GLib.idle_add(self._finish_raise)
+        GLib.timeout_add(120, self._finish_raise)
 
     def _finish_raise(self) -> bool:
         try:
             self.present()
             if sys.platform == "win32":
                 self._raise_win32_foreground()
+            else:
+                self._raise_linux_foreground()
         except Exception as e:
             log(f"[SETTINGS] could not raise the window: {e}")
-        return False
+        return False                    # idle/timeout: run once each
 
     def _raise_win32_foreground(self) -> None:
         """Ask Windows to put this HWND in front after a tray click."""
@@ -734,6 +783,56 @@ class SettingsWindow(Adw.ApplicationWindow):
             user32.SetForegroundWindow(wintypes.HWND(hwnd))
         except Exception as e:
             log(f"[SETTINGS] Win32 raise failed: {e}")
+
+    def _raise_linux_foreground(self) -> None:
+        """Activate this window via the compositor after a tray click.
+
+        Runs off the GTK thread: kdotool/wmctrl can block briefly and must
+        not stall the settings UI.
+        """
+        title = self.get_title() or "WhisperFlow settings"
+
+        def work():
+            try:
+                self._activate_by_title(title)
+            except Exception as e:
+                log(f"[SETTINGS] compositor raise failed: {e}")
+
+        threading.Thread(target=work, daemon=True,
+                         name="whisper-flow-settings-raise").start()
+
+    @staticmethod
+    def _activate_by_title(title: str) -> None:
+        """Best-effort focus for a window whose title matches `title`."""
+        import shutil
+
+        # KDE (Wayland + X11): same tool the paste path uses.
+        if shutil.which("kdotool"):
+            found = subprocess.run(
+                ["kdotool", "search", "--name", title],
+                capture_output=True, text=True, timeout=3, check=False,
+            )
+            for wid in found.stdout.splitlines():
+                wid = wid.strip()
+                if not wid:
+                    continue
+                subprocess.run(
+                    ["kdotool", "windowactivate", wid],
+                    capture_output=True, text=True, timeout=3, check=False,
+                )
+                return
+        if shutil.which("wmctrl"):
+            subprocess.run(
+                ["wmctrl", "-a", title],
+                capture_output=True, text=True, timeout=3, check=False,
+            )
+            return
+        # X11 only; harmless no-op when DISPLAY is unset.
+        if shutil.which("xdotool") and os.environ.get("DISPLAY"):
+            subprocess.run(
+                ["xdotool", "search", "--name", title, "windowactivate"],
+                capture_output=True, text=True, timeout=3, check=False,
+            )
 
     def _watch_the_daemon(self) -> bool:
         """Follow what the daemon does while this window is open.
@@ -1220,6 +1319,9 @@ class SettingsWindow(Adw.ApplicationWindow):
                 # grow past the row it hangs off.
                 row.set_list_factory(_wide_list_factory(row))
                 row.add_css_class("mic-row")
+                # Device choice for an in-progress Test - never polled from
+                # the paint timer (that freezes the combo popover).
+                row.connect("notify::selected", self._on_mic_device_changed)
             if field.help:
                 row.set_subtitle(field.help)
             self._rows[field.key] = row
@@ -1374,9 +1476,7 @@ class SettingsWindow(Adw.ApplicationWindow):
         """
         row = Adw.ActionRow(title="Level")
         row.set_subtitle("Press Test and speak to check this device")
-        meter = Gtk.ProgressBar(
-            fraction=0.0, show_text=False, valign=Gtk.Align.CENTER)
-        meter.add_css_class("mic-meter")
+        meter = _MicLevelStrip()
         meter.set_tooltip_text("Microphone activity")
         row.add_suffix(meter)
         self._mic_meter = meter
@@ -1401,16 +1501,25 @@ class SettingsWindow(Adw.ApplicationWindow):
         else:
             self._start_mic_test()
 
+    def _on_mic_device_changed(self, *_args) -> None:
+        """Follow the Device dropdown while a Test is running."""
+        if not self._mic_meter_active:
+            return
+        with self._mic_meter_lock:
+            self._mic_want_device = self._selected_mic_device()
+
     def _start_mic_test(self) -> None:
         self._mic_meter_active = True
         if self._mic_test_button is not None:
             self._mic_test_button.set_label("Stop")
-        # Publish the device immediately - waiting for the first paint tick
-        # left the capture thread idle for a frame and made Test look dead.
+        # Publish the device immediately. Never re-read the ComboRow from
+        # the paint timer - that freezes the device list popover.
         with self._mic_meter_lock:
             self._mic_want_device = self._selected_mic_device()
             self._mic_drawn_level = 0.0
             self._mic_meter_error = None
+        if self._mic_meter is not None:
+            self._mic_meter.set_level(0.0)
         self._ensure_mic_meter_thread()
         if not self._mic_meter_tick_id:
             self._mic_meter_tick_id = GLib.timeout_add(
@@ -1426,7 +1535,7 @@ class SettingsWindow(Adw.ApplicationWindow):
             self._mic_drawn_level = 0.0
             self._mic_meter_error = None
         if self._mic_meter is not None:
-            self._mic_meter.set_fraction(0.0)
+            self._mic_meter.set_level(0.0)
         if self._mic_test_button is not None:
             self._mic_test_button.set_label("Test")
 
@@ -1445,8 +1554,8 @@ class SettingsWindow(Adw.ApplicationWindow):
         """Index the Device row is showing, or None for the platform default.
 
         Main-thread only: it reads the ComboRow. The capture thread never
-        calls this; it reads the copy `_mic_want_device` that `_tick_mic_meter`
-        publishes.
+        calls this; it reads the copy `_mic_want_device` published on Test
+        and on selection-changed.
         """
         row = self._rows.get("mic_device_index")
         if row is None:
@@ -1465,14 +1574,13 @@ class SettingsWindow(Adw.ApplicationWindow):
             return None
 
     def _tick_mic_meter(self) -> bool:
-        """Publish the selected device and paint the latest level.
+        """Paint the latest level. Does not touch the Device ComboRow.
 
-        Two jobs, both main-thread only. The capture thread must not touch
-        GTK, and GTK must not open PortAudio on this loop - opening a
-        capture stream can take hundreds of milliseconds on Windows.
+        Reading the combo from this timer while its popover was open
+        re-entered GTK and froze the settings window.
 
         Returns False to disarm the GLib source when Test is no longer
-        running, so a stale tick cannot paint a ProgressBar mid-rebuild.
+        running.
         """
         if (self._mic_meter is None
                 or not self._mic_meter_active
@@ -1481,13 +1589,11 @@ class SettingsWindow(Adw.ApplicationWindow):
             return False
 
         self._ensure_mic_meter_thread()
-        want = self._selected_mic_device()
         with self._mic_meter_lock:
-            self._mic_want_device = want
             level = self._mic_drawn_level
             error = self._mic_meter_error
             self._mic_meter_error = None
-        self._mic_meter.set_fraction(max(0.0, min(1.0, level)))
+        self._mic_meter.set_level(level)
         if error:
             self._toast(error)
             self._stop_mic_test()
@@ -1581,12 +1687,16 @@ class SettingsWindow(Adw.ApplicationWindow):
                     samples = np.frombuffer(data, dtype=np.int16)
                     if samples.size < 1:
                         continue
+                    # Peak-abs moves more visibly than pure RMS on quiet
+                    # laptop mics (room tone RMS ~20 never clears a high floor).
+                    loud = float(np.max(np.abs(samples.astype(np.float32))))
                     rms = float(np.sqrt(
                         np.mean(samples.astype(np.float32) ** 2)))
+                    measure = max(loud * 0.7, rms)
                 except Exception:
                     continue
 
-                level, peak = _mic_level_from_rms(rms, peak)
+                level, peak = _mic_level_from_rms(measure, peak)
                 with self._mic_meter_lock:
                     self._mic_drawn_level = level
         finally:

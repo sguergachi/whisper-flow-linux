@@ -120,7 +120,11 @@ class TestWhisperFlow:
 
             assert result is True
             mock_audio.record_until_silence.assert_called_once_with(
-                3.0, level_file=None,
+                3.0,
+                stop_event=None,
+                level_file=None,
+                on_ready=None,
+                max_duration=None,
             )
 
     def test_run_comprehensive_validation(self, mock_config):

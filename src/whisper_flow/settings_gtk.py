@@ -673,7 +673,6 @@ _SPIN = {
     "silence_timeout": (1, 0.5),
     "auto_stop_silence_duration": (1, 0.5),
     "speedup_audio": (2, 0.25),
-    "noise_floor": (1, 0.1),
     "max_recording_duration": (0, 30),
     "notification_min_interval": (0, 1),
     "notification_timeout": (0, 500),

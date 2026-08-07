@@ -244,27 +244,16 @@ class Config(BaseSettings):
         le=65535,
         env="WHISPER_FLOW_LOCAL_SERVER_PORT",
     )
-    noise_filter: bool = Field(
+    smart_voice_amplification: bool = Field(
         default=True,
-        description=("Remove rumble and turn down the room between words "
-                     "before transcribing"),
-        env="WHISPER_FLOW_NOISE_FILTER",
-    )
-    noise_floor: float = Field(
-        default=2.2,
-        description=("How many times louder than the measured room tone a "
-                     "frame must be to count as speech. Higher ignores more "
-                     "background; lower keeps more of a quiet voice."),
-        ge=1.2,
-        le=5.0,
-        env="WHISPER_FLOW_NOISE_FLOOR",
-    )
-    spectral_denoise: bool = Field(
-        default=False,
-        description=("Stationary spectral subtraction for fans/AC and other "
-                     "steady mid-band noise on top of speech. Heavier; only "
-                     "on the final pass."),
-        env="WHISPER_FLOW_SPECTRAL_DENOISE",
+        description=("Prepare the mic signal for transcription: adaptive "
+                     "noise handling, speech-band lift, and gain. One "
+                     "toggle for all preprocessing."),
+        # Legacy noise_filter env maps here so existing .env keeps working.
+        validation_alias=AliasChoices(
+            "WHISPER_FLOW_SMART_VOICE_AMPLIFICATION",
+            "WHISPER_FLOW_NOISE_FILTER",
+        ),
     )
     fast_encoder: bool = Field(
         # Whisper encodes a full 30 seconds whatever it was given, so a short

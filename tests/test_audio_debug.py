@@ -41,7 +41,7 @@ def test_save_and_finalize_archives_blank(tmp_path):
         sent=raw,
         floor=400.0,
         gate_threshold=2.2,
-        settings={"noise_filter": True, "noise_floor": 2.2},
+        settings={"smart_voice_amplification": True},
         mode="transcribe",
     )
     assert dest is not None

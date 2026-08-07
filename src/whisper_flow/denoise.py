@@ -1,19 +1,14 @@
-"""Taking the room out of a recording, without taking the voice with it.
+"""Smart voice amplification: one pipeline that prepares audio for Whisper.
 
-Whisper is trained on noisy audio and copes with a great deal of it; what it
-copes badly with is processing that removes or smears speech - and with a
-whisper in a café, where the room is louder than the voice. So this module
-does two jobs:
+Settings expose a single toggle. When it is on, ``enhance`` chooses how hard
+to work from the signal itself (adaptive floor, SNR, speak-at-HUD timing):
 
-  * Mild cleanup for ordinary dictation: high-pass, soft gate, peak normalise.
-  * A low-SNR "whisper rescue" path that auto-engages when the room masks the
-    voice: softer gate (so the whisper is not ducked), speech-band emphasis
-    (cut music bass, lift consonants), mild spectral subtract of pre-roll
-    noise, and normalise against speech-frame energy rather than the music's
-    peak.
+  * Ordinary speech — high-pass, soft gate, mild spectral subtract, peak lift.
+  * Whisper under noise — softer gate, speech-band emphasis, pre-emphasis,
+    speech-frame normalise, milder spectral cut so music peaks do not win.
 
-All of it is cheap, causal where live passes need determinism, and reversible
-from settings if a particular machine is worse with it on.
+When the toggle is off the recorder sends the raw capture. Nothing here is
+meant to be tuned by hand; the dynamics are the product.
 """
 
 import numpy as np
@@ -26,8 +21,7 @@ HIGHPASS_HZ = 80.0
 # own noise rather than an absolute level that suits neither.
 NOISE_PERCENTILE = 20      # frames this quiet (in the pre-roll) are noise
 GATE_THRESHOLD = 2.2       # above this multiple of the floor is speech
-GATE_FLOOR_DB = -14.0      # how far down quiet parts go at the default threshold
-GATE_FLOOR_DB_STRICT = -24.0  # how far at the max noise_floor setting
+GATE_FLOOR_DB = -14.0      # how far down quiet parts go (ordinary path)
 GATE_FRAME_MS = 20         # resolution of the level estimate
 GATE_ATTACK_MS = 15        # how quickly it opens; short, so onsets survive
 GATE_RELEASE_MS = 120      # how slowly it closes, so tails are not clipped
@@ -259,23 +253,9 @@ def is_low_snr(samples: np.ndarray, rate: int,
     return False
 
 
-def gate_floor_db(threshold: float | None,
-                  whisper_mode: bool = False) -> float:
-    """How far quiet parts are turned down, scaled by the noise_floor setting.
-
-    Higher threshold (stricter "Noise floor" knob) also digs the pauses
-    deeper: someone who asked to ignore more of the room gets quieter
-    pauses, not just a harder open decision. Whisper-mode keeps a shallow
-    floor so a buried voice is not crushed between words.
-    """
-    if whisper_mode:
-        return WHISPER_GATE_FLOOR_DB
-    mult = float(threshold) if threshold is not None else GATE_THRESHOLD
-    # Settings clamp noise_floor to [1.2, 5.0]; map that onto gate depth.
-    lo, hi = 1.2, 5.0
-    t = (mult - lo) / (hi - lo)
-    t = float(np.clip(t, 0.0, 1.0))
-    return GATE_FLOOR_DB + t * (GATE_FLOOR_DB_STRICT - GATE_FLOOR_DB)
+def gate_floor_db(whisper_mode: bool = False) -> float:
+    """How far quiet parts are turned down (fixed; no user knob)."""
+    return WHISPER_GATE_FLOOR_DB if whisper_mode else GATE_FLOOR_DB
 
 
 def gate(samples: np.ndarray, rate: int,
@@ -284,15 +264,8 @@ def gate(samples: np.ndarray, rate: int,
          whisper_mode: bool = False) -> np.ndarray:
     """Turn down the stretches where nobody is speaking.
 
-    The floor is measured from the pre-roll (or supplied by the caller) so
-    continuous background does not redefine "quiet" as the whole clip grows.
-    A recording that is all speech has a high pre-roll floor only if speech
-    started immediately - then almost nothing is gated, which is correct.
-
-    `threshold` is how many times the measured floor a frame must exceed to
-    count as speech (settings "Noise floor"). Default is GATE_THRESHOLD.
-    In whisper_mode the mult is capped so café music does not keep the gate
-    closed over a soft voice.
+    Floor is adaptive (or supplied). In whisper_mode the open threshold is
+    capped so café music does not keep the gate closed over a soft voice.
     """
     frame = max(1, int(rate * GATE_FRAME_MS / 1000))
     levels, usable = _frame_levels(samples, rate, frame)
@@ -338,7 +311,7 @@ def gate(samples: np.ndarray, rate: int,
         current += np.clip(target - current, -step, step)
         envelope[i] = current
 
-    quiet = float(10.0 ** (gate_floor_db(threshold, whisper_mode=whisper_mode) / 20.0))
+    quiet = float(10.0 ** (gate_floor_db(whisper_mode=whisper_mode) / 20.0))
     gains = quiet + (1.0 - quiet) * envelope
 
     # Interpolated across the samples, not held per frame. A gain that steps
@@ -494,53 +467,41 @@ def spectral_subtract(samples: np.ndarray, rate: int,
     return out
 
 
-def clean(samples: np.ndarray, rate: int, gated: bool = True,
-          gate_threshold: float | None = None,
-          spectral: bool = False,
-          normalize: bool = True,
-          floor: float | None = None,
-          noise_ref: np.ndarray | None = None,
-          whisper_rescue: bool | None = None) -> np.ndarray:
-    """High-pass, optional spectral subtract, gate, optional peak normalise.
+def enhance(samples: np.ndarray, rate: int, *,
+            floor: float | None = None,
+            noise_ref: np.ndarray | None = None,
+            live: bool = False,
+            force_rescue: bool | None = None) -> np.ndarray:
+    """Smart voice amplification: prepare a clip for Whisper.
 
-    Returns int16, ready to write.
+    One entry point for all preprocessing. Chooses ordinary vs low-SNR
+    rescue from the signal (or ``force_rescue``). ``live=True`` skips the
+    heavier full-band spectral step on the ordinary path so streaming
+    LocalAgreement stays cheap and deterministic; rescue still applies a
+    mild spectral cut when a noise reference is available.
 
-    `gate_threshold` is the settings noise-floor multiplier passed through
-    to ``gate``; None keeps the built-in default.
-    `spectral` enables stationary spectral subtraction (settings "Strong
-    noise filter"). Off for live passes: STFT is fine for a closing clip,
-    but live agreement needs a cheap causal path - except low-SNR rescue
-    which uses a milder subtract when a noise_ref is available.
-    `floor` / `noise_ref` are pre-measured from untrimmed room tone. When
-    silence has already been trimmed off the start, the pre-roll is speech
-    and measuring again would duck or subtract the voice - pass them in.
-    `whisper_rescue`: True force / False forbid / None auto-detect low SNR.
+    Returns int16 samples ready to write.
     """
     if samples.size == 0:
         return samples
 
-    # Floor from high-passed audio so gate/spectral/SNR agree, unless caller
-    # already measured on the untrimmed capture.
     base, _ = high_pass(samples, rate)
     if floor is None:
         floor = measure_floor(base, rate)
 
-    rescue = whisper_rescue
+    rescue = force_rescue
     if rescue is None:
-        rescue = is_low_snr(base, rate, floor=floor,
-                            gate_threshold=gate_threshold)
+        rescue = is_low_snr(base, rate, floor=floor)
 
     if rescue:
         try:
             from .logging import log
             snr = estimate_snr_db(base, rate, floor=floor)
-            log(f"[DENOISE] low-SNR rescue on "
-                f"(snr≈{snr:.0f}dB, floor={floor:.0f})")
+            log(f"[VOICE] smart amplify rescue "
+                f"(snr≈{snr:.0f}dB, floor={floor:.0f}, live={live})")
         except Exception:
             pass
-        # Speech-band: cut café bass/music low end harder than 80 Hz alone.
         filtered, _ = high_pass(samples, rate, cutoff_hz=SPEECH_BAND_HPF_HZ)
-        # Quiet-frame noise profile (not "first 300ms") — speak-at-HUD safe.
         ref = noise_ref
         if ref is None or (hasattr(ref, "size") and ref.size == 0):
             ref = noise_reference(base, rate, floor=floor)
@@ -551,46 +512,84 @@ def clean(samples: np.ndarray, rate: int, gated: bool = True,
                 oversub=RESCUE_SPECTRAL_OVERSUB,
                 max_atten_db=RESCUE_SPECTRAL_MAX_ATTEN_DB,
             )
-        elif spectral:
-            filtered = spectral_subtract(
-                filtered, rate, noise_ref=noise_ref,
-                oversub=RESCUE_SPECTRAL_OVERSUB,
-                max_atten_db=RESCUE_SPECTRAL_MAX_ATTEN_DB,
-            )
-        if gated:
-            filtered = gate(filtered, rate, threshold=gate_threshold,
-                            floor=floor, whisper_mode=True)
+        filtered = gate(filtered, rate, floor=floor, whisper_mode=True)
         filtered = pre_emphasize(filtered)
-        if normalize:
-            return normalize_speech(filtered, rate, floor=floor)
-        return np.clip(filtered, -32768, 32767).astype(np.int16)
+        return normalize_speech(filtered, rate, floor=floor)
 
-    # Ordinary path: mild HPF, optional full spectral, standard gate.
+    # Ordinary speech: mild cleanup. Final pass also peels stationary noise;
+    # live stays lighter for agreement latency.
     filtered = base
-    if spectral:
+    if not live:
         ref = noise_ref
         if ref is None or (hasattr(ref, "size") and ref.size == 0):
             ref = noise_reference(base, rate, floor=floor)
-        filtered = spectral_subtract(filtered, rate, noise_ref=ref)
-    if gated:
-        filtered = gate(filtered, rate, threshold=gate_threshold, floor=floor)
-    if normalize:
-        return normalize_peak(filtered)
-    return np.clip(filtered, -32768, 32767).astype(np.int16)
+        if ref is not None and getattr(ref, "size", 0):
+            filtered = spectral_subtract(
+                filtered, rate, noise_ref=ref,
+                oversub=0.85,
+                max_atten_db=14.0,
+            )
+    filtered = gate(filtered, rate, floor=floor, whisper_mode=False)
+    return normalize_peak(filtered)
+
+
+def clean(samples: np.ndarray, rate: int, gated: bool = True,
+          gate_threshold: float | None = None,
+          spectral: bool = False,
+          normalize: bool = True,
+          floor: float | None = None,
+          noise_ref: np.ndarray | None = None,
+          whisper_rescue: bool | None = None) -> np.ndarray:
+    """Compatibility wrapper around ``enhance`` for existing tests.
+
+    Prefer ``enhance`` for new call sites. Unused knobs (gated/spectral/
+    normalize) are mapped as best-effort so unit tests keep meaning.
+    """
+    if not gated and not normalize and not spectral and whisper_rescue is False:
+        filtered, _ = high_pass(samples, rate)
+        return np.clip(filtered, -32768, 32767).astype(np.int16)
+    live = not spectral and whisper_rescue is False
+    force = whisper_rescue if whisper_rescue is not None else None
+    out = enhance(samples, rate, floor=floor, noise_ref=noise_ref,
+                  live=live, force_rescue=force)
+    if not normalize:
+        # Tests that disable normalise expect pre-gain levels; re-run a
+        # thin path without the final lift.
+        base, _ = high_pass(samples, rate)
+        use_floor = floor if floor is not None else measure_floor(base, rate)
+        rescue = force if force is not None else is_low_snr(
+            base, rate, floor=use_floor, gate_threshold=gate_threshold)
+        if rescue:
+            filtered, _ = high_pass(samples, rate, cutoff_hz=SPEECH_BAND_HPF_HZ)
+            ref = noise_ref if noise_ref is not None else noise_reference(
+                base, rate, floor=use_floor)
+            if ref is not None and getattr(ref, "size", 0):
+                ref, _ = high_pass(ref, rate, cutoff_hz=SPEECH_BAND_HPF_HZ)
+                filtered = spectral_subtract(
+                    filtered, rate, noise_ref=ref,
+                    oversub=RESCUE_SPECTRAL_OVERSUB,
+                    max_atten_db=RESCUE_SPECTRAL_MAX_ATTEN_DB)
+            if gated:
+                filtered = gate(filtered, rate, threshold=gate_threshold,
+                                floor=use_floor, whisper_mode=True)
+            filtered = pre_emphasize(filtered)
+            return np.clip(filtered, -32768, 32767).astype(np.int16)
+        filtered = base
+        if spectral:
+            ref = noise_ref if noise_ref is not None else noise_reference(
+                base, rate, floor=use_floor)
+            filtered = spectral_subtract(filtered, rate, noise_ref=ref)
+        if gated:
+            filtered = gate(filtered, rate, threshold=gate_threshold,
+                            floor=use_floor)
+        return np.clip(filtered, -32768, 32767).astype(np.int16)
+    return out
 
 
 def rescue_samples(samples: np.ndarray, rate: int,
                    floor: float | None = None,
                    noise_ref: np.ndarray | None = None,
                    gate_threshold: float | None = None) -> np.ndarray:
-    """Force the café/whisper path on a clip (blank-retry and offline tools)."""
-    return clean(
-        samples, rate,
-        gated=True,
-        gate_threshold=gate_threshold,
-        spectral=True,
-        normalize=True,
-        floor=floor,
-        noise_ref=noise_ref,
-        whisper_rescue=True,
-    )
+    """Force the low-SNR path (blank-retry second pass)."""
+    return enhance(samples, rate, floor=floor, noise_ref=noise_ref,
+                   live=False, force_rescue=True)

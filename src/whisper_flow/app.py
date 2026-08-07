@@ -113,6 +113,8 @@ class WhisperFlow:
         config = getattr(self, "config", None)
         if config is None:
             return None
+        if not bool(getattr(config, "smart_voice_amplification", True)):
+            return None
         try:
             last = audio_debug.last_dir(config.config_dir)
             # Prefer raw_trimmed (voice + room, no prior gate). Fall back to
@@ -144,7 +146,6 @@ class WhisperFlow:
                 str(source), out,
                 noise_ref_path=str(untrimmed) if untrimmed.is_file() else None,
                 floor=float(floor) if floor else None,
-                gate_threshold=getattr(config, "noise_floor", None),
             )
             if not gain:
                 return None

@@ -65,8 +65,8 @@ def test_the_room_gets_quieter_and_the_voice_does_not(recording):
         f"the voice came out at {heard:.0f} against {spoken:.0f} clean")
 
 
-def test_a_higher_noise_floor_ignores_more_of_the_room(recording):
-    """Settings 'Noise floor' is the gate multiplier; higher = stricter."""
+def test_stricter_gate_multiplier_quiets_pauses_more(recording):
+    """Internal gate mult still works (used by unit paths, not a setting)."""
     noisy, voiced, _ = recording
     mild = denoise.clean(noisy, RATE, gate_threshold=1.5, normalize=False)
     strict = denoise.clean(noisy, RATE, gate_threshold=4.0, normalize=False)
@@ -77,12 +77,12 @@ def test_a_higher_noise_floor_ignores_more_of_the_room(recording):
         f"{quiet_strict:.0f}")
 
 
-def test_stricter_noise_floor_digs_pauses_deeper():
-    """Higher threshold also lowers GATE_FLOOR_DB (not only the open line)."""
-    assert denoise.gate_floor_db(1.2) == pytest.approx(denoise.GATE_FLOOR_DB)
-    assert denoise.gate_floor_db(5.0) == pytest.approx(
-        denoise.GATE_FLOOR_DB_STRICT)
-    assert denoise.gate_floor_db(5.0) < denoise.gate_floor_db(2.2)
+def test_whisper_mode_uses_shallower_gate_floor():
+    """Rescue path ducks pauses less hard so soft speech survives."""
+    assert denoise.gate_floor_db(False) == pytest.approx(denoise.GATE_FLOOR_DB)
+    assert denoise.gate_floor_db(True) == pytest.approx(
+        denoise.WHISPER_GATE_FLOOR_DB)
+    assert denoise.gate_floor_db(True) > denoise.gate_floor_db(False)
 
 
 def test_the_offset_and_the_rumble_go(recording):

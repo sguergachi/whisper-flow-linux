@@ -919,8 +919,8 @@ class AudioRecorder:
         floor = None
         noise_ref = None
         rescue = False
-        thr = getattr(self.config, "noise_floor", None)
-        if self.config.noise_filter:
+        smart = bool(getattr(self.config, "smart_voice_amplification", True))
+        if smart:
             floor, noise_ref = self._room_tone_from_frames(frames)
             raw = np.frombuffer(b"".join(frames), dtype=np.int16)
             if self._rescue_latched:
@@ -931,7 +931,6 @@ class AudioRecorder:
                     floor = self._latched_floor
             elif denoise.is_low_snr(
                     raw, self.config.sample_rate, floor=floor,
-                    gate_threshold=thr,
                     min_ms=denoise.SNR_LATCH_MIN_MS):
                 self._rescue_latched = True
                 self._latched_floor = floor
@@ -939,21 +938,20 @@ class AudioRecorder:
                 log(f"[AUDIO] low-SNR latched mid-dictation "
                     f"(floor={floor or 0:.0f}); rescue for rest of utterance")
         frames = self.trim_frames(frames)
-        if not frames or not self.config.noise_filter:
+        if not frames or not smart:
             return frames
         try:
             samples = np.frombuffer(b"".join(frames), dtype=np.int16)
-            cleaned = denoise.clean(
+            cleaned = denoise.enhance(
                 samples, self.config.sample_rate,
-                gate_threshold=thr,
-                spectral=False,
                 floor=floor,
                 noise_ref=noise_ref,
-                whisper_rescue=True if rescue else False,
+                live=True,
+                force_rescue=True if rescue else False,
             )
             return [cleaned.tobytes()]
         except Exception as e:
-            log(f"[AUDIO] live noise filter skipped: {e}")
+            log(f"[AUDIO] smart voice amplify skipped: {e}")
             return frames
 
     def _save_wav_file(self, output_path: str, frames: list):
@@ -969,14 +967,14 @@ class AudioRecorder:
         floor = None
         noise_ref = None
         raw_untrimmed = b"".join(frames) if frames else b""
-        thr = getattr(self.config, "noise_floor", None)
+        smart = bool(getattr(self.config, "smart_voice_amplification", True))
         force_rescue = bool(self._rescue_latched)
-        if self.config.noise_filter and frames:
+        if smart and frames:
             floor, noise_ref = self._room_tone_from_frames(frames)
             try:
                 raw_i16 = np.frombuffer(raw_untrimmed, dtype=np.int16)
                 if denoise.is_low_snr(raw_i16, self.config.sample_rate,
-                                      floor=floor, gate_threshold=thr):
+                                      floor=floor):
                     if not force_rescue:
                         log("[AUDIO] low-SNR on full clip; "
                             "retroactive rescue on final pass")
@@ -993,20 +991,18 @@ class AudioRecorder:
 
         audio = b"".join(frames)
         raw_trimmed = audio
-        if self.config.noise_filter and audio:
+        if smart and audio:
             try:
                 samples = np.frombuffer(audio, dtype=np.int16)
-                audio = denoise.clean(
+                audio = denoise.enhance(
                     samples, self.config.sample_rate,
-                    gate_threshold=thr,
-                    spectral=bool(getattr(
-                        self.config, "spectral_denoise", False)) or force_rescue,
                     floor=floor,
                     noise_ref=noise_ref,
-                    whisper_rescue=True if force_rescue else None,
+                    live=False,
+                    force_rescue=True if force_rescue else None,
                 ).tobytes()
             except Exception as e:
-                log(f"[AUDIO] noise filter skipped: {e}")
+                log(f"[AUDIO] smart voice amplify skipped: {e}")
 
         # Always snapshot last capture for whisper/noise diagnosis. Bounded:
         # overwrites audio-debug/last/; blank transcripts also go to fail-*.
@@ -1018,12 +1014,8 @@ class AudioRecorder:
                 raw_trimmed=raw_trimmed,
                 sent=audio,
                 floor=floor,
-                gate_threshold=thr,
                 settings={
-                    "noise_filter": bool(self.config.noise_filter),
-                    "noise_floor": thr,
-                    "spectral_denoise": bool(getattr(
-                        self.config, "spectral_denoise", False)),
+                    "smart_voice_amplification": smart,
                     "trim_silence": bool(self.config.trim_silence),
                     "vad_mode": getattr(self.config, "vad_mode", None),
                     "mic_device_index": getattr(

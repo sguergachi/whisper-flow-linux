@@ -124,7 +124,7 @@ def analyze(
         "snr_db_est": round(snr_db, 1),
         "needs_boost": bool(needs_boost(peak)),
         "below_dead_peak": peak < DEAD_PEAK,
-        "gate_floor_db": round(denoise.gate_floor_db(mult), 1),
+        "gate_floor_db": round(denoise.gate_floor_db(False), 1),
         "diagnosis": diagnosis,
     }
 
@@ -161,9 +161,7 @@ def format_report(meta: dict) -> str:
     lines = [
         f"whisper-flow audio debug  {meta.get('timestamp', '')}",
         f"mode={meta.get('mode', '?')}  rate={meta.get('sample_rate', '?')}Hz",
-        f"noise_filter={meta.get('noise_filter')}  "
-        f"noise_floor={meta.get('noise_floor')}  "
-        f"spectral={meta.get('spectral_denoise')}",
+        f"smart_voice={meta.get('smart_voice_amplification', meta.get('noise_filter'))}",
         f"trim_silence={meta.get('trim_silence')}  "
         f"vad_mode={meta.get('vad_mode')}",
         "",
@@ -172,7 +170,7 @@ def format_report(meta: dict) -> str:
     raw = meta.get("raw_untrimmed") or {}
     for k in ("duration_s", "peak", "mean", "rms", "floor_rms", "speech_line",
               "gate_open_fraction", "snr_db_est", "level_p50", "level_p90",
-              "level_max"):
+              "level_max", "gate_threshold"):
         if k in raw:
             lines.append(f"  {k}: {raw[k]}")
     if raw.get("diagnosis"):

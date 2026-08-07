@@ -474,13 +474,16 @@ elif scenario == "mic_meter":
     assert w._mic_test_button is not None, "no Test button on the Device row"
     assert w._mic_test_button.get_label() == "Test"
 
-    quiet, peak = settings_gtk._mic_level_from_rms(0.0, 40.0)
+    quiet, peak = settings_gtk._mic_level_from_rms(0.0, 80.0)
     assert quiet == 0.0
     # Floor holds the peak open so room noise does not dance the bar.
     assert peak == settings_gtk._MIC_METER_PEAK_FLOOR
-    loud, peak = settings_gtk._mic_level_from_rms(3000.0, 40.0)
+    loud, peak = settings_gtk._mic_level_from_rms(3000.0, 80.0)
     assert 0.5 < loud <= 1.0, loud
     assert peak >= 3000.0
+    # Absolute speech ref makes ordinary peaks visible before adaptive gain.
+    speech, _ = settings_gtk._mic_level_from_rms(800.0, 80.0)
+    assert speech > 0.15, speech
 
     w.present()
     assert pump(lambda: w.get_visible()), "window never became visible"

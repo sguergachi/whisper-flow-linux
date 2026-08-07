@@ -530,18 +530,22 @@ def _meter_native_rate(pa, device) -> int:
     return 16000
 
 
-def _open_meter_stream(pa, device, callback):
-    """Open a callback capture stream for the Device-row level meter.
+def _open_meter_stream(pa, device):
+    """Open a blocking capture stream for the Device-row level meter.
 
-    Callback mode, not blocking ``read()``: a blocking read that stalls
-    holds the GIL and freezes the whole settings UI after a few seconds.
+    Callback streams went quiet on several ALSA/PipeWire setups (no
+    frames delivered, bar stuck at zero). Blocking open + short reads of
+    only what ``get_read_available`` reports keeps the UI responsive and
+    actually paints levels.
 
     Uses the device's own rate so WASAPI shared mode accepts the open.
+
+    Returns ``(stream, frames_per_read)`` or ``(None, 0)``.
     """
     import pyaudio
 
     rate = _meter_native_rate(pa, device)
-    # ~20 ms of audio per callback.
+    # ~20 ms of audio per read.
     chunk = max(256, rate // 50)
     try:
         with _suppress_alsa_for_meter():
@@ -552,20 +556,18 @@ def _open_meter_stream(pa, device, callback):
                 input=True,
                 input_device_index=device,
                 frames_per_buffer=chunk,
-                stream_callback=callback,
             )
-        stream.start_stream()
-        return stream
+        return stream, chunk
     except Exception as e:
         log(f"[SETTINGS] mic meter could not open device {device}: {e}")
-        return None
+        return None, 0
 
 
 def _close_meter_stream(stream) -> None:
     if stream is None:
         return
     try:
-        if stream.is_active():
+        if getattr(stream, "is_active", lambda: False)():
             stream.stop_stream()
     except Exception:
         pass
@@ -629,13 +631,14 @@ _SPIN = {
     "queue_request_timeout": (0, 5),
 }
 
-# Live Device-row meter. Floor is low enough that a quiet laptop mic still
-# moves the bar; the HUD uses 150 because it has many bars and noise would
-# dance - here one strip has to prove "this is the right device".
-_MIC_METER_PEAK_FLOOR = 40.0
-_MIC_METER_PEAK_DECAY = 0.92
+# Live Device-row meter. Absolute ref so ordinary speech (peaks ~1k–8k of
+# int16) fills the bar; adaptive peak still prevents permanent pegging.
+_MIC_METER_PEAK_FLOOR = 80.0
+_MIC_METER_PEAK_DECAY = 0.90
 _MIC_METER_LEVEL_GAMMA = 0.55
 _MIC_METER_LEVEL_CEILING = 32767.0
+# ~normal speech peak in int16; quieter mics still show via adaptive gain.
+_MIC_METER_SPEECH_REF = 2500.0
 _MIC_METER_POLL_MS = 50
 # "off" means close the stream; None means the platform default input.
 _MIC_METER_OFF = "off"
@@ -645,15 +648,20 @@ def _mic_level_from_rms(rms: float, peak: float) -> tuple[float, float]:
     """Map a frame level onto 0..1 and the peak used for adaptive gain.
 
     Pure so the test can pin the scaling without opening a microphone.
-    `rms` may be peak-abs or true RMS; either is fine for a preview meter.
+    Combines an absolute speech reference (so the bar moves even before the
+    adaptive peak has learned the room) with adaptive gain for loud mics.
     """
     if rms <= 0:
         return 0.0, max(peak * _MIC_METER_PEAK_DECAY, _MIC_METER_PEAK_FLOOR)
     if rms > _MIC_METER_LEVEL_CEILING:
         rms = _MIC_METER_LEVEL_CEILING
     peak = max(peak * _MIC_METER_PEAK_DECAY, float(rms), _MIC_METER_PEAK_FLOOR)
-    level = min(1.0, (rms / peak) ** _MIC_METER_LEVEL_GAMMA)
-    return level, peak
+    adaptive = min(1.0, (rms / peak) ** _MIC_METER_LEVEL_GAMMA)
+    absolute = min(1.0, (rms / _MIC_METER_SPEECH_REF) ** _MIC_METER_LEVEL_GAMMA)
+    # Absolute so a first word moves the bar; adaptive so a loud mic does
+    # not sit pegged at full forever.
+    level = max(absolute * 0.65, adaptive * 0.85)
+    return min(1.0, level), peak
 
 
 class _MicLevelStrip(Gtk.DrawingArea):
@@ -672,7 +680,9 @@ class _MicLevelStrip(Gtk.DrawingArea):
 
     def set_level(self, level: float) -> None:
         level = max(0.0, min(1.0, float(level)))
-        if abs(level - self._level) < 0.005:
+        # Always redraw while testing so a slow decay is visible even when
+        # the step is small.
+        if abs(level - self._level) < 0.002 and level == self._level:
             return
         self._level = level
         self.queue_draw()
@@ -1716,11 +1726,10 @@ class SettingsWindow(Adw.ApplicationWindow):
     def _mic_meter_loop(self) -> None:
         """Open the chosen input and publish levels until asked to stop.
 
-        Uses a PortAudio *callback* stream. A blocking ``stream.read`` that
-        stalls holds the GIL and freezes the GTK UI a few seconds into Test.
-
-        The control loop only opens/closes streams and sleeps; audio arrives
-        on PortAudio's thread via the callback.
+        Reads only what PortAudio already has buffered (or one short chunk)
+        so a stalled device cannot hold the GIL for seconds and freeze GTK.
+        Callback streams were tried first; on several ALSA/PipeWire setups
+        they delivered no frames and the bar sat at zero.
         """
         try:
             import pyaudio
@@ -1733,29 +1742,11 @@ class SettingsWindow(Adw.ApplicationWindow):
 
         pa = None
         stream = None
+        chunk = 0
         open_device = _MIC_METER_OFF
-        # Mutable peak shared with the callback (only this thread opens/
-        # closes; callback only updates level + peak under the lock).
-        peak_box = [_MIC_METER_PEAK_FLOOR]
+        peak = _MIC_METER_PEAK_FLOOR
         open_failures = 0
-
-        def on_audio(in_data, _frame_count, _time_info, _status):
-            try:
-                samples = np.frombuffer(in_data, dtype=np.int16)
-                if samples.size < 1:
-                    return (None, pyaudio.paContinue)
-                # Peak-abs moves more visibly than pure RMS on quiet mics.
-                loud = float(np.max(np.abs(samples.astype(np.float32))))
-                rms = float(np.sqrt(
-                    np.mean(samples.astype(np.float32) ** 2)))
-                measure = max(loud * 0.7, rms)
-                level, peak_box[0] = _mic_level_from_rms(
-                    measure, peak_box[0])
-                with self._mic_meter_lock:
-                    self._mic_drawn_level = level
-            except Exception:
-                pass
-            return (None, pyaudio.paContinue)
+        empty_reads = 0
 
         try:
             try:
@@ -1777,10 +1768,12 @@ class SettingsWindow(Adw.ApplicationWindow):
                         _close_meter_stream(stream)
                         stream = None
                         open_device = _MIC_METER_OFF
+                        chunk = 0
                     with self._mic_meter_lock:
                         self._mic_drawn_level = 0.0
-                    peak_box[0] = _MIC_METER_PEAK_FLOOR
+                    peak = _MIC_METER_PEAK_FLOOR
                     open_failures = 0
+                    empty_reads = 0
                     self._mic_meter_stop.wait(0.1)
                     continue
 
@@ -1788,23 +1781,69 @@ class SettingsWindow(Adw.ApplicationWindow):
                     if stream is not None:
                         _close_meter_stream(stream)
                         stream = None
-                    stream = _open_meter_stream(pa, want, on_audio)
+                    stream, chunk = _open_meter_stream(pa, want)
                     open_device = want if stream is not None else _MIC_METER_OFF
-                    peak_box[0] = _MIC_METER_PEAK_FLOOR
+                    peak = _MIC_METER_PEAK_FLOOR
+                    empty_reads = 0
                     if stream is None:
                         open_failures += 1
                         with self._mic_meter_lock:
                             self._mic_drawn_level = 0.0
-                            if open_failures >= 2:
+                            if open_failures >= 1:
                                 self._mic_meter_error = (
                                     "Could not open this microphone - it may "
                                     "be in use or unavailable.")
                         self._mic_meter_stop.wait(0.4)
                         continue
                     open_failures = 0
+                    log(f"[SETTINGS] mic meter listening on device {want}")
 
-                # Callback drives levels; this thread only supervises.
-                self._mic_meter_stop.wait(0.05)
+                try:
+                    # Prefer non-blocking: only take what is already buffered.
+                    available = 0
+                    try:
+                        available = int(stream.get_read_available())
+                    except Exception:
+                        available = 0
+                    if available > 0:
+                        n = min(available, chunk if chunk else available)
+                        data = stream.read(n, exception_on_overflow=False)
+                    else:
+                        # Some backends always report 0 available; take one
+                        # short frame rather than spinning.
+                        n = chunk if chunk else 512
+                        data = stream.read(n, exception_on_overflow=False)
+                except Exception as e:
+                    log(f"[SETTINGS] mic meter read failed: {e}")
+                    _close_meter_stream(stream)
+                    stream = None
+                    open_device = _MIC_METER_OFF
+                    chunk = 0
+                    with self._mic_meter_lock:
+                        self._mic_drawn_level = 0.0
+                    continue
+
+                try:
+                    samples = np.frombuffer(data, dtype=np.int16)
+                    if samples.size < 1:
+                        empty_reads += 1
+                        if empty_reads > 50:
+                            with self._mic_meter_lock:
+                                self._mic_meter_error = (
+                                    "Microphone opened but sent no audio.")
+                        self._mic_meter_stop.wait(0.02)
+                        continue
+                    empty_reads = 0
+                    loud = float(np.max(np.abs(samples.astype(np.float32))))
+                    rms = float(np.sqrt(
+                        np.mean(samples.astype(np.float32) ** 2)))
+                    measure = max(loud * 0.85, rms)
+                except Exception:
+                    continue
+
+                level, peak = _mic_level_from_rms(measure, peak)
+                with self._mic_meter_lock:
+                    self._mic_drawn_level = level
         finally:
             if stream is not None:
                 _close_meter_stream(stream)

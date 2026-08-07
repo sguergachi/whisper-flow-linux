@@ -27,10 +27,13 @@ def systemd_unit_active() -> bool:
         return False
     if not _which("systemctl"):
         return False
-    result = subprocess.run(
-        ["systemctl", "--user", "is-active", UNIT],
-        capture_output=True, check=False,
-    )
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "is-active", UNIT],
+            capture_output=True, check=False, timeout=2,
+        )
+    except subprocess.TimeoutExpired:
+        return False
     return result.stdout.strip() == b"active"
 
 
@@ -94,23 +97,31 @@ def restart_daemon() -> tuple[bool, str]:
     """
     if systemd_unit_active():
         # --kill-who=main: only the daemon, not its settings/HUD children.
-        result = subprocess.run(
-            ["systemctl", "--user", "kill", "-s", "SIGTERM",
-             "--kill-who=main", UNIT],
-            capture_output=True, check=False,
-        )
+        # Every systemctl call is hard-capped so a stuck dbus cannot freeze
+        # the settings worker (and, if the GIL were held, the UI).
+        try:
+            result = subprocess.run(
+                ["systemctl", "--user", "kill", "-s", "SIGTERM",
+                 "--kill-who=main", UNIT],
+                capture_output=True, check=False, timeout=2,
+            )
+        except subprocess.TimeoutExpired:
+            return False, "systemctl kill timed out"
         if result.returncode != 0:
             return False, result.stderr.decode(errors="replace").strip() or \
                 "systemctl refused to stop the daemon"
-        # Brief pause so the old main is gone; do not wait the full cleanup
-        # (which used to include a multi-second wait on the settings child).
+        # Brief pause so the old main is gone; keep it short.
         pid = daemon_pid()
         if pid:
-            _wait_for_exit(pid, timeout=1.5)
-        result = subprocess.run(
-            ["systemctl", "--user", "start", UNIT],
-            capture_output=True, check=False,
-        )
+            _wait_for_exit(pid, timeout=0.8)
+        try:
+            result = subprocess.run(
+                ["systemctl", "--user", "start", UNIT],
+                capture_output=True, check=False, timeout=3,
+            )
+        except subprocess.TimeoutExpired:
+            # Start may still be proceeding; treat as success so Save returns.
+            return True, "restarting via systemd (start still running)"
         if result.returncode == 0:
             return True, "restarting via systemd"
         return False, result.stderr.decode(errors="replace").strip() or \
@@ -125,7 +136,7 @@ def restart_daemon() -> tuple[bool, str]:
         except OSError as e:
             log(f"[SETTINGS] could not signal daemon {pid}: {e}")
         # Short wait only - settings is still open and must stay responsive.
-        if not _wait_for_exit(pid, timeout=1.5):
+        if not _wait_for_exit(pid, timeout=0.8):
             log(f"[SETTINGS] daemon {pid} still running after SIGTERM; "
                 "starting a replacement anyway")
 

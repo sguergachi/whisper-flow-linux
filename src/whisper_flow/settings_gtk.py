@@ -14,6 +14,12 @@ rather than a failure.
 Saving writes the .env file and restarts the daemon so the new values apply
 immediately. There is no "restart later" step: if a restart is needed, it
 happens as part of Save.
+
+UI thread rule
+--------------
+The GTK main loop must never block. PortAudio, ``systemctl``, disk writes,
+and network downloads run only on worker threads. Results return via
+``GLib.idle_add``. If something feels frozen, something has broken this rule.
 """
 
 import contextlib
@@ -531,21 +537,15 @@ def _meter_native_rate(pa, device) -> int:
 
 
 def _open_meter_stream(pa, device):
-    """Open a blocking capture stream for the Device-row level meter.
+    """Open a capture stream for the Device-row level meter.
 
-    Callback streams went quiet on several ALSA/PipeWire setups (no
-    frames delivered, bar stuck at zero). Blocking open + short reads of
-    only what ``get_read_available`` reports keeps the UI responsive and
-    actually paints levels.
-
-    Uses the device's own rate so WASAPI shared mode accepts the open.
-
-    Returns ``(stream, frames_per_read)`` or ``(None, 0)``.
+    Worker-thread only. Uses the device's own rate so WASAPI shared mode
+    accepts the open. Returns ``(stream, frames_per_read)`` or ``(None, 0)``.
     """
     import pyaudio
 
     rate = _meter_native_rate(pa, device)
-    # ~20 ms of audio per read.
+    # ~20 ms of audio per read when data is available.
     chunk = max(256, rate // 50)
     try:
         with _suppress_alsa_for_meter():
@@ -575,6 +575,37 @@ def _close_meter_stream(stream) -> None:
         stream.close()
     except Exception:
         pass
+
+
+def _run_in_background(name: str, work, done=None) -> None:
+    """Run ``work()`` off the GTK thread; optional ``done`` on the main loop.
+
+    ``work`` may return a value or raise. When ``done`` is given it is always
+    scheduled via ``GLib.idle_add`` as ``done(ok, result_or_error)`` so the
+    GTK thread never waits on the worker. Call this for any disk, PortAudio,
+    ``systemctl``, or network work that Save / Restart / downloads need.
+    """
+    def runner():
+        try:
+            result = work()
+            payload = (True, result)
+        except Exception as e:
+            log(f"[SETTINGS] background {name} failed: {e}")
+            payload = (False, e)
+        if done is None:
+            return
+
+        def finish(p=payload):
+            try:
+                done(*p)
+            except Exception as e:
+                log(f"[SETTINGS] background {name} done-handler failed: {e}")
+            return False            # idle_add: run once
+
+        GLib.idle_add(finish)
+
+    threading.Thread(target=runner, daemon=True,
+                     name=f"whisper-flow-settings-{name}").start()
 
 
 def _host_api_name(pa, info) -> str:
@@ -1798,21 +1829,31 @@ class SettingsWindow(Adw.ApplicationWindow):
                     open_failures = 0
                     log(f"[SETTINGS] mic meter listening on device {want}")
 
+                # Never stall the GIL on a device that will not deliver
+                # frames: PortAudio's stream.read holds the interpreter
+                # lock, so a multi-second block freezes GTK even though
+                # this loop is on a worker thread. Prefer only what is
+                # already buffered; when the available-count API is missing
+                # take one short chunk and rely on the empty-read timeout.
                 try:
-                    # Prefer non-blocking: only take what is already buffered.
-                    available = 0
+                    available = None
                     try:
                         available = int(stream.get_read_available())
                     except Exception:
-                        available = 0
-                    if available > 0:
-                        n = min(available, chunk if chunk else available)
-                        data = stream.read(n, exception_on_overflow=False)
-                    else:
-                        # Some backends always report 0 available; take one
-                        # short frame rather than spinning.
-                        n = chunk if chunk else 512
-                        data = stream.read(n, exception_on_overflow=False)
+                        available = None
+                    if available is not None and available < 32:
+                        empty_reads += 1
+                        if empty_reads > 150:
+                            with self._mic_meter_lock:
+                                self._mic_meter_error = (
+                                    "Microphone opened but sent no audio.")
+                        # Sleep releases the GIL so GTK stays responsive.
+                        self._mic_meter_stop.wait(0.02)
+                        continue
+                    n = chunk if chunk else 512
+                    if available is not None:
+                        n = min(available, n)
+                    data = stream.read(n, exception_on_overflow=False)
                 except Exception as e:
                     log(f"[SETTINGS] mic meter read failed: {e}")
                     _close_meter_stream(stream)
@@ -1826,11 +1867,6 @@ class SettingsWindow(Adw.ApplicationWindow):
                 try:
                     samples = np.frombuffer(data, dtype=np.int16)
                     if samples.size < 1:
-                        empty_reads += 1
-                        if empty_reads > 50:
-                            with self._mic_meter_lock:
-                                self._mic_meter_error = (
-                                    "Microphone opened but sent no audio.")
                         self._mic_meter_stop.wait(0.02)
                         continue
                     empty_reads = 0
@@ -2023,6 +2059,11 @@ class SettingsWindow(Adw.ApplicationWindow):
         self._toast("Changes discarded")
 
     def _on_save(self):
+        """Validate on the UI thread; write .env and restart off it.
+
+        The whole Save path is async after reading widget values: disk and
+        systemctl must never run under a button-clicked handler.
+        """
         if self._working:
             return
         values = self._values()
@@ -2040,20 +2081,35 @@ class SettingsWindow(Adw.ApplicationWindow):
             return
 
         env_path = Path(self.config.config_dir) / ".env"
-        try:
-            envfile.set_values(env_path, updates)
-        except Exception as e:
-            self._toast(f"Could not save: {e}")
-            return
-        log(f"[SETTINGS] saved {sorted(updates)} to {env_path}")
-
-        self._current = values
-        self._current_model = model or self._current_model
+        self._working = True
         self._banner.set_revealed(False)
-        # Settings only take effect in a new process. Do not ask - restart.
-        self._restart_daemon(toast_start="Saved. Restarting...",
-                             toast_ok="Saved and restarted.",
-                             toast_fail_prefix="Saved, but could not restart")
+        if self._mic_meter_active:
+            self._stop_mic_test()
+        self._toast("Saved. Restarting...")
+
+        def work():
+            envfile.set_values(env_path, updates)
+            log(f"[SETTINGS] saved {sorted(updates)} to {env_path}")
+            return restart.restart_daemon()
+
+        def done(ok, result):
+            self._working = False
+            if not ok:
+                self._toast(f"Could not save: {result}")
+                return False
+            restart_ok, detail = result
+            if restart_ok:
+                self._current = values
+                self._current_model = model or self._current_model
+                self._toast("Saved and restarted.")
+            else:
+                # File is written; only the restart failed.
+                self._current = values
+                self._current_model = model or self._current_model
+                self._toast(f"Saved, but could not restart: {detail}")
+            return False
+
+        _run_in_background("save", work, done)
 
     def _on_restart(self):
         """Manual restart (still available if something else needs one)."""
@@ -2063,44 +2119,30 @@ class SettingsWindow(Adw.ApplicationWindow):
 
     def _restart_daemon(self, toast_start: str, toast_ok: str,
                         toast_fail_prefix: str) -> None:
-        """Stop and start the daemon; report progress via toasts.
-
-        Never blocks the GTK main loop. The toast is drawn first; the actual
-        kill/start runs on a worker thread so Save cannot freeze the window
-        for the duration of the restart.
-        """
+        """Stop and start the daemon off the GTK thread."""
         if self._working:
             return
         self._working = True
-        # Mic test holds a capture stream; release it before the daemon
-        # comes back up and wants the same device.
         if self._mic_meter_active:
             self._stop_mic_test()
         self._toast(toast_start)
-        # Hand off on the next idle so this click handler returns and the
-        # toast can paint before any worker work starts.
-        GLib.idle_add(self._restart_daemon_begin, toast_ok, toast_fail_prefix)
 
-    def _restart_daemon_begin(self, toast_ok: str,
-                              toast_fail_prefix: str) -> bool:
         def work():
-            try:
-                ok, detail = restart.restart_daemon()
-            except Exception as e:
-                ok, detail = False, str(e)
+            return restart.restart_daemon()
 
-            def done():
-                self._working = False
-                if ok:
-                    self._toast(toast_ok)
-                else:
-                    self._toast(f"{toast_fail_prefix}: {detail}")
+        def done(ok, result):
+            self._working = False
+            if not ok:
+                self._toast(f"{toast_fail_prefix}: {result}")
+                return False
+            restart_ok, detail = result
+            if restart_ok:
+                self._toast(toast_ok)
+            else:
+                self._toast(f"{toast_fail_prefix}: {detail}")
+            return False
 
-            GLib.idle_add(done)
-
-        threading.Thread(target=work, daemon=True,
-                         name="whisper-flow-restart").start()
-        return False                    # idle_add: run once
+        _run_in_background("restart", work, done)
 
     def _start_download(self, model: str):
         if self._working:
@@ -2191,11 +2233,23 @@ class SettingsWindow(Adw.ApplicationWindow):
                 bar.set_fraction(fraction)
 
     def _open_config_folder(self):
+        """Open the config dir without blocking the UI on a hung file manager."""
         path = str(self.config.config_dir)
-        try:
-            subprocess.Popen(["xdg-open", path])
-        except Exception:
-            self._toast(f"Config folder: {path}")
+
+        def work():
+            try:
+                if sys.platform == "win32":
+                    os.startfile(path)  # type: ignore[attr-defined]
+                else:
+                    subprocess.Popen(
+                        ["xdg-open", path],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+            except Exception:
+                GLib.idle_add(self._toast, f"Config folder: {path}")
+
+        _run_in_background("open-config", work)
 
     # ------------------------------------------------------------------ blur
     def _frost(self):

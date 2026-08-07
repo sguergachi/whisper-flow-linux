@@ -113,9 +113,15 @@ elif scenario == "models":
 elif scenario == "save":
     w._rows["live_interval"].set_value(1.4)
     w._on_save()
-    # Save restarts on its own - no "Restart now" button to click.
+    # Save writes .env and restarts off the GTK thread so the UI never
+    # freezes; pump until that work finishes and the toast settles.
     assert "Saved" in w._last_toast_title
     assert "Restart" in w._last_toast_title
+    assert pump(lambda: (
+        not w._working
+        and os.path.exists(config_dir + "/.env")
+        and "Saved and restarted" in (w._last_toast_title or "")
+    )), f"async save never finished: toast={w._last_toast_title!r}"
 elif scenario == "cancel":
     # Discard unsaved edits without writing .env or restarting.
     w.present()
@@ -140,7 +146,9 @@ elif scenario == "cleared":
     mic = mic_row()
     mic.set_selected(1)
     w._on_save()
-    assert (config_dir + "/.env") and True
+    assert pump(lambda: (
+        not w._working and os.path.exists(config_dir + "/.env")
+    )), "async save never wrote .env"
 elif scenario == "daemon_moved_on":
     # The daemon restarts and comes up on a different model. The page exists
     # to say which model is in use, so it has to stop saying the old one.

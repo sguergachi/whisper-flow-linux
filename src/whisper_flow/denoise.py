@@ -32,13 +32,17 @@ GATE_FRAME_MS = 20         # resolution of the level estimate
 GATE_ATTACK_MS = 15        # how quickly it opens; short, so onsets survive
 GATE_RELEASE_MS = 120      # how slowly it closes, so tails are not clipped
 
-# Room tone is taken from the start of the clip, not the whole recording.
-# Push-to-talk opens before the sentence starts, so the first few hundred
-# milliseconds are almost always the room. Using the whole clip's quietest
-# fifth made continuous background (AC, café) raise the floor until quiet
-# speech looked like noise and was ducked.
+# Floor estimation cannot assume pure room tone at the start: the HUD means
+# "speak now", and users talk the moment capture begins. Pre-roll alone would
+# treat the first words as noise. Adaptive floor uses the quieter of (a) the
+# opening window and (b) the quiet percentile of everything heard so far, so
+# between-word gaps correct a speech-filled opening, and a true room-tone
+# opening still works.
 PRE_ROLL_MS = 300
-# Fallback when the pre-roll is shorter than this (very short clips).
+# How soon live SNR may latch rescue (ms of audio). Shorter = quicker switch
+# under café noise; needs a few frames of level history.
+SNR_LATCH_MIN_MS = 200
+# Fallback when the clip is shorter than this (very short clips).
 MIN_FLOOR_FRAMES = 3
 
 # Always-on peak normalise after cleaning. Milder than the blank-retry boost:
@@ -130,27 +134,81 @@ def _frame_levels(samples: np.ndarray, rate: int, frame: int):
     return np.sqrt((blocks ** 2).mean(axis=1)), usable
 
 
-def measure_floor(samples: np.ndarray, rate: int) -> float:
-    """RMS noise floor from the pre-roll (start of the clip).
+def measure_floor(samples: np.ndarray, rate: int,
+                  strategy: str = "adaptive") -> float:
+    """RMS noise floor for gating and SNR.
 
-    Causal and stable as a recording grows: live passes always see the same
-    first PRE_ROLL_MS, so the floor - and therefore the gate - does not drift
-    between passes and break LocalAgreement.
+    strategy:
+      * ``adaptive`` (default) — quieter of opening window vs whole-clip quiet
+        percentile. Correct when speech starts at HUD show (no pure pre-roll)
+        and when the user does wait a beat before talking.
+      * ``opening`` — first PRE_ROLL_MS only (spectral noise_ref source).
+      * ``full`` — quiet percentile of the entire clip.
     """
     frame = max(1, int(rate * GATE_FRAME_MS / 1000))
-    pre_n = min(samples.size, max(frame * MIN_FLOOR_FRAMES,
-                                  int(rate * PRE_ROLL_MS / 1000)))
-    if pre_n < frame:
-        return 0.0
-    levels, _ = _frame_levels(samples[:pre_n], rate, frame)
+    levels, _ = _frame_levels(samples, rate, frame)
     if levels.size == 0:
         return 0.0
-    return float(np.percentile(levels, NOISE_PERCENTILE))
+
+    pre_frames = max(MIN_FLOOR_FRAMES,
+                     int(PRE_ROLL_MS / GATE_FRAME_MS))
+    pre_levels = levels[:min(levels.size, pre_frames)]
+    opening = float(np.percentile(pre_levels, NOISE_PERCENTILE))
+    whole = float(np.percentile(levels, NOISE_PERCENTILE))
+
+    if strategy == "opening":
+        return opening
+    if strategy == "full":
+        return whole
+    # adaptive
+    return float(min(opening, whole))
+
+
+def noise_reference(samples: np.ndarray, rate: int,
+                    floor: float | None = None) -> np.ndarray:
+    """Samples that best represent the room for spectral subtraction.
+
+    Prefer frames at or below the floor (pauses / music bed). When speech
+    starts at HUD open there is no pure pre-roll, so stitching quiet frames
+    beats blindly taking the first 300ms of voice.
+    """
+    if samples.size == 0:
+        return samples
+    x = samples.astype(np.float32)
+    frame = max(1, int(rate * GATE_FRAME_MS / 1000))
+    levels, usable = _frame_levels(x, rate, frame)
+    if levels.size == 0:
+        n = min(x.size, max(frame * MIN_FLOOR_FRAMES,
+                            int(rate * PRE_ROLL_MS / 1000)))
+        return x[:n].copy()
+
+    if floor is None or floor <= 0:
+        floor = measure_floor(x, rate)
+    quiet_idx = np.where(levels <= max(floor * 1.2, floor + 1.0))[0]
+    if quiet_idx.size == 0:
+        # Loud throughout: take the quietest fifth of frames instead.
+        order = np.argsort(levels)
+        quiet_idx = order[:max(1, levels.size // 5)]
+
+    want = max(frame * MIN_FLOOR_FRAMES, int(rate * PRE_ROLL_MS / 1000))
+    chunks = []
+    total = 0
+    for i in quiet_idx:
+        start = int(i) * frame
+        end = min(start + frame, usable if usable else x.size)
+        chunks.append(x[start:end])
+        total += end - start
+        if total >= want:
+            break
+    if not chunks:
+        return x[:want].copy()
+    ref = np.concatenate(chunks)
+    return ref[:want].copy()
 
 
 def estimate_snr_db(samples: np.ndarray, rate: int,
                     floor: float | None = None) -> float:
-    """Rough SNR: loudest frame vs pre-roll floor, in dB.
+    """Rough SNR: loudest frame vs adaptive floor, in dB.
 
     Negative or low values mean the room is as loud as (or louder than) the
     voice - the café + whisper case. Returns a high number when there is no
@@ -172,9 +230,16 @@ def estimate_snr_db(samples: np.ndarray, rate: int,
 
 def is_low_snr(samples: np.ndarray, rate: int,
                floor: float | None = None,
-               gate_threshold: float | None = None) -> bool:
-    """Whether the clip looks like a whisper under continuous background."""
+               gate_threshold: float | None = None,
+               min_ms: float = 0.0) -> bool:
+    """Whether the clip looks like a whisper under continuous background.
+
+    `min_ms` skips the call until enough audio is in (live path waits
+    SNR_LATCH_MIN_MS so a single click does not latch rescue).
+    """
     if samples.size == 0:
+        return False
+    if min_ms > 0 and samples.size < int(rate * min_ms / 1000):
         return False
     x = samples.astype(np.float32)
     if floor is None or floor <= 0:
@@ -475,11 +540,11 @@ def clean(samples: np.ndarray, rate: int, gated: bool = True,
             pass
         # Speech-band: cut café bass/music low end harder than 80 Hz alone.
         filtered, _ = high_pass(samples, rate, cutoff_hz=SPEECH_BAND_HPF_HZ)
-        # Mild pre-roll subtract even without Strong mode - music is not
-        # stationary but the average spectrum still pulls some energy down.
-        if noise_ref is not None and noise_ref.size:
-            ref = noise_ref
-            # Match the speech-band high-pass on the reference.
+        # Quiet-frame noise profile (not "first 300ms") — speak-at-HUD safe.
+        ref = noise_ref
+        if ref is None or (hasattr(ref, "size") and ref.size == 0):
+            ref = noise_reference(base, rate, floor=floor)
+        if ref is not None and getattr(ref, "size", 0):
             ref, _ = high_pass(ref, rate, cutoff_hz=SPEECH_BAND_HPF_HZ)
             filtered = spectral_subtract(
                 filtered, rate, noise_ref=ref,
@@ -503,7 +568,10 @@ def clean(samples: np.ndarray, rate: int, gated: bool = True,
     # Ordinary path: mild HPF, optional full spectral, standard gate.
     filtered = base
     if spectral:
-        filtered = spectral_subtract(filtered, rate, noise_ref=noise_ref)
+        ref = noise_ref
+        if ref is None or (hasattr(ref, "size") and ref.size == 0):
+            ref = noise_reference(base, rate, floor=floor)
+        filtered = spectral_subtract(filtered, rate, noise_ref=ref)
     if gated:
         filtered = gate(filtered, rate, threshold=gate_threshold, floor=floor)
     if normalize:

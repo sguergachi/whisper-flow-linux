@@ -173,6 +173,11 @@ class AudioRecorder:
         self._capture_rate = config.sample_rate
         self._warm_timer = None
         self._stream_lock = threading.Lock()
+        # Live low-SNR latch: once café/whisper conditions are seen mid-
+        # dictation, stay on the rescue path for the rest of the utterance
+        # (and the final pass re-checks the full clip retroactively).
+        self._rescue_latched = False
+        self._latched_floor: float | None = None
         if pyaudio is None:
             log("[AUDIO] pyaudio is not installed; recording is unavailable")
             return
@@ -627,6 +632,8 @@ class AudioRecorder:
 
         frame_len = int(self.config.sample_rate * self.config.frame_ms / 1000)
         chunk = frame_len
+        # Fresh SNR state every dictation (HUD = speak now on this clip).
+        self._reset_snr_latch()
 
         try:
             opened_at = time.monotonic()
@@ -750,6 +757,7 @@ class AudioRecorder:
 
         frame_len = int(self.config.sample_rate * self.config.frame_ms / 1000)
         chunk = frame_len
+        self._reset_snr_latch()
         # Fall back to the configured ceiling so a missing max never means
         # "wait forever".
         if max_duration is None:
@@ -871,12 +879,17 @@ class AudioRecorder:
                 f"({(len(frames) - len(trimmed)) * self.config.frame_ms / 1000:.2f}s)")
         return trimmed
 
-    def _room_tone_from_frames(self, frames: list):
-        """High-passed room tone and RMS floor from the start of a capture.
+    def _reset_snr_latch(self) -> None:
+        """Clear mid-dictation rescue state at the start of each recording."""
+        self._rescue_latched = False
+        self._latched_floor = None
 
-        Trim drops the leading silence the gate and spectral estimate need;
-        measuring first keeps both stable for live prefixes and the closing
-        WAV. Returns ``(floor, noise_ref)`` or ``(None, None)``.
+    def _room_tone_from_frames(self, frames: list):
+        """Adaptive floor + quiet-frame noise ref from a capture prefix.
+
+        Speak-at-HUD: the opening may already be voice, so the floor is the
+        quieter of the opening window and the whole-prefix quiet percentile.
+        Returns ``(floor, noise_ref)`` or ``(None, None)``.
         """
         if not frames:
             return None, None
@@ -886,10 +899,9 @@ class AudioRecorder:
                 return None, None
             filtered, _ = denoise.high_pass(samples, self.config.sample_rate)
             floor = denoise.measure_floor(filtered, self.config.sample_rate)
-            pre_n = min(filtered.size,
-                        max(1, int(self.config.sample_rate
-                                   * denoise.PRE_ROLL_MS / 1000)))
-            return floor, filtered[:pre_n].copy()
+            ref = denoise.noise_reference(filtered, self.config.sample_rate,
+                                          floor=floor)
+            return floor, ref
         except Exception as e:
             log(f"[AUDIO] could not measure noise floor: {e}")
             return None, None
@@ -897,17 +909,35 @@ class AudioRecorder:
     def prepare_frames(self, frames: list) -> list:
         """Condition frames for a live transcription pass.
 
-        Measure room tone on the raw prefix, trim, then the light noise path
-        (high-pass + gate + peak normalise). Spectral subtraction stays off
-        here: it is for the final WAV only. The floor comes from the first
-        PRE_ROLL_MS of the untrimmed capture, which does not move as the
-        clip grows - so LocalAgreement still sees a deterministic prepare.
+        Floor/SNR are re-estimated as the prefix grows so café noise can
+        latch rescue within ~SNR_LATCH_MIN_MS after HUD (speak now). Once
+        latched, rescue stays on for the rest of the utterance so the path
+        does not flap. Final save re-evaluates the full clip retroactively.
         """
         if not frames:
             return frames
         floor = None
+        noise_ref = None
+        rescue = False
+        thr = getattr(self.config, "noise_floor", None)
         if self.config.noise_filter:
-            floor, _ = self._room_tone_from_frames(frames)
+            floor, noise_ref = self._room_tone_from_frames(frames)
+            raw = np.frombuffer(b"".join(frames), dtype=np.int16)
+            if self._rescue_latched:
+                rescue = True
+                if floor is not None and self._latched_floor is not None:
+                    floor = min(floor, self._latched_floor)
+                elif self._latched_floor is not None:
+                    floor = self._latched_floor
+            elif denoise.is_low_snr(
+                    raw, self.config.sample_rate, floor=floor,
+                    gate_threshold=thr,
+                    min_ms=denoise.SNR_LATCH_MIN_MS):
+                self._rescue_latched = True
+                self._latched_floor = floor
+                rescue = True
+                log(f"[AUDIO] low-SNR latched mid-dictation "
+                    f"(floor={floor or 0:.0f}); rescue for rest of utterance")
         frames = self.trim_frames(frames)
         if not frames or not self.config.noise_filter:
             return frames
@@ -915,9 +945,11 @@ class AudioRecorder:
             samples = np.frombuffer(b"".join(frames), dtype=np.int16)
             cleaned = denoise.clean(
                 samples, self.config.sample_rate,
-                gate_threshold=getattr(self.config, "noise_floor", None),
+                gate_threshold=thr,
                 spectral=False,
                 floor=floor,
+                noise_ref=noise_ref,
+                whisper_rescue=True if rescue else False,
             )
             return [cleaned.tobytes()]
         except Exception as e:
@@ -932,12 +964,25 @@ class AudioRecorder:
             frames: List of audio frames to save
 
         """
-        # Room tone lives in the leading silence. Capture it before trim.
+        # Full-clip adaptive floor (speak-at-HUD safe). Retroactive: if live
+        # never latched but the finished clip is low-SNR, force rescue here.
         floor = None
         noise_ref = None
         raw_untrimmed = b"".join(frames) if frames else b""
+        thr = getattr(self.config, "noise_floor", None)
+        force_rescue = bool(self._rescue_latched)
         if self.config.noise_filter and frames:
             floor, noise_ref = self._room_tone_from_frames(frames)
+            try:
+                raw_i16 = np.frombuffer(raw_untrimmed, dtype=np.int16)
+                if denoise.is_low_snr(raw_i16, self.config.sample_rate,
+                                      floor=floor, gate_threshold=thr):
+                    if not force_rescue:
+                        log("[AUDIO] low-SNR on full clip; "
+                            "retroactive rescue on final pass")
+                    force_rescue = True
+            except Exception:
+                pass
 
         frames = self.trim_frames(frames)
 
@@ -949,18 +994,16 @@ class AudioRecorder:
         audio = b"".join(frames)
         raw_trimmed = audio
         if self.config.noise_filter and audio:
-            # Whole clip, not per chunk. Live passes use prepare_frames with
-            # the same light path (no spectral) so they stay in agreement.
             try:
                 samples = np.frombuffer(audio, dtype=np.int16)
                 audio = denoise.clean(
                     samples, self.config.sample_rate,
-                    gate_threshold=getattr(
-                        self.config, "noise_floor", None),
+                    gate_threshold=thr,
                     spectral=bool(getattr(
-                        self.config, "spectral_denoise", False)),
+                        self.config, "spectral_denoise", False)) or force_rescue,
                     floor=floor,
                     noise_ref=noise_ref,
+                    whisper_rescue=True if force_rescue else None,
                 ).tobytes()
             except Exception as e:
                 log(f"[AUDIO] noise filter skipped: {e}")
@@ -975,21 +1018,26 @@ class AudioRecorder:
                 raw_trimmed=raw_trimmed,
                 sent=audio,
                 floor=floor,
-                gate_threshold=getattr(self.config, "noise_floor", None),
+                gate_threshold=thr,
                 settings={
                     "noise_filter": bool(self.config.noise_filter),
-                    "noise_floor": getattr(self.config, "noise_floor", None),
+                    "noise_floor": thr,
                     "spectral_denoise": bool(getattr(
                         self.config, "spectral_denoise", False)),
                     "trim_silence": bool(self.config.trim_silence),
                     "vad_mode": getattr(self.config, "vad_mode", None),
                     "mic_device_index": getattr(
                         self.config, "mic_device_index", None),
+                    "rescue_latched": bool(self._rescue_latched),
+                    "force_rescue": force_rescue,
                 },
                 mode=getattr(self, "_debug_mode", "") or "",
             )
         except Exception as e:
             log(f"[AUDIO] audio debug capture skipped: {e}")
+
+        # Ready for the next dictation.
+        self._reset_snr_latch()
 
         with wave.open(output_path, "wb") as wf:
             wf.setnchannels(1)

@@ -122,12 +122,22 @@ class WhisperFlow:
                 source = Path(audio_file)
             untrimmed = last / "raw_untrimmed.wav"
             out = f"{audio_file}.rescue.wav"
+            # Recompute adaptive floor on the full capture (speak-at-HUD:
+            # meta pre-roll floor may have been speech). Second pass is the
+            # retroactive correction when live never latched in time.
             floor = None
             try:
-                import json
-                meta = json.loads((last / "report.json").read_text(
-                    encoding="utf-8"))
-                floor = (meta.get("raw_untrimmed") or {}).get("floor_rms")
+                import numpy as np
+                from . import denoise as denoise_mod
+                import wave as _wave
+                with _wave.open(str(
+                        untrimmed if untrimmed.is_file() else source),
+                        "rb") as wf:
+                    pcm = np.frombuffer(
+                        wf.readframes(wf.getnframes()), dtype=np.int16)
+                    rate = wf.getframerate()
+                hp, _ = denoise_mod.high_pass(pcm, rate)
+                floor = denoise_mod.measure_floor(hp, rate)
             except Exception:
                 pass
             gain = rescue_wav(

@@ -158,13 +158,8 @@ def test_the_shortened_kernel_still_is_the_filter():
         "the truncated kernel no longer matches the one-pole it stands for")
 
 
-def test_floor_comes_from_the_pre_roll_not_the_whole_clip():
-    """Continuous mid-clip noise must not redefine the room floor.
-
-    A whole-clip 20th percentile on a busy recording sits near speech energy.
-    Pre-roll uses only the opening room tone, so a café bed after speech
-    starts cannot raise the gate line.
-    """
+def test_floor_uses_opening_when_room_tone_comes_first():
+    """Opening room tone still wins when the user waits before speaking."""
     rng = np.random.default_rng(11)
     n = RATE * 3
     # 300ms of soft hiss, then loud continuous noise mixed with speech.
@@ -173,13 +168,38 @@ def test_floor_comes_from_the_pre_roll_not_the_whole_clip():
     samples = np.clip(audio, -32768, 32767).astype(np.int16)
 
     floor = denoise.measure_floor(samples, RATE)
-    whole = float(np.percentile(
-        denoise._frame_levels(samples, RATE,
-                              max(1, int(RATE * denoise.GATE_FRAME_MS / 1000)))[0],
-        denoise.NOISE_PERCENTILE))
-    assert floor < whole * 0.5, (
-        f"pre-roll floor {floor:.0f} should be well below whole-clip "
-        f"{whole:.0f}")
+    opening = denoise.measure_floor(samples, RATE, strategy="opening")
+    assert floor <= opening * 1.05
+    assert floor < 400, f"expected quiet opening floor, got {floor:.0f}"
+
+
+def test_floor_recovers_when_speech_starts_at_hud():
+    """Speak-at-HUD: first 300ms is voice; later quiet gaps must set the floor."""
+    rng = np.random.default_rng(13)
+    n = RATE * 3
+    audio = rng.normal(0, 60, n)  # quiet room throughout
+    # Immediate loud speech for 400ms (HUD appeared, user talks).
+    t = np.arange(int(0.4 * RATE)) / RATE
+    audio[: t.size] += np.sin(2 * np.pi * 200 * t) * 6000
+    # Another burst later, with quiet between.
+    t2 = np.arange(int(0.5 * RATE)) / RATE
+    start = int(1.5 * RATE)
+    audio[start:start + t2.size] += np.sin(2 * np.pi * 220 * t2) * 5000
+    samples = np.clip(audio, -32768, 32767).astype(np.int16)
+
+    opening = denoise.measure_floor(samples, RATE, strategy="opening")
+    adaptive = denoise.measure_floor(samples, RATE, strategy="adaptive")
+    assert adaptive < opening * 0.5, (
+        f"adaptive floor {adaptive:.0f} should drop below speech-filled "
+        f"opening {opening:.0f}")
+
+
+def test_low_snr_can_latch_after_minimum_audio():
+    noisy, _ = _cafe_whisper(seconds=1.0)
+    assert not denoise.is_low_snr(
+        noisy[:int(RATE * 0.05)], RATE, min_ms=denoise.SNR_LATCH_MIN_MS)
+    assert denoise.is_low_snr(
+        noisy, RATE, min_ms=denoise.SNR_LATCH_MIN_MS)
 
 
 def test_peak_normalise_lifts_a_quiet_recording():
@@ -301,7 +321,7 @@ def _band_rms(samples, rate, lo_hz, hi_hz, mask=None):
 
 
 def test_cafe_whisper_rescue_lifts_speech_band():
-    """Rescue should raise mid-band (whisper) energy vs ordinary gate+peak."""
+    """Rescue should favour mid-band whisper over café bass vs ordinary path."""
     noisy, span = _cafe_whisper(speech_peak=200, music_rms=1200)
     filtered, _ = denoise.high_pass(noisy, RATE)
     floor = denoise.measure_floor(filtered, RATE)
@@ -314,11 +334,16 @@ def test_cafe_whisper_rescue_lifts_speech_band():
         floor=floor, whisper_rescue=True)
 
     # Whisper formants sit ~500–2500 Hz; bass music is lower.
-    mid_ord = _band_rms(ordinary, RATE, 500, 2500, span)
-    mid_res = _band_rms(rescued, RATE, 500, 2500, span)
-    assert mid_res > mid_ord * 1.2, (
-        f"rescue did not lift speech band: ordinary {mid_ord:.0f} "
-        f"vs rescue {mid_res:.0f}")
+    def mid_over_bass(x):
+        mid = _band_rms(x, RATE, 500, 2500, span)
+        bass = _band_rms(x, RATE, 60, 160, span)
+        return mid / max(bass, 1.0)
+
+    ratio_ord = mid_over_bass(ordinary)
+    ratio_res = mid_over_bass(rescued)
+    assert ratio_res > ratio_ord * 1.25, (
+        f"rescue did not favour speech band: ordinary ratio {ratio_ord:.2f} "
+        f"vs rescue {ratio_res:.2f}")
 
 
 def test_normalize_speech_lifts_under_music_peak():

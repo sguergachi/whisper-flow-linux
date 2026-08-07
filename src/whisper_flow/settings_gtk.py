@@ -11,10 +11,9 @@ compositor that offers the protocol (KWin does). Everywhere else the window
 keeps the stock opaque Adwaita look, which is the point of having a fallback
 rather than a failure.
 
-Saving writes the .env file; nothing here applies the values. The daemon
-adopts a changed speech model as soon as this window closes - it reads the
-models directory, not the running config - and everything else takes effect
-on the restart the toast offers afterwards.
+Saving writes the .env file and restarts the daemon so the new values apply
+immediately. There is no "restart later" step: if a restart is needed, it
+happens as part of Save.
 """
 
 import contextlib
@@ -589,6 +588,10 @@ class SettingsWindow(Adw.ApplicationWindow):
         self._rows: dict[str, Gtk.Widget] = {}
         self._mic_display: dict[str, str] = {}
         self._mic_meter: Gtk.LevelBar | None = None
+        self._mic_test_button: Gtk.Button | None = None
+        # Only True while the user has pressed Test. The meter never opens
+        # the microphone just because settings is on screen.
+        self._mic_meter_active = False
         # Shared with the capture thread. Main thread writes the wanted
         # device; the thread opens/closes and publishes the drawn level.
         self._mic_want_device = _MIC_METER_OFF   # int | None | "off"
@@ -629,8 +632,8 @@ class SettingsWindow(Adw.ApplicationWindow):
         self._load_mics_in_background()
         GLib.timeout_add(400, self._refresh_dirty)
         GLib.timeout_add(2000, self._watch_the_daemon)
-        # The Device meter only listens while this window is on screen: a
-        # prewarmed process must not hold the microphone open for hours.
+        # Paints the LevelBar while a Test is running. Capture itself only
+        # starts when the user presses Test, never on open.
         GLib.timeout_add(_MIC_METER_POLL_MS, self._tick_mic_meter)
         self.connect("notify::visible", self._on_visible_for_mic_meter)
         if sys.platform == "win32":
@@ -1109,8 +1112,10 @@ class SettingsWindow(Adw.ApplicationWindow):
                         "connection.")
             return
         self._rebuild_speech_page()
-        self._toast("Installed - restart to use it.",
-                    button="Restart now", on_button=self._on_restart)
+        self._restart_daemon(toast_start="Installed. Restarting...",
+                             toast_ok="Installed and restarted.",
+                             toast_fail_prefix="Installed, but could not "
+                                               "restart")
 
     # ------------------------------------------------------------------ rows
     def _build_row(self, field) -> Gtk.Widget:
@@ -1141,9 +1146,10 @@ class SettingsWindow(Adw.ApplicationWindow):
                 # grow past the row it hangs off.
                 row.set_list_factory(_wide_list_factory(row))
                 row.add_css_class("mic-row")
-                # Live level so the user can hear (see) which entry is the
-                # right mic without saving and restarting a dictation. The
-                # bar rides the suffix slot next to the closed combo.
+                # Live level so the user can see which entry is the right
+                # mic. Off until Test is pressed - holding the input open
+                # for the whole settings session lights the in-use
+                # indicator and can fight a live dictation.
                 meter = Gtk.LevelBar(
                     mode=Gtk.LevelBarMode.CONTINUOUS,
                     min_value=0.0, max_value=1.0, value=0.0,
@@ -1152,6 +1158,13 @@ class SettingsWindow(Adw.ApplicationWindow):
                 meter.set_tooltip_text("Microphone activity")
                 row.add_suffix(meter)
                 self._mic_meter = meter
+                test = Gtk.Button(label="Test", valign=Gtk.Align.CENTER)
+                test.add_css_class("flat")
+                test.set_tooltip_text(
+                    "Listen to this device and show activity on the meter")
+                test.connect("clicked", self._on_mic_test_toggle)
+                row.add_suffix(test)
+                self._mic_test_button = test
             if field.help:
                 row.set_subtitle(field.help)
             self._rows[field.key] = row
@@ -1298,15 +1311,32 @@ class SettingsWindow(Adw.ApplicationWindow):
 
     # -------------------------------------------------------- mic meter
     def _on_visible_for_mic_meter(self, *_args) -> None:
-        """Start or stop capture as the window comes and goes."""
-        if self.get_visible():
-            self._ensure_mic_meter_thread()
+        """Drop an in-progress Test when the window is hidden."""
+        if not self.get_visible() and self._mic_meter_active:
+            self._stop_mic_test()
+
+    def _on_mic_test_toggle(self, *_args) -> None:
+        """Test starts capture; Stop releases it."""
+        if self._mic_meter_active:
+            self._stop_mic_test()
         else:
-            with self._mic_meter_lock:
-                self._mic_want_device = _MIC_METER_OFF
-                self._mic_drawn_level = 0.0
-            if self._mic_meter is not None:
-                self._mic_meter.set_value(0.0)
+            self._start_mic_test()
+
+    def _start_mic_test(self) -> None:
+        self._mic_meter_active = True
+        if self._mic_test_button is not None:
+            self._mic_test_button.set_label("Stop")
+        self._ensure_mic_meter_thread()
+
+    def _stop_mic_test(self) -> None:
+        self._mic_meter_active = False
+        with self._mic_meter_lock:
+            self._mic_want_device = _MIC_METER_OFF
+            self._mic_drawn_level = 0.0
+        if self._mic_meter is not None:
+            self._mic_meter.set_value(0.0)
+        if self._mic_test_button is not None:
+            self._mic_test_button.set_label("Test")
 
     def _ensure_mic_meter_thread(self) -> None:
         """One capture thread for the life of the window."""
@@ -1351,7 +1381,7 @@ class SettingsWindow(Adw.ApplicationWindow):
         """
         if self._mic_meter is None:
             return True
-        if not self.get_visible():
+        if not self.get_visible() or not self._mic_meter_active:
             with self._mic_meter_lock:
                 self._mic_want_device = _MIC_METER_OFF
                 level = 0.0
@@ -1370,10 +1400,10 @@ class SettingsWindow(Adw.ApplicationWindow):
     def _mic_meter_loop(self) -> None:
         """Open the chosen input and publish RMS levels until asked to stop.
 
-        Holds the stream only while the window is visible. Changing the
-        Device dropdown swaps streams on the next iteration so the bar
-        follows the selection, not the saved config - which is the whole
-        point of listening before you save.
+        Holds the stream only while a Test is running. Changing the Device
+        dropdown swaps streams on the next iteration so the bar follows the
+        selection, not the saved config - which is the whole point of
+        listening before you save.
         """
         try:
             import pyaudio
@@ -1522,7 +1552,7 @@ class SettingsWindow(Adw.ApplicationWindow):
         if changed:
             self._banner.set_title(
                 f"{len(changed)} unsaved change"
-                f"{'s' if len(changed) != 1 else ''} - applies on restart")
+                f"{'s' if len(changed) != 1 else ''}")
         self._banner.set_revealed(bool(changed))
         return True
 
@@ -1627,22 +1657,37 @@ class SettingsWindow(Adw.ApplicationWindow):
 
         self._current = values
         self._current_model = model or self._current_model
-        self._toast(
-            "Saved. A model applies on close; the rest on restart.",
-            button="Restart now", on_button=self._on_restart)
+        self._banner.set_revealed(False)
+        # Settings only take effect in a new process. Do not ask - restart.
+        self._restart_daemon(toast_start="Saved. Restarting...",
+                             toast_ok="Saved and restarted.",
+                             toast_fail_prefix="Saved, but could not restart")
 
     def _on_restart(self):
+        """Manual restart (still available if something else needs one)."""
+        self._restart_daemon(toast_start="Restarting...",
+                             toast_ok="Restarted.",
+                             toast_fail_prefix="Could not restart")
+
+    def _restart_daemon(self, toast_start: str, toast_ok: str,
+                        toast_fail_prefix: str) -> None:
+        """Stop and start the daemon; report progress via toasts."""
         if self._working:
             return
         self._working = True
-        self._toast("Restarting...")
+        self._toast(toast_start)
 
         def work():
             ok, detail = restart.restart_daemon()
-            GLib.idle_add(
-                lambda: self._toast("Restarted." if ok
-                                    else f"Could not restart: {detail}"))
-            self._working = False
+
+            def done():
+                self._working = False
+                if ok:
+                    self._toast(toast_ok)
+                else:
+                    self._toast(f"{toast_fail_prefix}: {detail}")
+
+            GLib.idle_add(done)
 
         threading.Thread(target=work, daemon=True,
                          name="whisper-flow-restart").start()

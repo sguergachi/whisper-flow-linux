@@ -61,6 +61,8 @@ def _devices():
 # the real function builds and got "Built-in mic".
 _real_list_input_devices = settings_gtk._list_input_devices
 settings_gtk._list_input_devices = _devices
+# Save restarts the daemon by default; tests must not kill a real process.
+settings_gtk.restart.restart_daemon = lambda: (True, "ok")
 Gtk.init()
 w = settings_gtk.SettingsWindow()
 w.config.config_dir = config_dir
@@ -111,7 +113,9 @@ elif scenario == "models":
 elif scenario == "save":
     w._rows["live_interval"].set_value(1.4)
     w._on_save()
-    assert "restart" in w._last_toast_title
+    # Save restarts on its own - no "Restart now" button to click.
+    assert "Saved" in w._last_toast_title
+    assert "Restart" in w._last_toast_title
 elif scenario == "invalid":
     w._rows["hotkey_transcribe"].set_text("super++alt")
     w._on_save()
@@ -430,15 +434,14 @@ elif scenario == "version":
     w._copy_version()
     assert version in w._last_toast_title
 elif scenario == "mic_meter":
-    # Device row carries a live level bar so a wrong mic is obvious without
-    # saving and dictating. The capture thread is not under test here - only
-    # that the bar exists, that scaling is sane, and that the main-thread
-    # tick paints what the thread publishes and releases the mic when the
-    # window is hidden.
+    # Device row has a level bar and a Test button. Capture is off until
+    # Test is pressed, and Stop / hiding the window releases the mic.
     from gi.repository import Gtk as _Gtk
 
     assert w._mic_meter is not None, "no level bar on the Device row"
     assert isinstance(w._mic_meter, _Gtk.LevelBar)
+    assert w._mic_test_button is not None, "no Test button on the Device row"
+    assert w._mic_test_button.get_label() == "Test"
 
     quiet, peak = settings_gtk._mic_level_from_rms(0.0, 150.0)
     assert quiet == 0.0
@@ -450,17 +453,37 @@ elif scenario == "mic_meter":
 
     w.present()
     assert pump(lambda: w.get_visible()), "window never became visible"
+    # Visible alone must not open the microphone.
+    with w._mic_meter_lock:
+        w._mic_drawn_level = 0.42
+    assert w._tick_mic_meter() is True
+    assert w._mic_meter.get_value() == 0.0
+    with w._mic_meter_lock:
+        assert w._mic_want_device == settings_gtk._MIC_METER_OFF, (
+            "opening settings listened without pressing Test")
+
+    w._start_mic_test()
+    assert w._mic_test_button.get_label() == "Stop"
     with w._mic_meter_lock:
         w._mic_drawn_level = 0.42
     assert w._tick_mic_meter() is True
     assert abs(w._mic_meter.get_value() - 0.42) < 1e-6, w._mic_meter.get_value()
     with w._mic_meter_lock:
         assert w._mic_want_device != settings_gtk._MIC_METER_OFF, (
-            "a visible window never asked the meter thread to listen")
+            "Test did not ask the meter thread to listen")
 
+    w._stop_mic_test()
+    assert w._mic_test_button.get_label() == "Test"
+    assert w._mic_meter.get_value() == 0.0
+    with w._mic_meter_lock:
+        assert w._mic_want_device == settings_gtk._MIC_METER_OFF
+
+    # A Test left running is cancelled when the window goes away.
+    w._start_mic_test()
     w.set_visible(False)
     assert w._tick_mic_meter() is True
     assert w._mic_meter.get_value() == 0.0
+    assert not w._mic_meter_active
     with w._mic_meter_lock:
         assert w._mic_want_device == settings_gtk._MIC_METER_OFF, (
             "hiding the window left the capture stream requested")

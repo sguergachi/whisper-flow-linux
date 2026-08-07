@@ -42,7 +42,8 @@ def test_systemd_installations_restart_through_systemd(monkeypatch):
 def test_a_running_daemon_is_stopped_then_respawned(monkeypatch):
     monkeypatch.setattr(restart, "systemd_unit_active", lambda: False)
     monkeypatch.setattr(restart, "daemon_pid", lambda: 4321)
-    monkeypatch.setattr(restart, "_wait_for_exit", lambda pid: True)
+    monkeypatch.setattr(restart, "_wait_for_exit",
+                        lambda pid, timeout=10.0: True)
     kill = Mock()
     monkeypatch.setattr(restart.os, "kill", kill)
     popen = Mock()
@@ -72,16 +73,22 @@ def test_no_running_daemon_just_starts_one(monkeypatch):
     popen.assert_called_once()
 
 
-def test_a_daemon_that_will_not_die_is_a_failure(monkeypatch):
+def test_a_stubborn_daemon_still_gets_a_replacement(monkeypatch):
+    """Do not freeze settings for 10s if the old process is slow to exit.
+
+    Save runs restart from the settings window; a long hard wait made the
+    UI look locked until the old daemon finally died. Prefer starting the
+    replacement after a short wait.
+    """
     monkeypatch.setattr(restart, "systemd_unit_active", lambda: False)
     monkeypatch.setattr(restart, "daemon_pid", lambda: 4321)
-    monkeypatch.setattr(restart, "_wait_for_exit", lambda pid: False)
+    monkeypatch.setattr(restart, "_wait_for_exit", lambda pid, timeout=10.0: False)
     monkeypatch.setattr(restart.os, "kill", Mock())
     popen = Mock()
     monkeypatch.setattr(restart.subprocess, "Popen", popen)
+    monkeypatch.setattr(sys, "frozen", False, raising=False)
 
-    ok, detail = restart.restart_daemon()
+    ok, _detail = restart.restart_daemon()
 
-    assert not ok
-    assert "would not stop" in detail
-    popen.assert_not_called()
+    assert ok
+    popen.assert_called_once()

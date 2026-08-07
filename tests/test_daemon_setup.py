@@ -279,11 +279,13 @@ class WaitingWindow:
         self.stdout = None
         self.returncode = None
         self.killed = False
+        self.wait_calls = 0
 
     def poll(self):
         return self.returncode
 
     def wait(self, timeout=None):
+        self.wait_calls += 1
         self.returncode = self.returncode or 0
         return self.returncode
 
@@ -442,6 +444,9 @@ def test_the_daemon_takes_the_waiting_window_with_it(daemon):
     window = _waiting(daemon)
     daemon.shutdown_settings()
     window.stdin.close.assert_called_once()
+    # Restart path must not wait on or kill settings - Save still owns it.
+    assert window.wait_calls == 0
+    assert not window.killed
     assert daemon._setup_process is None
 
 
@@ -455,6 +460,7 @@ def test_tray_exit_tells_settings_to_quit(daemon):
     daemon.shutdown_settings(quit=True)
     assert any("quit" in str(chunk) for chunk in window.written), window.written
     window.stdin.close.assert_called_once()
+    assert window.wait_calls == 1
     assert daemon._setup_process is None
 
 

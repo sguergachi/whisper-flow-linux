@@ -82,12 +82,15 @@ def _wait_for_exit(pid: int, timeout: float = 10.0) -> bool:
 def restart_daemon() -> tuple[bool, str]:
     """Stop the daemon and start it again. Returns (ok, what happened).
 
-    Must not take the settings window down with it. The settings process is
-    a child of the daemon (prewarmed at login), and systemd's default
-    KillMode=control-group would kill that child on ``systemctl restart`` -
-    the Save toast never appears and the window freezes mid-click. So under
-    systemd we signal only the main process, wait for it to exit, then start
-    the unit again.
+    Must not take the settings window down with it, and must not block the
+    settings UI for the whole restart. The settings process is a child of
+    the daemon (prewarmed at login); systemd's default KillMode=control-group
+    would kill that child on ``systemctl restart``. So under systemd we
+    signal only the main process, then start the unit again.
+
+    Waits for the old process are short and always release the GIL
+    (``time.sleep``): a multi-second block with the GIL held froze the
+    settings window until restart finished.
     """
     if systemd_unit_active():
         # --kill-who=main: only the daemon, not its settings/HUD children.
@@ -99,9 +102,11 @@ def restart_daemon() -> tuple[bool, str]:
         if result.returncode != 0:
             return False, result.stderr.decode(errors="replace").strip() or \
                 "systemctl refused to stop the daemon"
+        # Brief pause so the old main is gone; do not wait the full cleanup
+        # (which used to include a multi-second wait on the settings child).
         pid = daemon_pid()
-        if pid and not _wait_for_exit(pid):
-            return False, "the old daemon would not stop"
+        if pid:
+            _wait_for_exit(pid, timeout=1.5)
         result = subprocess.run(
             ["systemctl", "--user", "start", UNIT],
             capture_output=True, check=False,
@@ -119,8 +124,10 @@ def restart_daemon() -> tuple[bool, str]:
             os.kill(pid, 15)
         except OSError as e:
             log(f"[SETTINGS] could not signal daemon {pid}: {e}")
-        if not _wait_for_exit(pid):
-            return False, "the old daemon would not stop"
+        # Short wait only - settings is still open and must stay responsive.
+        if not _wait_for_exit(pid, timeout=1.5):
+            log(f"[SETTINGS] daemon {pid} still running after SIGTERM; "
+                "starting a replacement anyway")
 
     try:
         subprocess.Popen(

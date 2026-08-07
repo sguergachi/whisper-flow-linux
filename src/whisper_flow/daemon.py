@@ -924,6 +924,11 @@ class WhisperFlowDaemon:
         settings toast must stay put). Tray Exit is different - the whole app
         is going away - so ``quit=True`` tells the child to exit even when
         visible.
+
+        When ``quit`` is false, do not wait for or kill the child. Waiting
+        up to three seconds then killing it made Save (which restarts the
+        daemon from inside settings) freeze that window until timeout and
+        then destroy it mid-toast.
         """
         with self._setup_lock:
             process, self._setup_process = self._setup_process, None
@@ -945,14 +950,14 @@ class WhisperFlowDaemon:
                 process.stdin.close()
         except Exception:
             pass
+        if not quit:
+            # Leave a visible settings process alone - Save is still using it.
+            return
         try:
-            process.wait(timeout=2 if quit else 3)
+            process.wait(timeout=2)
         except Exception:
-            try:
-                process.kill()
-            except Exception:
-                pass
-        if quit and process.poll() is None:
+            pass
+        if process.poll() is None:
             try:
                 process.kill()
             except Exception:

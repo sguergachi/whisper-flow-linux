@@ -2065,9 +2065,9 @@ class SettingsWindow(Adw.ApplicationWindow):
                         toast_fail_prefix: str) -> None:
         """Stop and start the daemon; report progress via toasts.
 
-        The toast is drawn first, then the restart is deferred a frame so
-        the user sees "Saved. Restarting..." before any work that can block
-        the pipe to the daemon. The restart itself runs off the main thread.
+        Never blocks the GTK main loop. The toast is drawn first; the actual
+        kill/start runs on a worker thread so Save cannot freeze the window
+        for the duration of the restart.
         """
         if self._working:
             return
@@ -2077,14 +2077,17 @@ class SettingsWindow(Adw.ApplicationWindow):
         if self._mic_meter_active:
             self._stop_mic_test()
         self._toast(toast_start)
-        # One frame for the toast to map, then hand off to a worker.
-        GLib.timeout_add(80, self._restart_daemon_begin,
-                         toast_ok, toast_fail_prefix)
+        # Hand off on the next idle so this click handler returns and the
+        # toast can paint before any worker work starts.
+        GLib.idle_add(self._restart_daemon_begin, toast_ok, toast_fail_prefix)
 
     def _restart_daemon_begin(self, toast_ok: str,
                               toast_fail_prefix: str) -> bool:
         def work():
-            ok, detail = restart.restart_daemon()
+            try:
+                ok, detail = restart.restart_daemon()
+            except Exception as e:
+                ok, detail = False, str(e)
 
             def done():
                 self._working = False
@@ -2097,7 +2100,7 @@ class SettingsWindow(Adw.ApplicationWindow):
 
         threading.Thread(target=work, daemon=True,
                          name="whisper-flow-restart").start()
-        return False                    # timeout_add: run once
+        return False                    # idle_add: run once
 
     def _start_download(self, model: str):
         if self._working:

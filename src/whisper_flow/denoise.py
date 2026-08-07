@@ -1,15 +1,17 @@
 """Smart voice amplification: one pipeline that prepares audio for Whisper.
 
-Settings expose a single toggle. When it is on, ``enhance`` chooses how hard
-to work from the signal itself (adaptive floor, SNR, speak-at-HUD timing):
+Settings expose a single toggle. When it is on, ``enhance``:
 
-  * Ordinary speech — high-pass, soft gate, mild spectral subtract, peak lift.
-  * Whisper under noise — softer gate, speech-band emphasis, pre-emphasis,
-    speech-frame normalise, milder spectral cut so music peaks do not win.
+  1. Profiles the clip (floor, SNR, bass load, level).
+  2. Builds a filter plan — only the steps that input needs.
+  3. Applies them.
+  4. On the final (non-live) path, if the result still looks weak, runs a
+     second pass from the original with an escalated plan.
 
-When the toggle is off the recorder sends the raw capture. Nothing here is
-meant to be tuned by hand; the dynamics are the product.
+When the toggle is off the recorder sends the raw capture.
 """
+
+from dataclasses import dataclass, replace
 
 import numpy as np
 
@@ -72,6 +74,44 @@ RESCUE_SPECTRAL_MAX_ATTEN_DB = 12.0
 # Normalise so speech-frame energy reaches this, even if music peaks higher.
 SPEECH_NORM_TARGET = 0.78
 SPEECH_NORM_MAX_GAIN = 90.0
+
+# Dynamic plan thresholds (absolute int16 RMS / ratios).
+BASS_RATIO_SPEECH_BAND = 0.28   # bass share → raise HPF to speech band
+BASS_RATIO_STRONG = 0.40
+FLOOR_SPECTRAL = 200.0          # room energy worth peeling
+FLOOR_GATE = 40.0               # anything above digital quiet gets gated
+SNR_MILD_DB = 16.0              # below this, prefer speech-aware gain
+PEAK_QUIET = 4000.0             # below → peak or speech normalise
+# Second pass: first output still not good enough for Whisper.
+SECOND_PASS_SNR_DB = 12.0
+SECOND_PASS_PEAK = 2500.0
+
+
+@dataclass(frozen=True)
+class VoicePlan:
+    """Which filters to run for this clip. Built from the signal, not settings."""
+
+    hpf_hz: float = HIGHPASS_HZ
+    spectral: bool = False
+    spectral_oversub: float = 0.85
+    spectral_max_atten_db: float = 14.0
+    gate: bool = True
+    whisper_gate: bool = False
+    preemph: bool = False
+    speech_norm: bool = False       # else peak_norm when normalize
+    normalize: bool = True
+    pass_index: int = 1
+    # Why this plan (for logs / debug).
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class SignalProfile:
+    floor: float
+    snr_db: float
+    peak: float
+    bass_ratio: float
+    low_snr: bool
 
 
 def high_pass(samples: np.ndarray, rate: int, state=None, cutoff_hz: float = HIGHPASS_HZ):
@@ -467,70 +507,235 @@ def spectral_subtract(samples: np.ndarray, rate: int,
     return out
 
 
+def bass_ratio(samples: np.ndarray, rate: int) -> float:
+    """Fraction of energy below ~150 Hz (music bass / rumble vs speech)."""
+    if samples.size < 32:
+        return 0.0
+    # Cap FFT cost on long clips: a 1s mid window is enough to classify.
+    x = samples.astype(np.float64)
+    if x.size > rate:
+        mid = x.size // 2
+        half = rate // 2
+        x = x[mid - half:mid + half]
+    spec = np.abs(np.fft.rfft(x))
+    freqs = np.fft.rfftfreq(x.size, 1.0 / rate)
+    total = float(np.sum(spec ** 2))
+    if total <= 1e-12:
+        return 0.0
+    bass = float(np.sum(spec[freqs < 150.0] ** 2))
+    return bass / total
+
+
+def profile_signal(samples: np.ndarray, rate: int,
+                   floor: float | None = None) -> SignalProfile:
+    """Measure what the clip needs before choosing filters."""
+    if samples.size == 0:
+        return SignalProfile(0.0, 99.0, 0.0, 0.0, False)
+    base, _ = high_pass(samples, rate)
+    use_floor = float(floor) if floor is not None and floor > 0 else measure_floor(
+        base, rate)
+    snr = estimate_snr_db(base, rate, floor=use_floor)
+    peak = float(np.abs(samples.astype(np.float32)).max())
+    bass = bass_ratio(base, rate)
+    low = is_low_snr(base, rate, floor=use_floor) or snr < LOW_SNR_DB
+    return SignalProfile(
+        floor=use_floor,
+        snr_db=snr,
+        peak=peak,
+        bass_ratio=bass,
+        low_snr=low,
+    )
+
+
+def plan_filters(profile: SignalProfile, *, live: bool = False,
+                 force_rescue: bool | None = None,
+                 pass_index: int = 1) -> VoicePlan:
+    """Turn a signal profile into which filters to enable."""
+    rescue = force_rescue if force_rescue is not None else profile.low_snr
+    reasons = []
+
+    hpf = HIGHPASS_HZ
+    if profile.bass_ratio >= BASS_RATIO_SPEECH_BAND or rescue:
+        hpf = SPEECH_BAND_HPF_HZ
+        reasons.append(f"speech-band HPF ({profile.bass_ratio:.0%} bass)")
+    else:
+        reasons.append("rumble HPF")
+
+    spectral = False
+    oversub = 0.85
+    atten = 14.0
+    if rescue or profile.floor >= FLOOR_SPECTRAL or profile.snr_db < SNR_MILD_DB:
+        spectral = True
+        reasons.append("spectral")
+        if rescue or profile.bass_ratio >= BASS_RATIO_STRONG:
+            oversub = RESCUE_SPECTRAL_OVERSUB
+            atten = RESCUE_SPECTRAL_MAX_ATTEN_DB
+        if pass_index >= 2:
+            oversub = min(1.15, oversub + 0.2)
+            atten = min(20.0, atten + 4.0)
+            reasons.append("spectral+")
+    # Live ordinary path: skip spectral unless rescue — keeps LocalAgreement cheap.
+    if live and not rescue:
+        spectral = False
+        reasons = [r for r in reasons if not r.startswith("spectral")]
+
+    gate_on = profile.floor >= FLOOR_GATE or profile.peak > NORM_DEAD_PEAK
+    whisper_gate = bool(rescue or profile.snr_db < SNR_MILD_DB)
+    if gate_on:
+        reasons.append("soft-gate" if whisper_gate else "gate")
+
+    preemph = bool(rescue or profile.snr_db < SNR_MILD_DB)
+    if preemph:
+        reasons.append("preemph")
+
+    speech_norm = bool(
+        rescue
+        or profile.snr_db < SNR_MILD_DB
+        or (profile.peak >= PEAK_QUIET and profile.floor > FLOOR_SPECTRAL * 0.5)
+    )
+    need_norm = profile.peak < (NORM_TARGET_PEAK * 32767 * 0.5) or speech_norm
+    if need_norm:
+        reasons.append("speech-norm" if speech_norm else "peak-norm")
+
+    if rescue:
+        reasons.insert(0, "low-SNR")
+
+    return VoicePlan(
+        hpf_hz=hpf,
+        spectral=spectral,
+        spectral_oversub=oversub,
+        spectral_max_atten_db=atten,
+        gate=gate_on,
+        whisper_gate=whisper_gate,
+        preemph=preemph,
+        speech_norm=speech_norm,
+        normalize=need_norm,
+        pass_index=pass_index,
+        reason=", ".join(reasons) or "passthrough",
+    )
+
+
+def escalate_plan(plan: VoicePlan, profile: SignalProfile) -> VoicePlan:
+    """Stronger plan for an audio-domain second pass."""
+    return replace(
+        plan,
+        hpf_hz=max(plan.hpf_hz, SPEECH_BAND_HPF_HZ),
+        spectral=True,
+        spectral_oversub=min(1.2, max(plan.spectral_oversub, RESCUE_SPECTRAL_OVERSUB) + 0.15),
+        spectral_max_atten_db=min(20.0, max(plan.spectral_max_atten_db,
+                                            RESCUE_SPECTRAL_MAX_ATTEN_DB) + 4.0),
+        gate=True,
+        whisper_gate=True,
+        preemph=True,
+        speech_norm=True,
+        normalize=True,
+        pass_index=2,
+        reason=(plan.reason + " → 2nd: full rescue"),
+    )
+
+
+def needs_second_pass(original: np.ndarray, first: np.ndarray, rate: int,
+                      first_plan: VoicePlan,
+                      floor: float | None) -> bool:
+    """Whether the first enhance left a clip still risky for Whisper."""
+    if first_plan.pass_index >= 2:
+        return False
+    if first.size == 0:
+        return True
+    out_prof = profile_signal(first, rate, floor=floor)
+    # Still buried or still quiet after pass 1.
+    if out_prof.snr_db < SECOND_PASS_SNR_DB:
+        return True
+    if out_prof.peak < SECOND_PASS_PEAK and first_plan.whisper_gate:
+        return True
+    if out_prof.peak < SECOND_PASS_PEAK * 0.5:
+        return True
+    # First pass was mild but input was already marginal.
+    in_prof = profile_signal(original, rate, floor=floor)
+    if in_prof.low_snr and not first_plan.whisper_gate:
+        return True
+    if in_prof.snr_db < SNR_MILD_DB and not first_plan.spectral:
+        return True
+    return False
+
+
+def apply_plan(samples: np.ndarray, rate: int, plan: VoicePlan, *,
+               floor: float | None = None,
+               noise_ref: np.ndarray | None = None) -> np.ndarray:
+    """Run only the filters the plan enabled."""
+    if samples.size == 0:
+        return samples
+
+    filtered, _ = high_pass(samples, rate, cutoff_hz=plan.hpf_hz)
+    use_floor = float(floor) if floor is not None and floor > 0 else measure_floor(
+        filtered, rate)
+
+    if plan.spectral:
+        ref = noise_ref
+        if ref is None or (hasattr(ref, "size") and ref.size == 0):
+            base80, _ = high_pass(samples, rate)
+            ref = noise_reference(base80, rate, floor=use_floor)
+        if ref is not None and getattr(ref, "size", 0):
+            ref, _ = high_pass(ref, rate, cutoff_hz=plan.hpf_hz)
+            filtered = spectral_subtract(
+                filtered, rate, noise_ref=ref,
+                oversub=plan.spectral_oversub,
+                max_atten_db=plan.spectral_max_atten_db,
+            )
+
+    if plan.gate:
+        filtered = gate(filtered, rate, floor=use_floor,
+                        whisper_mode=plan.whisper_gate)
+
+    if plan.preemph:
+        filtered = pre_emphasize(filtered)
+
+    if plan.normalize:
+        if plan.speech_norm:
+            return normalize_speech(filtered, rate, floor=use_floor)
+        return normalize_peak(filtered)
+    return np.clip(filtered, -32768, 32767).astype(np.int16)
+
+
 def enhance(samples: np.ndarray, rate: int, *,
             floor: float | None = None,
             noise_ref: np.ndarray | None = None,
             live: bool = False,
             force_rescue: bool | None = None) -> np.ndarray:
-    """Smart voice amplification: prepare a clip for Whisper.
+    """Smart voice amplification: profile → plan → filters → optional 2nd pass.
 
-    One entry point for all preprocessing. Chooses ordinary vs low-SNR
-    rescue from the signal (or ``force_rescue``). ``live=True`` skips the
-    heavier full-band spectral step on the ordinary path so streaming
-    LocalAgreement stays cheap and deterministic; rescue still applies a
-    mild spectral cut when a noise reference is available.
-
-    Returns int16 samples ready to write.
+    ``live=True``: one pass only (streaming). ``live=False``: may re-run from
+    the original samples with an escalated plan if pass 1 still looks weak.
     """
     if samples.size == 0:
         return samples
 
-    base, _ = high_pass(samples, rate)
-    if floor is None:
-        floor = measure_floor(base, rate)
+    profile = profile_signal(samples, rate, floor=floor)
+    plan = plan_filters(profile, live=live, force_rescue=force_rescue,
+                        pass_index=1)
+    try:
+        from .logging import log
+        log(f"[VOICE] pass1 snr≈{profile.snr_db:.0f}dB floor={profile.floor:.0f} "
+            f"bass={profile.bass_ratio:.0%} → {plan.reason}")
+    except Exception:
+        pass
 
-    rescue = force_rescue
-    if rescue is None:
-        rescue = is_low_snr(base, rate, floor=floor)
+    out = apply_plan(samples, rate, plan, floor=profile.floor,
+                     noise_ref=noise_ref)
 
-    if rescue:
+    if live:
+        return out
+
+    if needs_second_pass(samples, out, rate, plan, profile.floor):
+        plan2 = escalate_plan(plan, profile)
         try:
             from .logging import log
-            snr = estimate_snr_db(base, rate, floor=floor)
-            log(f"[VOICE] smart amplify rescue "
-                f"(snr≈{snr:.0f}dB, floor={floor:.0f}, live={live})")
+            log(f"[VOICE] pass2 (audio) → {plan2.reason}")
         except Exception:
             pass
-        filtered, _ = high_pass(samples, rate, cutoff_hz=SPEECH_BAND_HPF_HZ)
-        ref = noise_ref
-        if ref is None or (hasattr(ref, "size") and ref.size == 0):
-            ref = noise_reference(base, rate, floor=floor)
-        if ref is not None and getattr(ref, "size", 0):
-            ref, _ = high_pass(ref, rate, cutoff_hz=SPEECH_BAND_HPF_HZ)
-            filtered = spectral_subtract(
-                filtered, rate, noise_ref=ref,
-                oversub=RESCUE_SPECTRAL_OVERSUB,
-                max_atten_db=RESCUE_SPECTRAL_MAX_ATTEN_DB,
-            )
-        filtered = gate(filtered, rate, floor=floor, whisper_mode=True)
-        filtered = pre_emphasize(filtered)
-        return normalize_speech(filtered, rate, floor=floor)
-
-    # Ordinary speech: mild cleanup. Final pass also peels stationary noise;
-    # live stays lighter for agreement latency.
-    filtered = base
-    if not live:
-        ref = noise_ref
-        if ref is None or (hasattr(ref, "size") and ref.size == 0):
-            ref = noise_reference(base, rate, floor=floor)
-        if ref is not None and getattr(ref, "size", 0):
-            filtered = spectral_subtract(
-                filtered, rate, noise_ref=ref,
-                oversub=0.85,
-                max_atten_db=14.0,
-            )
-    filtered = gate(filtered, rate, floor=floor, whisper_mode=False)
-    return normalize_peak(filtered)
+        out = apply_plan(samples, rate, plan2, floor=profile.floor,
+                         noise_ref=noise_ref)
+    return out
 
 
 def clean(samples: np.ndarray, rate: int, gated: bool = True,

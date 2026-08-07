@@ -307,6 +307,62 @@ def test_cafe_whisper_triggers_low_snr_rescue():
     assert denoise.is_low_snr(filtered, RATE, floor=floor, gate_threshold=2.2)
 
 
+def test_plan_enables_filters_from_signal():
+    """Quiet clean speech → light plan; café bed → spectral + soft gate."""
+    # Room tone first, then a clear speech burst (speak-after-pause).
+    n = RATE * 2
+    t = np.arange(n) / RATE
+    clean = np.random.default_rng(2).normal(0, 40, n)
+    span = (t >= 0.5) & (t < 1.4)
+    clean[span] += np.sin(2 * np.pi * 400 * t[span]) * 8000
+    clean = np.clip(clean, -32768, 32767).astype(np.int16)
+    prof = denoise.profile_signal(clean, RATE)
+    plan = denoise.plan_filters(prof, live=False)
+    assert not plan.whisper_gate, f"clean speech planned rescue: {plan.reason}"
+    assert plan.hpf_hz == denoise.HIGHPASS_HZ or prof.bass_ratio < 0.3
+
+    cafe, _ = _cafe_whisper()
+    cprof = denoise.profile_signal(cafe, RATE)
+    cplan = denoise.plan_filters(cprof, live=False)
+    assert cplan.spectral or cplan.whisper_gate
+    assert cplan.hpf_hz >= denoise.SPEECH_BAND_HPF_HZ
+
+
+def test_live_plan_skips_spectral_unless_rescue():
+    t = np.arange(RATE) / RATE
+    # Mild room noise, decent speech — spectral on final, not live.
+    x = (np.sin(2 * np.pi * 300 * t) * 5000
+         + np.random.default_rng(1).normal(0, 250, t.size)).astype(np.int16)
+    prof = denoise.profile_signal(x, RATE)
+    live = denoise.plan_filters(prof, live=True, force_rescue=False)
+    final = denoise.plan_filters(prof, live=False, force_rescue=False)
+    if not prof.low_snr:
+        assert live.spectral is False
+        # Final may still enable spectral if floor warrants it.
+        assert final.spectral or final.gate
+
+
+def test_second_pass_escalates_weak_first_result():
+    cafe, _ = _cafe_whisper(speech_peak=100, music_rms=1500)
+    # Mild first plan as if we mis-classified.
+    mild = denoise.VoicePlan(
+        hpf_hz=denoise.HIGHPASS_HZ, spectral=False, gate=True,
+        whisper_gate=False, preemph=False, speech_norm=False,
+        normalize=True, pass_index=1, reason="test-mild")
+    first = denoise.apply_plan(cafe, RATE, mild)
+    assert denoise.needs_second_pass(cafe, first, RATE, mild, None)
+    plan2 = denoise.escalate_plan(mild, denoise.profile_signal(cafe, RATE))
+    assert plan2.pass_index == 2
+    assert plan2.whisper_gate and plan2.spectral and plan2.preemph
+
+
+def test_enhance_final_may_run_two_passes():
+    """Café whisper should not leave a near-silent sent clip."""
+    cafe, _ = _cafe_whisper(speech_peak=120, music_rms=1400)
+    out = denoise.enhance(cafe, RATE, live=False)
+    assert int(np.abs(out).max()) > 500
+
+
 def _band_rms(samples, rate, lo_hz, hi_hz, mask=None):
     """Energy in a frequency band, optionally restricted to a time mask."""
     x = samples.astype(float)

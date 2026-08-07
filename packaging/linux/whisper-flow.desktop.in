@@ -7,6 +7,6 @@ Comment=Hold a key, talk, and the words appear where you type
 Exec=@BIN@/whisper-flow daemon
 Icon=whisper-flow
 Terminal=false
-Categories=Utility;Audio;Accessibility;
+Categories=Utility;Accessibility;
 Keywords=voice;dictation;speech;whisper;transcription;
 StartupNotify=false

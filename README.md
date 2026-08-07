@@ -78,28 +78,25 @@ Nothing large is ever downloaded without being asked.
 
 ## Linux
 
-### Double-click install (like Windows)
+Download **`WhisperFlow-*-x86_64.AppImage`** from the
+[latest release](https://github.com/sguergachi/whisper-flow-linux/releases)
+and **double-click it**.
 
-Download **`WhisperFlow-*-Setup.deb`** from the
-[latest release](https://github.com/sguergachi/whisper-flow-linux/releases),
-then **double-click it**. The Software app opens — click Install. No terminal.
+- First run installs for your user (desktop dialogs only — no terminal)
+- Later runs start the tray app
+- Hold `Super+Alt` to dictate
+- It starts again at login on its own
 
-When it finishes, look for the microphone in the notification area (or open
-**WhisperFlow** from the app menu). Hold `Super+Alt` to dictate. It starts
-again at login on its own.
+If the file manager will not run it the first time: right-click → Properties →
+**Allow executing file as program**, then double-click again (browsers strip
+that flag on download).
 
-On Arch, Fedora, or if you prefer not to use a `.deb`: download
-**`WhisperFlow-*-Setup`**, right-click → **Allow executing file as program**,
-then double-click. A desktop dialog installs it — still no terminal.
-
-### If something is missing
-
-The installer needs GTK4 and `python3-gi`. `ydotool` is recommended for typing
+Needs GTK4 and `python3-gi` on the system. `ydotool` is recommended for typing
 on Wayland. Global hotkeys need the `input` group
 (`sudo usermod -aG input $USER`, then log out and back in).
 
 ```bash
-# Debian/Ubuntu (usually pulled in by the .deb)
+# Debian/Ubuntu
 sudo apt install python3-gi gir1.2-gtk-4.0 ydotool zenity
 
 # Arch
@@ -109,8 +106,7 @@ sudo pacman -S python-gobject gtk4 gtk4-layer-shell ydotool zenity
 sudo dnf install python3-gobject gtk4 gtk4-layer-shell ydotool zenity
 ```
 
-Remove with `~/.local/share/whisper-flow/uninstall.sh`, or uninstall the
-`.deb` from Software.
+Remove with `~/.local/share/whisper-flow/uninstall.sh`.
 
 ### From source (developers)
 

@@ -204,38 +204,58 @@ decoration, decoration:backdrop {
 }
 """
 
-# The few nodes the shared stylesheet does not already clear. Deliberately
-# not the window itself: its translucent fill is the frost. The blur comes
-# from DWM behind it, exactly as the compositor's does on Wayland, and a
-# fully transparent window would show a sharp desktop rather than glass.
+# Windows acrylic frost. Applied only after accent acrylic is confirmed.
+#
+# CSS_BLUR (shared with Wayland) sets window_bg_color to 0.66 near-black and
+# paints the window that way. On Wayland that *is* the material. On Windows
+# acrylic is already tinted by ACCENT_TINT_DARK, so the same fill (and every
+# Adwaita node that uses @window_bg_color) flattens the blur into a solid
+# slab - which is exactly "I used to see acrylic and now I do not".
+#
+# Named colours are overridden here at a higher priority than CSS_BLUR.
+# Selectors clear every intermediate node; one opaque box in the chain
+# hides the whole backdrop.
 CSS_WIN_BACKDROP = b"""
-/* Every node between the surface and the content. One opaque box in this
-   chain hides the whole backdrop, which is exactly what happened when this
-   list was trimmed - the blur was there and covered. */
+@define-color window_bg_color rgba(0, 0, 0, 0);
+@define-color view_bg_color rgba(0, 0, 0, 0);
+@define-color headerbar_bg_color rgba(0, 0, 0, 0);
+@define-color sidebar_bg_color rgba(0, 0, 0, 0);
+@define-color secondary_sidebar_bg_color rgba(0, 0, 0, 0);
+
+/* Every node between the surface and the content. */
+window.blurred,
+window.blurred > .background,
 window.blurred > widget,
 window.blurred windowhandle,
 window.blurred box,
 window.blurred toolbarview,
 window.blurred .toolbar-view,
 window.blurred stack,
-window.blurred overlay { background-color: transparent; background-image: none; }
+window.blurred viewstack,
+window.blurred overlay,
+window.blurred toastoverlay,
+window.blurred .toast-overlay,
+window.blurred scrolledwindow,
+window.blurred viewport,
+window.blurred preferencespage,
+window.blurred preferencesgroup,
+window.blurred clamp,
+window.blurred headerbar { background-color: transparent; background-image: none; }
 
-/* One radius, and it has to be DWM's. The backdrop fills the window
-   rectangle, so a corner GTK rounds is a corner where the frost carries on
-   past it - the sliver of material outside Adwaita's 12px arc. Painting
-   square lets DWM's own rounding cut the window and the material together,
-   which is also the radius every other window on this desktop uses. */
+/* DWM rounds the window; GTK must paint square so frost is not clipped short. */
 window.blurred,
 window.blurred > .background { border-radius: 0; }
 
-/* No tint at all, unlike Wayland.
-   There the compositor hands back a raw blur and this fill is the entire
-   material - 0.66 of near-black is what makes it glass. Acrylic arrives
-   already tinted, by the alpha in ACCENT_TINT_DARK, so anything added here
-   lands on a finished material and flattens it. The window has to be clear
-   for the acrylic underneath to be the thing you see. */
-window.blurred,
-window.blurred > .background { background-color: transparent; }
+window.blurred headerbar { box-shadow: none; border-color: transparent; }
+
+/* Cards stay lightly lifted so content still reads on the acrylic. */
+window.blurred .boxed-list,
+window.blurred list.boxed-list,
+window.blurred listview.boxed-list {
+    background-color: rgba(255, 255, 255, 0.055);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    box-shadow: none;
+}
 """
 
 CSS_BLUR = b"""
@@ -756,6 +776,8 @@ class SettingsWindow(Adw.ApplicationWindow):
         # _start_mic_test). Leaving it idle here keeps rebuilds free of
         # widget traffic on the Device row.
         self.connect("notify::visible", self._on_visible_for_mic_meter)
+        self._win_frosted = False
+        self._win_backdrop = None
         if sys.platform == "win32":
             # Undecorated, and before realize. GTK's client-side decoration
             # carries a shadow the surface is sized to include; DWM knows
@@ -770,6 +792,10 @@ class SettingsWindow(Adw.ApplicationWindow):
             Gtk.StyleContext.add_provider_for_display(
                 Gdk.Display.get_default(), provider,
                 Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 2)
+            # Map, not only realize: prewarm realizes the window while it is
+            # still hidden, and DWM often drops accent acrylic before the
+            # first show. Re-applying on map is what makes Settings glass.
+            self.connect("map", self._on_map_win32)
         self.connect("realize", self._on_realize)
 
     # ------------------------------------------------------ shown on request
@@ -794,6 +820,11 @@ class SettingsWindow(Adw.ApplicationWindow):
         if not self.get_visible() and not self._working:
             self._reload_from_disk()
         self._raise_to_front()
+        # Map re-applies acrylic; also nudge once on idle so a window that
+        # was already mapped still gets a fresh composition attribute after
+        # a long prewarm sleep.
+        if sys.platform == "win32":
+            GLib.idle_add(self._ensure_win32_backdrop)
         return False                    # idle_add: run once
 
     def _raise_to_front(self) -> None:
@@ -2139,10 +2170,29 @@ class SettingsWindow(Adw.ApplicationWindow):
             Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 1)
         self.add_css_class("blurred")
 
+    def _frost_win32(self):
+        """Wayland frost, then Windows overrides that un-slab the acrylic.
+
+        CSS_BLUR alone paints @window_bg_color at 0.66 and the window fill
+        the same way - correct on Wayland, fatal on Windows where acrylic is
+        already the material. CSS_WIN_BACKDROP clears those and every
+        intermediate node so the blur is what the eye sees.
+        """
+        if self._win_frosted:
+            self.add_css_class("blurred")
+            return
+        self._frost()
+        provider = Gtk.CssProvider()
+        _load_css(provider, CSS_WIN_BACKDROP)
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(), provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 2)
+        self._win_frosted = True
+
     def _on_realize(self, *_):
         """Frost the window where the platform offers a backdrop."""
         if sys.platform == "win32":
-            self._realize_win32()
+            self._ensure_win32_backdrop(set_icon=True)
             return
         if not (os.environ.get("WAYLAND_DISPLAY")
                 or os.environ.get("XDG_SESSION_TYPE") == "wayland"):
@@ -2170,13 +2220,29 @@ class SettingsWindow(Adw.ApplicationWindow):
         except Exception as e:
             log(f"[SETTINGS] blur unavailable: {e}")
 
-    def _realize_win32(self):
-        """Acrylic behind the window, through DWM.
+    def _on_map_win32(self, *_):
+        """Re-apply acrylic when the window actually appears.
+
+        Prewarm builds the HWND at login with no pixels on screen. DWM is
+        free to drop composition attributes on an unmapped window, and even
+        when it keeps them the first map is when the material has to be
+        right. Cheap, and the path that makes tray → Settings glass.
+        """
+        self._ensure_win32_backdrop()
+        return False
+
+    def _ensure_win32_backdrop(self, set_icon: bool = False) -> bool:
+        """Acrylic behind the window, through DWM. Safe to call more than once.
 
         The pill could not use this - the backdrop is the window's rectangle
         and ignores any attempt to shape it - but a settings window is a
         rectangle, so it is precisely the intended case. GTK's transparent
         pixels let it through; nothing else is needed.
+
+        Only accent acrylic is useful under GTK: the documented
+        DWMWA_SYSTEMBACKDROP_TYPE paints the frame, which a toolkit that
+        owns its client area never shows. apply_backdrop still tries that
+        fallback, but we only frost when the client-area material landed.
 
         Worth knowing when this looks flat: Windows drops every acrylic and
         Mica surface to a solid fallback colour under battery saver, and
@@ -2186,36 +2252,38 @@ class SettingsWindow(Adw.ApplicationWindow):
             from . import blur_win
         except Exception as e:                  # not a Windows build
             log(f"[SETTINGS] no Windows backdrop support: {e}")
-            return
+            return False
         try:
             surface = self.get_surface()
+            if surface is None:
+                return False
             hwnd = blur_win.surface_handle(_gobject_pointer(surface))
             if not hwnd:
                 log("[SETTINGS] no HWND; window stays opaque")
-                return
-            # Before the backdrop, and not conditional on it: the icon is
-            # what the taskbar draws, and a window with no backdrop still has
-            # a taskbar button.
-            self._set_window_icon(hwnd)
+                return False
+            # Icon is independent of the material: set once on first realize.
+            if set_icon:
+                self._set_window_icon(hwnd)
             applied = blur_win.apply_backdrop(hwnd, transient=True)
-            if not applied:
-                log("[SETTINGS] backdrop unavailable; window stays opaque")
-                return
-            self._frost()
-            # GTK reserves a transparent margin around the window for its own
-            # drop shadow. DWM does not know about it and paints the backdrop
-            # across the whole window rectangle, so the material appears as a
-            # grey rectangle standing out past the rounded corners. Take the
-            # margin away and the window rectangle is the window; DWM rounds
-            # the corners itself, which is what DWMWCP_ROUND was for.
-            provider = Gtk.CssProvider()
-            _load_css(provider, CSS_WIN_BACKDROP)
-            Gtk.StyleContext.add_provider_for_display(
-                Gdk.Display.get_default(), provider,
-                Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 2)
-            log(f"[SETTINGS] backdrop blur enabled ({applied})")
+            if applied != "accent-acrylic":
+                # Documented backdrop alone is invisible through GTK's client
+                # area - the commit that added this called that out. Do not
+                # frost as if glass is there; the user would get a clear
+                # (or slab) window and no blur.
+                if applied:
+                    log(f"[SETTINGS] backdrop {applied} is not client acrylic; "
+                        f"window stays unfrosted")
+                else:
+                    log("[SETTINGS] backdrop unavailable; window stays opaque")
+                return False
+            self._frost_win32()
+            if applied != self._win_backdrop:
+                log(f"[SETTINGS] backdrop blur enabled ({applied})")
+            self._win_backdrop = applied
+            return False                    # idle_add: run once
         except Exception as e:
             log(f"[SETTINGS] blur unavailable: {e}")
+            return False
 
     @staticmethod
     def _set_window_icon(hwnd: int) -> None:
@@ -2313,6 +2381,14 @@ def main() -> int:
     # the line saying whether backdrop blur was applied, and the one saying
     # why it was not. Diagnosing "the blur is missing" meant re-running it by
     # hand with the flag forced; the daemon's own setting answers it now.
+    #
+    # Soft renderer on Windows: GSK's GL/Vulkan path has been seen to paint
+    # CSS alpha as opaque, which covers accent acrylic completely - the
+    # material is applied and the window still looks solid. Cairo honours
+    # the transparent fills CSS_WIN_BACKDROP depends on.
+    if sys.platform == "win32":
+        os.environ.setdefault("GSK_RENDERER", "cairo")
+
     config = None
     try:
         config = Config()

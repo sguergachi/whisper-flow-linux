@@ -786,3 +786,23 @@ def test_hotkey_rows_guard_set_subtitle_on_entryrow():
         "EntryRow must not call set_subtitle without checking; that crash "
         "kept the settings window from opening at all")
     assert "set_tooltip_text" in body
+
+
+def test_windows_frost_clears_the_slab_that_hides_acrylic():
+    """Accent acrylic is useless if Adwaita still paints @window_bg_color.
+
+    CSS_BLUR sets that named colour to 0.66 near-black for Wayland. On
+    Windows the same fill flattens DWM acrylic into a solid panel. The
+    Windows override must clear it, and acrylic must be re-applied on map
+    because prewarm realizes the window while it is still hidden.
+    """
+    source = (Path(__file__).resolve().parents[1]
+              / "src/whisper_flow/settings_gtk.py").read_text(encoding="utf-8")
+    assert "CSS_WIN_BACKDROP" in source
+    win = source.split("CSS_WIN_BACKDROP = b", 1)[1].split('"""', 2)[1]
+    assert "@define-color window_bg_color" in win
+    assert "rgba(0, 0, 0, 0)" in win or "transparent" in win
+    assert "_ensure_win32_backdrop" in source
+    assert 'self.connect("map", self._on_map_win32)' in source
+    assert 'applied != "accent-acrylic"' in source
+    assert 'setdefault("GSK_RENDERER", "cairo")' in source

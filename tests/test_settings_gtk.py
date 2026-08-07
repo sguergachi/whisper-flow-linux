@@ -278,8 +278,9 @@ elif scenario == "mic_race":
         f"than from the row")
 elif scenario == "mic_host_api":
     # PortAudio lists every microphone once per Windows audio API, so the
-    # same headset is four entries with the same name and four indices. The
-    # list read as duplicates and there was no way to tell which was which.
+    # same headset is four entries with the same name and four indices.
+    # DirectSound freezes Test; WDM-KS is exclusive - both are hidden.
+    # WASAPI and MME stay, with the API on the label so they differ.
     import types
     fake = types.ModuleType("pyaudio")
 
@@ -287,9 +288,16 @@ elif scenario == "mic_host_api":
         devices = [
             {"name": "Headset", "maxInputChannels": 1, "hostApi": 0},
             {"name": "Headset", "maxInputChannels": 1, "hostApi": 1},
-            {"name": "Speakers", "maxInputChannels": 0, "hostApi": 1},
+            {"name": "Headset", "maxInputChannels": 1, "hostApi": 2},
+            {"name": "Headset", "maxInputChannels": 1, "hostApi": 3},
+            {"name": "Speakers", "maxInputChannels": 0, "hostApi": 2},
         ]
-        apis = [{"name": "MME"}, {"name": "Windows WASAPI"}]
+        apis = [
+            {"name": "MME"},
+            {"name": "Windows DirectSound"},
+            {"name": "Windows WASAPI"},
+            {"name": "Windows WDM-KS"},
+        ]
 
         def get_device_count(self):
             return len(self.devices)
@@ -307,9 +315,16 @@ elif scenario == "mic_host_api":
     sys.modules["pyaudio"] = fake
 
     listed = _real_list_input_devices()
-    assert listed == [(0, "Headset (MME)"), (1, "Headset (WASAPI)")], listed
-    # Outputs are still left out, and "Windows " is not repeated on every row.
+    assert listed == [(0, "Headset (MME)"), (2, "Headset (WASAPI)")], listed
+    # Outputs, DirectSound and WDM-KS are left out.
     assert all("Speakers" not in name for _, name in listed)
+    assert all("DirectSound" not in name for _, name in listed)
+    assert all("WDM" not in name for _, name in listed)
+    assert settings_gtk._host_api_supported("WASAPI")
+    assert settings_gtk._host_api_supported("MME")
+    assert settings_gtk._host_api_supported("ALSA")
+    assert not settings_gtk._host_api_supported("DirectSound")
+    assert not settings_gtk._host_api_supported("WDM-KS")
 elif scenario == "mic_selected":
     # Which device is in use, in the open list. Replacing the factory to stop
     # it ellipsizing the names also dropped the tick the stock one draws, so

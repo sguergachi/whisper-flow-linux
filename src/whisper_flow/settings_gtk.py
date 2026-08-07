@@ -416,16 +416,45 @@ def _gobject_pointer(obj) -> int:
     return ctypes.pythonapi.PyCapsule_GetPointer(obj.__gpointer__, None)
 
 
+# Windows host APIs we will not open for capture. PortAudio still lists them
+# (one physical mic becomes four rows), but DirectSound hangs the settings
+# Test meter and freezes the UI, and WDM-KS is exclusive kernel streaming
+# that fails whenever anything else holds the endpoint. Default recording
+# already prefers WASAPI; the dropdown must not offer the bad paths.
+_UNSUPPORTED_HOST_APIS = frozenset({
+    "directsound",
+    "wdm-ks",
+    "wdm ks",
+    "wdmks",
+})
+
+
+def _host_api_supported(api: str) -> bool:
+    """Whether this PortAudio host API is safe to offer for capture.
+
+    Empty/unknown (typical on Linux: ALSA, PulseAudio) is kept. Only the
+    known-bad Windows backends are filtered out.
+    """
+    if not api:
+        return True
+    key = api.lower().replace("windows ", "").strip()
+    if key in _UNSUPPORTED_HOST_APIS:
+        return False
+    if "directsound" in key or "wdm-ks" in key or "wdmks" in key:
+        return False
+    return True
+
+
 def _list_input_devices() -> list[tuple[int, str]]:
-    """(index, name) for every capture device, or nothing if audio is down.
+    """(index, name) for every *supported* capture device, or nothing if down.
 
     The name carries the host API, because without it the list reads as
     duplicates: PortAudio enumerates each physical microphone once per
     Windows audio API - MME, DirectSound, WASAPI, WDM-KS - so one headset is
     four entries with the same name and four different indices. They are not
-    interchangeable either. WASAPI is the modern path and the one that says
-    what it will and will not resample; MME is the oldest and the loosest.
-    Which was picked is exactly what a name repeated four times cannot say.
+    interchangeable either. WASAPI is the modern path; MME still works.
+    DirectSound and WDM-KS are omitted - selecting them caused freezes and
+    exclusive-mode open failures.
     """
     try:
         import pyaudio
@@ -436,8 +465,10 @@ def _list_input_devices() -> list[tuple[int, str]]:
                 info = pa.get_device_info_by_index(i)
                 if int(info.get("maxInputChannels", 0)) <= 0:
                     continue
-                name = str(info.get("name", f"device {i}"))
                 api = _host_api_name(pa, info)
+                if not _host_api_supported(api):
+                    continue
+                name = str(info.get("name", f"device {i}"))
                 devices.append((i, f"{name} ({api})" if api else name))
             return devices
         finally:
@@ -1499,11 +1530,14 @@ class SettingsWindow(Adw.ApplicationWindow):
         self._mic_display = {"Default": ""}
         for index, name in devices:
             self._mic_display[f"{index}: {name}"] = str(index)
-        # A device that is configured but no longer present keeps its row,
-        # or selecting it would silently fall back to the default and read
-        # as a change the user made.
+        # A device that is configured but no longer listed keeps its row, or
+        # selecting it would silently fall back to Default. That covers both
+        # unplugged hardware and a saved DirectSound/WDM-KS index after those
+        # APIs were removed from the list - without a row, the user could not
+        # see they need to pick WASAPI.
         if selected and selected not in self._mic_display.values():
-            self._mic_display[f"{selected}: (not connected)"] = selected
+            self._mic_display[f"{selected}: (unsupported - pick WASAPI)"] = (
+                selected)
 
         displays = list(self._mic_display)
         row.set_model(Gtk.StringList.new(displays))

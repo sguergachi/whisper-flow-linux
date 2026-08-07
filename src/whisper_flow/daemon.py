@@ -723,8 +723,11 @@ class WhisperFlowDaemon:
                 )
 
             if not success:
+                # Auto/command already toast "No speech heard" when the mic
+                # opened but VAD got nothing. Only escalate the hard failures.
                 log(f"[DAEMON] Recording failed for mode: {mode}")
-                self._report_failure(f"Recording failed ({mode})")
+                if mode not in ("auto_transcribe", "command"):
+                    self._report_failure(f"Recording failed ({mode})")
             else:
                 log(f"[DAEMON] Recording completed successfully for mode: {mode}")
 
@@ -1656,7 +1659,10 @@ Use 'whisper-flow stop' to exit daemon
             self._start_managed_backend()
 
             if foreground:
-                # Foreground mode: try tray, fallback to notification mode
+                # Foreground mode: try tray, then keep hotkeys alive without a
+                # tray. Never fall through to the interactive CLI under
+                # systemd: input() hits EOF immediately and used to stop the
+                # whole daemon - which is exactly "hotkeys do nothing".
                 log("[DAEMON] Running in foreground mode")
                 try:
                     self.tray_icon = _pystray().Icon(
@@ -1669,7 +1675,11 @@ Use 'whisper-flow stop' to exit daemon
                     self.tray_icon.run()
                 except Exception as e:
                     log(f"[DAEMON] Tray setup failed: {e}")
-                    self.run_notification_mode()
+                    if sys.stdin.isatty():
+                        self.run_notification_mode()
+                    else:
+                        log("[DAEMON] no TTY; staying up headless with hotkeys")
+                        self.run_headless_mode()
             else:
                 # Background mode: try tray, fallback to headless
                 log("[DAEMON] Running in background mode")

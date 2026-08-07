@@ -231,9 +231,14 @@ class HotkeyManager:
             press_cb = binding.callback_press
             release_cb = binding.callback_release if binding.mode == HotkeyMode.PUSH_TO_TALK else None
 
+            # Mute the chord from the compositor for every binding, not only
+            # push-to-talk. Single-press auto (ctrl+alt+space) was leaving
+            # Space held as far as the desktop was concerned, so the press
+            # typed a space (or fired a desktop shortcut) and looked like
+            # auto-transcribe "did nothing".
             self._evdev_listener.register_hotkey(
                 name, key_str, press_cb, release_cb,
-                release_modifiers=binding.mode == HotkeyMode.PUSH_TO_TALK,
+                release_modifiers=True,
             )
 
         self._evdev_listener.start()

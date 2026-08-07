@@ -220,7 +220,15 @@ class WhisperFlow:
             )
 
             if not audio_file:
+                # Distinct from a hard failure: the mic opened, nobody spoke
+                # (or VAD heard nothing). Without this toast, single-press
+                # auto looks exactly like a dead hotkey.
                 log("No audio recorded")
+                try:
+                    self.system_manager.notify(
+                        "No speech heard - press the hotkey and speak")
+                except Exception:
+                    pass
                 return False
 
             return self._process_recorded_audio(audio_file)

@@ -796,8 +796,13 @@ class AudioRecorder:
                     frames.append(buf)
                     self._write_level(level_file, buf)
 
-                    # Check for voice activity
-                    voiced = vad.is_speech(buf, self.config.sample_rate)
+                    # Check for voice activity. webrtcvad raises on a bad
+                    # frame size; that must not kill the whole recording.
+                    try:
+                        voiced = vad.is_speech(buf, self.config.sample_rate)
+                    except Exception as e:
+                        log(f"[AUDIO] VAD skipped a frame: {e}")
+                        voiced = False
 
                     if voiced:
                         last_voice_time = time.time()
@@ -815,12 +820,13 @@ class AudioRecorder:
                         break
                     elif (
                         not recording_started
-                        and time.time() - started_at > silence_duration + 1.0
+                        and time.time() - started_at
+                        > max(silence_duration + 2.0, 5.0)
                     ):
-                        # No speech at all after a short wait: stop rather
-                        # than sit open until max_duration. Auto-transcribe
-                        # is a single tap; an empty room should not pin the
-                        # daemon for two minutes.
+                        # No speech after the HUD has been up long enough to
+                        # speak: stop rather than sit open until max_duration.
+                        # Was silence+1s (~3s), which was too short once the
+                        # mic open + overlay lag ate a second of the window.
                         log("[AUDIO] auto-stop: no voice heard, giving up")
                         stop_flag["stop"] = True
                         break

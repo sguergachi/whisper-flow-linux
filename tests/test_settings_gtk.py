@@ -113,15 +113,47 @@ elif scenario == "models":
 elif scenario == "save":
     w._rows["live_interval"].set_value(1.4)
     w._on_save()
-    # Save writes .env and restarts off the GTK thread so the UI never
-    # freezes; pump until that work finishes and the toast settles.
-    assert "Saved" in w._last_toast_title
-    assert "Restart" in w._last_toast_title
+    # Immediate toast is "Saving..." - write + restart finish off-thread.
+    assert "Saving" in (w._last_toast_title or "")
     assert pump(lambda: (
         not w._working
         and os.path.exists(config_dir + "/.env")
         and "Saved and restarted" in (w._last_toast_title or "")
     )), f"async save never finished: toast={w._last_toast_title!r}"
+elif scenario == "save_write_fail":
+    # Disk error must not claim success, and must leave edits dirty.
+    def _boom(*_a, **_k):
+        raise PermissionError(13, "Permission denied",
+                              config_dir + "/.env")
+    settings_gtk.envfile.set_values = _boom
+    w.present()
+    assert pump(lambda: w.get_visible())
+    w._rows["live_interval"].set_value(1.4)
+    w._refresh_dirty()
+    assert w._banner.get_revealed(), "dirty strip never appeared before save"
+    w._on_save()
+    assert pump(lambda: (
+        not w._working
+        and "Could not save" in (w._last_toast_title or "")
+    )), f"write failure never toasted: {w._last_toast_title!r}"
+    assert "permission denied" in (w._last_toast_title or "").lower()
+    assert not os.path.exists(config_dir + "/.env"), "failed write created .env"
+    # Dirty banner returns so the user can try again or Cancel.
+    assert pump(lambda: w._banner.get_revealed()), (
+        "dirty strip stayed hidden after a failed save")
+elif scenario == "save_restart_fail":
+    # .env is written; only restart fails - toast offers Retry.
+    settings_gtk.restart.restart_daemon = lambda: (False, "unit missing")
+    w._rows["live_interval"].set_value(1.4)
+    w._on_save()
+    assert pump(lambda: (
+        not w._working
+        and os.path.exists(config_dir + "/.env")
+        and "could not restart" in (w._last_toast_title or "").lower()
+    )), f"restart failure never toasted: {w._last_toast_title!r}"
+    # Values are committed (file on disk); dirty strip stays clear.
+    assert abs(w._rows["live_interval"].get_value() - 1.4) < 1e-6
+    assert not w._banner.get_revealed()
 elif scenario == "cancel":
     # Discard unsaved edits without writing .env or restarting.
     w.present()
@@ -590,6 +622,22 @@ def test_a_checkbutton_exists_per_known_model(tmp_path):
 
 def test_saving_a_change_writes_the_env_file(tmp_path):
     result = _run(tmp_path, "save")
+    assert "OK" in result.stdout, result.stderr
+    from whisper_flow import envfile
+    assert envfile.get(tmp_path / ".env",
+                       "WHISPER_FLOW_LIVE_INTERVAL") == "1.4"
+
+
+def test_a_failed_write_does_not_claim_success(tmp_path):
+    """Permission errors on .env keep edits dirty and say Could not save."""
+    result = _run(tmp_path, "save_write_fail")
+    assert "OK" in result.stdout, result.stderr
+    assert not (tmp_path / ".env").exists()
+
+
+def test_a_failed_restart_still_keeps_the_saved_file(tmp_path):
+    """Write landed; restart failed - user sees that and keeps the values."""
+    result = _run(tmp_path, "save_restart_fail")
     assert "OK" in result.stdout, result.stderr
     from whisper_flow import envfile
     assert envfile.get(tmp_path / ".env",

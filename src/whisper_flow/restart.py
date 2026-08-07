@@ -94,7 +94,18 @@ def restart_daemon() -> tuple[bool, str]:
     Waits for the old process are short and always release the GIL
     (``time.sleep``): a multi-second block with the GIL held froze the
     settings window until restart finished.
+
+    Never raises: callers in the settings UI treat any exception as a
+    frozen/broken Save path, so every failure is a ``(False, reason)``.
     """
+    try:
+        return _restart_daemon()
+    except Exception as e:
+        log(f"[SETTINGS] restart_daemon failed: {e}")
+        return False, str(e) or e.__class__.__name__
+
+
+def _restart_daemon() -> tuple[bool, str]:
     if systemd_unit_active():
         # --kill-who=main: only the daemon, not its settings/HUD children.
         # Every systemctl call is hard-capped so a stuck dbus cannot freeze
@@ -107,6 +118,8 @@ def restart_daemon() -> tuple[bool, str]:
             )
         except subprocess.TimeoutExpired:
             return False, "systemctl kill timed out"
+        except OSError as e:
+            return False, f"systemctl kill failed: {e}"
         if result.returncode != 0:
             return False, result.stderr.decode(errors="replace").strip() or \
                 "systemctl refused to stop the daemon"
@@ -122,6 +135,8 @@ def restart_daemon() -> tuple[bool, str]:
         except subprocess.TimeoutExpired:
             # Start may still be proceeding; treat as success so Save returns.
             return True, "restarting via systemd (start still running)"
+        except OSError as e:
+            return False, f"systemctl start failed: {e}"
         if result.returncode == 0:
             return True, "restarting via systemd"
         return False, result.stderr.decode(errors="replace").strip() or \

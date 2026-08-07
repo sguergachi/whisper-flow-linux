@@ -577,6 +577,26 @@ def _close_meter_stream(stream) -> None:
         pass
 
 
+def _format_error(err) -> str:
+    """One short line for a toast: OS errors without the errno prefix noise."""
+    if err is None:
+        return "unknown error"
+    if isinstance(err, BaseException):
+        if isinstance(err, PermissionError):
+            return f"permission denied ({err.filename or 'file'})"
+        if isinstance(err, FileNotFoundError):
+            return f"not found ({err.filename or err})"
+        if isinstance(err, OSError):
+            detail = err.strerror or str(err)
+            if err.filename:
+                return f"{detail} ({err.filename})"
+            return detail
+        text = str(err).strip() or err.__class__.__name__
+        return text
+    text = str(err).strip()
+    return text or "unknown error"
+
+
 def _run_in_background(name: str, work, done=None) -> None:
     """Run ``work()`` off the GTK thread; optional ``done`` on the main loop.
 
@@ -942,33 +962,32 @@ class SettingsWindow(Adw.ApplicationWindow):
         """Best-effort focus for a window whose title matches `title`."""
         import shutil
 
+        def run(cmd: list[str]) -> subprocess.CompletedProcess | None:
+            try:
+                return subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=3,
+                    check=False,
+                )
+            except (subprocess.TimeoutExpired, OSError) as e:
+                log(f"[SETTINGS] focus tool failed ({cmd[0]}): {e}")
+                return None
+
         # KDE (Wayland + X11): same tool the paste path uses.
         if shutil.which("kdotool"):
-            found = subprocess.run(
-                ["kdotool", "search", "--name", title],
-                capture_output=True, text=True, timeout=3, check=False,
-            )
-            for wid in found.stdout.splitlines():
-                wid = wid.strip()
-                if not wid:
-                    continue
-                subprocess.run(
-                    ["kdotool", "windowactivate", wid],
-                    capture_output=True, text=True, timeout=3, check=False,
-                )
-                return
+            found = run(["kdotool", "search", "--name", title])
+            if found is not None:
+                for wid in found.stdout.splitlines():
+                    wid = wid.strip()
+                    if not wid:
+                        continue
+                    run(["kdotool", "windowactivate", wid])
+                    return
         if shutil.which("wmctrl"):
-            subprocess.run(
-                ["wmctrl", "-a", title],
-                capture_output=True, text=True, timeout=3, check=False,
-            )
+            run(["wmctrl", "-a", title])
             return
         # X11 only; harmless no-op when DISPLAY is unset.
         if shutil.which("xdotool") and os.environ.get("DISPLAY"):
-            subprocess.run(
-                ["xdotool", "search", "--name", title, "windowactivate"],
-                capture_output=True, text=True, timeout=3, check=False,
-            )
+            run(["xdotool", "search", "--name", title, "windowactivate"])
 
     def _watch_the_daemon(self) -> bool:
         """Follow what the daemon does while this window is open.
@@ -1419,21 +1438,25 @@ class SettingsWindow(Adw.ApplicationWindow):
         def work():
             try:
                 ok = self.backend.install(model, progress=self._on_progress)
+                err = None
             except Exception as e:
                 log(f"[SETTINGS] engine download failed: {e}")
-                ok = False
-            GLib.idle_add(self._engine_download_done, ok)
+                ok, err = False, _format_error(e)
+            GLib.idle_add(self._engine_download_done, ok, err)
 
         threading.Thread(target=work, daemon=True,
                          name="whisper-flow-engine-download").start()
 
-    def _engine_download_done(self, ok: bool):
+    def _engine_download_done(self, ok: bool, err: str | None = None):
         self._working = False
         for button in self._download_buttons:
             button.set_sensitive(True)
         if not ok:
-            self._toast("Could not install the GPU engine - check the "
-                        "connection.")
+            if err:
+                self._toast(f"Could not install the GPU engine: {err}")
+            else:
+                self._toast("Could not install the GPU engine - check the "
+                            "connection.")
             return
         self._rebuild_speech_page()
         self._restart_daemon(toast_start="Installed. Restarting...",
@@ -1883,6 +1906,13 @@ class SettingsWindow(Adw.ApplicationWindow):
                 level, peak = _mic_level_from_rms(measure, peak)
                 with self._mic_meter_lock:
                     self._mic_drawn_level = level
+        except Exception as e:
+            # Unexpected crash in the capture loop must surface as a toast,
+            # not leave Test stuck "on" with a dead thread and a zero bar.
+            log(f"[SETTINGS] mic meter crashed: {e}")
+            with self._mic_meter_lock:
+                self._mic_meter_error = (
+                    f"Microphone test failed: {_format_error(e)}")
         finally:
             if stream is not None:
                 _close_meter_stream(stream)
@@ -2065,20 +2095,27 @@ class SettingsWindow(Adw.ApplicationWindow):
         """Validate on the UI thread; write .env and restart off it.
 
         The whole Save path is async after reading widget values: disk and
-        systemctl must never run under a button-clicked handler.
+        systemctl must never run under a button-clicked handler. Write and
+        restart failures are reported separately so a permission error does
+        not look like a successful save, and a restart failure still offers
+        Retry after the file is on disk.
         """
         if self._working:
             return
-        values = self._values()
-        problem = settings_def.validate(values)
-        if problem:
-            self._toast(problem)
+        try:
+            values = self._values()
+            problem = settings_def.validate(values)
+            if problem:
+                self._toast(problem)
+                return
+            updates = settings_def.updates_from(values, self._current)
+            model = self._selected_model()
+            if model and model != self._current_model:
+                updates["WHISPER_FLOW_MODEL_NAME"] = model
+        except Exception as e:
+            log(f"[SETTINGS] save prepare failed: {e}")
+            self._toast(f"Could not read settings: {_format_error(e)}")
             return
-
-        updates = settings_def.updates_from(values, self._current)
-        model = self._selected_model()
-        if model and model != self._current_model:
-            updates["WHISPER_FLOW_MODEL_NAME"] = model
         if not updates:
             self._toast("Nothing changed")
             return
@@ -2088,31 +2125,70 @@ class SettingsWindow(Adw.ApplicationWindow):
         self._banner.set_revealed(False)
         if self._mic_meter_active:
             self._stop_mic_test()
-        self._toast("Saved. Restarting...")
+        # Honest until the write lands - "Saved" only after success.
+        self._toast("Saving...")
 
         def work():
-            envfile.set_values(env_path, updates)
+            try:
+                envfile.set_values(env_path, updates)
+            except OSError as e:
+                log(f"[SETTINGS] could not write {env_path}: {e}")
+                return ("write_failed", _format_error(e))
+            except Exception as e:
+                log(f"[SETTINGS] could not write {env_path}: {e}")
+                return ("write_failed", _format_error(e))
             log(f"[SETTINGS] saved {sorted(updates)} to {env_path}")
-            return restart.restart_daemon()
+            try:
+                restart_ok, detail = restart.restart_daemon()
+            except Exception as e:
+                log(f"[SETTINGS] restart after save failed: {e}")
+                return ("restart_failed", _format_error(e))
+            if not restart_ok:
+                return ("restart_failed", detail or "restart failed")
+            return ("ok", detail)
 
         def done(ok, result):
             self._working = False
             if not ok:
-                self._toast(f"Could not save: {result}")
-                return False
-            restart_ok, detail = result
-            if restart_ok:
+                self._save_write_failed(_format_error(result))
+                return
+            try:
+                phase, detail = result
+            except (TypeError, ValueError):
+                self._save_write_failed(_format_error(result))
+                return
+            if phase == "ok":
                 self._current = values
                 self._current_model = model or self._current_model
                 self._toast("Saved and restarted.")
-            else:
-                # File is written; only the restart failed.
-                self._current = values
-                self._current_model = model or self._current_model
-                self._toast(f"Saved, but could not restart: {detail}")
-            return False
+                return
+            if phase == "write_failed":
+                self._save_write_failed(detail)
+                return
+            # File is on disk; only the restart failed.
+            self._current = values
+            self._current_model = model or self._current_model
+            self._toast(
+                f"Saved, but could not restart: {detail}",
+                button="Retry",
+                on_button=lambda: self._restart_daemon(
+                    toast_start="Restarting...",
+                    toast_ok="Restarted.",
+                    toast_fail_prefix="Could not restart",
+                ),
+            )
 
         _run_in_background("save", work, done)
+
+    def _save_write_failed(self, detail: str) -> None:
+        """Write never landed: keep edits dirty and tell the user why."""
+        self._toast(f"Could not save: {detail}")
+        # Banner was hidden for the attempt; dirty poll would re-show it on
+        # the next tick, but re-evaluate now so the failure is obvious.
+        try:
+            self._refresh_dirty()
+        except Exception as e:
+            log(f"[SETTINGS] dirty refresh after save failure: {e}")
 
     def _on_restart(self):
         """Manual restart (still available if something else needs one)."""
@@ -2131,19 +2207,41 @@ class SettingsWindow(Adw.ApplicationWindow):
         self._toast(toast_start)
 
         def work():
-            return restart.restart_daemon()
+            try:
+                return restart.restart_daemon()
+            except Exception as e:
+                log(f"[SETTINGS] restart_daemon raised: {e}")
+                return False, _format_error(e)
 
         def done(ok, result):
             self._working = False
             if not ok:
-                self._toast(f"{toast_fail_prefix}: {result}")
-                return False
-            restart_ok, detail = result
+                self._toast(
+                    f"{toast_fail_prefix}: {_format_error(result)}",
+                    button="Retry",
+                    on_button=lambda: self._restart_daemon(
+                        toast_start, toast_ok, toast_fail_prefix),
+                )
+                return
+            try:
+                restart_ok, detail = result
+            except (TypeError, ValueError):
+                self._toast(
+                    f"{toast_fail_prefix}: {_format_error(result)}",
+                    button="Retry",
+                    on_button=lambda: self._restart_daemon(
+                        toast_start, toast_ok, toast_fail_prefix),
+                )
+                return
             if restart_ok:
                 self._toast(toast_ok)
             else:
-                self._toast(f"{toast_fail_prefix}: {detail}")
-            return False
+                self._toast(
+                    f"{toast_fail_prefix}: {detail}",
+                    button="Retry",
+                    on_button=lambda: self._restart_daemon(
+                        toast_start, toast_ok, toast_fail_prefix),
+                )
 
         _run_in_background("restart", work, done)
 
@@ -2160,15 +2258,16 @@ class SettingsWindow(Adw.ApplicationWindow):
         def work():
             try:
                 ok = self.backend.install(model, progress=self._on_progress)
+                err = None
             except Exception as e:
                 log(f"[SETTINGS] download failed: {e}")
-                ok = False
-            GLib.idle_add(self._download_done, model, ok)
+                ok, err = False, _format_error(e)
+            GLib.idle_add(self._download_done, model, ok, err)
 
         threading.Thread(target=work, daemon=True,
                          name="whisper-flow-model-download").start()
 
-    def _download_done(self, model: str, ok: bool):
+    def _download_done(self, model: str, ok: bool, err: str | None = None):
         self._working = False
         for button in self._download_buttons:
             button.set_sensitive(True)
@@ -2177,6 +2276,8 @@ class SettingsWindow(Adw.ApplicationWindow):
             self._rebuild_speech_page()
             self._model_checks[model].set_active(True)
             self._toast(f"Got {model.replace('ggml-', '')} - Save to use it.")
+        elif err:
+            self._toast(f"Download failed: {err}")
         else:
             self._toast("Download failed - check the connection.")
 

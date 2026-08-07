@@ -92,3 +92,27 @@ def test_a_stubborn_daemon_still_gets_a_replacement(monkeypatch):
 
     assert ok
     popen.assert_called_once()
+
+
+def test_restart_daemon_never_raises(monkeypatch):
+    """Settings treats every failure as (False, reason), never an exception."""
+    monkeypatch.setattr(restart, "systemd_unit_active",
+                        Mock(side_effect=RuntimeError("dbus dead")))
+
+    ok, detail = restart.restart_daemon()
+
+    assert ok is False
+    assert "dbus dead" in detail
+
+
+def test_systemctl_os_error_is_reported(monkeypatch):
+    monkeypatch.setattr(restart, "systemd_unit_active", lambda: True)
+    monkeypatch.setattr(
+        restart.subprocess, "run",
+        Mock(side_effect=OSError(2, "No such file or directory")),
+    )
+
+    ok, detail = restart.restart_daemon()
+
+    assert ok is False
+    assert "systemctl" in detail.lower() or "No such file" in detail

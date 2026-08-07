@@ -199,8 +199,11 @@ jobs:
           # ships inside the AppImage and works without a distro package.
           git clone --depth 1 --branch v1.0.3 \
             https://github.com/wmww/gtk4-layer-shell.git /tmp/gtk4-layer-shell
+          # vapi needs vapigen (Vala); we only need the .so + typelib for the
+          # AppImage, so skip VAPI generation. smoke-tests pull in examples.
           meson setup /tmp/gtk4-layer-shell/build /tmp/gtk4-layer-shell \
             -Dexamples=false -Ddocs=false -Dtests=false \
+            -Dsmoke-tests=false -Dvapi=false \
             --prefix=/usr
           ninja -C /tmp/gtk4-layer-shell/build
           sudo ninja -C /tmp/gtk4-layer-shell/build install

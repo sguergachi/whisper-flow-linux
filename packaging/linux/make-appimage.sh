@@ -68,6 +68,9 @@ X-AppImage-Version=${VERSION}
 EOF
 
 # AppRun: double-click entry. No terminal. Hands off to the frozen binary.
+# Nothing is exported into LD_LIBRARY_PATH: PyInstaller already knows where
+# its own libs live, and the bundle contains no host-system libraries, so
+# children (sh, notify-send, the engine) never pick up conflicts.
 cat > "$APPDIR/AppRun" <<'APPRUN'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -75,11 +78,21 @@ HERE="${APPDIR:-}"
 if [[ -z "$HERE" ]]; then
     HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 fi
-export APPDIR="$HERE"
-# Bundled libs first; glibc still comes from the host.
-if [[ -d "$HERE/lib" ]]; then
-    export LD_LIBRARY_PATH="$HERE/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-fi
+# The HUD needs gtk4-layer-shell to load before libwayland-client (it is
+# dlopen'd through a typelib otherwise, which is too late). LD_PRELOAD is
+# read at process start, so it has to be set here, before exec. The daemon
+# and the HUD/settings children it spawns all inherit it.
+for LAYER in \
+    /usr/lib/x86_64-linux-gnu/libgtk4-layer-shell.so.0 \
+    /usr/lib64/libgtk4-layer-shell.so.0 \
+    /usr/lib/libgtk4-layer-shell.so.0 \
+    /usr/local/lib/libgtk4-layer-shell.so.0
+do
+    if [[ -f "$LAYER" ]]; then
+        export LD_PRELOAD="$LAYER${LD_PRELOAD:+:$LD_PRELOAD}"
+        break
+    fi
+done
 exec "$HERE/whisper-flow" "$@"
 APPRUN
 chmod +x "$APPDIR/AppRun"

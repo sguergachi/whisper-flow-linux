@@ -195,8 +195,10 @@ jobs:
             pkg-config meson ninja-build cmake \
             curl file fuse libfuse2 \
             xvfb adwaita-icon-theme
-          # gtk4-layer-shell is not in 22.04; build it so the Wayland HUD
-          # ships inside the AppImage and works without a distro package.
+          # gtk4-layer-shell is not in 22.04; build it so the selftest can
+          # exercise the HUD typelib. It is not bundled: the AppImage uses
+          # the host's copy (the Wayland HUD needs the host's layer-shell
+          # anyway, and bundling the GTK stack broke newer distros).
           git clone --depth 1 --branch v1.0.3 \
             https://github.com/wmww/gtk4-layer-shell.git /tmp/gtk4-layer-shell
           # vapi needs vapigen (Vala); we only need the .so + typelib for the

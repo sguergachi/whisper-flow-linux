@@ -6,6 +6,17 @@
 #
 # GTK reaches us through dlopen + typelibs, so the .so closure and
 # girepository data are collected by hand, same idea as the Windows spec.
+#
+# The bundle deliberately does NOT ship the GTK/glib stack. Bundling an
+# old glib poisons newer distros: the dynamic loader fixes LD_LIBRARY_PATH
+# at process start, so a bundled Ubuntu-22.04 glib always wins over the
+# host's, and then every host library that depends on a newer glib
+# (libjson-glib, libnotify, system binaries like sh and notify-send)
+# breaks with "undefined symbol". The host must provide GTK4, libadwaita,
+# gtk4-layer-shell and the gi typelibs — the same requirement the venv
+# installer (install.sh) already documents. The bundle keeps the parts the
+# host cannot reasonably provide: the Python runtime, the app itself, the
+# whisper.cpp engine and the model.
 
 import glob
 import os
@@ -16,31 +27,6 @@ from PyInstaller.utils.hooks import collect_submodules
 
 block_cipher = None
 
-# Prefixes to search for typelibs / libs (Debian multiarch + Fedora + Arch).
-_LIB_PREFIXES = [
-    "/usr/lib/x86_64-linux-gnu",
-    "/usr/lib64",
-    "/usr/lib",
-    "/usr/local/lib",
-]
-
-REQUIRED_TYPELIBS = (
-    "Gtk-4.0",
-    "Gdk-4.0",
-    "Adw-1",
-    "Pango-1.0",
-    "GLib-2.0",
-    "GObject-2.0",
-    "Gio-2.0",
-    "cairo-1.0",
-    "HarfBuzz-0.0",
-    "GdkPixbuf-2.0",
-    "Graphene-1.0",
-)
-
-# Optional but wanted for the Wayland HUD.
-OPTIONAL_TYPELIBS = ("Gtk4LayerShell-1.0",)
-
 # Do not ship the host glibc / dynamic linker — those must come from the
 # target machine, which is what makes one build run on many distros.
 _SKIP_SO = re.compile(
@@ -49,172 +35,42 @@ _SKIP_SO = re.compile(
     r"libthread_db|libcidn)\.so"
 )
 
-
-def _find_file(*candidates):
-    for path in candidates:
-        if path and os.path.isfile(path):
-            return path
-    return None
-
-
-def _find_typelib(name: str) -> str | None:
-    for prefix in (
-        "/usr/lib/x86_64-linux-gnu/girepository-1.0",
-        "/usr/lib64/girepository-1.0",
-        "/usr/lib/girepository-1.0",
-        "/usr/local/lib/girepository-1.0",
-    ):
-        path = os.path.join(prefix, f"{name}.typelib")
-        if os.path.isfile(path):
-            return path
-    return None
-
-
-def _ldd_libs(binary: str) -> list[str]:
-    """Shared libraries a binary needs, absolute paths, host-resolved."""
-    try:
-        out = subprocess.check_output(["ldd", binary], text=True, stderr=subprocess.DEVNULL)
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return []
-    found = []
-    for line in out.splitlines():
-        # "libfoo.so.0 => /usr/lib/libfoo.so.0 (0x...)"
-        if "=>" not in line:
-            continue
-        right = line.split("=>", 1)[1].strip().split()[0]
-        if right.startswith("/") and os.path.isfile(right):
-            found.append(right)
-    return found
-
-
-def _so_closure(roots: list[str]) -> list[str]:
-    """Every non-glibc .so reachable from the roots, recursively via ldd."""
-    seen: dict[str, str] = {}
-    todo = [p for p in roots if p and os.path.isfile(p)]
-    while todo:
-        path = todo.pop()
-        name = os.path.basename(path)
-        if name in seen:
-            continue
-        if _SKIP_SO.match(name):
-            continue
-        seen[name] = path
-        for dep in _ldd_libs(path):
-            dep_name = os.path.basename(dep)
-            if dep_name not in seen and not _SKIP_SO.match(dep_name):
-                todo.append(dep)
-    return sorted(seen.values())
-
-
-def _find_lib(names: list[str]) -> str | None:
-    for name in names:
-        for prefix in _LIB_PREFIXES:
-            path = os.path.join(prefix, name)
-            if os.path.isfile(path):
-                return path
-        # bare name on ldconfig path
-        try:
-            out = subprocess.check_output(
-                ["ldconfig", "-p"], text=True, stderr=subprocess.DEVNULL
-            )
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            out = ""
-        for line in out.splitlines():
-            if f"{name} " in line or line.strip().startswith(name):
-                if "=>" in line:
-                    path = line.split("=>", 1)[1].strip()
-                    if os.path.isfile(path):
-                        return path
-    return None
+# System libraries that must come from the host. These are the GTK stack
+# PyGObject loads through typelibs, the notification/readline libs that
+# system tools (notify-send, sh) load from LD_LIBRARY_PATH, and everything
+# the GTK closure dragged in. Shipping them makes the bundle shadow the
+# host's versions and breaks distros whose system libraries are newer.
+_SKIP_BUNDLE_LIBS = re.compile(
+    r"^lib(glib|gobject|gio|gmodule|girepository|gtk-4|gtk-3|adwaita|"
+    r"gtk4-layer-shell|gdk-4|gdk-3|gdk_pixbuf|graphene|pango|cairo|"
+    r"harfbuzz|fribidi|fontconfig|freetype|graphite2|pixman|epoxy|"
+    r"xkbcommon|json-glib|notify|readline|thai|datrie|dbus|appindicator|"
+    r"ayatana|wayland|X11|Xau|Xext|Xcursor|Xdamage|Xdmcp|Xfixes|Xinerama|"
+    r"Xi|Xrandr|Xrender|xcb|atk|drm|gbm|EGL|GLX|pcre|pcre2|blkid|mount|"
+    r"selinux|uuid|lzo2|md|bsd|deflate|jbig|tiff|webp|jpeg|png16)"
+)
 
 
 def gtk_runtime():
-    """Typelibs, schemas, icons, pixbuf loaders, and the .so closure."""
-    datas = []
+    """Nothing to ship: the host provides GTK, typelibs, schemas and icons.
+
+    Kept as a function so the failure mode is explicit — this build no
+    longer bundles any part of the GTK runtime. portaudio stays in the
+    bundle: nothing on the host loads it, so it cannot conflict.
+    """
     binaries = []
-
-    for ns in REQUIRED_TYPELIBS:
-        path = _find_typelib(ns)
-        if not path:
-            raise SystemExit(f"required typelib missing: {ns}.typelib")
-        datas.append((path, "girepository-1.0"))
-
-    for ns in OPTIONAL_TYPELIBS:
-        path = _find_typelib(ns)
-        if path:
-            datas.append((path, "girepository-1.0"))
-        else:
-            print(f"warning: optional typelib missing: {ns} (Wayland HUD may degrade)")
-
-    # Compiled schemas — GLib aborts without them when anything touches GSettings.
-    schema_candidates = [
-        "/usr/share/glib-2.0/schemas/gschemas.compiled",
-    ]
-    schema = _find_file(*schema_candidates)
-    if not schema:
-        raise SystemExit("gschemas.compiled not found")
-    datas.append((schema, "share/glib-2.0/schemas"))
-
-    # Adwaita symbolic icons the settings window names.
-    adwaita_index = "/usr/share/icons/Adwaita/index.theme"
-    if os.path.isfile(adwaita_index):
-        datas.append((adwaita_index, "share/icons/Adwaita"))
-        symbolic = "/usr/share/icons/Adwaita/symbolic"
-        if os.path.isdir(symbolic):
-            for folder, _subs, names in os.walk(symbolic):
-                rel = os.path.relpath(folder, symbolic)
-                dest = (
-                    "share/icons/Adwaita/symbolic"
-                    if rel == "."
-                    else f"share/icons/Adwaita/symbolic/{rel}"
-                )
-                for name in names:
-                    if name.endswith(".svg"):
-                        datas.append((os.path.join(folder, name), dest))
-
-    # gdk-pixbuf loaders.
-    loader_dirs = glob.glob("/usr/lib/*/gdk-pixbuf-2.0/*/loaders") + glob.glob(
-        "/usr/lib/gdk-pixbuf-2.0/*/loaders"
-    )
-    for loader_dir in loader_dirs:
-        for so in glob.glob(os.path.join(loader_dir, "*.so*")):
-            binaries.append((so, "lib/gdk-pixbuf-2.0/2.10.0/loaders"))
-
-    # Roots of the shared-library closure.
-    roots = []
-    for names in (
-        ["libgtk-4.so.1", "libgtk-4.so"],
-        ["libadwaita-1.so.0", "libadwaita-1.so"],
-        ["libgobject-2.0.so.0", "libgobject-2.0.so"],
-        ["libglib-2.0.so.0", "libglib-2.0.so"],
-        ["libgio-2.0.so.0", "libgio-2.0.so"],
-        ["libcairo.so.2", "libcairo.so"],
-        ["libcairo-gobject.so.2", "libcairo-gobject.so"],
-        ["libgirepository-1.0.so.1", "libgirepository-1.0.so",
-         "libgirepository-2.0.so.0", "libgirepository-2.0.so"],
-        ["libportaudio.so.2", "libportaudio.so"],
-        ["libgtk4-layer-shell.so.0", "libgtk4-layer-shell.so"],
-    ):
-        found = _find_lib(names)
-        if found:
-            roots.append(found)
-        elif "layer-shell" not in names[0]:
-            print(f"warning: library not found for {names[0]}")
-
-    # Also pull in the PyGObject C extension's own deps.
-    try:
-        import gi
-        gi_path = os.path.dirname(gi.__file__)
-        for so in glob.glob(os.path.join(gi_path, "_gi*.so")) + glob.glob(
-            os.path.join(gi_path, "*.so")
+    datas = []
+    for names in (["libportaudio.so.2", "libportaudio.so"],):
+        for prefix in (
+            "/usr/lib/x86_64-linux-gnu",
+            "/usr/lib64",
+            "/usr/lib",
+            "/usr/local/lib",
         ):
-            roots.append(so)
-    except Exception as e:
-        print(f"warning: could not inspect gi package: {e}")
-
-    for so in _so_closure(roots):
-        binaries.append((so, "lib"))
-
+            path = os.path.join(prefix, names[0])
+            if os.path.isfile(path):
+                binaries.append((path, "lib"))
+                break
     return datas, binaries
 
 
@@ -286,6 +142,27 @@ app = Analysis(
     excludes=EXCLUDES,
     cipher=block_cipher,
 )
+
+# PyInstaller's gi hooks collect the gi_typelibs directory, gio modules and
+# every shared library the typelibs name — the whole GTK stack again. Strip
+# it: the host provides typelibs, schemas, icons and libraries. Shipping
+# any of them shadows the host's newer versions and is exactly what broke
+# the old fully-bundled build on Arch/Fedora/current Ubuntu.
+app.binaries = [
+    (dest, src, typ)
+    for (dest, src, typ) in app.binaries
+    if not _SKIP_BUNDLE_LIBS.match(os.path.basename(src))
+    and not _SKIP_BUNDLE_LIBS.match(os.path.basename(dest))
+]
+app.datas = [
+    (dest, src, typ)
+    for (dest, src, typ) in app.datas
+    if not any(
+        dest == prefix or dest.startswith(prefix + "/")
+        for prefix in ("girepository-1.0", "gi_typelibs", "gio_modules",
+                       "share/glib-2.0", "share/icons", "lib/gdk-pixbuf")
+    )
+]
 
 pyz = PYZ(app.pure, app.zipped_data, cipher=block_cipher)
 

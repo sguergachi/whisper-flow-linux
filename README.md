@@ -83,9 +83,11 @@ Download **`WhisperFlow-*-x86_64.AppImage`** from the
 and **double-click it**.
 
 One portable file for **most x86_64 Linux desktops** (Ubuntu 22.04 and newer,
-Fedora, Arch, Mint, Debian bookworm+, Pop!_OS, …). It bundles the app, a GTK
-runtime, a speech engine and a starter model — no Python install, no package
-manager, no terminal.
+Fedora, Arch, Mint, Debian bookworm+, Pop!_OS, …). It bundles the app, a
+Python runtime, a speech engine and a starter model — no Python install, no
+package manager, no terminal. The first time it runs it registers itself with
+the desktop: an app-menu entry, an icon, and login autostart, so it behaves
+like a normally installed program from then on.
 
 Hold `Super+Alt` to dictate. Look for the microphone in the notification area.
 
@@ -95,17 +97,19 @@ that flag on download).
 
 **Host bits that stay system-side** (the AppImage cannot own these):
 
+- GTK 4 + libadwaita + the GTK typelibs — the app's own window toolkit
+- `gtk4-layer-shell` — the overlay HUD on Wayland
 - `ydotool` — typing into other apps on Wayland  
 - membership in the `input` group — global hotkeys  
   (`sudo usermod -aG input $USER`, then log out and back in)
 
 ```bash
-# Debian/Ubuntu
-sudo apt install ydotool
+# Debian/Ubuntu (gtk4-layer-shell is not packaged; see install.sh)
+sudo apt install python3-gi gir1.2-gtk-4.0 libadwaita-1-0 ydotool
 # Arch
-sudo pacman -S ydotool
+sudo pacman -S python-gobject gtk4 libadwaita gtk4-layer-shell ydotool
 # Fedora
-sudo dnf install ydotool
+sudo dnf install python3-gobject gtk4 libadwaita gtk4-layer-shell ydotool
 ```
 
 ### From source (developers)

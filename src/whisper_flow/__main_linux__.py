@@ -5,8 +5,17 @@ settings window (`--settings`). Same shape as the Windows freeze, without
 Velopack hooks.
 
 The AppImage wraps this binary so double-click runs on most x86_64 Linux
-desktops (glibc from the build host onward). GTK, typelibs and shared libs
-ship inside; nothing is pip-installed on the user's machine.
+desktops (glibc from the build host onward). The bundle ships the Python
+runtime, the app and the engine; GTK, typelibs and system libraries come
+from the host, exactly as they do for the venv installer (install.sh).
+
+Bundling the GTK stack instead was tried and broke newer distros. The
+dynamic loader fixes LD_LIBRARY_PATH at process start, so a bundled
+Ubuntu-era glib always shadows the host's, and every host library that
+needs a newer glib (libjson-glib, libnotify, system binaries like `sh`)
+then dies with "undefined symbol". The bundle therefore contains none of
+those libraries, and PyInstaller's runtime hooks are made to point back at
+the host by scrubbing the paths they force.
 """
 from __future__ import annotations
 
@@ -14,73 +23,107 @@ import multiprocessing
 import os
 import sys
 
+# What GTK runtime the current process uses. Frozen builds always run on
+# the host's stack; source runs are the venv installer's world.
+RUNTIME_MODE = "host" if getattr(sys, "frozen", False) else "source"
+
+# Paths PyInstaller's runtime hooks force onto the bundle, which is thin
+# and does not contain them. Removed so gi, GSettings and GdkPixbuf resolve
+# the host's typelibs, schemas and loaders instead.
+_BUNDLE_ENV_KEYS = (
+    "GI_TYPELIB_PATH",
+    "GSETTINGS_SCHEMA_DIR",
+    "GDK_PIXBUF_MODULEDIR",
+    "GIO_MODULE_DIR",
+)
+
+
+def _patch_pygobject_deprecation_assertion() -> None:
+    """Work around pygobject's GLib override crash on glib >= 2.88.
+
+    glib 2.88 moved GLib.unix_signal_add to GLibUnix.signal_add. The GLib
+    override module in PyGObject 3.56 still registers the old name as a
+    deprecated alias without defining it, and gi.overrides.load_overrides
+    raises AssertionError when a registered deprecation is not in the
+    module's __all__. Surface runtimes hide it with a stale .pyc; a frozen
+    build compiles the fresh source and dies on the first Gtk import.
+    Dropping deprecations for names the module does not export is exactly
+    what the assertion is enforcing anyway.
+    """
+    try:
+        import gi.importer as _importer
+        import gi.overrides as _overrides
+
+        _load = _importer.load_overrides
+        if getattr(_load, "_wf_patched", False):
+            return
+
+        def _load_patched(introspection_module):
+            try:
+                return _load(introspection_module)
+            except AssertionError:
+                ns = introspection_module.__name__.rsplit(".", 1)[-1]
+                override_mod = sys.modules.get(f"gi.overrides.{ns}")
+                if override_mod is None or not hasattr(override_mod, "__all__"):
+                    raise
+                exported = set(override_mod.__all__)
+                _overrides._deprecated_attrs[ns] = [
+                    (attr, replacement)
+                    for attr, replacement in _overrides._deprecated_attrs.get(ns, [])
+                    if attr in exported
+                ]
+                return _load(introspection_module)
+
+        _load_patched._wf_patched = True
+        _importer.load_overrides = _load_patched
+    except Exception:
+        pass
+
 
 def _bootstrap_gtk_runtime() -> None:
-    """Point PyGObject / the dynamic linker at the bundled GTK runtime.
+    """Point PyGObject at the host's GTK stack.
 
-    Must run before anything imports gi. Same assignment rules as Windows:
-    PyInstaller's own gi hook may set GI_TYPELIB_PATH first to a wrong set
-    (pystray's GTK 3), so ours is assigned and put first.
+    Must run before anything imports gi. PyInstaller's rthooks set
+    GI_TYPELIB_PATH and GIO_MODULE_DIR onto the bundle's (now absent)
+    gi_typelibs/gio_modules; scrubbing them here lets gi find the host's
+    typelibs. LD_LIBRARY_PATH is left alone on purpose: the loader fixed it
+    at startup, and the bundle no longer contains any host-system library,
+    so children (sh, notify-send, the engine) cannot pick up conflicts.
     """
     if not getattr(sys, "frozen", False):
+        _patch_pygobject_deprecation_assertion()
         return
-    base = sys._MEIPASS
-
-    typelibs = os.path.join(base, "girepository-1.0")
-    if os.path.isdir(typelibs):
-        inherited = os.environ.get("GI_TYPELIB_PATH")
-        os.environ["GI_TYPELIB_PATH"] = (
-            f"{typelibs}{os.pathsep}{inherited}" if inherited else typelibs
-        )
-
-    schemas = os.path.join(base, "share", "glib-2.0", "schemas")
-    if os.path.isdir(schemas):
-        os.environ["GSETTINGS_SCHEMA_DIR"] = schemas
-
-    # Prefer bundled shared libraries over whatever the host has (or lacks).
-    lib_dirs = [
-        os.path.join(base, "lib"),
-        os.path.join(base, "lib", "x86_64-linux-gnu"),
-        base,
-    ]
-    existing_ld = os.environ.get("LD_LIBRARY_PATH", "")
-    lib_path = os.pathsep.join(d for d in lib_dirs if os.path.isdir(d))
-    if lib_path:
-        os.environ["LD_LIBRARY_PATH"] = (
-            f"{lib_path}{os.pathsep}{existing_ld}" if existing_ld else lib_path
-        )
-
-    loaders = os.path.join(base, "lib", "gdk-pixbuf-2.0", "2.10.0", "loaders")
-    if os.path.isdir(loaders):
-        os.environ.setdefault("GDK_PIXBUF_MODULEDIR", loaders)
-
-    # Soft renderer: portable across GPUs and remote/nested displays.
-    os.environ.setdefault("GSK_RENDERER", "cairo")
+    for key in _BUNDLE_ENV_KEYS:
+        os.environ.pop(key, None)
+    os.environ.pop("LD_PRELOAD", None)
     os.environ.setdefault("NO_AT_BRIDGE", "1")
-
-    # gtk4-layer-shell must preload ahead of libwayland-client. Prefer the
-    # copy we shipped; fall back to the host if the user has a newer one.
-    for name in (
-        "libgtk4-layer-shell.so.0",
-        "libgtk4-layer-shell.so",
-    ):
-        candidate = os.path.join(base, "lib", name)
-        if not os.path.exists(candidate):
-            candidate = os.path.join(base, name)
-        if os.path.exists(candidate):
-            existing = os.environ.get("LD_PRELOAD", "")
-            os.environ["LD_PRELOAD"] = (
-                f"{candidate}:{existing}" if existing else candidate
-            )
-            break
+    _patch_pygobject_deprecation_assertion()
 
 
 def _selftest() -> int:
-    """Prove the frozen GTK runtime can open a window on this machine."""
+    """Prove the host GTK stack can open a window on this machine."""
     report: list[str] = []
     status = 0
     try:
         import gi
+
+        _dbg = os.environ.get("WHISPER_FLOW_SELFTEST_DEBUG")
+        if _dbg:
+            import gi.overrides as _ov
+            report.append(f"DEBUG _deprecated_attrs={dict(_ov._deprecated_attrs)}")
+            from gi.module import get_introspection_module
+            raw = get_introspection_module("GLib")
+            report.append(f"DEBUG raw unix_signal_add={hasattr(raw, 'unix_signal_add')}")
+            import gi._gi as _g
+            report.append(f"DEBUG _gi={_g.__file__}")
+            try:
+                with open("/proc/self/maps") as mf:
+                    for line in mf:
+                        p = line.strip().split()[-1]
+                        if any(s in p for s in ("girepository", "libglib", "libgobject")):
+                            report.append("DEBUG MAP " + p)
+            except OSError:
+                pass
 
         gi.require_version("Gtk", "4.0")
         gi.require_version("Adw", "1")
@@ -103,6 +146,7 @@ def _selftest() -> int:
             report.append("Gtk4LayerShell available")
         except Exception as e:
             report.append(f"Gtk4LayerShell optional: {e}")
+        report.append(f"GTK runtime: {RUNTIME_MODE}")
         report.append("selftest OK")
     except Exception:
         import traceback
@@ -140,6 +184,17 @@ def main() -> int:
         from whisper_flow.settings_gtk import main as settings_main
 
         return settings_main()
+
+    # First run of the AppImage registers it with the desktop - app menu
+    # entry, icon, login autostart - so it installs like a normal app.
+    # HUD/settings children above never reach this; source runs are the
+    # venv installer's world and are left alone.
+    try:
+        from whisper_flow.desktop_install import ensure_desktop_integration
+
+        ensure_desktop_integration()
+    except Exception:
+        pass
 
     from whisper_flow.daemon import WhisperFlowDaemon
 

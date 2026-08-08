@@ -123,10 +123,17 @@ def test_the_typelib_path_is_not_left_to_pyinstaller():
 
 
 def test_the_linux_entry_also_assigns_the_typelib_path():
-    """Same trap as Windows: setdefault loses to PyInstaller's rthook."""
+    """Same trap as Windows: setdefault loses to PyInstaller's rthook.
+
+    The Linux build is thin - no typelibs in the bundle - so the fix is the
+    reverse of Windows: the rthook's GI_TYPELIB_PATH must be scrubbed (not
+    setdefault-assigned) for gi to find the host's typelibs.
+    """
     entry = LINUX_ENTRY.read_text(encoding="utf-8")
-    assert 'os.environ["GI_TYPELIB_PATH"] =' in entry
+    assert 'os.environ.pop(key, None)' in entry
+    assert '"GI_TYPELIB_PATH"' in entry
     assert 'setdefault("GI_TYPELIB_PATH"' not in entry
+    assert 'os.environ["GI_TYPELIB_PATH"] =' not in entry
 
 
 def test_the_linux_spec_declares_lazy_pystray():

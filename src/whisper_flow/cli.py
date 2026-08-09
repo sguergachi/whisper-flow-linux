@@ -171,6 +171,109 @@ def daemon(
         raise typer.Exit(1)
 
 
+@app.command("capture-test")
+def capture_test(
+    seconds: Annotated[
+        float,
+        Option("--seconds", "-s", help="How long to record (default 5)"),
+    ] = 5.0,
+    config_dir: ConfigDirOption = None,
+):
+    """Record a fixed-duration clip into the samples library.
+
+    For testing whisper-in-noise: run this in a café, whisper a sentence
+    you can recall, and the capture lands in audio-debug/samples/ with the
+    raw audio, the metrics report and whatever Whisper made of it. The
+    transcript is printed at the end; the raw capture is what later testing
+    of denoise or decode changes actually uses.
+    """
+    import threading
+    import time
+
+    from . import audio_debug
+
+    if seconds <= 0:
+        typer.echo("Seconds must be positive")
+        raise typer.Exit(1)
+
+    flow_app = WhisperFlow(config_dir)
+    # The whole point of this command is the sample: force the library copy
+    # whatever the toggle in settings says.
+    try:
+        flow_app.config.keep_all_captures = True
+    except Exception:
+        pass
+
+    # A standalone run has no daemon to have started the engine. Bring the
+    # managed server up (if configured and installed) or connect to the URL
+    # the .env points at. Only stop it when we started it: a running daemon
+    # owns its own server, and killing that one out from under it would be
+    # exactly the orphan/stray mess stop_strays exists to clean up.
+    backend = None
+    if not flow_app.transcription_service.local_url:
+        from .backend import LocalBackend
+
+        backend = LocalBackend(flow_app.config)
+        if flow_app.config.manage_local_server:
+            model = backend.working_model()
+            url = backend.start(model) if model else None
+            if url:
+                flow_app.config.local_whisper_url = url
+                flow_app.transcription_service.local_url = url.rstrip("/")
+        if not flow_app.transcription_service.local_url:
+            typer.echo(
+                "No whisper server reachable and none could be started. "
+                "Run the daemon first, or point WHISPER_FLOW_LOCAL_WHISPER_URL "
+                "at one.")
+            raise typer.Exit(1)
+
+    stop_event = threading.Event()
+    timer = threading.Timer(seconds, stop_event.set)
+    timer.daemon = True
+
+    typer.echo(f"Recording {seconds:g}s from the configured microphone...")
+    timer.start()
+    try:
+        ok = flow_app.run_voice_flow_push_to_talk_daemon(
+            "(capture-test timer)", stop_event)
+    finally:
+        timer.cancel()
+        stop_event.set()
+        if backend:
+            try:
+                backend.stop()
+            except Exception:
+                pass
+
+    if not ok:
+        typer.echo("No usable audio captured (or it did not transcribe).")
+        typer.echo("The sample, if any, is in:")
+        typer.echo(f"  {audio_debug.samples_dir(flow_app.config.config_dir)}")
+        raise typer.Exit(1)
+
+    # Print where the newest sample went.
+    samples = sorted(
+        audio_debug.samples_dir(flow_app.config.config_dir).glob("sample-*"),
+        key=lambda p: p.name,
+    )
+    if samples:
+        newest = samples[-1]
+        transcript = ""
+        try:
+            import json
+            meta = json.loads(
+                (newest / "report.json").read_text(encoding="utf-8"))
+            transcript = (meta.get("transcript") or
+                          meta.get("boost_transcript") or "")
+        except Exception:
+            pass
+        typer.echo("Sample saved:")
+        typer.echo(f"  {newest}")
+        typer.echo(f"Transcript: {transcript or '(blank)'}")
+    else:
+        typer.echo(f"No sample kept; check {flow_app.config.config_dir}")
+
+
 @app.command()
 def stop(
     config_dir: ConfigDirOption = None,

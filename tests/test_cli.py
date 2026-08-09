@@ -50,6 +50,53 @@ def test_set_device_rejects_an_out_of_range_index(monkeypatch, tmp_path):
     assert not (tmp_path / ".env").exists()
 
 
+# ---------------------------------------------------------------- capture-test
+def test_capture_test_forces_the_samples_library(monkeypatch, tmp_path):
+    """The point of the command is the corpus: it must keep the clip even if
+    the settings toggle is off, and it must not leave a server it started."""
+    import threading
+
+    flow = Mock()
+    flow.config.config_dir = tmp_path
+    flow.transcription_service.local_url = "http://127.0.0.1:9999"
+    flow.run_voice_flow_push_to_talk_daemon.return_value = True
+
+    monkeypatch.setattr(cli, "WhisperFlow", lambda config_dir: flow)
+    monkeypatch.setattr(threading, "Timer", lambda t, fn: Mock())
+
+    result = CliRunner().invoke(cli.app, ["capture-test", "--seconds", "3"])
+
+    assert result.exit_code == 0
+    assert flow.config.keep_all_captures is True
+    assert flow.run_voice_flow_push_to_talk_daemon.called
+    args, _ = flow.run_voice_flow_push_to_talk_daemon.call_args
+    assert isinstance(args[1], threading.Event)
+
+
+def test_capture_test_without_a_server_says_so(monkeypatch, tmp_path):
+    """No daemon, no reachable URL, and nothing to start: tell the user."""
+    import sys
+
+    flow = Mock()
+    flow.config.config_dir = tmp_path
+    flow.config.manage_local_server = True
+    flow.transcription_service.local_url = None
+
+    backend = Mock()
+    backend.working_model.return_value = None
+    backend.start.return_value = None
+
+    monkeypatch.setattr(cli, "WhisperFlow", lambda config_dir: flow)
+    fake_backend = Mock(LocalBackend=lambda config: backend)
+    monkeypatch.setitem(sys.modules, "whisper_flow.backend", fake_backend)
+
+    result = CliRunner().invoke(cli.app, ["capture-test"])
+
+    assert result.exit_code == 1
+    assert "No whisper server" in result.output
+    assert not flow.run_voice_flow_push_to_talk_daemon.called
+
+
 def test_set_device_rejects_an_output_only_device(monkeypatch, tmp_path):
     pa = _stub_pyaudio(monkeypatch, device_count=3)
     pa.get_device_info_by_index.return_value = {"maxInputChannels": 0}

@@ -273,6 +273,48 @@ class Config(BaseSettings):
         env="WHISPER_FLOW_FAST_ENCODER",
     )
 
+    # --- Decode knobs -------------------------------------------------------
+    # Passed to the server per request, so no restart applies them. The
+    # managed whisper.cpp server is started once and never restarted just to
+    # change how it decodes; these become form fields on the /inference post.
+    #
+    # Beam search (beam_size > 1) keeps several candidate paths and picks the
+    # best-scoring one. It is more stable than greedy on noisy input, but
+    # measured against the café captures it traded one hallucination for
+    # another rather than recovering words - so 1 (greedy) stays the default.
+    beam_size: int = Field(
+        default=1,
+        ge=1,
+        le=16,
+        description="Beam search width (1 = greedy; 5+ explores alternatives)",
+        env="WHISPER_FLOW_BEAM_SIZE",
+    )
+    best_of: int = Field(
+        default=2,
+        ge=1,
+        le=16,
+        description="Candidate paths kept at each greedy step",
+        env="WHISPER_FLOW_BEST_OF",
+    )
+    no_speech_thold: float = Field(
+        # Lower means the decoder tries harder on quiet clips instead of
+        # calling them "no speech". 0.4 is the app's long-standing value.
+        default=0.4,
+        ge=0.0,
+        le=1.0,
+        description="No-speech probability threshold (lower tries harder)",
+        env="WHISPER_FLOW_NO_SPEECH_THOLD",
+    )
+    suppress_nst: bool = Field(
+        # Experimental. Suppressing non-speech tokens stops [MUSIC] tags -
+        # but measured against real captures it replaced the tags with word
+        # fillers ("Thank you.", "Bye, guys.") that read as dictation and get
+        # pasted. Off unless someone is testing it.
+        default=False,
+        description="Suppress non-speech tokens (experimental)",
+        env="WHISPER_FLOW_SUPPRESS_NST",
+    )
+
     # Local whisper.cpp configuration
     local_whisper_url: str | None = Field(
         default=None,
@@ -302,6 +344,17 @@ class Config(BaseSettings):
         default=False,  # Disable debug logging now that hotkeys work
         description="Enable debug logging and print statements",
         env="WHISPER_FLOW_LOGGING_ENABLED",
+    )
+
+    # Keep a copy of every capture, not just the ones Whisper blanked.
+    # The failure ring already archives blanks under audio-debug/fail-*;
+    # this archives *everything* under audio-debug/samples/, so a week of
+    # café dictation becomes a corpus for testing denoise and decode
+    # changes against real recordings.
+    keep_all_captures: bool = Field(
+        default=False,
+        description="Archive every capture to the samples library",
+        env="WHISPER_FLOW_KEEP_ALL_CAPTURES",
     )
 
     @field_validator("config_dir", mode="before")

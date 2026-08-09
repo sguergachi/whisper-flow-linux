@@ -36,6 +36,9 @@ _PROBE = {
     "processing_lock_timeout": ("7.0", 7.0),
     "watchdog_interval": ("1.5", 1.5),
     "queue_request_timeout": ("60.0", 60.0),
+    "beam_size": ("5", 5),
+    "best_of": ("4", 4),
+    "no_speech_thold": ("0.5", 0.5),
 }
 
 

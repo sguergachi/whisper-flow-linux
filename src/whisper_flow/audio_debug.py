@@ -30,6 +30,12 @@ from .logging import log
 # Keep this many failed-dictation folders; oldest deleted first.
 MAX_FAIL_CAPTURES = 8
 
+# How many captures the samples library may hold before the oldest go.
+# Deliberately generous: the whole point of the library is a corpus of real
+# café/whisper recordings to test denoise changes against, and each capture
+# is a few hundred KB at most.
+MAX_SAMPLE_CAPTURES = 200
+
 
 def debug_root(config_dir: Path) -> Path:
     return Path(config_dir) / "audio-debug"
@@ -37,6 +43,11 @@ def debug_root(config_dir: Path) -> Path:
 
 def last_dir(config_dir: Path) -> Path:
     return debug_root(config_dir) / "last"
+
+
+def samples_dir(config_dir: Path) -> Path:
+    """The library of every capture kept while keep_all_captures is on."""
+    return debug_root(config_dir) / "samples"
 
 
 def _write_wav(path: Path, samples: np.ndarray | bytes, rate: int) -> None:
@@ -222,6 +233,19 @@ def _prune_fails(root: Path) -> None:
             pass
 
 
+def _prune_samples(root: Path) -> None:
+    samples = sorted(
+        (p for p in root.glob("sample-*") if p.is_dir()),
+        key=lambda p: p.name,
+    )
+    while len(samples) > MAX_SAMPLE_CAPTURES:
+        old = samples.pop(0)
+        try:
+            shutil.rmtree(old)
+        except Exception:
+            pass
+
+
 def save_capture(
     config_dir: Path,
     *,
@@ -301,8 +325,14 @@ def finalize_capture(
     boost_transcript: str | None = None,
     boosted_wav: bytes | np.ndarray | None = None,
     rate: int = 16000,
+    keep_sample: bool = False,
 ) -> Path | None:
-    """Attach transcription outcome; archive under fail-* if blank."""
+    """Attach transcription outcome; archive under fail-* if blank.
+
+    ``keep_sample=True`` archives the capture under samples/ regardless of
+    outcome - the "keep every capture" toggle, which turns everyday dictation
+    into a corpus of real recordings for testing denoise and decode changes.
+    """
     try:
         dest = last_dir(config_dir)
         meta_path = dest / ".meta.json"
@@ -333,6 +363,22 @@ def finalize_capture(
         if boost_gain:
             log(f"[AUDIO-DEBUG] boost={boost_gain:.0f}x -> "
                 f"{'(blank)' if not boost_transcript else repr(boost_transcript[:80])}")
+
+        # Samples library first: it keeps successes too, so a "keep every
+        # capture" run must archive before the blank-only branch decides.
+        if keep_sample:
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            sample = samples_dir(config_dir) / f"sample-{stamp}"
+            if sample.exists():
+                shutil.rmtree(sample)
+            shutil.copytree(dest, sample)
+            _prune_samples(samples_dir(config_dir))
+            log(f"[AUDIO-DEBUG] sample kept at {sample}")
+            meta["dir"] = str(sample)
+            (sample / "report.txt").write_text(
+                format_report(meta), encoding="utf-8")
+            (sample / "report.json").write_text(
+                json.dumps(meta, indent=2), encoding="utf-8")
 
         blank = not (transcript or boost_transcript)
         if blank:

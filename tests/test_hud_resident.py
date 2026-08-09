@@ -64,7 +64,7 @@ def test_showing_sends_a_command_rather_than_starting_a_process(hud, monkeypatch
                         lambda *a, **k: spawned.append(a) or FakeProcess())
 
     hud.show(level_file="/tmp/levels")
-    assert process.written == ["show - /tmp/levels\n"]
+    assert process.written == ["show - 0 /tmp/levels\n"]
     assert spawned == []            # nothing was started
 
 
@@ -104,6 +104,31 @@ def test_nothing_is_commanded_when_residency_is_off(monkeypatch):
 
     hud.show(level_file="/tmp/levels")
     assert spawned, "the one-shot path must still start a process"
+
+
+def test_a_per_recording_overlay_is_told_about_the_stop_button(monkeypatch):
+    """Off Windows the overlay is spawned per recording, so everything it
+    needs to know must arrive in the environment it is born with."""
+    monkeypatch.setattr(hud_module, "RESIDENT", False)
+    hud = hud_module.HUD()
+    monkeypatch.setattr(hud, "_hide_locked", Mock())
+    seen = {}
+
+    def fake_popen(*args, **kwargs):
+        seen["env"] = kwargs.get("env", {})
+        return FakeProcess()
+
+    monkeypatch.setattr(hud_module.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(hud_module.tempfile, "mkstemp", lambda **k: (0, "/tmp/x.log"))
+    monkeypatch.setattr(hud_module.os, "close", lambda fd: None)
+    monkeypatch.setattr("builtins.open", lambda *a, **k: Mock())
+
+    hud.show(level_file="/tmp/levels", stop_button=True)
+    assert seen["env"].get("WHISPER_FLOW_HUD_STOP_BUTTON") == "1"
+
+    seen.clear()
+    hud.show(level_file="/tmp/levels")
+    assert "WHISPER_FLOW_HUD_STOP_BUTTON" not in seen["env"]
 
 
 # ------------------------------------------------------------------ shutdown
@@ -370,6 +395,29 @@ elif scenario == "reset":
     # Otherwise the new recording starts mid-waveform at the old scale.
     assert win.level_pos == 0
     assert win.peak == hud_app.PEAK_FLOOR
+elif scenario == "stop_button":
+    # The auto-transcribe modes grow the window with a hanging tab; the
+    # button is part of the overlay, not a control floating near it.
+    win.begin_show("", "", stop_button=True)
+    assert win.stop_button
+    assert win._window_height() > hud_app.HEIGHT
+    assert win._in_stop_button(hud_app.STOP_BTN_X + 10,
+                               hud_app.HEIGHT + hud_app.STOP_GAP + 5)
+    assert not win._in_stop_button(hud_app.STOP_BTN_X - 20,
+                                   hud_app.HEIGHT + hud_app.STOP_GAP)
+    # The tab is gone once there is nothing left to stop.
+    win.begin_processing()
+    assert win._window_height() == hud_app.HEIGHT
+elif scenario == "stop_request":
+    import os
+    import tempfile
+    fd, path = tempfile.mkstemp(suffix=".levels")
+    os.close(fd)
+    win.level_file = path
+    win._request_stop()
+    assert os.path.exists(path + hud_app.STOP_SUFFIX)
+    os.unlink(path)
+    os.unlink(path + hud_app.STOP_SUFFIX)
 print("OK")
 """
 
@@ -415,6 +463,28 @@ def test_a_second_recording_resets_the_waveform(tmp_path):
         [sys.executable, "-c", _GTK_CHILD,
          str(__import__("pathlib").Path(__file__).resolve().parents[1]),
          "reset"],
+        capture_output=True, text=True, check=False, timeout=60)
+    assert "OK" in result.stdout, result.stderr
+
+
+@pytest.mark.skipif(not _gtk_available(), reason="needs GTK4 and a display")
+def test_the_stop_button_grows_the_pill_and_shrinks_back(tmp_path):
+    import subprocess
+    result = subprocess.run(
+        [sys.executable, "-c", _GTK_CHILD,
+         str(__import__("pathlib").Path(__file__).resolve().parents[1]),
+         "stop_button"],
+        capture_output=True, text=True, check=False, timeout=60)
+    assert "OK" in result.stdout, result.stderr
+
+
+@pytest.mark.skipif(not _gtk_available(), reason="needs GTK4 and a display")
+def test_pressing_the_stop_button_asks_the_daemon(tmp_path):
+    import subprocess
+    result = subprocess.run(
+        [sys.executable, "-c", _GTK_CHILD,
+         str(__import__("pathlib").Path(__file__).resolve().parents[1]),
+         "stop_request"],
         capture_output=True, text=True, check=False, timeout=60)
     assert "OK" in result.stdout, result.stderr
 
@@ -486,7 +556,7 @@ def test_showing_after_prewarm_does_not_start_another(hud, monkeypatch):
     before = len(calls)
 
     hud.show(level_file="/tmp/levels")
-    assert process.written == ["show - /tmp/levels\n"]
+    assert process.written == ["show - 0 /tmp/levels\n"]
     assert len(calls) == before + 1      # asked for the same live one
     assert process.poll() is None
 
@@ -512,14 +582,14 @@ def test_the_active_windows_screen_goes_with_every_show(hud, monkeypatch):
     """
     process = _running(hud, monkeypatch)
     hud.show(level_file="/tmp/levels", point=(2560, 400))
-    assert process.written == ["show 2560,400 /tmp/levels\n"]
+    assert process.written == ["show 2560,400 0 /tmp/levels\n"]
 
 
 def test_a_second_recording_can_land_on_a_different_screen(hud, monkeypatch):
     process = _running(hud, monkeypatch)
     hud.show(level_file="/tmp/a", point=(100, 100))
     hud.show(level_file="/tmp/b", point=(3000, 100))
-    assert process.written == ["show 100,100 /tmp/a\n", "show 3000,100 /tmp/b\n"]
+    assert process.written == ["show 100,100 0 /tmp/a\n", "show 3000,100 0 /tmp/b\n"]
 
 
 def test_a_point_that_makes_no_sense_does_not_stop_the_overlay(hud, monkeypatch):
@@ -528,7 +598,18 @@ def test_a_point_that_makes_no_sense_does_not_stop_the_overlay(hud, monkeypatch)
     for bad in (None, (), ("left", "top"), (1,)):
         process.written.clear()
         hud.show(level_file="/tmp/levels", point=bad)
-        assert process.written == ["show - /tmp/levels\n"]
+        assert process.written == ["show - 0 /tmp/levels\n"]
+
+
+def test_auto_modes_ask_for_the_stop_button(hud, monkeypatch):
+    """The single-press modes get the button; the held one does not."""
+    process = _running(hud, monkeypatch)
+    hud.show(level_file="/tmp/levels", stop_button=True)
+    hud.show(level_file="/tmp/levels")
+    assert process.written == [
+        "show - 1 /tmp/levels\n",
+        "show - 0 /tmp/levels\n",
+    ]
 
 
 def test_nothing_is_drawn_before_the_pill_has_been_placed():

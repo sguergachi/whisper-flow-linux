@@ -22,7 +22,7 @@ from .app import WhisperFlow
 from .backend import LocalBackend
 from .config import Config
 from .hotkey_manager import HotkeyManager, HotkeyMode
-from .hud import HUD
+from .hud import HUD, STOP_SUFFIX
 from .logging import log, recent_log, set_logging_enabled
 from .paths import pid_file as _pid_file
 from .version import build_version
@@ -610,6 +610,19 @@ class WhisperFlowDaemon:
                 name=f"WhisperFlow-Recording-{mode}",
             )
             self.recording_thread.start()
+
+            if mode in ("auto_transcribe", "command"):
+                # The HUD shows a stop button for these modes; pressing it
+                # ends the recording from the other side of the process
+                # boundary. It asks through a marker file, and this thread -
+                # which lives only as long as the recording does - watches
+                # for it.
+                threading.Thread(
+                    target=self._watch_hud_stop_request,
+                    args=(mode,),
+                    daemon=True,
+                    name="WhisperFlow-HUDStop",
+                ).start()
         except Exception:
             # Roll back rather than leave is_recording set with no thread to
             # clear it: the watchdog ignores a recording with no thread, so
@@ -637,6 +650,7 @@ class WhisperFlowDaemon:
             return
         self._level_file = None
         self.hud.clear_processing(level_file)
+        self.hud.clear_stop_marker(level_file)
         try:
             os.unlink(level_file)
         except OSError:
@@ -672,7 +686,9 @@ class WhisperFlowDaemon:
             ptl.mark("mic open")
         try:
             self.hud.show(level_file=getattr(self, "_level_file", None),
-                          point=getattr(self, "_hud_point", None))
+                          point=getattr(self, "_hud_point", None),
+                          stop_button=self.current_mode in ("auto_transcribe",
+                                                            "command"))
         except Exception as e:
             log(f"[DAEMON] could not show the overlay: {e}")
         finally:
@@ -698,6 +714,36 @@ class WhisperFlowDaemon:
             self._stop_recording()
         else:
             log("[DAEMON] Not stopping - mode mismatch or not recording")
+
+    def _watch_hud_stop_request(self, mode: str):
+        """End the recording when the HUD's stop button is pressed.
+
+        The overlay is a separate process with no pipe back into this one, so
+        it drops a marker file beside the level file - the mirror of the
+        processing marker the daemon uses in the other direction - and this
+        thread, which lives only as long as the recording, polls for it.
+        """
+        level_file = getattr(self, "_level_file", None) or ""
+        marker = (level_file + STOP_SUFFIX) if level_file else ""
+        # A marker left by a dead overlay must not end the next recording the
+        # instant it starts.
+        try:
+            os.unlink(marker)
+        except OSError:
+            pass
+        try:
+            while self.is_recording and self.current_mode == mode:
+                if marker and os.path.exists(marker):
+                    try:
+                        os.unlink(marker)
+                    except OSError:
+                        pass
+                    log("[DAEMON] stop requested from the HUD")
+                    self._stop_recording()
+                    return
+                time.sleep(0.05)
+        except Exception as e:
+            log(f"[DAEMON] HUD stop watcher gave up: {e}")
 
     def _record_audio_thread(self, mode: str):
         """Handle audio recording in a separate thread with timeout protection."""

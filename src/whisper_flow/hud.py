@@ -25,6 +25,12 @@ CREATE_NO_WINDOW = 0x08000000
 # the overlay would pull GTK 4 in beside pystray's GTK 3.
 PROCESSING_SUFFIX = ".processing"
 
+# The marker the overlay drops beside the level file when its stop button is
+# pressed, and the daemon polls while an auto-stop recording is live. The
+# mirror of PROCESSING_SUFFIX: that one runs daemon -> overlay, this one
+# overlay -> daemon. Kept in step with hud_app.STOP_SUFFIX.
+STOP_SUFFIX = ".stop"
+
 # Keep one overlay process alive and command it, instead of starting one per
 # recording. Starting a frozen process is the largest cost between the hotkey
 # and anything appearing on screen, and no amount of making our own code
@@ -82,7 +88,8 @@ class HUD:
         self._lock = threading.RLock()
 
     def show(self, level_file: str = "", monitor: str | None = None,
-             point: tuple[int, int] | None = None):
+             point: tuple[int, int] | None = None,
+             stop_button: bool = False):
         """Show the recording HUD overlay.
 
         Returns as soon as the subprocess is spawned. This runs on the path
@@ -92,12 +99,15 @@ class HUD:
         Args:
             level_file: Path to a file containing audio level data (int16 values)
             monitor: Connector name of the output to show on, e.g. "DP-1"
-
+            stop_button: Whether the overlay should offer its stop button.
+                The single-press modes (auto-transcribe) end on silence, so
+                they are the ones that need a mouse-visible way out.
         """
         with self._lock:
-            self._show_locked(level_file, monitor, point)
+            self._show_locked(level_file, monitor, point, stop_button)
 
-    def _overlay_env(self, level_file, monitor=None, point=None):
+    def _overlay_env(self, level_file, monitor=None, point=None,
+                     stop_button=False):
         """Environment for the overlay process."""
         env = os.environ.copy()
         if not IS_WINDOWS:
@@ -121,6 +131,11 @@ class HUD:
             env["LD_PRELOAD"] = f"{preload}:{existing}" if existing else preload
         if level_file:
             env["WHISPER_FLOW_HUD_LEVEL_FILE"] = level_file
+        if stop_button:
+            # Per-recording overlays - every non-Windows one - are told
+            # everything through the environment; resident overlays are told
+            # through the show command instead.
+            env["WHISPER_FLOW_HUD_STOP_BUTTON"] = "1"
         if monitor:
             env["WHISPER_FLOW_HUD_MONITOR"] = monitor
         if point:
@@ -140,7 +155,7 @@ class HUD:
         except (TypeError, ValueError, IndexError, KeyError):
             return "-"
 
-    def _show_locked(self, level_file, monitor, point):
+    def _show_locked(self, level_file, monitor, point, stop_button):
         # A resident overlay is already running and already built; showing it
         # is a message down a pipe rather than a process start. Everything
         # below - spawning, loading Python, creating a window - is what made
@@ -152,13 +167,14 @@ class HUD:
         # startup and stayed there for the rest of the session, wherever the
         # user was actually typing. Only an overlay spawned per recording can
         # be told this through the environment, because only it is built per
-        # recording.
+        # recording. The stop button travels with the show, for the same
+        # reason: which mode is recording is decided per recording.
         if RESIDENT and self._command(
-                f"show {self._point_arg(point)} {level_file}"):
+                f"show {self._point_arg(point)} {int(stop_button)} {level_file}"):
             return
         self.hide()
 
-        env = self._overlay_env(level_file, monitor, point)
+        env = self._overlay_env(level_file, monitor, point, stop_button)
         # Launched by path rather than with -m: importing the package would
         # pull in the daemon and with it pystray's GTK 3, and one process
         # cannot hold both GTK 3 and the overlay's GTK 4.
@@ -374,6 +390,17 @@ class HUD:
             return
         try:
             os.unlink(level_file + PROCESSING_SUFFIX)
+        except OSError:
+            pass
+
+    @staticmethod
+    def clear_stop_marker(level_file: str = ""):
+        """Remove the stop-request marker, so the next recording does not
+        end the instant it starts because of a stale one."""
+        if not level_file:
+            return
+        try:
+            os.unlink(level_file + STOP_SUFFIX)
         except OSError:
             pass
 

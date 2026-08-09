@@ -45,7 +45,7 @@ if sys.platform != "win32":
     # silently becomes an ordinary toplevel with decorations.
     gi.require_version("Gtk4LayerShell", "1.0")
 
-from gi.repository import Gdk, GLib, Gtk  # noqa: E402
+from gi.repository import Gdk, GLib, Gtk, Pango, PangoCairo  # noqa: E402
 
 if IS_WINDOWS:
     # No layer-shell on Windows: the pill is an ordinary undecorated window,
@@ -71,6 +71,7 @@ def _load_sibling(name):
 
 if IS_WINDOWS:
     _win_blur = _load_sibling("blur_win")
+    _wayland_blur = None
 
     class _WINDOWPOS(ctypes.Structure):
         """What a window is about to be moved to, while it is still a proposal.
@@ -96,7 +97,13 @@ if IS_WINDOWS:
         ctypes.c_ssize_t, ctypes.c_void_p, ctypes.c_uint,
         ctypes.c_void_p, ctypes.c_void_p)
 else:
-    enable_blur = _load_sibling("wayland_blur").enable_blur
+    # Both names are used off the drawing path and on it: the blur is enabled
+    # at realize and reshaped when the stop button appears or goes.
+    _wayland_blur = _load_sibling("wayland_blur")
+    enable_blur = _wayland_blur.enable_blur
+    enable_blur_rows = _wayland_blur.enable_blur_rows
+    pill_rects = _wayland_blur.pill_rects
+    rows_translated = _wayland_blur.rows_translated
 # The processing sweep's arithmetic. Out here so it can be tested without a
 # desktop; see hud_anim.
 _anim = _load_sibling("hud_anim")
@@ -153,6 +160,27 @@ PROCESS_RGB = (0.45, 0.72, 1.0)
 PROCESS_RING_R = 1.55       # spinner radius, in dot radii
 PROCESS_TINT = 0.75         # how far the bars move towards PROCESS_RGB
 # The timings live in hud_anim, which is where they can be tested.
+
+# The stop button. The single-press modes (auto-transcribe) end on silence,
+# so they are the ones that need a mouse-visible way out: a tab hanging off
+# the pill's bottom edge, drawn and cut from the same capsule geometry, so it
+# reads as part of the pill rather than a widget attached to it. Only shown
+# while actually recording - once the pill is processing there is nothing
+# left to stop, and it shrinks back to just the pill.
+#
+# A fixed size rather than SIZE_SCALE's: the label has to stay legible at the
+# pill's smaller heights, and it is always well inside the pill's width.
+STOP_SUFFIX = ".stop"
+STOP_LABEL = "Stop transcription"
+# The tab never gets wider than the pill it hangs from, whatever the pill
+# has been scaled to.
+STOP_BTN_W = min(140, WIDTH - 12)
+STOP_BTN_H = 22
+STOP_GAP = 5                    # air between the pill and the hanging tab
+# An int: the blur region is built from these and wl_region takes ints.
+STOP_BTN_X = int((WIDTH - STOP_BTN_W) / 2)
+STOP_FONT_PX = 10.0
+STOP_GLYPH = 8                  # the stop square's size
 
 STROKE_W = 1.0              # outline width in surface-local units
 STROKE_RGB = (0.42, 0.43, 0.47)
@@ -410,7 +438,19 @@ class HudWindow(Gtk.Window):
         # pill still on screen. Always tear down through this instead.
         self._on_quit = on_quit
         self._quitting = False
-        self.set_default_size(WIDTH, HEIGHT)
+        # Recording is over, the transcript is not back yet. The pill stays
+        # up and says so, instead of disappearing into a silence the user
+        # cannot tell from a failure.
+        self.processing = False
+        self._processing_t0 = 0.0
+        # Which mode this overlay is showing for. A resident overlay learns
+        # it per recording, from the show command; one spawned per recording
+        # gets it here, from the environment the daemon built for it.
+        self.stop_button = os.environ.get("WHISPER_FLOW_HUD_STOP_BUTTON") == "1"
+        self.stop_hover = 0.0
+        self.stop_hover_target = 0.0
+        self._stop_label = None     # the Pango layout, built once
+        self.set_default_size(WIDTH, self._window_height())
         self.set_resizable(False)
 
         provider = Gtk.CssProvider()
@@ -471,15 +511,10 @@ class HudWindow(Gtk.Window):
         self.level_pos = 0
         self.start = time.monotonic()
         self._blur = None
-        # Recording is over, the transcript is not back yet. The pill stays
-        # up and says so, instead of disappearing into a silence the user
-        # cannot tell from a failure.
-        self.processing = False
-        self._processing_t0 = 0.0
 
         area = Gtk.DrawingArea()
         area.set_content_width(WIDTH)
-        area.set_content_height(HEIGHT)
+        area.set_content_height(self._window_height())
         area.set_draw_func(self._draw)
         self.area = area
         self.set_child(area)
@@ -492,6 +527,7 @@ class HudWindow(Gtk.Window):
 
         motion = Gtk.EventControllerMotion()
         motion.connect("enter", self._on_enter)
+        motion.connect("motion", self._on_motion)
         motion.connect("leave", self._on_leave)
         area.add_controller(motion)
 
@@ -650,9 +686,8 @@ class HudWindow(Gtk.Window):
             wl_surface = lib.gdk_wayland_surface_get_wl_surface(
                 ctypes.c_void_p(_gobject_pointer(surface)))
             _mark("realize: blur start")
-            self._blur = enable_blur(
-                wl_display, wl_surface, WIDTH, HEIGHT, SQUIRCLE_N, BLUR_INSET,
-                active=False)
+            self._blur = enable_blur_rows(
+                wl_display, wl_surface, self._blur_rows(), active=False)
             _mark("realize: blur done")
             print(f"[HUD] blur {'enabled' if self._blur else 'unavailable'}", flush=True)
         except Exception as e:
@@ -772,6 +807,10 @@ class HudWindow(Gtk.Window):
         GTK owns the surface size and applies the display scale itself, and a
         region built from what we assumed the size was would be wrong on
         every display that is not at 100%.
+
+        The stop button is cut with it: the pill is the top HEIGHT of the
+        window, the tab hangs below it, and a window that covered the whole
+        rectangle would put an opaque slab under both.
         """
         # Not with a material: a region does not clip one, so cutting the
         # window would leave the acrylic rectangular and the content capsule
@@ -787,8 +826,24 @@ class HudWindow(Gtk.Window):
             if w <= 0 or h <= 0:
                 return
             bleed = self.SHAPE_BLEED
-            points = _squircle_points(-bleed, -bleed, w + 2 * bleed, h + 2 * bleed)
-            applied = _win_blur.set_shape(self._hwnd, points)
+            if self.stop_button and not self.processing:
+                # The pill is the top HEIGHT of the window and the tab hangs
+                # below it. The drawn geometry is logical and this cut is
+                # physical, so scale it like GDK does.
+                scale = self._monitor_scale()
+                shapes = [
+                    _squircle_points(-bleed, -bleed,
+                                     w + 2 * bleed, HEIGHT * scale + 2 * bleed),
+                    _squircle_points(
+                        STOP_BTN_X * scale - bleed,
+                        (HEIGHT + STOP_GAP) * scale - bleed,
+                        STOP_BTN_W * scale + 2 * bleed,
+                        STOP_BTN_H * scale + 2 * bleed),
+                ]
+            else:
+                shapes = [_squircle_points(-bleed, -bleed,
+                                           w + 2 * bleed, h + 2 * bleed)]
+            applied = _win_blur.set_shape(self._hwnd, shapes)
             print(f"[HUD] window shape: {w}x{h} "
                   f"{'clipped to the pill' if applied else 'not applied'}",
                   flush=True)
@@ -959,6 +1014,69 @@ class HudWindow(Gtk.Window):
         os._exit(0)
 
     # ------------------------------------------------------- resident mode
+    def _window_height(self):
+        """How tall the whole overlay is: the pill, plus the hanging stop
+        button when this recording has one. The button is only there while
+        there is a recording to stop."""
+        if self.stop_button and not self.processing:
+            return HEIGHT + STOP_GAP + STOP_BTN_H
+        return HEIGHT
+
+    def _stop_rect(self):
+        """The button's rectangle, in the area's own coordinates."""
+        return (STOP_BTN_X, HEIGHT + STOP_GAP,
+                STOP_BTN_X + STOP_BTN_W, HEIGHT + STOP_GAP + STOP_BTN_H)
+
+    def _blur_rows(self):
+        """Rows tracing everything the glass covers: the pill, and the stop
+        button hanging off it. One region, because both are drawn as glass."""
+        rows = pill_rects(WIDTH, HEIGHT, SQUIRCLE_N, BLUR_INSET)
+        if self.stop_button and not self.processing:
+            rows += rows_translated(
+                pill_rects(STOP_BTN_W, STOP_BTN_H, SQUIRCLE_N, BLUR_INSET),
+                STOP_BTN_X, HEIGHT + STOP_GAP)
+        return rows
+
+    def _window_resize(self):
+        """Fit the window to what this recording needs: pill only, or pill
+        plus the stop button. Also moves the blur and the Win32 cut with it,
+        so the shape on screen and the shape the compositor blurs never
+        disagree."""
+        height = self._window_height()
+        if height == self.get_height():
+            return
+        self.set_default_size(WIDTH, height)
+        self.area.set_content_height(height)
+        self._chrome = None
+        self._chrome_size = None
+        if self._blur is not None:
+            self._blur.set_region(self._blur_rows())
+        if IS_WINDOWS:
+            if self.get_mapped():
+                self._apply_shape_win32()
+            # The resize lands a layout pass later, when the window rect is
+            # what the cut is measured from; re-cut then too.
+            GLib.idle_add(self._apply_shape_win32)
+
+    def _request_stop(self):
+        """The button was pressed: ask the daemon to end this recording.
+
+        The overlay cannot call back into the daemon - it is a separate
+        process with no pipe in that direction - so it drops a marker file
+        beside the level file, the mirror of the processing marker the
+        daemon uses the other way, and the daemon polls for it.
+        """
+        if not self.level_file:
+            print("[HUD] stop requested but there is no level file",
+                  flush=True)
+            return
+        try:
+            with open(self.level_file + STOP_SUFFIX, "w") as handle:
+                handle.write("1")
+            print(f"[HUD] stop requested {time.time():.6f}", flush=True)
+        except OSError as e:
+            print(f"[HUD] could not request stop: {e}", flush=True)
+
     def begin_processing(self):
         """Recording is over; keep the pill up while the words are worked out.
 
@@ -969,14 +1087,21 @@ class HudWindow(Gtk.Window):
             return False
         self.processing = True
         self._processing_t0 = time.monotonic()
+        # Nothing is left to stop; the tab goes back to being a part of the
+        # window nobody can see, and the pill drops back to its own size.
+        self._window_resize()
         print(f"[HUD] processing {time.time():.6f}", flush=True)
         return False
 
-    def begin_show(self, level_file: str, point: str = ""):
+    def begin_show(self, level_file: str, point: str = "",
+                   stop_button: bool = False):
         """Show for a new recording. No process start, no window creation."""
         self._move_to_monitor(point)
         self.level_file = level_file
         self.processing = False
+        self.stop_button = stop_button
+        self.stop_hover = 0.0
+        self.stop_hover_target = 0.0
         self.level_pos = 0
         self.peak = PEAK_FLOOR
         self.targets = deque([0.0] * BARS, maxlen=BARS)
@@ -990,6 +1115,7 @@ class HudWindow(Gtk.Window):
         self._fade_in_t0 = time.monotonic()
         self._fade_out_t0 = None
         self._quitting = False
+        self._window_resize()
         self._apply_position()
         # A window already on screen gets no map event, so no correction is
         # coming and the position applied just above is the final one. Nor is
@@ -1024,7 +1150,8 @@ class HudWindow(Gtk.Window):
         if self._monitor is None:
             return (0, 0)
         g = self._monitor.get_geometry()
-        return ((g.width - WIDTH) // 2, g.height - HEIGHT - BOTTOM_MARGIN)
+        return ((g.width - WIDTH) // 2,
+                g.height - self._window_height() - BOTTOM_MARGIN)
 
     def _apply_position(self):
         """Anchor bottom-centre by default, or top-left at a dragged position."""
@@ -1057,7 +1184,7 @@ class HudWindow(Gtk.Window):
             return (x, y)
         g = self._monitor.get_geometry()
         return (max(0, min(int(x), g.width - WIDTH)),
-                max(0, min(int(y), g.height - HEIGHT)))
+                max(0, min(int(y), g.height - self._window_height())))
 
     def _on_drag_begin(self, gesture, sx, sy):
         self._drag_origin = self._pos if self._pos is not None else self._default_pos()
@@ -1076,20 +1203,37 @@ class HudWindow(Gtk.Window):
         moved = abs(dx) + abs(dy)
         self._drag_origin = None
         if moved < DRAG_SLOP:
-            # A tap. Only the close affordance dismisses; anywhere else would
-            # make the pill vanish whenever a drag came up a pixel short.
+            # A tap. Only the two affordances do anything: the stop button,
+            # which ends the recording, and the close X, which dismisses the
+            # pill. Anywhere else would make the pill vanish or stop whenever
+            # a drag came up a pixel short.
             sx, sy = self._drag_start_xy
+            if self._in_stop_button(sx, sy):
+                self._request_stop()
+                return
             if sx >= WIDTH - 34 * SIZE_SCALE:
                 self.quit()
             return
         _save_position(self._connector, *self._pos)
         print(f"[HUD] position saved for {self._connector}: {self._pos}", flush=True)
 
-    def _on_enter(self, *_):
+    def _in_stop_button(self, x, y):
+        x0, y0, x1, y1 = self._stop_rect()
+        return (self.stop_button and not self.processing
+                and x0 <= x <= x1 and y0 <= y <= y1)
+
+    def _on_enter(self, _, x, y):
         self.want_hover = True
+        # Enter carries the position too, so a pointer that lands on the
+        # button and never moves still lights it.
+        self.stop_hover_target = 1.0 if self._in_stop_button(x, y) else 0.0
+
+    def _on_motion(self, _, x, y):
+        self.stop_hover_target = 1.0 if self._in_stop_button(x, y) else 0.0
 
     def _on_leave(self, *_):
         self.want_hover = False
+        self.stop_hover_target = 0.0
 
     def _frame(self):
         if self._resident and not self.get_visible():
@@ -1110,6 +1254,7 @@ class HudWindow(Gtk.Window):
             if t >= 1.0:
                 self._after_fade_out()
         self.hover += ((1.0 if self.want_hover else 0.0) - self.hover) * 0.25
+        self.stop_hover += (self.stop_hover_target - self.stop_hover) * 0.25
         if self.processing:
             targets = self._processing_levels(now)
         else:
@@ -1220,15 +1365,20 @@ class HudWindow(Gtk.Window):
         The outline used to be drawn after the bars, to be certain nothing
         painted over it. It is safe here - the waveform stops well inside
         the glass - and it has to be here for the cache to hold all of it.
+
+        The pill is the top HEIGHT of the window; with the stop button the
+        window is taller, and the tab is drawn (and blurred) separately, so
+        the chrome never reaches past the pill's own edge.
         """
+        pill_h = HEIGHT if self.stop_button else h
         inner = STROKE_W / 2
         material = (ACRYLIC_TINT_ALPHA if self._style == "accent-acrylic"
                     else MATERIAL_ALPHA)
-        self._outline(cr, inner, inner, w - 2 * inner, h - 2 * inner)
+        self._outline(cr, inner, inner, w - 2 * inner, pill_h - 2 * inner)
         cr.set_source_rgba(*MATERIAL_RGB, material * a)
         cr.fill_preserve()
 
-        sheen = cairo.LinearGradient(0, 0, 0, h)
+        sheen = cairo.LinearGradient(0, 0, 0, pill_h)
         sheen.add_color_stop_rgba(0.0, 1, 1, 1, 0.10 * a)
         sheen.add_color_stop_rgba(0.45, 1, 1, 1, 0.015 * a)
         sheen.add_color_stop_rgba(1.0, 0, 0, 0, 0.14 * a)
@@ -1238,13 +1388,13 @@ class HudWindow(Gtk.Window):
         # Everything to the border is clipped to the pill, so strokes centred
         # on the outline only paint inwards.
         cr.save()
-        self._outline(cr, 0, 0, w, h)
+        self._outline(cr, 0, 0, w, pill_h)
         cr.clip()
 
         # Opaque rim covering the blur region's staircase. The region is
         # built from rectangles and cannot be antialiased, so its curved ends
         # are ragged; this hides that boundary rather than leaving it on show.
-        self._outline(cr, 0, 0, w, h)
+        self._outline(cr, 0, 0, w, pill_h)
         cr.set_line_width(2 * EDGE_COVER)
         cr.set_source_rgba(*MATERIAL_RGB, EDGE_COVER_ALPHA * a)
         cr.stroke()
@@ -1255,7 +1405,7 @@ class HudWindow(Gtk.Window):
         for i in range(INNER_SHADOW_STEPS):
             frac = i / max(1, INNER_SHADOW_STEPS - 1)
             reach = INNER_SHADOW_SPREAD + INNER_SHADOW_BLUR * frac
-            self._outline(cr, 0, 0, w, h)
+            self._outline(cr, 0, 0, w, pill_h)
             cr.set_line_width(2 * reach)
             cr.set_source_rgba(*INNER_SHADOW_RGB, band * a)
             cr.stroke()
@@ -1263,7 +1413,7 @@ class HudWindow(Gtk.Window):
 
         # Solid and fully opaque: a translucent hairline picks up whatever is
         # behind the glass and reads as a ragged edge rather than a clean one.
-        self._outline(cr, inner, inner, w - 2 * inner, h - 2 * inner)
+        self._outline(cr, inner, inner, w - 2 * inner, pill_h - 2 * inner)
         cr.set_line_width(STROKE_W)
         cr.set_source_rgba(*STROKE_RGB, a)
         cr.stroke()
@@ -1309,7 +1459,9 @@ class HudWindow(Gtk.Window):
             self._drew = True
             _mark("first draw")
         a = self.alpha
-        mid = h / 2
+        # The pill's own centre, not the window's: the stop button hangs
+        # below the pill, so the window can be taller than it.
+        mid = HEIGHT / 2
 
         cr.save()
         cr.set_operator(cairo.OPERATOR_SOURCE)
@@ -1420,7 +1572,67 @@ class HudWindow(Gtk.Window):
             cr.line_to(cx - r, mid + r)
             cr.stroke()
 
+        if self.stop_button and not self.processing:
+            self._draw_stop_button(cr, a)
+
         cr.restore()
+
+    def _draw_stop_button(self, cr, a):
+        """The tab hanging off the pill, and its label.
+
+        The same recipe as the pill's chrome - material, sheen, outline,
+        hover glow - so the tab reads as glass attached to the pill rather
+        than a control floating near it.
+        """
+        x0, y0 = STOP_BTN_X, HEIGHT + STOP_GAP
+        hov = self.stop_hover
+
+        _squircle(cr, x0, y0, STOP_BTN_W, STOP_BTN_H)
+        material = (ACRYLIC_TINT_ALPHA if self._style == "accent-acrylic"
+                    else MATERIAL_ALPHA)
+        cr.set_source_rgba(*MATERIAL_RGB, material * a)
+        cr.fill_preserve()
+        if hov > 0.01:
+            cr.set_source_rgba(1, 1, 1, 0.10 * hov * a)
+            cr.fill_preserve()
+        sheen = cairo.LinearGradient(0, y0, 0, y0 + STOP_BTN_H)
+        sheen.add_color_stop_rgba(0.0, 1, 1, 1, 0.10 * a)
+        sheen.add_color_stop_rgba(1.0, 0, 0, 0, 0.14 * a)
+        cr.set_source(sheen)
+        cr.fill()
+
+        inner = STROKE_W / 2
+        _squircle(cr, x0 + inner, y0 + inner,
+                  STOP_BTN_W - 2 * inner, STOP_BTN_H - 2 * inner)
+        cr.set_line_width(STROKE_W)
+        cr.set_source_rgba(*STROKE_RGB, a)
+        cr.stroke()
+
+        # The stop glyph and the label, both in the pill's white.
+        gx, gy = x0 + 13, y0 + (STOP_BTN_H - STOP_GLYPH) / 2
+        cr.set_source_rgba(1, 1, 1, (0.82 + 0.18 * hov) * a)
+        _round_rect(cr, gx, gy, STOP_GLYPH, STOP_GLYPH, 2)
+        cr.fill()
+
+        layout = self._stop_label_layout(cr)
+        _, th = layout.get_pixel_size()
+        cr.set_source_rgba(1, 1, 1, (0.88 + 0.12 * hov) * a)
+        cr.move_to(gx + STOP_GLYPH + 7,
+                   y0 + (STOP_BTN_H - th) / 2.0)
+        PangoCairo.show_layout(cr, layout)
+
+    def _stop_label_layout(self, cr):
+        """The button's label, built once and kept (it never changes)."""
+        if self._stop_label is not None:
+            return self._stop_label
+        layout = PangoCairo.create_layout(cr)
+        layout.set_text(STOP_LABEL, -1)
+        font = Pango.FontDescription()
+        font.set_family("sans")
+        font.set_absolute_size(int(round(STOP_FONT_PX * Pango.SCALE)))
+        layout.set_font_description(font)
+        self._stop_label = layout
+        return layout
 
 
 def _command_loop(win: "HudWindow"):
@@ -1430,13 +1642,17 @@ def _command_loop(win: "HudWindow"):
         for line in sys.stdin:
             command = line.strip()
             if command.startswith("show"):
-                # "show <x>,<y> <path>". The point comes first so the path,
-                # which may hold spaces, is simply the rest of the line. A
-                # daemon that has no point to give sends "-".
+                # "show <x>,<y> <stop-button> <path>". The point comes first
+                # so the path, which may hold spaces, is simply the rest of
+                # the line. A daemon that has no point to give sends "-";
+                # the stop flag is 0 or 1, for whether this mode's overlay
+                # should offer its stop button.
                 _, _, rest = command.partition(" ")
-                point, _, path = rest.partition(" ")
+                point, _, rest = rest.partition(" ")
+                stop, _, path = rest.partition(" ")
                 GLib.idle_add(win.begin_show, path.strip(),
-                              "" if point in ("", "-") else point)
+                              "" if point in ("", "-") else point,
+                              stop == "1")
             elif command == "processing":
                 GLib.idle_add(win.begin_processing)
             elif command == "hide":

@@ -862,6 +862,40 @@ def _stub_daemon(temp_config_dir):
 class TestDaemonStability:
     """Guards on the failure paths that used to wedge the daemon."""
 
+    @staticmethod
+    def _hud_stop_watcher_spawned(daemon, mode):
+        """Start a recording and say whether the HUD stop watcher went up."""
+        from whisper_flow import daemon as daemon_module
+
+        started = []
+        real_thread = daemon_module.threading.Thread
+
+        def spy(*args, **kwargs):
+            thread = real_thread(*args, **kwargs)
+            started.append(thread)
+            return thread
+
+        with (
+            patch.object(daemon_module.threading, "Thread", side_effect=spy),
+            patch.object(daemon, "_record_audio_thread"),  # no real recording
+        ):
+            daemon.start_recording(mode)
+        watcher = any(t.name == "WhisperFlow-HUDStop" for t in started)
+        # The patched recording thread never finishes, so settle the state
+        # that would make the next start a no-op.
+        daemon.is_recording = False
+        daemon.current_mode = None
+        daemon.stop_recording_event = None
+        daemon.recording_thread = None
+        return watcher
+
+    def test_auto_modes_watch_for_the_stop_button(self, temp_config_dir):
+        """Only the modes that show the stop button need to hear it."""
+        daemon = _stub_daemon(temp_config_dir)
+        assert self._hud_stop_watcher_spawned(daemon, "auto_transcribe")
+        assert self._hud_stop_watcher_spawned(daemon, "command")
+        assert not self._hud_stop_watcher_spawned(daemon, "transcribe")
+
     def test_start_recording_rolls_back_state_when_startup_fails(self, temp_config_dir):
         """A failed start must not leave the daemon 'recording' forever.
 

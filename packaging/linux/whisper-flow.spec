@@ -139,6 +139,7 @@ hidden = collect_submodules("pydantic") + [
     "gi.repository.GObject",
     "gi.repository.Gio",
     "gi.repository.Pango",
+    "gi.repository.PangoCairo",
     "gi.repository.cairo",
 ]
 

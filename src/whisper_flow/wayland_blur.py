@@ -135,7 +135,8 @@ class BlurHandle:
     """Keeps the blur objects alive; dropping it would drop the effect."""
 
     def __init__(self, manager, effect_surface, queue, display, region,
-                 empty_region, version):
+                 empty_region, version, compositor, region_iface,
+                 compositor_version):
         self._manager = manager
         self._effect_surface = effect_surface
         self._queue = queue
@@ -143,6 +144,12 @@ class BlurHandle:
         self._region = region
         self._empty_region = empty_region
         self._version = version
+        self._compositor = compositor
+        self._region_iface = region_iface
+        self._cver = compositor_version
+        # Regions handed to the compositor stay referenced on this side, so a
+        # destroyed proxy can never race a compositor still reading it.
+        self._retired = []
         self.active = False
 
     def set_active(self, on: bool):
@@ -168,6 +175,40 @@ class BlurHandle:
         )
         wl.wl_display_flush(ctypes.c_void_p(self._display))
         self.active = on
+
+    def set_region(self, rows: list[tuple[int, int, int, int]]):
+        """Replace the blur region with a new shape.
+
+        The stop button grows the pill, and the pill shrinks back when the
+        recording ends - a region built for one of those shapes blurs
+        through the other. The effect surface only accepts one effect, so a
+        second enable_blur is a protocol error; this asks the same effect
+        for a new region instead.
+        """
+        wl = _wl()
+        region = wl.wl_proxy_marshal_flags(
+            ctypes.c_void_p(self._compositor), WL_COMPOSITOR_CREATE_REGION,
+            ctypes.c_void_p(self._region_iface), ctypes.c_uint32(self._cver),
+            ctypes.c_uint32(0), None,
+        )
+        if not region:
+            return
+        wl.wl_proxy_set_queue(ctypes.c_void_p(region), ctypes.c_void_p(self._queue))
+        for x, y, w, h in rows:
+            wl.wl_proxy_marshal_flags(
+                ctypes.c_void_p(region), WL_REGION_ADD,
+                None, ctypes.c_uint32(self._cver), ctypes.c_uint32(0),
+                ctypes.c_int32(x), ctypes.c_int32(y),
+                ctypes.c_int32(w), ctypes.c_int32(h),
+            )
+        wl.wl_proxy_marshal_flags(
+            ctypes.c_void_p(self._effect_surface), SURFACE_SET_BLUR_REGION,
+            None, ctypes.c_uint32(self._version), ctypes.c_uint32(0),
+            ctypes.c_void_p(region),
+        )
+        wl.wl_display_flush(ctypes.c_void_p(self._display))
+        self._retired.append(self._region)
+        self._region = region
 
 
 def rounded_rect_rows(width: int, height: int, radius: float,
@@ -233,6 +274,12 @@ def pill_rects(width: int, height: int, exponent: float,
     return rects
 
 
+def rows_translated(rows: list[tuple[int, int, int, int]],
+                    dx: int, dy: int) -> list[tuple[int, int, int, int]]:
+    """A shape's rows moved to another place on the surface."""
+    return [(x + dx, y + dy, w, h) for x, y, w, h in rows]
+
+
 def enable_blur(wl_display: int, wl_surface: int,
                 width: int, height: int, exponent: float,
                 inset: int = 0, active: bool = True) -> BlurHandle | None:
@@ -240,6 +287,17 @@ def enable_blur(wl_display: int, wl_surface: int,
     return _enable_blur_impl(
         wl_display, wl_surface, pill_rects(width, height, exponent, inset),
         active)
+
+
+def enable_blur_rows(wl_display: int, wl_surface: int,
+                     rows: list[tuple[int, int, int, int]],
+                     active: bool = True) -> BlurHandle | None:
+    """Ask the compositor to blur behind rows we built.
+
+    The pill's blur region is not always one capsule: the stop button hangs
+    below it, and the two shapes blur as one region.
+    """
+    return _enable_blur_impl(wl_display, wl_surface, rows, active)
 
 
 def enable_window_blur(wl_display: int, wl_surface: int,
@@ -401,10 +459,9 @@ def _enable_blur_impl(wl_display: int, wl_surface: int,
     wl.wl_display_flush(ctypes.c_void_p(wl_display))
 
     handle = BlurHandle(manager, effect, queue, wl_display, region,
-                        empty_region, version)
+                        empty_region, version, compositor, region_iface, cver)
     handle.active = True
     handle._listener = listener  # the callbacks must outlive the registry
-    handle._compositor = compositor
     if not active:
         handle.set_active(False)
     return handle

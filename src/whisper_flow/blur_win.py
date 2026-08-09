@@ -437,7 +437,7 @@ def apply_backdrop(hwnd: int, transient: bool = True) -> str | None:
     return "acrylic" if transient else "mica"
 
 
-def set_shape(hwnd: int, points) -> bool:
+def set_shape(hwnd: int, *shapes) -> bool:
     """Clip the window to a polygon; everything outside it becomes nothing.
 
     A top-level window on Windows is a rectangle, and DWM composites its
@@ -452,16 +452,20 @@ def set_shape(hwnd: int, points) -> bool:
     is why the caller inflates it past the drawn outline: the ragged edge
     then falls outside the pill instead of eating into its rim.
 
+    Each `shape` is one closed outline, and the shapes are ORed together:
+    the pill and the stop button hanging below it are two capsules that
+    together are the one shape this window is allowed to be.
+
     Args:
         hwnd: Native window handle.
-        points: The outline, in physical pixels relative to the window's
+        shapes: The outlines, in physical pixels relative to the window's
             top-left corner.
 
     Returns:
         Whether the region was applied.
 
     """
-    if not hwnd or not points:
+    if not hwnd or not shapes:
         return False
     try:
         gdi32 = ctypes.WinDLL("gdi32")
@@ -472,24 +476,40 @@ def set_shape(hwnd: int, points) -> bool:
         gdi32.CreatePolygonRgn.argtypes = [
             ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
         gdi32.CreatePolygonRgn.restype = ctypes.c_void_p
+        gdi32.CombineRgn.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
+        gdi32.CombineRgn.restype = ctypes.c_int
+        gdi32.DeleteObject.argtypes = [ctypes.c_void_p]
         user32.SetWindowRgn.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_bool]
         user32.SetWindowRgn.restype = ctypes.c_int
 
-        count = len(points)
-        buffer = (wintypes.POINT * count)()
-        for i, (x, y) in enumerate(points):
-            buffer[i].x = round(x)
-            buffer[i].y = round(y)
         WINDING = 2      # correct for a closed outline that never self-crosses
-        region = gdi32.CreatePolygonRgn(ctypes.byref(buffer), count, WINDING)
-        if not region:
+        combined = None
+        for points in shapes:
+            count = len(points)
+            buffer = (wintypes.POINT * count)()
+            for i, (x, y) in enumerate(points):
+                buffer[i].x = round(x)
+                buffer[i].y = round(y)
+            region = gdi32.CreatePolygonRgn(ctypes.byref(buffer), count, WINDING)
+            if not region:
+                break
+            if combined is None:
+                combined = region
+            else:
+                RGN_OR = 2
+                gdi32.CombineRgn(ctypes.c_void_p(combined),
+                                 ctypes.c_void_p(combined),
+                                 ctypes.c_void_p(region), RGN_OR)
+                gdi32.DeleteObject(ctypes.c_void_p(region))
+        if not combined:
             return False
         # Redraw: without it the old rectangle stays on screen until
         # something else invalidates the window. Windows owns the region
         # after this call, so it must not be deleted here.
         return bool(user32.SetWindowRgn(
-            ctypes.c_void_p(hwnd), ctypes.c_void_p(region), True))
+            ctypes.c_void_p(hwnd), ctypes.c_void_p(combined), True))
     except Exception:
         return False
 

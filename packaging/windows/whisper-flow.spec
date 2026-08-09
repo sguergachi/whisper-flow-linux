@@ -29,7 +29,8 @@ EXCLUDES = ["evdev", "pynput"]
 # absence means the prefix is not a GTK 4 one at all. Kept in step with
 # --selftest, and with the test that reads this list.
 REQUIRED_NAMESPACES = ("Gtk-4.0", "Gdk-4.0", "Adw-1", "Pango-1.0",
-                       "GLib-2.0", "GObject-2.0", "Gio-2.0")
+                       "PangoCairo-1.0", "GLib-2.0", "GObject-2.0",
+                       "Gio-2.0")
 
 
 def gtk_runtime():

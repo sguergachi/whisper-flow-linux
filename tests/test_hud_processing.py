@@ -290,6 +290,90 @@ def test_the_marker_suffix_matches_on_both_sides():
     assert f'PROCESSING_SUFFIX = "{hud_module.PROCESSING_SUFFIX}"' in source
 
 
+def test_the_stop_suffix_matches_on_both_sides():
+    """The overlay drops the stop-request marker; the daemon polls it."""
+    from whisper_flow import hud as hud_module
+
+    source = _hud_app_source()
+    assert f'STOP_SUFFIX = "{hud_module.STOP_SUFFIX}"' in source
+    assert "level_file + STOP_SUFFIX" in source, (
+        "the overlay must ask for the stop beside the level file, which is "
+        "the only path the daemon can watch")
+
+
+# ------------------------------------------------------- the stop button
+def test_auto_modes_show_the_stop_button(daemon):
+    """Only the modes that end on silence need a mouse-visible way out.
+
+    Push-to-talk already has one: the user is holding the key.
+    """
+    instance, level_file = daemon
+    instance.current_mode = "auto_transcribe"
+    instance._hud_point = None
+    instance._show_hud_now()
+    assert instance.hud.show.call_args.kwargs["stop_button"] is True
+
+    instance.hud.reset_mock()
+    instance.current_mode = "transcribe"
+    instance._show_hud_now()
+    assert instance.hud.show.call_args.kwargs["stop_button"] is False
+
+
+def test_pressing_the_stop_button_ends_the_recording(daemon):
+    """The overlay's marker is the daemon's stop signal.
+
+    The overlay is a separate process and cannot call back, so it drops a
+    file beside the level file and the daemon polls for it.
+    """
+    import threading
+    import time
+
+    instance, level_file = daemon
+    instance.current_mode = "auto_transcribe"
+    marker = level_file.with_suffix(level_file.suffix + ".stop")
+    stopped = []
+
+    def stop():
+        stopped.append(1)
+        instance.is_recording = False
+
+    instance._stop_recording = stop
+    # The watcher sweeps stale markers as it starts, so the press has to land
+    # after that, the way a real one does.
+    thread = threading.Thread(
+        target=instance._watch_hud_stop_request, args=("auto_transcribe",),
+        daemon=True)
+    thread.start()
+    time.sleep(0.1)
+    marker.write_bytes(b"1")
+    thread.join(timeout=2)
+
+    assert stopped == [1]
+    assert not marker.exists(), "the marker must be consumed, not re-seen"
+
+
+def test_a_stale_stop_marker_cannot_stop_the_next_recording(daemon):
+    """An overlay that died after writing its marker must not end the next
+    recording the instant it starts."""
+    instance, level_file = daemon
+    instance.current_mode = "auto_transcribe"
+    marker = level_file.with_suffix(level_file.suffix + ".stop")
+    marker.write_bytes(b"1")
+    instance.is_recording = False
+
+    instance._watch_hud_stop_request("auto_transcribe")
+
+    assert not marker.exists(), "a leftover marker must be swept at the start"
+
+
+def test_taking_the_overlay_down_clears_the_stop_marker(daemon):
+    instance, level_file = daemon
+    instance._stop_recording_locked()
+    instance._take_down_overlay()
+
+    instance.hud.clear_stop_marker.assert_called_once_with(str(level_file))
+
+
 def test_the_animation_is_loaded_as_a_sibling_and_shipped():
     """hud_app cannot import through the package, so hud_anim is a file.
 

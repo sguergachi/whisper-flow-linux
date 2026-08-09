@@ -389,3 +389,35 @@ def test_text_is_read_and_written_as_utf8_everywhere():
                 offenders.append(f"{path.name}:{number}")
     assert not offenders, (
         "text read or written with the platform encoding: " + ", ".join(offenders))
+
+
+def test_apprun_only_preloads_the_layer_shell_for_gtk4_roles():
+    """The daemon must never load gtk4-layer-shell - it drags GTK4 in.
+
+    libgtk4-layer-shell links GTK4, and once GTK4 is in the daemon's
+    process pystray's tray backend (GTK3) resolves its gdk_display_manager_
+    get call to GTK4's implementation, which aborts with
+    "gdk_display_manager_get() was called before gtk_init()" - the whole
+    daemon, tray and hotkeys, dies on the user's desktop. Only the GTK4
+    windows (--hud, --settings) need the preload, and only they may set it.
+    """
+    script = (Path(__file__).resolve().parents[1]
+              / "packaging/linux/make-appimage.sh").read_text(encoding="utf-8")
+    apprun = script.split('<<\'APPRUN\'', 1)[1].split('APPRUN', 1)[0]
+    assert 'case " $* " in' in apprun, (
+        "AppRun must gate the layer-shell preload on the invocation: the "
+        "daemon (no flags) must not load gtk4-layer-shell or GTK4's gdk "
+        "interposes pystray's GTK3 call and the daemon aborts"
+    )
+    assert '" --hud "*|*" --settings "*' in apprun, (
+        "the preload must be limited to the GTK4 windows, the HUD and the "
+        "settings window"
+    )
+    assert 'export LD_PRELOAD' in apprun
+    # The export must live inside the case, never before it.
+    before_case = apprun.split('case " $* " in', 1)[0]
+    assert "export LD_PRELOAD" not in before_case, (
+        "an unconditional preload poisons the daemon: GTK4 loads at process "
+        "start, and pystray's GTK3 tray backend then aborts on GTK4's "
+        "gdk_display_manager_get"
+    )

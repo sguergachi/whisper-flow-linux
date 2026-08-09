@@ -78,21 +78,29 @@ HERE="${APPDIR:-}"
 if [[ -z "$HERE" ]]; then
     HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 fi
-# The HUD needs gtk4-layer-shell to load before libwayland-client (it is
-# dlopen'd through a typelib otherwise, which is too late). LD_PRELOAD is
-# read at process start, so it has to be set here, before exec. The daemon
-# and the HUD/settings children it spawns all inherit it.
-for LAYER in \
-    /usr/lib/x86_64-linux-gnu/libgtk4-layer-shell.so.0 \
-    /usr/lib64/libgtk4-layer-shell.so.0 \
-    /usr/lib/libgtk4-layer-shell.so.0 \
-    /usr/local/lib/libgtk4-layer-shell.so.0
-do
-    if [[ -f "$LAYER" ]]; then
-        export LD_PRELOAD="$LAYER${LD_PRELOAD:+:$LD_PRELOAD}"
-        break
-    fi
-done
+# Only the GTK4 windows need gtk4-layer-shell loaded ahead of
+# libwayland-client (it is dlopen'd through a typelib otherwise, which is
+# too late): the HUD overlay (--hud) and the settings window (--settings).
+# The daemon itself must never load it: libgtk4-layer-shell links GTK4,
+# and once GTK4 is in the process pystray's tray backend (GTK3) resolves
+# its gdk_display_manager_get call to GTK4's implementation, which aborts
+# with "gdk_display_manager_get() was called before gtk_init()" and takes
+# the whole daemon - tray and hotkeys - down with it.
+case " $* " in
+    *" --hud "*|*" --settings "*)
+        for LAYER in \
+            /usr/lib/x86_64-linux-gnu/libgtk4-layer-shell.so.0 \
+            /usr/lib64/libgtk4-layer-shell.so.0 \
+            /usr/lib/libgtk4-layer-shell.so.0 \
+            /usr/local/lib/libgtk4-layer-shell.so.0
+        do
+            if [[ -f "$LAYER" ]]; then
+                export LD_PRELOAD="$LAYER${LD_PRELOAD:+:$LD_PRELOAD}"
+                break
+            fi
+        done
+        ;;
+esac
 exec "$HERE/whisper-flow" "$@"
 APPRUN
 chmod +x "$APPDIR/AppRun"

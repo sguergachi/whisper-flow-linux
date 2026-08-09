@@ -301,6 +301,22 @@ def test_the_stop_suffix_matches_on_both_sides():
         "the only path the daemon can watch")
 
 
+def test_the_stop_button_is_the_pill_grown_not_a_floating_tab():
+    """The button is the capsule's own lower half - one outline, no gap.
+
+    A tab drawn below the pill reads as a separate control floating beside
+    the HUD; the stop button must read as part of it. The outline is one
+    continuous path that grows the pill's straight sides down past its
+    bottom cap.
+    """
+    source = _hud_app_source()
+    assert "_extended_pill(cr, x, y, w, HEIGHT, STOP_BTN_H)" in source, (
+        "the stop button must be drawn as one extended capsule with the "
+        "pill - not as a separate shape hanging below it")
+    assert "STOP_GAP" not in source, (
+        "any air between the pill and the button makes it a floating tab")
+
+
 # ------------------------------------------------------- the stop button
 def test_auto_modes_show_the_stop_button(daemon):
     """Only the modes that end on silence need a mouse-visible way out.

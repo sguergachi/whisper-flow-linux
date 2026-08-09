@@ -274,10 +274,54 @@ def pill_rects(width: int, height: int, exponent: float,
     return rects
 
 
-def rows_translated(rows: list[tuple[int, int, int, int]],
-                    dx: int, dy: int) -> list[tuple[int, int, int, int]]:
-    """A shape's rows moved to another place on the surface."""
-    return [(x + dx, y + dy, w, h) for x, y, w, h in rows]
+def extended_pill_rects(width: int, height: int, extension: int,
+                        exponent: float, inset: int = 0,
+                        cap: float = 1.12) -> list[tuple[int, int, int, int]]:
+    """Rows tracing the pill grown its stop button, as wl_region rects.
+
+    The mirror of _extended_pill_points in hud_app: the pill's top cap and
+    straight sides, but instead of the bottom cap the sides continue down by
+    `extension` and close over a rounded bottom - the button is the pill's
+    own lower half. If this drifts from what is drawn, the blur shows
+    outside the glass.
+
+    The inset pulls the shape in on every side, but must not shorten the
+    extension: the row range is the whole height and the corners sit on the
+    inset bottom edge.
+    """
+    import math
+
+    width -= 2 * inset
+    if width <= 0:
+        return []
+    b = height / 2.0
+    rx = min(b * cap, width / 2.0)
+    rb = min(b, extension, width / 2.0)
+    total = height + extension - inset   # the bottom edge of the blur
+    rects = []
+    # The pill's top cap: the superelliptical rows, narrowing to nothing at
+    # the very top.
+    for y in range(int(math.floor(b))):
+        dy = abs(y + 0.5 - b) / b
+        f = (1.0 - dy ** exponent) ** (1.0 / exponent)
+        x0 = int(math.ceil(rx * (1.0 - f)))
+        w = width - 2 * x0
+        if w > 0:
+            rects.append((x0 + inset, y + inset, w, 1))
+    # Everything below the cap is the full width, down to the rounded
+    # bottom corners.
+    for y in range(int(math.floor(b)), total):
+        dy = total - (y + 0.5)           # distance below the corner centres
+        if dy < rb:
+            d = rb - dy
+            dx = rb - math.sqrt(max(0.0, rb * rb - d * d))
+            x0 = int(math.ceil(dx))
+        else:
+            x0 = 0
+        w = width - 2 * x0
+        if w > 0:
+            rects.append((x0 + inset, y + inset, w, 1))
+    return rects
 
 
 def enable_blur(wl_display: int, wl_surface: int,

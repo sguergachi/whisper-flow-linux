@@ -396,16 +396,16 @@ elif scenario == "reset":
     assert win.level_pos == 0
     assert win.peak == hud_app.PEAK_FLOOR
 elif scenario == "stop_button":
-    # The auto-transcribe modes grow the window with a hanging tab; the
-    # button is part of the overlay, not a control floating near it.
+    # The auto-transcribe modes grow the pill's own capsule with the stop
+    # button: the lower half of the same piece of glass, not a control
+    # floating next to it.
     win.begin_show("", "", stop_button=True)
     assert win.stop_button
     assert win._window_height() > hud_app.HEIGHT
-    assert win._in_stop_button(hud_app.STOP_BTN_X + 10,
-                               hud_app.HEIGHT + hud_app.STOP_GAP + 5)
-    assert not win._in_stop_button(hud_app.STOP_BTN_X - 20,
-                                   hud_app.HEIGHT + hud_app.STOP_GAP)
-    # The tab is gone once there is nothing left to stop.
+    assert win._in_stop_button(10, hud_app.HEIGHT + 5)
+    assert win._in_stop_button(hud_app.WIDTH - 10, hud_app.HEIGHT + 5)
+    assert not win._in_stop_button(10, 5)   # the pill itself is not the button
+    # The button is gone once there is nothing left to stop.
     win.begin_processing()
     assert win._window_height() == hud_app.HEIGHT
 elif scenario == "stop_request":

@@ -69,3 +69,36 @@ captures (server v1.9.1, ggml-silero-v5.1.2 VAD, threshold sweep 0.10-0.50).
 Leave both flags off. The app's own webrtc VAD and the boost chain
 already do the only thing that works: keep the whisper's energy and gate
 on the client, then reject any all-bracket decode instead of pasting it.
+
+## Spectral gating (noisereduce): works, but beats nothing shipped
+
+The one family left untested was classical DSP spectral gating - estimate
+the stationary noise spectrum, then soft-mask each time-frequency bin.
+Measured with `noisereduce` (stationary=True, prop_decrease 0.70-0.99,
+n_fft 256-1024) layered with the shipped HPF and boost, plus a
+gate-then-rescue ordering, on all six captures:
+
+* 13:06:14 (the recoverable whisper): gate+boost returns real words
+  ("Keeps you, Doctor." 3/3, "Keeps you, cop truckers." through
+  gate>rescue) where the *café rescue* returns blank - but the shipped
+  plain-boost-of-raw (`_retry_boost_raw`) already returns the correct
+  "Keeps you going." earlier in the chain. The gate recovers nothing the
+  chain does not.
+* Every buried capture (11:48, 11:51, 12:38, 13:27, 15:09:24): gate
+  produces only tags or blank at every setting - never words, and never a
+  hallucination that would be pasted. The whisper-band (300-3400 Hz)
+  energy is 0.0 dB above the rest of the spectrum in these clips: the
+  voice's band carries no measurable advantage to extract.
+
+Cost: ~35ms on a 2s clip (2% of real time) in pure numpy - cheap enough
+for the final pass. It does no harm (worst case is a tag the app already
+rejects), but it is not an improvement over the shipped chain on any
+capture, so it is not integrated.
+
+The complete answer is empirical: DTLN, DeepFilterNet, Silero VAD,
+--suppress-nst, spectral gating, whisper-lift, and the café rescue have
+all been measured against real captures. The shipped chain - plain boost
+of raw with cold-open silence skipped, then the escalation rungs - is the
+best available for whisper-under-music, and captures where the voice's
+band shows no energy advantage over the bed are unrecoverable by any
+filtering.

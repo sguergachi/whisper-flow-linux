@@ -145,6 +145,82 @@ def test_the_linux_spec_declares_lazy_pystray():
     assert "whisper_flow.hotkey_win" in text  # appears under EXCLUDES
 
 
+def _linux_spec_is_host_lib() -> "object":
+    """Evaluate the Linux spec's bundling filter without importing the spec.
+
+    The spec is a PyInstaller script, not a module, so importing it would run
+    the whole Analysis. The top of the file through the predicate is plain
+    Python; executing just that yields the _is_host_lib decision function.
+    """
+    lines = LINUX_SPEC.read_text(encoding="utf-8").splitlines(keepends=True)
+    code = []
+    for line in lines:
+        if line.startswith("app = Analysis("):
+            break
+        code.append(line)
+    namespace = {"re": re}
+    exec("".join(code), namespace)  # noqa: S102 - static regex definitions
+    return namespace["_is_host_lib"]
+
+
+def test_the_linux_bundle_never_ships_the_openssl_the_host_already_has():
+    """A bundled Ubuntu-era libssl shadows the host's and kills host libs.
+
+    On Arch/Fedora/current Ubuntu the host libcurl and libsoup need
+    OPENSSL_3.2.0; the AppImage bundled the 22.04 libssl.so.3, the loader
+    resolved it first (LD_LIBRARY_PATH is fixed at process start), and every
+    GTK typelib load died with "version 'OPENSSL_3.2.0' not found". The whole
+    family must be skipped so the host provides it.
+    """
+    is_host_lib = _linux_spec_is_host_lib()
+    for name in (
+        "libssl.so.3",
+        "libcrypto.so.3",
+        "libgnutls.so.30",
+        "libz.so.1",
+        "libbz2.so.1.0",
+        "libexpat.so.1",
+        "libffi.so.8",
+        "liblzma.so.5",
+        "libzstd.so.1",
+        "libbrotlicommon.so.1",
+        "libstdc++.so.6",
+        "libgcc_s.so.1",
+        "libasound.so.2",
+        "libjack.so.0",
+    ):
+        assert is_host_lib(name), (
+            f"{name} is a system library the host provides on every distro "
+            f"this AppImage targets; bundling it shadows the host's copy and "
+            f"breaks loaders that need a newer one"
+        )
+
+
+def test_the_linux_bundle_keeps_pyinstallers_hashed_libraries():
+    """The skip list names jpeg/png16/tiff/freetype and friends by basename.
+
+    PyInstaller renames collision-prone libs to name-<hash>.so and rewires
+    every reference to the hashed name, so those can never shadow the host
+    and must survive the filter. When the filter stripped them too, it left
+    dangling symlinks behind and Pillow could not import - the daemon died on
+    every machine, including ones whose system libraries were fine.
+    """
+    is_host_lib = _linux_spec_is_host_lib()
+    for name in (
+        "libtiff-fc87e79d.so.6.2.0",
+        "libjpeg-31e2ca52.so.62.4.0",
+        "libpng16-abb096d5.so.16.58.0",
+        "libfreetype-9fc94c80.so.6.20.6",
+        "libharfbuzz-172d1f63.so.0.61421.0",
+        "libzstd-44be1190.so.1.5.7",
+        "libXau-154567c4.so.6.0.0",
+    ):
+        assert not is_host_lib(name), (
+            f"{name} is a hashed/renamed lib: keeping it is what stops the "
+            f"pillow.libs symlinks from dangling and Pillow from failing"
+        )
+
+
 def test_the_cairo_foreign_struct_bridge_is_declared():
     """The overlay is one cairo draw callback; without this it draws nothing.
 

@@ -633,8 +633,11 @@ jobs:
           **Linux** — download \`WhisperFlow-*-x86_64.AppImage\` and
           double-click it. One portable build for most x86_64 desktops
           (Ubuntu 22.04+, Fedora, Arch, Mint, Debian bookworm+, Pop!_OS…).
-          Bundles the app, GTK runtime, speech engine and a starter model —
-          no Python install, no package manager. Hold Super+Alt to dictate.
+          Bundles the app, a Python runtime, a speech engine and a starter
+          model — no Python install, no package manager. GTK 4, libadwaita,
+          gtk4-layer-shell and ydotool stay system-side: the distro's own
+          copies, so the one file keeps working as distros move on. Hold
+          Super+Alt to dictate.
 
           If the file manager will not run it: right-click → Properties →
           Allow executing file as program (browsers strip that once).

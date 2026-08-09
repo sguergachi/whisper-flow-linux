@@ -37,9 +37,17 @@ _SKIP_SO = re.compile(
 
 # System libraries that must come from the host. These are the GTK stack
 # PyGObject loads through typelibs, the notification/readline libs that
-# system tools (notify-send, sh) load from LD_LIBRARY_PATH, and everything
-# the GTK closure dragged in. Shipping them makes the bundle shadow the
-# host's versions and breaks distros whose system libraries are newer.
+# system tools (notify-send, sh) load from LD_LIBRARY_PATH, everything the
+# GTK closure dragged in, the OpenSSL/curl/gnutls families, the zlib/bzip2/
+# lzma/zstd/brotli compression runtimes, and the ALSA+JACK audio stack the
+# bundled portaudio links against. Shipping any of them makes the bundle
+# shadow the host's version, and when the host's needs a newer one -
+# libcurl and libsoup on Arch/Fedora/current Ubuntu need OPENSSL_3.2.0,
+# which the bundled Ubuntu-22.04 libssl does not have - the load dies with
+# "version ... not found". The bundled Ubuntu libjack also auto-starts a
+# JACK server (`jackd -l`) that the host's copy never would, spamming every
+# start. Every target this AppImage runs on (glibc of Ubuntu 22.04 or
+# newer) ships all of them.
 _SKIP_BUNDLE_LIBS = re.compile(
     r"^lib(glib|gobject|gio|gmodule|girepository|gtk-4|gtk-3|adwaita|"
     r"gtk4-layer-shell|gdk-4|gdk-3|gdk_pixbuf|graphene|pango|cairo|"
@@ -47,8 +55,29 @@ _SKIP_BUNDLE_LIBS = re.compile(
     r"xkbcommon|json-glib|notify|readline|thai|datrie|dbus|appindicator|"
     r"ayatana|wayland|X11|Xau|Xext|Xcursor|Xdamage|Xdmcp|Xfixes|Xinerama|"
     r"Xi|Xrandr|Xrender|xcb|atk|drm|gbm|EGL|GLX|pcre|pcre2|blkid|mount|"
-    r"selinux|uuid|lzo2|md|bsd|deflate|jbig|tiff|webp|jpeg|png16)"
+    r"selinux|uuid|lzo2|md|bsd|deflate|jbig|tiff|webp|jpeg|png16|"
+    r"ssl|crypto|curl|soup|nghttp2|gnutls|nettle|hogweed|idn2|unistring|"
+    r"tasn1|p11-kit|gmp|proxy|bz2|expat|ffi|tinfo|ncurses|zstd|lzma|"
+    r"brotli|gcc_s|stdc\+\+|asound|jack|db-5|z\b)"
 )
+
+# PyInstaller renames collision-prone libraries to name-<hash>.so and
+# rewires every reference to the hashed name, so they can never shadow the
+# host's copies and must be kept. The hashed files (Pillow's libjpeg/
+# libpng/libtiff/..., numpy/scipy's openblas and gfortran, the renamed
+# libxcb/libXau) live under the collection root or pillow.libs/, and the
+# plain-SONAME symlinks that the loader follows to them are the ones the
+# filter above drops. Without this exception the skip list - which lists
+# jpeg/png16/tiff/freetype/harfbuzz and friends by name - also strips those
+# hashed files and leaves dangling symlinks behind, so Pillow cannot import
+# and the daemon dies on a machine that would otherwise run fine.
+_HASHED_LIB = re.compile(r"-[0-9a-f]{8}(?:-[0-9a-f]{8})?\.so(?:\.\d+)*$")
+
+
+def _is_host_lib(name: str) -> bool:
+    if _HASHED_LIB.search(name):
+        return False
+    return bool(_SKIP_BUNDLE_LIBS.match(name))
 
 
 def gtk_runtime():
@@ -151,8 +180,8 @@ app = Analysis(
 app.binaries = [
     (dest, src, typ)
     for (dest, src, typ) in app.binaries
-    if not _SKIP_BUNDLE_LIBS.match(os.path.basename(src))
-    and not _SKIP_BUNDLE_LIBS.match(os.path.basename(dest))
+    if not _is_host_lib(os.path.basename(src))
+    and not _is_host_lib(os.path.basename(dest))
 ]
 app.datas = [
     (dest, src, typ)

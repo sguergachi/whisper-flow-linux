@@ -215,8 +215,15 @@ class TranscriptionService:
             # returning blank. Temperature 0 keeps the first pass deterministic.
             "temperature": "0.0",
             "temperature_inc": "0.2",
-            "no_speech_thold": "0.4",
+            "no_speech_thold": str(self.config.no_speech_thold),
         }
+        # Decode knobs from settings; the defaults match what the app always
+        # sent, so a fresh install behaves exactly as before.
+        if getattr(self.config, "beam_size", 1) > 1:
+            data["beam_size"] = str(self.config.beam_size)
+            data["best_of"] = str(getattr(self.config, "best_of", 2))
+        if getattr(self.config, "suppress_nst", False):
+            data["suppress_nst"] = "true"
         # English-locked installs (common) stay stable under noise; a free
         # language id on café music hallucinates other languages.
         language = getattr(self.config, "language", None) or "en"

@@ -333,6 +333,8 @@ class WhisperFlow:
             audio_debug.finalize_capture(
                 config.config_dir,
                 rate=getattr(config, "sample_rate", 16000),
+                keep_sample=bool(
+                    getattr(config, "keep_all_captures", False)),
                 **kwargs,
             )
         except Exception as e:

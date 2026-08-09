@@ -86,3 +86,50 @@ def test_fail_ring_is_bounded(tmp_path):
         audio_debug.finalize_capture(tmp_path, transcript=None, rate=RATE)
     fails = list(Path(tmp_path).glob("fail-*"))
     assert len(fails) <= audio_debug.MAX_FAIL_CAPTURES
+
+
+def test_keep_sample_archives_even_a_success(tmp_path):
+    """The samples library keeps successes too - that is the point of it."""
+    samples = (np.sin(2 * np.pi * 220 * np.arange(RATE) / RATE) * 8000).astype(
+        np.int16)
+    audio_debug.save_capture(
+        tmp_path, rate=RATE,
+        raw_untrimmed=samples.tobytes(),
+        raw_trimmed=samples.tobytes(),
+        sent=samples.tobytes(),
+    )
+    out = audio_debug.finalize_capture(
+        tmp_path, transcript="hello world", rate=RATE, keep_sample=True)
+    assert out is not None
+    kept = list(audio_debug.samples_dir(tmp_path).glob("sample-*"))
+    assert len(kept) == 1
+    report = (kept[0] / "report.json").read_text(encoding="utf-8")
+    assert '"transcript": "hello world"' in report
+    # No fail archive for a successful capture.
+    assert not list(Path(tmp_path).glob("fail-*"))
+
+
+def test_keep_sample_off_archives_nothing(tmp_path):
+    samples = _whisper_in_noise(seconds=0.5)
+    raw = samples.tobytes()
+    audio_debug.save_capture(
+        tmp_path, rate=RATE,
+        raw_untrimmed=raw, raw_trimmed=raw, sent=raw,
+    )
+    audio_debug.finalize_capture(tmp_path, transcript="hi", rate=RATE)
+    assert not list(audio_debug.samples_dir(tmp_path).glob("sample-*"))
+
+
+def test_sample_library_is_bounded(tmp_path):
+    samples = _whisper_in_noise(seconds=0.5)
+    raw = samples.tobytes()
+    for i in range(audio_debug.MAX_SAMPLE_CAPTURES + 3):
+        audio_debug.save_capture(
+            tmp_path, rate=RATE,
+            raw_untrimmed=raw, raw_trimmed=raw, sent=raw,
+            mode=str(i),
+        )
+        audio_debug.finalize_capture(
+            tmp_path, transcript=f"t{i}", rate=RATE, keep_sample=True)
+    kept = list(audio_debug.samples_dir(tmp_path).glob("sample-*"))
+    assert len(kept) <= audio_debug.MAX_SAMPLE_CAPTURES

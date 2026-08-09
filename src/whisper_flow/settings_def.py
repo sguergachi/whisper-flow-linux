@@ -82,6 +82,26 @@ FIELDS = (
           help="Up to 1.9x quicker, less exact",
           group="Engine", advanced=True),
 
+    # Decode knobs passed through per request. Expert because each one was
+    # measured against real captures: beam search trades one hallucination
+    # for another, and suppress-nst replaces tags with word fillers.
+    Field("beam_size", "WHISPER_FLOW_BEAM_SIZE",
+          "Beam search width", "Speech", "int", 1, 16,
+          help="1 is greedy; 5+ explores alternatives (experimental)",
+          group="Engine", advanced=True),
+    Field("best_of", "WHISPER_FLOW_BEST_OF",
+          "Best-of candidates", "Speech", "int", 1, 16,
+          help="Candidate paths kept at each greedy step",
+          group="Engine", advanced=True),
+    Field("no_speech_thold", "WHISPER_FLOW_NO_SPEECH_THOLD",
+          "No-speech threshold", "Speech", "float", 0.0, 1.0,
+          help="Lower tries harder on quiet clips",
+          group="Engine", advanced=True),
+    Field("suppress_nst", "WHISPER_FLOW_SUPPRESS_NST",
+          "Suppress non-speech tokens", "Speech", "bool",
+          help="Experimental: may turn [MUSIC] into pasted filler words",
+          group="Engine", advanced=True),
+
     # --------------------------------------------------------------- Hotkeys
     # Three bindings, two behaviours. Push-to-talk is hold-to-speak.
     # Auto-transcribe and the spare "command" binding are both single-press
@@ -115,6 +135,10 @@ FIELDS = (
           group="Microphone", advanced=True),
     Field("vad_mode", "VAD_MODE", "Voice detection",
           "Dictation", "choice", choices=("0", "1", "2", "3"),
+          group="Microphone", advanced=True),
+    Field("keep_all_captures", "WHISPER_FLOW_KEEP_ALL_CAPTURES",
+          "Keep every capture", "Dictation", "bool",
+          help="Archive all recordings to the samples library for testing",
           group="Microphone", advanced=True),
 
     Field("live_transcription", "WHISPER_FLOW_LIVE_TRANSCRIPTION",

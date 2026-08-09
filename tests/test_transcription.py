@@ -26,6 +26,10 @@ def test_hallucination_tags_are_rejected():
 class FakeConfig:
     local_whisper_url = "http://127.0.0.1:8082"
     fast_encoder = True
+    beam_size = 1
+    best_of = 2
+    no_speech_thold = 0.4
+    suppress_nst = False
 
 
 def _wav(path, seconds, rate=16000):
@@ -145,3 +149,40 @@ def test_the_shortened_window_is_off_unless_it_is_asked_for():
     from whisper_flow.config import Config
 
     assert Config().fast_encoder is False
+
+
+# ------------------------------------------------------------- decode knobs
+def test_defaults_are_greedy_and_send_the_usual_thresholds(tmp_path, monkeypatch):
+    """A fresh install must not change what is sent to the server."""
+    config = FakeConfig()
+    service, posted = _service_posting(monkeypatch, config)
+    service.transcribe_audio(_wav(tmp_path / "a.wav", 3.0))
+    assert "beam_size" not in posted["data"]
+    assert posted["data"].get("no_speech_thold") == "0.4"
+    assert "suppress_nst" not in posted["data"]
+
+
+def test_beam_search_is_sent_with_its_best_of(tmp_path, monkeypatch):
+    config = FakeConfig()
+    config.beam_size = 5
+    config.best_of = 3
+    service, posted = _service_posting(monkeypatch, config)
+    service.transcribe_audio(_wav(tmp_path / "a.wav", 3.0))
+    assert posted["data"].get("beam_size") == "5"
+    assert posted["data"].get("best_of") == "3"
+
+
+def test_no_speech_threshold_comes_from_settings(tmp_path, monkeypatch):
+    config = FakeConfig()
+    config.no_speech_thold = 0.6
+    service, posted = _service_posting(monkeypatch, config)
+    service.transcribe_audio(_wav(tmp_path / "a.wav", 3.0))
+    assert posted["data"].get("no_speech_thold") == "0.6"
+
+
+def test_suppress_nst_is_sent_only_when_asked_for(tmp_path, monkeypatch):
+    config = FakeConfig()
+    config.suppress_nst = True
+    service, posted = _service_posting(monkeypatch, config)
+    service.transcribe_audio(_wav(tmp_path / "a.wav", 3.0))
+    assert posted["data"].get("suppress_nst") == "true"

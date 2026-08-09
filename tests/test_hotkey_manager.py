@@ -44,7 +44,7 @@ class TestHotkeyManager:
 
         manager.register_hotkey(
             name="test_hotkey",
-            keys="ctrl+cmd",
+            keys="ctrl+cmd+space",
             mode=HotkeyMode.SINGLE_PRESS,
             callback_press=callback,
             priority=1,
@@ -53,11 +53,36 @@ class TestHotkeyManager:
 
         assert "test_hotkey" in manager.active_bindings
         binding = manager.active_bindings["test_hotkey"]
-        assert binding.keys == {"ctrl", "cmd"}
+        assert binding.keys == {"ctrl", "cmd", "space"}
         assert binding.mode == HotkeyMode.SINGLE_PRESS
         assert binding.callback_press == callback
         assert binding.priority == 1
         assert binding.description == "Test hotkey"
+
+    def test_register_hotkey_refuses_two_modifier_single_press(self):
+        """ctrl+shift fires on every chord that holds it; the daemon must
+        refuse it rather than dictating on the user's Ctrl+Shift+T."""
+        manager = HotkeyManager()
+        ok = manager.register_hotkey(
+            "broken", "ctrl+shift", HotkeyMode.SINGLE_PRESS,
+            callback_press=Mock(),
+        )
+        assert ok is False
+        assert "broken" not in manager.active_bindings
+
+    def test_register_hotkey_keeps_push_to_talk_and_three_modifier_chords(self):
+        """super+alt push-to-talk and the shipped ctrl+super+alt command
+        hotkey are modifiers-only by design and must still register."""
+        manager = HotkeyManager()
+        assert manager.register_hotkey(
+            "ptt", "super+alt", HotkeyMode.PUSH_TO_TALK,
+            callback_press=Mock(),
+        ) is True
+        assert manager.register_hotkey(
+            "cmd", "ctrl+super+alt", HotkeyMode.SINGLE_PRESS,
+            callback_press=Mock(),
+        ) is True
+        assert {"ptt", "cmd"} <= set(manager.active_bindings)
 
     def test_parse_hotkey_combination(self):
         """Test parsing hotkey combinations."""
@@ -223,7 +248,7 @@ class TestHotkeyManager:
 
         manager.register_hotkey(
             "test",
-            "ctrl+cmd",
+            "ctrl+cmd+space",
             HotkeyMode.SINGLE_PRESS,
             callback_press=test_callback,
         )
@@ -236,6 +261,7 @@ class TestHotkeyManager:
         # This should not trigger the callback because processing callback returns True
         manager._on_key_press(MockKey("ctrl"))
         manager._on_key_press(MockKey("cmd"))
+        manager._on_key_press(MockKey("space"))
 
         # Callback should not be called because system is processing
         assert not callback_called
@@ -246,6 +272,7 @@ class TestHotkeyManager:
         manager.pressed_keys.clear()
         manager._on_key_press(MockKey("ctrl"))
         manager._on_key_press(MockKey("cmd"))
+        manager._on_key_press(MockKey("space"))
 
         # Now callback should be called
         assert callback_called
@@ -261,13 +288,13 @@ class TestHotkeyManager:
 
         manager.register_hotkey(
             "test",
-            "ctrl+cmd",
+            "ctrl+cmd+space",
             HotkeyMode.SINGLE_PRESS,
             callback_press=bad_callback,
         )
 
         # This should not crash even though callback raises an exception
-        manager.pressed_keys = {"ctrl", "cmd"}
+        manager.pressed_keys = {"ctrl", "cmd", "space"}
         manager._check_hotkey_combinations()
 
         # The combination should still be set even if callback fails
@@ -286,13 +313,13 @@ class TestHotkeyManager:
 
         manager.register_hotkey(
             "good",
-            "ctrl+alt",
+            "ctrl+alt+space",
             HotkeyMode.SINGLE_PRESS,
             callback_press=good_callback,
         )
 
         # This should work normally
-        manager.pressed_keys = {"ctrl", "alt"}
+        manager.pressed_keys = {"ctrl", "alt", "space"}
         manager._check_hotkey_combinations()
 
         assert callback_called
@@ -311,7 +338,7 @@ class TestHotkeyManager:
 
         manager.register_hotkey(
             "test",
-            "ctrl+cmd",
+            "ctrl+cmd+space",
             HotkeyMode.SINGLE_PRESS,
             callback_press=test_callback,
         )
@@ -363,7 +390,7 @@ class TestHotkeyManager:
 
         manager.register_hotkey(
             "test",
-            "ctrl+cmd",
+            "ctrl+cmd+space",
             HotkeyMode.SINGLE_PRESS,
             callback_press=test_callback,
         )
@@ -428,7 +455,7 @@ class TestHotkeyManager:
 
         manager.register_hotkey(
             "test",
-            "ctrl+cmd",
+            "ctrl+cmd+space",
             HotkeyMode.SINGLE_PRESS,
             callback_press=test_callback,
         )
@@ -441,8 +468,10 @@ class TestHotkeyManager:
         for _ in range(10):
             manager._on_key_press(MockKey("ctrl"))
             manager._on_key_press(MockKey("cmd"))
+            manager._on_key_press(MockKey("space"))
             manager._on_key_release(MockKey("ctrl"))
             manager._on_key_release(MockKey("cmd"))
+            manager._on_key_release(MockKey("space"))
 
         # State should be consistent
         assert len(manager.pressed_keys) == 0

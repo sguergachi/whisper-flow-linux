@@ -365,36 +365,56 @@ class WhisperFlowDaemon:
             # Register processing callback
             self.hotkey_manager.register_processing_callback(self._is_processing)
 
+            refused = []
+
+            def _register(name, keys, mode, callback_press,
+                          callback_release=None, priority=0, description=""):
+                ok = self.hotkey_manager.register_hotkey(
+                    name=name,
+                    keys=keys,
+                    mode=mode,
+                    callback_press=callback_press,
+                    callback_release=callback_release,
+                    priority=priority,
+                    description=description,
+                )
+                if not ok:
+                    refused.append(keys)
+
             # Register transcribe hotkey (push-to-talk)
-            self.hotkey_manager.register_hotkey(
-                name="transcribe",
-                keys=self.config.hotkey_transcribe,
-                mode=HotkeyMode.PUSH_TO_TALK,
-                callback_press=lambda: self._handle_hotkey_press("transcribe"),
-                callback_release=lambda: self._stop_recording_if_active("transcribe"),
+            _register(
+                "transcribe",
+                self.config.hotkey_transcribe,
+                HotkeyMode.PUSH_TO_TALK,
+                lambda: self._handle_hotkey_press("transcribe"),
+                lambda: self._stop_recording_if_active("transcribe"),
                 priority=1,
                 description="Push-to-talk transcription",
             )
 
             # Register auto-transcribe hotkey (single press)
-            self.hotkey_manager.register_hotkey(
-                name="auto_transcribe",
-                keys=self.config.hotkey_auto_transcribe,
-                mode=HotkeyMode.SINGLE_PRESS,
-                callback_press=lambda: self._handle_hotkey_press("auto_transcribe"),
+            _register(
+                "auto_transcribe",
+                self.config.hotkey_auto_transcribe,
+                HotkeyMode.SINGLE_PRESS,
+                lambda: self._handle_hotkey_press("auto_transcribe"),
                 priority=3,  # Highest priority since it has most keys
                 description="Auto-stop transcription",
             )
 
             # Register command hotkey (single press, stop on silence)
-            self.hotkey_manager.register_hotkey(
-                name="command",
-                keys=self.config.hotkey_command,
-                mode=HotkeyMode.SINGLE_PRESS,
-                callback_press=lambda: self._handle_hotkey_press("command"),
+            _register(
+                "command",
+                self.config.hotkey_command,
+                HotkeyMode.SINGLE_PRESS,
+                lambda: self._handle_hotkey_press("command"),
                 priority=2,  # Higher than transcribe since it has more keys
                 description="Single-press command dictation (stop on silence)",
             )
+            if refused:
+                log(f"[DAEMON] Refused broken hotkeys: {refused}")
+                self.notify("A hotkey needs a key beyond the modifiers - "
+                            "re-set it in Settings")
 
             # Set up escape key handling for canceling recordings
             self.hotkey_manager._handle_escape_key = self.cancel_recording

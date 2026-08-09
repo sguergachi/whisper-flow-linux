@@ -335,12 +335,39 @@ def _load_css(provider, css: bytes):
         provider.load_from_data(css)
 
 
-def _gdk_key_to_hotkey_part(keyval: int) -> str | None:
+# Keysyms for "switch input source". Most Linux layouts and input methods
+# bind Ctrl+Shift+Space (and friends) to this, and deliver the keysym instead
+# of the space it was pressed on. Without this the capture records only
+# "ctrl+shift", which is a shortcut that fires on every Ctrl+Shift chord.
+_GROUP_SWITCH_KEYSYMS = frozenset({
+    Gdk.KEY_ISO_Next_Group,
+    Gdk.KEY_ISO_Prev_Group,
+    Gdk.KEY_ISO_First_Group,
+    Gdk.KEY_ISO_Last_Group,
+    Gdk.KEY_ISO_Group_Latch,
+    Gdk.KEY_ISO_Group_Shift,
+    Gdk.KEY_Multi_key,
+})
+
+
+def _state_has_modifier(state: int) -> bool:
+    """Whether the GDK state holds any modifier meaningful to a hotkey."""
+    mask = (Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK
+            | Gdk.ModifierType.ALT_MASK | Gdk.ModifierType.SUPER_MASK
+            | Gdk.ModifierType.META_MASK | Gdk.ModifierType.HYPER_MASK
+            | Gdk.ModifierType.LOCK_MASK)
+    return bool(int(state) & int(mask))
+
+
+def _gdk_key_to_hotkey_part(keyval: int, state: int = 0) -> str | None:
     """Map a GDK keyval to the config name the hotkey listeners understand.
 
     Returns None for keys that cannot be part of a binding (unknown, pure
     dead keys, etc.). Modifiers and a-z / 0-9 / F-keys / a few named keys
     match what hotkey_evdev and hotkey_win parse.
+
+    `state` is the GDK modifier mask from the same event. It decides what
+    the layout-switch keysyms stand for: see _GROUP_SWITCH_KEYSYMS.
     """
     keyval = Gdk.keyval_to_lower(keyval)
     if keyval in (Gdk.KEY_Control_L, Gdk.KEY_Control_R):
@@ -356,6 +383,16 @@ def _gdk_key_to_hotkey_part(keyval: int) -> str | None:
     if keyval in (Gdk.KEY_Meta_L, Gdk.KEY_Meta_R):
         return "super"
     if keyval == Gdk.KEY_space:
+        return "space"
+    # Layout-switch keysyms. On Linux, Ctrl+Shift+Space is most layouts' and
+    # input methods' "switch input source" shortcut, and by the time the key
+    # arrives here it has already been turned into ISO_Next_Group or one of
+    # its siblings - so the capture would silently record "ctrl+shift" and
+    # the user would save a shortcut that fires on every Ctrl+Shift chord.
+    # With a modifier held the physical key behind these is space, which is
+    # the chord the user is actually recording. Without one they are a plain
+    # layout toggle and stay unrecordable.
+    if keyval in _GROUP_SWITCH_KEYSYMS and _state_has_modifier(state):
         return "space"
     if keyval in (Gdk.KEY_Escape,):
         return "escape"
@@ -484,18 +521,29 @@ def _list_input_devices() -> list[tuple[int, str]]:
     """
     try:
         import pyaudio
-        pa = pyaudio.PyAudio()
+        try:
+            pa = pyaudio.PyAudio()
+        except Exception as e:
+            log(f"[SETTINGS] could not open the audio system: {e}")
+            return []
         try:
             devices = []
-            for i in range(pa.get_device_count()):
-                info = pa.get_device_info_by_index(i)
-                if int(info.get("maxInputChannels", 0)) <= 0:
+            count = pa.get_device_count()
+            for i in range(count):
+                # A device that vanishes mid-enumeration (unplugged headset,
+                # dead Bluetooth) raises from get_device_info_by_index; one
+                # missing row must not lose the whole list.
+                try:
+                    info = pa.get_device_info_by_index(i)
+                    if int(info.get("maxInputChannels", 0)) <= 0:
+                        continue
+                    api = _host_api_name(pa, info)
+                    if not _host_api_supported(api):
+                        continue
+                    name = str(info.get("name", f"device {i}"))
+                    devices.append((i, f"{name} ({api})" if api else name))
+                except Exception:
                     continue
-                api = _host_api_name(pa, info)
-                if not _host_api_supported(api):
-                    continue
-                name = str(info.get("name", f"device {i}"))
-                devices.append((i, f"{name} ({api})" if api else name))
             return devices
         finally:
             pa.terminate()
@@ -803,6 +851,7 @@ class SettingsWindow(Adw.ApplicationWindow):
         self._download_buttons: list[Gtk.Button] = []
         self._progress_bars: dict[str, Gtk.ProgressBar] = {}
         self._last_toast_title = ""
+        self._last_error_dialog = None
         self._blur = None
 
         Adw.StyleManager.get_default().set_color_scheme(
@@ -1549,24 +1598,33 @@ class SettingsWindow(Adw.ApplicationWindow):
         held: set[str] = set()
 
         def pressed(_controller, keyval, _keycode, _state):
-            part = _gdk_key_to_hotkey_part(keyval)
-            if part is None:
-                return True             # swallow unknowns; do not type junk
-            if part in ("escape", "backspace"):
-                held.clear()
-                row.set_text("")
+            try:
+                part = _gdk_key_to_hotkey_part(keyval, _state)
+                if part is None:
+                    return True         # swallow unknowns; do not type junk
+                if part in ("escape", "backspace"):
+                    held.clear()
+                    row.set_text("")
+                    return True
+                # First key after a full release starts a new combination.
+                if not held:
+                    held.clear()
+                held.add(part)
+                row.set_text(settings_def.format_hotkey(held))
+                return True             # do not let EntryRow insert a letter
+            except Exception as e:
+                # Nothing in capture may take the window down; a chord that
+                # crashes its own formatter leaves the row as it was.
+                log(f"[SETTINGS] hotkey capture error: {e}")
                 return True
-            # First key after a full release starts a new combination.
-            if not held:
-                held.clear()
-            held.add(part)
-            row.set_text(settings_def.format_hotkey(held))
-            return True                 # do not let EntryRow insert a letter
 
         def released(_controller, keyval, _keycode, _state):
-            part = _gdk_key_to_hotkey_part(keyval)
-            if part is not None:
-                held.discard(part)
+            try:
+                part = _gdk_key_to_hotkey_part(keyval, _state)
+                if part is not None:
+                    held.discard(part)
+            except Exception as e:
+                log(f"[SETTINGS] hotkey release error: {e}")
             # Text stays at the last full chord so modifiers-only shortcuts
             # (super+alt) survive letting go of every key.
             return True
@@ -1774,7 +1832,8 @@ class SettingsWindow(Adw.ApplicationWindow):
             self._mic_meter_error = None
         self._mic_meter.set_level(level)
         if error:
-            self._toast(error)
+            self._toast_error("Microphone test failed", error,
+                              on_retry=self._start_mic_test)
             self._stop_mic_test()
             return False
         return True
@@ -2064,6 +2123,71 @@ class SettingsWindow(Adw.ApplicationWindow):
         self._last_toast_title = message
         self._toasts.add_toast(toast)
 
+    def _copy_text(self, text: str) -> bool:
+        """Put `text` on the system clipboard, best effort.
+
+        Through a content provider rather than Gdk.Clipboard.set(), which is
+        a varargs C convenience with no binding: the introspected pair is
+        what every GTK4 version here offers (same as _copy_version).
+        """
+        try:
+            display = self.get_display()
+            if display is None:
+                return False
+            provider = Gdk.ContentProvider.new_for_value(
+                GObject.Value(str, text))
+            display.get_clipboard().set_content(provider)
+            return True
+        except Exception as e:
+            log(f"[SETTINGS] could not copy to clipboard: {e}")
+            return False
+
+    def _toast_error(self, title: str, detail: str | None = None,
+                     on_retry=None) -> None:
+        """Report a failure with Copy error and Retry, and copy it anyway.
+
+        A toast holds one button, which is never enough for an error somebody
+        might need to send to a bug tracker and might need to try again.
+        Where libadwaita has a message dialog there is room for both; the
+        details go on the clipboard regardless, so the failure survives even
+        if the dialog is dismissed and whatever else is on the clipboard
+        replaces it. On a libadwaita too old for MessageDialog the toast
+        keeps the single button - Retry when there is something to retry -
+        and the "(details copied to clipboard)" suffix says where the story
+        went.
+        """
+        self._last_toast_title = title
+        message = detail or title
+        copied = self._copy_text(message)
+        self._last_error_dialog = None
+        if getattr(Adw, "MessageDialog", None) is not None:
+            dialog = Adw.MessageDialog.new(self, title, message)
+            dialog.add_response("close", "Close")
+            dialog.set_default_response("close")
+            if on_retry is not None:
+                dialog.add_response("retry", "Retry")
+                dialog.set_response_appearance(
+                    "retry", Adw.ResponseAppearance.SUGGESTED)
+            dialog.add_response("copy", "Copy error")
+
+            def on_response(_dialog, response):
+                if response == "retry":
+                    on_retry()
+                elif response == "copy":
+                    if self._copy_text(message):
+                        self._toast("Error copied to clipboard")
+                _dialog.close()
+
+            dialog.connect("response", on_response)
+            self._last_error_dialog = dialog
+            dialog.present()
+            return
+        suffix = " (details copied to clipboard)" if copied else ""
+        self._toast(f"{title}{suffix}",
+                    button="Retry" if on_retry is not None else None,
+                    on_button=on_retry)
+
+
     def _on_cancel(self):
         """Throw away unsaved edits and put the rows back to the last save.
 
@@ -2167,10 +2291,9 @@ class SettingsWindow(Adw.ApplicationWindow):
             # File is on disk; only the restart failed.
             self._current = values
             self._current_model = model or self._current_model
-            self._toast(
+            self._toast_error(
                 f"Saved, but could not restart: {detail}",
-                button="Retry",
-                on_button=lambda: self._restart_daemon(
+                on_retry=lambda: self._restart_daemon(
                     toast_start="Restarting...",
                     toast_ok="Restarted.",
                     toast_fail_prefix="Could not restart",
@@ -2181,7 +2304,7 @@ class SettingsWindow(Adw.ApplicationWindow):
 
     def _save_write_failed(self, detail: str) -> None:
         """Write never landed: keep edits dirty and tell the user why."""
-        self._toast(f"Could not save: {detail}")
+        self._toast_error(f"Could not save: {detail}", on_retry=self._on_save)
         # Banner was hidden for the attempt; dirty poll would re-show it on
         # the next tick, but re-evaluate now so the failure is obvious.
         try:
@@ -2215,30 +2338,27 @@ class SettingsWindow(Adw.ApplicationWindow):
         def done(ok, result):
             self._working = False
             if not ok:
-                self._toast(
+                self._toast_error(
                     f"{toast_fail_prefix}: {_format_error(result)}",
-                    button="Retry",
-                    on_button=lambda: self._restart_daemon(
+                    on_retry=lambda: self._restart_daemon(
                         toast_start, toast_ok, toast_fail_prefix),
                 )
                 return
             try:
                 restart_ok, detail = result
             except (TypeError, ValueError):
-                self._toast(
+                self._toast_error(
                     f"{toast_fail_prefix}: {_format_error(result)}",
-                    button="Retry",
-                    on_button=lambda: self._restart_daemon(
+                    on_retry=lambda: self._restart_daemon(
                         toast_start, toast_ok, toast_fail_prefix),
                 )
                 return
             if restart_ok:
                 self._toast(toast_ok)
             else:
-                self._toast(
+                self._toast_error(
                     f"{toast_fail_prefix}: {detail}",
-                    button="Retry",
-                    on_button=lambda: self._restart_daemon(
+                    on_retry=lambda: self._restart_daemon(
                         toast_start, toast_ok, toast_fail_prefix),
                 )
 
@@ -2276,7 +2396,7 @@ class SettingsWindow(Adw.ApplicationWindow):
             self._model_checks[model].set_active(True)
             self._toast(f"Got {model.replace('ggml-', '')} - Save to use it.")
         elif err:
-            self._toast(f"Download failed: {err}")
+            self._toast_error(f"Download failed: {err}")
         else:
             self._toast("Download failed - check the connection.")
 

@@ -72,7 +72,11 @@ def set_device(
         typer.echo("PyAudio not available")
         raise typer.Exit(1)
 
-    pa = pyaudio.PyAudio()
+    try:
+        pa = pyaudio.PyAudio()
+    except Exception as e:
+        typer.echo(f"Could not open the audio system: {e}")
+        raise typer.Exit(1)
     try:
         # Global PortAudio indices, matching what the recorder passes to
         # pa.open() - numbering them per host API stored a value that named
@@ -80,7 +84,11 @@ def set_device(
         if device_index < 0 or device_index >= pa.get_device_count():
             typer.echo("Invalid device index. Use 'whisper-flow list-devices' to see available devices.")
             raise typer.Exit(1)
-        dev = pa.get_device_info_by_index(device_index)
+        try:
+            dev = pa.get_device_info_by_index(device_index)
+        except Exception as e:
+            typer.echo(f"Could not read device [{device_index}]: {e}")
+            raise typer.Exit(1)
         if dev.get("maxInputChannels", 0) == 0:
             typer.echo(f"Device [{device_index}] is not an input device.")
             raise typer.Exit(1)
@@ -106,12 +114,19 @@ def list_devices(config_dir: ConfigDirOption = None):
         typer.echo("PyAudio not available")
         return
 
-    pa = pyaudio.PyAudio()
+    try:
+        pa = pyaudio.PyAudio()
+    except Exception as e:
+        typer.echo(f"Could not open the audio system: {e}")
+        return
     try:
         typer.echo("Available audio input devices:")
         typer.echo("─" * 50)
         for i in range(pa.get_device_count()):
-            dev = pa.get_device_info_by_index(i)
+            try:
+                dev = pa.get_device_info_by_index(i)
+            except Exception:
+                continue            # vanished mid-enumeration; skip the row
             if dev.get("maxInputChannels", 0) > 0:
                 name = dev.get("name", "Unknown")
                 channels = dev.get("maxInputChannels", 0)

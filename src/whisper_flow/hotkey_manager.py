@@ -57,6 +57,15 @@ class HotkeyBinding:
     description: str = ""
 
 
+# Single-press bindings of one or two modifiers fire on every chord that
+# holds them - Ctrl+Shift is held by dozens of shortcuts - so the daemon
+# must not run one. Push-to-talk is exempt (holding a modifier pair is its
+# design), and so are three-modifier chords: ctrl+super+alt is the shipped
+# command hotkey and is distinctive enough to be real.
+_MODS_ONLY = frozenset({"ctrl", "cmd", "alt", "shift"})
+_MAX_SAFE_MODIFIER_ONLY_KEYS = 2
+
+
 class HotkeyManager:
     """Simple, robust hotkey manager with minimal complexity."""
 
@@ -143,8 +152,22 @@ class HotkeyManager:
             priority: Priority for conflict resolution (higher = checked first)
             description: Human-readable description
 
+        Returns:
+            True when the binding was registered, False when it was refused
+            (a single-press combination with no key beyond the modifiers).
+
         """
         key_set = self._parse_hotkey_combination(keys)
+        mods_only = bool(key_set) and key_set <= _MODS_ONLY
+        if (mode == HotkeyMode.SINGLE_PRESS and mods_only
+                and len(key_set) <= _MAX_SAFE_MODIFIER_ONLY_KEYS):
+            # Nothing non-modifier in the chord (the layout-switch shortcut
+            # eating the Space during capture is the usual cause). Registering
+            # it would fire on every Ctrl+Shift chord the user types, so it
+            # is refused rather than run.
+            log(f"[HOTKEY] Refusing modifiers-only single-press hotkey "
+                f"'{name}': {keys} - needs a key beyond the modifiers")
+            return False
         binding = HotkeyBinding(
             keys=key_set,
             mode=mode,
@@ -157,6 +180,7 @@ class HotkeyManager:
         log(
             f"[HOTKEY] Registered hotkey '{name}': {keys} ({mode.value}) - keys: {key_set}",
         )
+        return True
 
     def start(self) -> None:
         """Start the hotkey listener."""

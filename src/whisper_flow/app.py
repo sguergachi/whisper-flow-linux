@@ -686,9 +686,14 @@ class WhisperFlow:
         try:
             inputs = []
             for i in range(pa.get_device_count()):
-                info = pa.get_device_info_by_index(i)
-                if int(info.get("maxInputChannels", 0)) > 0:
-                    inputs.append(info.get("name", f"device {i}"))
+                # A device that vanished mid-enumeration raises; one missing
+                # row must not fail the whole check.
+                try:
+                    info = pa.get_device_info_by_index(i)
+                    if int(info.get("maxInputChannels", 0)) > 0:
+                        inputs.append(info.get("name", f"device {i}"))
+                except Exception:
+                    continue
 
             if inputs:
                 chosen = self.config.mic_device_index

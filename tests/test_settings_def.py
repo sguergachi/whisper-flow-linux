@@ -120,6 +120,31 @@ def test_validate_rejects_a_hotkey_with_an_empty_part():
     assert "empty key name" in problem
 
 
+def test_validate_rejects_a_two_modifier_single_press_hotkey():
+    """ctrl+shift is held by dozens of shortcuts; it must never be a
+    single-press binding (the usual cause is the layout-switch shortcut
+    eating the Space out of Ctrl+Shift+Space during capture)."""
+    problem = settings_def.validate({"hotkey_auto_transcribe": "ctrl+shift"})
+    assert "beyond the modifiers" in problem
+    problem = settings_def.validate({"hotkey_command": "alt+shift"})
+    assert "beyond the modifiers" in problem
+    problem = settings_def.validate({"hotkey_command": "ctrl"})
+    assert "beyond the modifiers" in problem
+
+
+def test_validate_allows_three_modifier_single_press_hotkeys():
+    """ctrl+super+alt is the shipped command hotkey: three modifiers are
+    distinctive enough to be a real shortcut, and it must stay saveable."""
+    assert settings_def.validate({"hotkey_command": "ctrl+super+alt"}) is None
+
+
+def test_validate_allows_the_modifiers_only_push_to_talk_default():
+    """super+alt push-to-talk is the shipped default; it must stay saveable."""
+    assert settings_def.validate({"hotkey_transcribe": "super+alt"}) is None
+    assert settings_def.validate(
+        {"hotkey_auto_transcribe": "ctrl+shift+space"}) is None
+
+
 def test_format_hotkey_orders_modifiers_then_keys():
     assert settings_def.format_hotkey({"k", "alt", "ctrl"}) == "ctrl+alt+k"
     assert settings_def.format_hotkey(["super", "alt"]) == "super+alt"

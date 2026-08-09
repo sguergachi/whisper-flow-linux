@@ -38,7 +38,7 @@ if scenario == "mic_race":
 import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import GLib, Gtk, Pango
+from gi.repository import GLib, Gtk, Gdk, Pango
 
 from whisper_flow import settings_def, settings_gtk
 
@@ -154,6 +154,42 @@ elif scenario == "save_restart_fail":
     # Values are committed (file on disk); dirty strip stays clear.
     assert abs(w._rows["live_interval"].get_value() - 1.4) < 1e-6
     assert not w._banner.get_revealed()
+elif scenario == "restart_fail_dialog":
+    # The same failure now offers Copy error and Retry, and the toast title
+    # the old surface used is still the one reported.
+    settings_gtk.restart.restart_daemon = lambda: (False, "unit missing")
+    w._rows["live_interval"].set_value(1.4)
+    w._on_save()
+    assert pump(lambda: not w._working), "async save never finished"
+    assert "could not restart" in (w._last_toast_title or "").lower()
+    dialog = w._last_error_dialog
+    assert dialog is not None, "no error dialog after a failed restart"
+    assert dialog.has_response("retry"), "dialog lost the Retry button"
+    assert dialog.has_response("copy"), "dialog lost the Copy error button"
+    assert "unit missing" in (dialog.get_body() or "")
+elif scenario == "capture_group_switch":
+    # Linux delivers Ctrl+Shift+Space as ISO_Next_Group (the layout-switch
+    # shortcut) while the modifiers are held; the capture must still record
+    # the space, or the user saves "ctrl+shift" and every Ctrl+Shift chord
+    # starts a dictation. Without a modifier held the keysym stays a plain
+    # layout toggle and is not recorded at all.
+    row = w._rows["hotkey_transcribe"]
+    controller = None
+    for c in row.observe_controllers():
+        if isinstance(c, Gtk.EventControllerKey):
+            controller = c
+            break
+    assert controller is not None, "hotkey row has no key controller"
+    held = (Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK)
+    controller.emit("key-pressed", Gdk.KEY_Control_L, 0,
+                    Gdk.ModifierType.CONTROL_MASK)
+    controller.emit("key-pressed", Gdk.KEY_Shift_L, 0, held)
+    controller.emit("key-pressed", Gdk.KEY_ISO_Next_Group, 0, held)
+    assert row.get_text() == "ctrl+shift+space", row.get_text()
+    # A layout toggle pressed on its own must not type junk or alter the
+    # recorded chord.
+    controller.emit("key-pressed", Gdk.KEY_ISO_Next_Group, 0, 0)
+    assert row.get_text() == "ctrl+shift+space", row.get_text()
 elif scenario == "cancel":
     # Discard unsaved edits without writing .env or restarting.
     w.present()
@@ -642,6 +678,19 @@ def test_a_failed_restart_still_keeps_the_saved_file(tmp_path):
     from whisper_flow import envfile
     assert envfile.get(tmp_path / ".env",
                        "WHISPER_FLOW_LIVE_INTERVAL") == "1.4"
+
+
+def test_a_failed_restart_offers_copy_error_and_retry(tmp_path):
+    """The error dialog carries the detail and both actions."""
+    result = _run(tmp_path, "restart_fail_dialog")
+    assert "OK" in result.stdout, result.stderr
+
+
+def test_hotkey_capture_survives_the_layout_switch_keysym(tmp_path):
+    """Ctrl+Shift+Space arrives as ISO_Next_Group on Linux and must still
+    capture as ctrl+shift+space, never as the broken ctrl+shift."""
+    result = _run(tmp_path, "capture_group_switch")
+    assert "OK" in result.stdout, result.stderr
 
 
 def test_cancel_discards_unsaved_changes(tmp_path):

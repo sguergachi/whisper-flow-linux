@@ -281,6 +281,28 @@ def validate_hotkey(value: str) -> str | None:
     return None
 
 
+# Keys that never do anything on their own. A single-press hotkey made of
+# nothing else fires on every chord that happens to hold them - Ctrl+Shift
+# is held by dozens of shortcuts - so it can never be useful and feels like
+# the app is dictating on its own. Push-to-talk is exempt: holding a
+# modifier pair is its design (the default is super+alt). Three modifiers
+# are exempt too: ctrl+super+alt is the shipped command hotkey, and a
+# three-modifier chord is distinctive enough to be a real shortcut.
+_MODIFIER_KEYS = frozenset({"ctrl", "super", "alt", "shift", "cmd", "win",
+                            "meta", "control"})
+
+# Two modifiers is how broken captures come out - the layout-switch
+# shortcut eats the Space out of Ctrl+Shift+Space and leaves Ctrl+Shift.
+_MAX_SAFE_MODIFIER_ONLY_KEYS = 2
+
+
+def _modifier_only_count(parts: set) -> int:
+    """How many of a chord's keys are modifiers (0 when any is not)."""
+    if parts - _MODIFIER_KEYS:
+        return 0
+    return len(parts)
+
+
 def validate(values: dict) -> str | None:
     """The first thing wrong with these values, or None if they can be saved."""
     for field in FIELDS:
@@ -302,4 +324,15 @@ def validate(values: dict) -> str | None:
             problem = validate_hotkey(raw)
             if problem:
                 return f"{field.label}: {problem}"
+            # A single-press binding of one or two modifiers fires on every
+            # chord that holds them (Ctrl+Shift+T, Ctrl+Shift+N...). The
+            # usual cause is the layout-switch shortcut swallowing the
+            # non-modifier key during capture, so this is the net that
+            # catches what the capture could not.
+            if field.key != "hotkey_transcribe":
+                parts = {p.strip().lower() for p in raw.split("+")}
+                mods = _modifier_only_count(parts)
+                if 0 < mods <= _MAX_SAFE_MODIFIER_ONLY_KEYS:
+                    return (f"{field.label}: needs a key beyond the "
+                            f"modifiers (try {raw}+space)")
     return None

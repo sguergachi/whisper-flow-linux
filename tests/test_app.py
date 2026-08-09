@@ -458,6 +458,68 @@ def test_a_recording_that_transcribes_is_not_retried(tmp_path):
     assert len(attempts) == 1        # the retry costs a pass; do not spend it
 
 
+def test_cold_open_silence_is_skipped_before_boosting_the_raw(tmp_path):
+    """A cold-opened stream starts with ~0.4s of exact digital silence. The
+    raw boost retry must cut that silence before amplifying: boosting it
+    alongside the voice only raises the noise floor, and the whisper-lift
+    path the silence previously forced amplifies a music bed into the
+    transcript instead of the words."""
+    import wave
+
+    import numpy as np
+
+    from whisper_flow import app as app_module
+    from whisper_flow import audio_debug
+
+    # A capture that opens with digital silence, then holds a quiet voice.
+    rng = np.random.default_rng(23)
+    n = int(16000 * 2.5)
+    audio = np.zeros(n)
+    audio[int(0.4 * 16000):] = rng.normal(0, 150, n - int(0.4 * 16000))
+    t = np.arange(int(1.2 * 16000)) / 16000
+    start = int(0.8 * 16000)
+    audio[start:start + t.size] += np.sin(2 * np.pi * 220 * t) * 600
+    samples = np.clip(audio, -32768, 32767).astype(np.int16)
+
+    last = audio_debug.last_dir(tmp_path)
+    last.mkdir(parents=True, exist_ok=True)
+    for name in ("raw_untrimmed.wav", "raw_trimmed.wav"):
+        with wave.open(str(last / name), "wb") as f:
+            f.setnchannels(1)
+            f.setsampwidth(2)
+            f.setframerate(16000)
+            f.writeframes(samples.tobytes())
+
+    boosted = tmp_path / "audio_file.wav"
+    with wave.open(str(boosted), "wb") as f:
+        f.setnchannels(1)
+        f.setsampwidth(2)
+        f.setframerate(16000)
+        f.writeframes(samples.tobytes())
+
+    seen = {}
+
+    class Service:
+        def transcribe_audio(self, path, **kw):
+            with wave.open(path, "rb") as f:
+                got = np.frombuffer(f.readframes(f.getnframes()),
+                                    dtype=np.int16)
+            seen["data"] = got
+            return "recovered words"
+
+    flow = app_module.WhisperFlow.__new__(app_module.WhisperFlow)
+    flow.config = Mock(config_dir=tmp_path, smart_voice_amplification=True)
+    flow.transcription_service = Service()
+
+    assert flow._retry_boost_raw(str(boosted)) == "recovered words"
+    # The boosted wav is a plain peak-normalised copy of the capture with
+    # the leading digital silence removed - not the smart-voice output.
+    got = seen["data"]
+    assert int(np.abs(got).max()) > 10000
+    # 2.5s of capture minus the 0.4s of cold-open digital silence.
+    assert got.size < int(16000 * 2.2)
+
+
 def test_a_silent_recording_is_not_retried(tmp_path):
     """Amplifying a noise floor wastes a pass to produce louder noise."""
     import wave

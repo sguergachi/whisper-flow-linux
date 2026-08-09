@@ -54,8 +54,21 @@ class WhisperFlow:
             self._finalize_audio_debug(transcript=text)
             return text
 
-        # Blank / *sad music* means Whisper never heard the voice. Lift the
-        # quiet speech (gate room → amplify voiced frames) before raw boost.
+        # Blank / *sad music* means Whisper never heard the voice. First try
+        # a plain peak-normalised boost of the *raw* capture - not of
+        # audio_file, which is already the smart-voice output and so reads as
+        # loud enough for needs_boost to refuse - with the cold-open leading
+        # digital silence skipped. That silence makes the floor read as a
+        # dead-silent room, sends the clip down the whisper-lift path, and in
+        # a room with music the 40x speech-frame gain then amplifies the music
+        # bed into the transcript.
+        boosted = self._retry_boost_raw(audio_file)
+        if boosted:
+            self._finalize_audio_debug(transcript=text, boost_transcript=boosted)
+            return boosted
+
+        # Quiet-whisper in a genuinely silent room: gate room -> lift voiced
+        # frames before the plain boost that amplifies the room with it.
         lifted = self._retry_whisper_lift(audio_file)
         if lifted:
             self._finalize_audio_debug(transcript=text, boost_transcript=lifted)
@@ -102,6 +115,83 @@ class WhisperFlow:
             boost_transcript=boost_text or rescued_text,
         )
         return boost_text
+
+    def _retry_boost_raw(self, audio_file: str) -> str | None:
+        """Boost the raw capture, skipping the cold-open leading silence.
+
+        A freshly opened capture stream delivers ~0.3-0.5s of exact digital
+        silence while the device wakes up. That silence is what made the
+        noise floor read as a dead-silent room (``floor_rms: 0.0`` in every
+        failed capture, ``> 0`` in every successful one), which then pushed
+        the smart-voice plan into whisper-lift - and in a room with music the
+        40x speech-frame gain amplifies the music bed into the transcript.
+
+        Boosting the raw audio without that silence keeps the voice/music
+        ratio as the mic heard it, and is what actually recovers the words.
+        """
+        config = getattr(self, "config", None)
+        if config is None:
+            return None
+        try:
+            import wave as _wave
+
+            last = audio_debug.last_dir(config.config_dir)
+            source = last / "raw_untrimmed.wav"
+            if not source.is_file():
+                source = last / "raw_trimmed.wav"
+            if not source.is_file():
+                source = Path(audio_file)
+            with _wave.open(str(source), "rb") as wf:
+                rate = wf.getframerate()
+                channels = wf.getnchannels()
+                width = wf.getsampwidth()
+                pcm = wf.readframes(wf.getnframes())
+            import numpy as np
+
+            samples = np.frombuffer(pcm, dtype=np.int16)
+            if samples.size == 0:
+                return None
+            # Skip the cold-open digital silence: it is not room tone, and
+            # boosting it alongside the voice only raises the noise floor.
+            frame = max(1, int(rate * 0.02))
+            usable = samples.size - (samples.size % frame)
+            blocks = samples[:usable].reshape(-1, frame).astype(np.float64)
+            levels = np.sqrt((blocks ** 2).mean(axis=1))
+            first = np.nonzero(levels > 10.0)[0]
+            start = first[0] * frame if first.size else 0
+            clean = samples[start:]
+
+            clean_path = f"{audio_file}.clean.wav"
+            with _wave.open(clean_path, "wb") as wf:
+                wf.setnchannels(channels)
+                wf.setsampwidth(width)
+                wf.setframerate(rate)
+                wf.writeframes(clean.tobytes())
+            louder = f"{audio_file}.boosted.wav"
+            try:
+                gain = boost_wav(clean_path, louder)
+                if not gain:
+                    return None
+                text = self.transcription_service.transcribe_audio(louder)
+                self._copy_debug_wav(louder, "boosted.wav")
+                if text:
+                    log(f"[BOOST] {len(text)} characters recovered from the "
+                        f"raw capture at {gain:.0f}x")
+                    return text
+                log(f"[BOOST] still nothing after {gain:.0f}x on the raw capture")
+                return None
+            finally:
+                try:
+                    Path(clean_path).unlink()
+                except Exception:
+                    pass
+                try:
+                    Path(louder).unlink()
+                except Exception:
+                    pass
+        except Exception as e:
+            log(f"[BOOST] raw retry failed: {e}")
+            return None
 
     def _retry_whisper_lift(self, audio_file: str) -> str | None:
         """Gate the room, then lift quiet speech — for missed whispers.

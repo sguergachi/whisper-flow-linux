@@ -194,6 +194,32 @@ def test_floor_recovers_when_speech_starts_at_hud():
         f"opening {opening:.0f}")
 
 
+def test_cold_open_silence_must_not_zero_the_floor():
+    """A freshly opened capture stream starts with ~0.4s of exact digital
+    silence. That is device warm-up, not a dead-silent room: the floor must
+    come from the room tone in the rest of the clip, or the smart-voice plan
+    amplifies a music bed into the transcript.
+    """
+    rng = np.random.default_rng(17)
+    n = RATE * 3
+    # 400ms of exact digital silence (cold stream warm-up), then a noisy room.
+    audio = np.zeros(n)
+    audio[int(0.4 * RATE):] = rng.normal(0, 300, n - int(0.4 * RATE))
+    samples = np.clip(audio, -32768, 32767).astype(np.int16)
+
+    opening = denoise.measure_floor(samples, RATE, strategy="opening")
+    whole = denoise.measure_floor(samples, RATE, strategy="full")
+    adaptive = denoise.measure_floor(samples, RATE)
+    assert opening < 0.01, f"opening should be digital silence, got {opening:.2f}"
+    assert adaptive == whole, (
+        f"adaptive floor {adaptive:.2f} must fall back to the room floor "
+        f"{whole:.2f} instead of the warm-up silence")
+    # And the ordinary adaptive behaviour is untouched when the opening
+    # actually has room tone.
+    warm = np.clip(rng.normal(0, 300, n), -32768, 32767).astype(np.int16)
+    assert denoise.measure_floor(warm, RATE) > 1.0
+
+
 def test_low_snr_can_latch_after_minimum_audio():
     noisy, _ = _cafe_whisper(seconds=1.0)
     assert not denoise.is_low_snr(

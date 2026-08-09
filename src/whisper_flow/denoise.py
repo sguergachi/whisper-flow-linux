@@ -214,6 +214,15 @@ def measure_floor(samples: np.ndarray, rate: int,
         return opening
     if strategy == "full":
         return whole
+    # A cold-opened capture stream delivers ~0.3-0.5s of exact digital silence
+    # while the device wakes up, so an opening of pure zeros must not be read
+    # as "a dead-silent room" - the room's floor is in the rest of the clip,
+    # and treating it as zero sent the smart-voice plan down the whisper-lift
+    # path, which then amplified the music bed into the transcript. A warm
+    # stream's opening carries real room tone (~0.04+), so only an opening
+    # that is (near-)digital silence is overridden by the whole clip.
+    if opening < 0.01 and whole > opening * 10:
+        return whole
     # adaptive
     return float(min(opening, whole))
 

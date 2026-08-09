@@ -24,14 +24,23 @@ def _normalize(text: str | None) -> str:
 
 
 # Non-speech tags Whisper invents on over-amplified room noise / music beds.
-# Treat as blank so the caller can retry milder processing.
+# Treat as blank so the caller can retry milder processing. The greedy pass
+# labels a voice-over-music clip "[MUSIC]", and a re-roll at higher
+# temperature often recovers the words - so every tag must be caught here or
+# the retry pastes "*(laughing)*" as if it were dictation.
 _HALLUCINATION = re.compile(
     r"^[\s\*\[\(\{\"']*"
-    r"(blank[_\s-]?audio|music|sad music|upbeat music|applause|laughter|"
-    r"silence|inaudible|inaudible\.|coughing|breathing|background noise|"
-    r"speaking in foreign language|foreign language|thank you\.?|thanks for watching\.?|"
-    r"subscribe|you$)"
-    r"[\s\*\]\)\}\"']*$",
+    r"(blank[_\s-]?audio|music|sad music|upbeat music|music playing|"
+    r"applause|applaud|applauding|laughter|laughing|laughs|chuckling|"
+    r"giggling|mumbling|mumbles|muffled|muffled voices|muffled speaking|"
+    r"chattering|chatter|whistling|singing|humming|clapping|clicking|"
+    r"beeping|tones|tone|feedback|static|noise|background noise|"
+    r"off-mic|off mic|conversation|crowd|audience|cheering|cheers|"
+    r"silence|inaudible|inaudible\.|coughing|cough|breathing|sigh|"
+    r"sniffing|speaking in foreign language|foreign language|"
+    r"thank you\.?|thanks for watching\.?|please subscribe( to my channel)?"
+    r"( for more)?\.?!?|subscribe|you$)"
+    r"[\s\*\]\)\}\"'.,!?]*$",
     re.IGNORECASE,
 )
 
@@ -45,13 +54,16 @@ def is_hallucination(text: str | None) -> bool:
         return True
     if _HALLUCINATION.match(t):
         return True
-    # Entirely bracketed/starred tags: *music*, [Music], (applause)
-    if re.fullmatch(r"[\*\[\(\s]*[A-Za-z ._-]+[\*\]\)\s]*", t) and len(t) < 40:
-        if re.search(
-                r"music|applause|laughter|silence|blank|inaudible|cough",
-                t, re.I):
-            return True
-    return False
+    # Words outside the brackets are dictation: "Keeps you going. [INAUDIBLE]"
+    # is words plus one trailing tag, and the words must be kept. A transcript
+    # that is entirely tags - *(laughing)*, [Music], (muffled voices),
+    # [SOUND], [CLICK] [INAUDIBLE] - is never dictation, whatever the tag
+    # says. Whisper invents unbounded tag words for nature beds ([birdsong],
+    # [wind], [SOUND]...), so no keyword list can close the set.
+    outside = re.sub(r"[\*\[\(\{][^\]\)\}]*[\*\]\)\}]", " ", t)
+    if re.search(r"[A-Za-z]", outside):
+        return False
+    return True
 
 
 # A recording can run to the configured maximum, and a CPU-only machine

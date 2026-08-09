@@ -54,21 +54,20 @@ class WhisperFlow:
             self._finalize_audio_debug(transcript=text)
             return text
 
-        # Blank / *sad music* means Whisper never heard the voice. First try
-        # a plain peak-normalised boost of the *raw* capture - not of
-        # audio_file, which is already the smart-voice output and so reads as
-        # loud enough for needs_boost to refuse - with the cold-open leading
-        # digital silence skipped. That silence makes the floor read as a
-        # dead-silent room, sends the clip down the whisper-lift path, and in
-        # a room with music the 40x speech-frame gain then amplifies the music
-        # bed into the transcript.
+        # Still nothing: a plain peak-normalised boost of the *raw* capture -
+        # not of audio_file, which is already the smart-voice output and so
+        # reads as loud enough for needs_boost to refuse - with the cold-open
+        # leading digital silence skipped. That silence makes the floor read
+        # as a dead-silent room, sends the clip down the whisper-lift path,
+        # and in a room with music the 40x speech-frame gain then amplifies
+        # the music bed into the transcript.
         boosted = self._retry_boost_raw(audio_file)
         if boosted:
             self._finalize_audio_debug(transcript=text, boost_transcript=boosted)
             return boosted
 
-        # Quiet-whisper in a genuinely silent room: gate room -> lift voiced
-        # frames before the plain boost that amplifies the room with it.
+        # Quiet-whisper in a genuinely silent room: gate room → amplify voiced
+        # frames before raw boost.
         lifted = self._retry_whisper_lift(audio_file)
         if lifted:
             self._finalize_audio_debug(transcript=text, boost_transcript=lifted)

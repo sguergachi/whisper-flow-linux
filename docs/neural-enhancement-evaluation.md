@@ -48,6 +48,24 @@ ever added, it belongs *last* in the rescue chain, gated by a setting,
 and only for the café-music case — with the DTLN "blank output" failure
 mode checked before any paste.
 
-Free wins that remain (no new deps): whisper.cpp server `--vad` (Silero
-VAD segment gating) and `--suppress-nst` (suppress non-speech tokens),
-neither currently enabled by the app.
+## Whisper.cpp server flags: tested, both are dead ends
+
+`--vad` (Silero) and `--suppress-nst` were also measured against the same
+captures (server v1.9.1, ggml-silero-v5.1.2 VAD, threshold sweep 0.10-0.50).
+
+* **`--vad`**: Silero VAD does not register whisper-level speech. The one
+  recoverable capture (13:06:14, "Keeps you going." via plain boost) comes
+  back empty at every threshold, while music beds still leak "Thank you."
+  fillers at the low thresholds that would let a whisper through. It
+  removes exactly the clips this app is built to recover.
+* **`--suppress-nst`**: worse than nothing. It replaces the bracketed
+  tags - `[APPLAUSE]`, `[MUSIC PLAYING]`, `[ Inaudible ]` - with word
+  fillers: "Thank you.", "I'm sorry, I'm sorry.", "Bye, guys. Bye. Bye."
+  The bracketed tags are caught and rejected by the app's
+  `is_hallucination`; the word fillers look like dictation and would be
+  pasted. 13:06:14 goes from "(muffled voices)" (rejected) to
+  "I'm sorry, I'm sorry." (pasted).
+
+Leave both flags off. The app's own webrtc VAD and the boost chain
+already do the only thing that works: keep the whisper's energy and gate
+on the client, then reject any all-bracket decode instead of pasting it.

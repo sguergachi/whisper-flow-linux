@@ -78,6 +78,12 @@ NORM_TARGET_PEAK = 0.70
 NORM_MAX_GAIN = 6.0
 # Leave headroom so speech-norm never rails int16 (clipping → garbage decode).
 NORM_CLIP_PEAK = 0.89
+# Plain fallback when a speech-frame lift failed to separate voice from room:
+# boost the raw high-passed capture to near full scale, preserving the
+# voice/room ratio the mic heard (measured: 30x plain gain recovered "Keeps
+# you going." where 40x whisper-lift returned [MUSIC]).
+PLAIN_BOOST_TARGET = 0.89
+PLAIN_BOOST_MAX_GAIN = 300.0
 
 # Dynamic plan thresholds (absolute int16 RMS / ratios).
 BASS_RATIO_SPEECH_BAND = 0.35   # bass share alone is not enough (see below)
@@ -95,6 +101,10 @@ SPEECH_P90_USABLE = 1200.0      # normal talking
 SPEECH_P90_WHISPER = 500.0      # quiet / whispered speech
 PEAK_USABLE = 1500.0
 PEAK_QUIET = 800.0
+# A whisper is quiet speech in a quiet room. Above this floor, a low p90 is a
+# voice *masked* by a bed (café music, nature ambience) - whisper-lift's 40x
+# gain would amplify the bed with the voice, and Whisper hears the bed.
+WHISPER_MAX_FLOOR = 80.0
 # Second pass: first output still not good enough for Whisper.
 SECOND_PASS_SNR_DB = 12.0
 SECOND_PASS_PEAK = 1200.0
@@ -600,17 +610,18 @@ def profile_signal(samples: np.ndarray, rate: int,
            or speech_snr < LOW_SNR_DB)
 
     # Quiet voice with real activity — needs gate-then-lift, not "clean/no-gain".
+    #
+    # A whisper is quiet speech in a *quiet* room. A low p90 over an elevated
+    # floor is a masked voice, not a whisper: the 40x speech-frame gain would
+    # amplify the bed with the voice and Whisper hears the bed ([MUSIC] over
+    # café music, [SOUND] over a nature bed). Those go to the rescue path
+    # (spectral subtraction + speech-band + capped gain) instead.
     is_whisper = (
         peak > NORM_DEAD_PEAK * 2
         and voiced_frac >= 0.06
         and speech_p90 < SPEECH_P90_WHISPER
         and speech_p90 > NORM_DEAD_PEAK
-    ) or (
-        # Whisper under elevated floor: speech barely clears room.
-        use_floor >= 80
-        and speech_p90 < max(SPEECH_P90_WHISPER, use_floor * 2.5)
-        and voiced_frac >= 0.05
-        and peak > NORM_DEAD_PEAK * 2
+        and use_floor < WHISPER_MAX_FLOOR
     )
 
     return SignalProfile(
@@ -860,6 +871,31 @@ def enhance(samples: np.ndarray, rate: int, *,
 
     if live:
         return out
+
+    # Verify the boost actually separated voice from room. Whisper-lift's
+    # 40x speech-frame gain is aimed at a quiet-room whisper; over a music
+    # or nature bed it amplifies the bed with the voice, and Whisper hears
+    # the bed ([MUSIC]/[SOUND] tags - the failure in every noisy-room
+    # report). If the output's speech p90 still sits close to its floor, the
+    # gain lifted the room, not the voice: fall back to a plain peak boost of
+    # the raw capture, which preserves the voice/room ratio as the mic heard
+    # it and is what actually recovers the words.
+    if plan.speech_norm and plan.normalize:
+        out_prof = profile_signal(out, rate, floor=profile.floor)
+        if out_prof.floor > 1 and out_prof.speech_p90 <= out_prof.floor * 3:
+            try:
+                from .logging import log
+                log(f"[VOICE] lift did not separate speech from room "
+                    f"(out p90={out_prof.speech_p90:.0f} floor="
+                    f"{out_prof.floor:.0f}); reverting to plain peak boost")
+            except Exception:
+                pass
+            plain, _ = high_pass(samples, rate, cutoff_hz=HIGHPASS_HZ)
+            plain_peak = float(np.abs(plain).max())
+            if plain_peak > 1:
+                gain = min(PLAIN_BOOST_MAX_GAIN,
+                           PLAIN_BOOST_TARGET * 32767.0 / plain_peak)
+                out = np.clip(plain * gain, -32768, 32767).astype(np.int16)
 
     if needs_second_pass(samples, out, rate, plan, profile.floor):
         plan2 = escalate_plan(plan, profile)

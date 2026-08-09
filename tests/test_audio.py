@@ -13,6 +13,8 @@ def _recorder() -> AudioRecorder:
     """A recorder with no audio system; the warm pool does not need one."""
     config = Mock()
     config.vad_mode = 2
+    config.frame_ms = 30
+    config.sample_rate = 16000
     with patch("whisper_flow.audio.pyaudio", None):
         return AudioRecorder(config, Mock())
 
@@ -109,3 +111,52 @@ def test_a_level_the_overlay_cannot_use_is_never_written(tmp_path):
 
     (value,) = struct.unpack("<i", path.read_bytes())
     assert 0 <= value <= 32767
+
+
+def test_cold_open_silence_is_skipped():
+    """A freshly opened stream delivers zeros, then a ramp: cut to the signal.
+
+    That silence made the floor read as a dead-silent room and the VAD's pad
+    kept it in the trimmed file, where it poisoned the first transcription.
+    """
+    import numpy as np
+
+    recorder = _recorder()
+    rate = 16000
+    frame = 480
+    rng = np.random.default_rng(4)
+    n = rate * 2
+    audio = np.zeros(n)
+    t = np.arange(n) / rate
+    span = (t >= 0.5) & (t < 1.6)
+    audio[span] = np.sin(2 * np.pi * 1800 * t[span]) * 80 + rng.normal(0, 30, span.sum())
+    audio = np.clip(audio, -32768, 32767).astype(np.int16)
+    frames = [audio[i:i+frame].tobytes() for i in range(0, len(audio)-frame+1, frame)]
+
+    skipped = recorder._skip_cold_open_silence(frames)
+    assert len(skipped) < len(frames)
+    first = np.frombuffer(skipped[0], dtype=np.int16)
+    assert abs(first).mean() > 30.0, "the signal onset must survive"
+
+
+def test_whisper_with_a_small_mean_is_not_wrongly_skipped():
+    """A genuine quiet whisper (frame mean ~50) must not look like warm-up."""
+    import numpy as np
+
+    recorder = _recorder()
+    rate = 16000
+    frame = 480
+    rng = np.random.default_rng(5)
+    n = rate * 2
+    # No cold-open zeros: the stream is warm, the whisper is just quiet.
+    audio = rng.normal(0, 8, n)
+    t = np.arange(n) / rate
+    span = (t >= 0.4) & (t < 1.6)
+    audio[span] += np.sin(2 * np.pi * 1800 * t[span]) * 40
+    audio = np.clip(audio, -32768, 32767).astype(np.int16)
+    frames = [audio[i:i+frame].tobytes() for i in range(0, len(audio)-frame+1, frame)]
+
+    skipped = recorder._skip_cold_open_silence(frames)
+    # Room tone at mean ~8 is below the 30 threshold: nothing should be cut,
+    # because the clip never had a warm-up to drop.
+    assert len(skipped) == len(frames)

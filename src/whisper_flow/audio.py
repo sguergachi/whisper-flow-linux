@@ -879,6 +879,34 @@ class AudioRecorder:
                 f"({(len(frames) - len(trimmed)) * self.config.frame_ms / 1000:.2f}s)")
         return trimmed
 
+    def _skip_cold_open_silence(self, frames: list) -> list:
+        """Drop the leading warm-up of a freshly opened capture stream.
+
+        A cold-opened WASAPI capture delivers ~0.3-0.5s of digital silence
+        (exact zeros, then a faint ramp) while the device wakes up. That is
+        not room tone - nothing was captured yet - and it made the adaptive
+        floor read as a dead-silent room (``floor_rms: 0.0`` in every failed
+        capture, ``> 0`` in every successful one). Cut to where the signal
+        actually starts; the VAD trim's own pad restores any needed lead-in.
+        """
+        try:
+            import numpy as np
+            frame = max(1, int(self.config.sample_rate * self.config.frame_ms / 1000))
+            frame_bytes = frame * 2
+            start = None
+            for index, buf in enumerate(frames):
+                if len(buf) < frame_bytes:
+                    continue
+                samples = np.frombuffer(buf[:frame_bytes], dtype=np.int16)
+                if abs(samples.astype(np.float64)).mean() > 30.0:
+                    start = index
+                    break
+            if start is None:
+                return frames
+            return frames[start:]
+        except Exception:
+            return frames
+
     def _reset_snr_latch(self) -> None:
         """Clear mid-dictation rescue state at the start of each recording."""
         self._rescue_latched = False
@@ -914,6 +942,11 @@ class AudioRecorder:
         latched, rescue stays on for the rest of the utterance so the path
         does not flap. Final save re-evaluates the full clip retroactively.
         """
+        if not frames:
+            return frames
+        # A cold-opened stream's leading digital silence must not shape the
+        # live floor or the rescue latch either - see _save_wav_file.
+        frames = self._skip_cold_open_silence(frames)
         if not frames:
             return frames
         floor = None
@@ -966,6 +999,12 @@ class AudioRecorder:
         # never latched but the finished clip is low-SNR, force rescue here.
         floor = None
         noise_ref = None
+        # A cold-opened stream delivers ~0.3-0.5s of digital silence while the
+        # device wakes up. Cut it before anything measures the room or the
+        # voice: it is not room tone, it made the floor read as a dead-silent
+        # room, and the VAD's pad kept it in the trimmed file where it
+        # poisoned the first transcription.
+        frames = self._skip_cold_open_silence(frames)
         raw_untrimmed = b"".join(frames) if frames else b""
         smart = bool(getattr(self.config, "smart_voice_amplification", True))
         force_rescue = bool(self._rescue_latched)
@@ -994,13 +1033,23 @@ class AudioRecorder:
         if smart and audio:
             try:
                 samples = np.frombuffer(audio, dtype=np.int16)
-                audio = denoise.enhance(
-                    samples, self.config.sample_rate,
-                    floor=floor,
-                    noise_ref=noise_ref,
-                    live=False,
-                    force_rescue=True if force_rescue else None,
-                ).tobytes()
+                # First pass is a *plain* boost: high-pass + peak-normalise.
+                # Whisper-lift's 40x speech-frame gain plus pre-emphasis is a
+                # destructive operation that, over a music or nature bed,
+                # amplifies the bed into the transcript ([MUSIC]/[SOUND] tags
+                # in every noisy-room failure). The spectrum-preserving boost
+                # keeps the voice/room ratio the mic heard and is what
+                # actually recovers quiet speech; the rescue chain in
+                # _transcribe_allowing_for_a_whisper escalates only when
+                # Whisper still returns blank.
+                base, _ = denoise.high_pass(samples, self.config.sample_rate,
+                                            cutoff_hz=denoise.HIGHPASS_HZ)
+                peak = float(np.abs(base).max())
+                if peak > 1.0:
+                    gain = min(denoise.PLAIN_BOOST_MAX_GAIN,
+                               denoise.PLAIN_BOOST_TARGET * 32767.0 / peak)
+                    audio = np.clip(base * gain, -32768, 32767
+                                    ).astype(np.int16).tobytes()
             except Exception as e:
                 log(f"[AUDIO] smart voice amplify skipped: {e}")
 

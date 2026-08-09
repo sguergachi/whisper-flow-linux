@@ -149,14 +149,18 @@ def _linux_spec_is_host_lib() -> "object":
     """Evaluate the Linux spec's bundling filter without importing the spec.
 
     The spec is a PyInstaller script, not a module, so importing it would run
-    the whole Analysis. The top of the file through the predicate is plain
-    Python; executing just that yields the _is_host_lib decision function.
+    the whole Analysis - and it imports PyInstaller, which the test
+    environments do not install. Only the definitions up to the first helper
+    are plain Python; executing just those yields the _is_host_lib decision
+    function without ever touching PyInstaller.
     """
     lines = LINUX_SPEC.read_text(encoding="utf-8").splitlines(keepends=True)
     code = []
     for line in lines:
-        if line.startswith("app = Analysis("):
+        if line.startswith("def gtk_runtime"):
             break
+        if line.startswith("from PyInstaller"):
+            continue
         code.append(line)
     namespace = {"re": re}
     exec("".join(code), namespace)  # noqa: S102 - static regex definitions

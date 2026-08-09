@@ -34,6 +34,11 @@ WHISPER_CPP_RELEASE = "v1.9.1"
 RELEASE_URL = (
     "https://github.com/ggml-org/whisper.cpp/releases/download/" + WHISPER_CPP_RELEASE
 )
+# Used to build the Linux CUDA engine, which upstream ships no binary for.
+SOURCE_URL = (
+    "https://github.com/ggml-org/whisper.cpp/archive/refs/tags/"
+    + WHISPER_CPP_RELEASE + ".tar.gz"
+)
 MODEL_URL = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main"
 
 # name -> (approximate download size MB, VRAM/RAM it wants)
@@ -85,6 +90,44 @@ def _runtime_dir(config_dir: Path) -> Path:
 
 def _model_dir(config_dir: Path) -> Path:
     return Path(config_dir) / "models"
+
+
+def _cuda_dir(config_dir: Path) -> Path:
+    """Where the source-built Linux CUDA engine lives (runtime/cuda/).
+
+    Separate from the flat runtime directory because the Linux CUDA build
+    cannot sit beside the CPU build there: the flat layout expects one
+    whisper-server and one set of libraries, and the two builds would
+    clobber each other whenever either was refreshed. On Windows the
+    cuBLAS engine unpacks flat like the CPU one and this is never used.
+    """
+    return _runtime_dir(config_dir) / "cuda"
+
+
+def _cuda_toolkit() -> str | None:
+    """The nvcc compiler path, or None when there is no CUDA toolkit.
+
+    The Linux GPU engine is built from source, and nvcc is the whole
+    toolkit's anchor: its parent's parent is the toolkit root, which is
+    where the runtime libraries live. Looked up on PATH first (the
+    toolkit's own bin directory is usually there), then the conventional
+    fixed locations, because /opt/cuda is commonly installed but never
+    exported.
+    """
+    found = shutil.which("nvcc")
+    if found:
+        return found
+    for root in ("/opt/cuda", "/usr/local/cuda", "/usr/cuda"):
+        candidate = Path(root) / "bin" / "nvcc"
+        if candidate.exists():
+            return str(candidate)
+    return None
+
+
+def _cuda_lib_dirs(nvcc: str) -> list[Path]:
+    """The toolkit's runtime-library directories, given its nvcc path."""
+    root = Path(nvcc).resolve().parent.parent
+    return [p for name in ("lib64", "lib") if (p := root / name).is_dir()]
 
 
 # Answered once per process. nvidia-smi is a real program that has to load a
@@ -286,12 +329,17 @@ def recommended_model(accelerator: str) -> str:
 def wanted_engine(accelerator: str) -> str:
     """The engine kind that should be installed for this machine.
 
-    Only Windows has a CUDA asset to fetch; upstream's Linux build is
-    CPU-only, so on Linux the answer is 'cpu' whatever card is fitted.
+    Windows fetches a prebuilt cuBLAS engine for a CUDA card. Linux has no
+    upstream CUDA binary - the Linux release asset is CPU-only - so there
+    the GPU engine is built from source, which needs the CUDA toolkit on
+    the host. A Linux machine without nvcc gets the CPU engine whatever
+    card is fitted.
     """
-    if sys.platform != "win32":
+    if not accelerator.startswith("cuda"):
         return "cpu"
-    return accelerator if accelerator.startswith("cuda") else "cpu"
+    if sys.platform != "win32" and not _cuda_toolkit():
+        return "cpu"
+    return accelerator
 
 
 def _server_archive(accelerator: str) -> str:
@@ -322,6 +370,25 @@ def _extract(archive: Path, into: Path) -> None:
     else:
         with zipfile.ZipFile(archive) as z:
             z.extractall(into)
+
+
+def _run_build_command(cmd: list[str], message: str) -> None:
+    """Run a compiler step, raising RuntimeError with its tail on failure.
+
+    The CUDA build is the one thing this module runs that is not ours: a
+    cmake configure or compile can fail on the host's toolkit, compilers,
+    or kernel headers in ways a download never can. The tail of the
+    output is the whole diagnosis, and swallowing it would leave the
+    settings window saying "could not install" with nothing to act on.
+    """
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=3600)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise RuntimeError(f"{message}: {e}") from e
+    if result.returncode != 0:
+        tail = (result.stderr or result.stdout or "").strip().splitlines()[-8:]
+        raise RuntimeError(f"{message}:\n" + "\n".join(tail))
 
 
 def _stage(progress, name: str):
@@ -527,11 +594,17 @@ class LocalBackend:
 
     @property
     def server_exe(self) -> Path:
-        """The downloaded engine if there is one, else the bundled engine.
+        """The engine binary that will actually run.
 
-        Downloaded wins: it is only ever present because this machine has a
-        GPU and the better engine was fetched for it.
+        Downloaded engines win over the bundled one - a downloaded engine
+        only exists because this machine has a GPU and the better engine
+        was fetched for it. On Linux the source-built CUDA engine lives in
+        its own directory (runtime/cuda), so it is the one that wins there.
         """
+        if self.installed_engine().startswith("cuda"):
+            cuda = _cuda_dir(self.config.config_dir) / self._exe_name
+            if cuda.exists():
+                return cuda
         downloaded = _runtime_dir(self.config.config_dir) / self._exe_name
         if downloaded.exists():
             return downloaded
@@ -539,6 +612,12 @@ class LocalBackend:
         if bundled:
             return bundled / "engine" / self._exe_name
         return downloaded
+
+    def _engine_exe(self, kind: str) -> Path:
+        """Where a given engine kind's binary lives."""
+        if sys.platform != "win32" and kind.startswith("cuda"):
+            return _cuda_dir(self.config.config_dir) / self._exe_name
+        return _runtime_dir(self.config.config_dir) / self._exe_name
 
     @property
     def _engine_marker(self) -> Path:
@@ -554,26 +633,34 @@ class LocalBackend:
         downloaded the 1.6GB GPU model, ran it on the CPU engine that shipped
         beside it, and took twenty seconds a sentence. The engine and the
         model were each fine; nothing compared them.
+
+        The marker records the kind when an engine is fetched or built, and
+        is checked against what is actually on disk: a marker left pointing
+        at an engine that has since been deleted must not win.
         """
-        downloaded = _runtime_dir(self.config.config_dir) / self._exe_name
-        if not downloaded.exists():
+        flat = _runtime_dir(self.config.config_dir) / self._exe_name
+        cuda = _cuda_dir(self.config.config_dir) / self._exe_name
+        if not flat.exists() and not cuda.exists():
             return "cpu"        # bundled, or nothing: the shipped build is CPU
         try:
             recorded = self._engine_marker.read_text(encoding="utf-8").strip()
-            if recorded in ("cpu", "cuda11", "cuda12"):
-                return recorded
         except OSError:
-            pass
+            recorded = ""
+        if recorded in ("cpu", "cuda11", "cuda12"):
+            if self._engine_exe(recorded).exists():
+                return recorded
         # Installed before the marker existed. cuBLAS ships its own libraries
         # beside the binary and the CPU build has none, so the directory says
         # what it is without needing to have been told.
-        names = {path.name.lower() for path in downloaded.parent.glob("*")}
+        names = {path.name.lower() for path in flat.parent.glob("*")}
         if any(name.startswith("cublas64_12") for name in names):
             return "cuda12"
         if any(name.startswith("cublas64_11") for name in names):
             return "cuda11"
         if any(name.startswith(("ggml-cuda", "cudart64_")) for name in names):
             return "cuda12"     # a CUDA build of unknown vintage; not the CPU one
+        if sys.platform != "win32" and cuda.exists():
+            return "cuda12"     # the source-built Linux engine, pre-marker
         return "cpu"
 
     def engine_is_gpu(self) -> bool:
@@ -715,9 +802,15 @@ class LocalBackend:
         model = model or recommended_model(accelerator)
         log(f"[BACKEND] accelerator={accelerator} model={model}")
 
+        wanted = wanted_engine(accelerator)
         downloaded_exe = _runtime_dir(self.config.config_dir) / self._exe_name
         downloaded_model = _model_dir(self.config.config_dir) / f"{model}.bin"
-        have_exe = downloaded_exe.exists() if force_download else self.server_exe.exists()
+        # The engine this machine wants does not always live in the flat
+        # runtime directory: on Linux the source-built CUDA engine has its
+        # own directory, because it cannot sit beside the CPU build without
+        # the two clobbering each other whenever either is refreshed.
+        engine_exe = self._engine_exe(wanted)
+        have_exe = engine_exe.exists() if force_download else self.server_exe.exists()
         # An engine built for the wrong thing is not an engine we have.
         #
         # This is the whole of the bug that made a GPU machine slower than a
@@ -728,7 +821,6 @@ class LocalBackend:
         # utterance, during which every further press was dropped as busy and
         # the text landed wherever the focus had wandered to by the time it
         # arrived.
-        wanted = wanted_engine(accelerator)
         if have_exe and self.installed_engine() != wanted:
             log(f"[BACKEND] the installed {self.installed_engine()} engine is "
                 f"not the {wanted} one this machine wants; fetching it")
@@ -739,31 +831,42 @@ class LocalBackend:
 
         try:
             if not have_exe:
-                archive = _server_archive(accelerator)
-                # Name what is actually being fetched. On Linux that is the
-                # CPU build even on a CUDA machine, and claiming otherwise
-                # would make a slow transcription look like a broken GPU.
-                kind = "GPU" if "cublas" in archive else "CPU"
-                self._notify(f"Downloading the {kind} speech engine...")
-                runtime = _runtime_dir(self.config.config_dir)
-                archive_path = runtime / archive
-                _download(f"{RELEASE_URL}/{archive}", archive_path,
-                          _stage(progress, "engine"))
-                _extract(archive_path, runtime)
-                archive_path.unlink(missing_ok=True)
-                # The archives nest the binaries a directory deep, and the
-                # shared libraries beside them have to stay beside them: the
-                # Linux build finds them through RUNPATH=$ORIGIN.
-                if not downloaded_exe.exists():
-                    for found in runtime.rglob(self._exe_name):
-                        for item in found.parent.iterdir():
-                            shutil.move(str(item), runtime)
-                        break
-                if not downloaded_exe.exists():
-                    raise RuntimeError(f"{self._exe_name} not found in {archive}")
-                if sys.platform != "win32":
-                    # A tarball's mode bits do not survive every extraction path.
-                    downloaded_exe.chmod(0o755)
+                if sys.platform != "win32" and wanted.startswith("cuda"):
+                    # Upstream ships no Linux CUDA binary; build one. Raises
+                    # on a missing toolkit or a failed compile, and the
+                    # failure lands in the notification below.
+                    self._build_cuda_engine(progress)
+                else:
+                    archive = _server_archive(accelerator)
+                    # Name what is actually being fetched. On Linux that is the
+                    # CPU build even on a CUDA machine, and claiming otherwise
+                    # would make a slow transcription look like a broken GPU.
+                    kind = "GPU" if "cublas" in archive else "CPU"
+                    self._notify(f"Downloading the {kind} speech engine...")
+                    runtime = _runtime_dir(self.config.config_dir)
+                    archive_path = runtime / archive
+                    _download(f"{RELEASE_URL}/{archive}", archive_path,
+                              _stage(progress, "engine"))
+                    # Extract into a staging directory so the flattening
+                    # below cannot reach engines that already live in the
+                    # runtime directory (the Linux CUDA build in runtime/cuda).
+                    staging = runtime / ".extract"
+                    shutil.rmtree(staging, ignore_errors=True)
+                    _extract(archive_path, staging)
+                    archive_path.unlink(missing_ok=True)
+                    # The archives nest the binaries a directory deep, and the
+                    # shared libraries beside them have to stay beside them:
+                    # the Linux build finds them through RUNPATH=$ORIGIN.
+                    found = next(staging.rglob(self._exe_name), None)
+                    if found is None:
+                        raise RuntimeError(
+                            f"{self._exe_name} not found in {archive}")
+                    for item in found.parent.iterdir():
+                        shutil.move(str(item), runtime)
+                    shutil.rmtree(staging, ignore_errors=True)
+                    if sys.platform != "win32":
+                        # A tarball's mode bits do not survive every extraction path.
+                        downloaded_exe.chmod(0o755)
                 # Last, and only once the binary is in place: the marker is
                 # read as "this engine is that kind", so it must never be
                 # there describing an engine that failed to unpack.
@@ -792,6 +895,85 @@ class LocalBackend:
             log(f"[BACKEND] install failed: {e}")
             self._notify(f"Could not set up the speech model: {e}")
             return False
+
+    def _build_cuda_engine(self, progress=None) -> None:
+        """Compile whisper.cpp with the CUDA backend into runtime/cuda/.
+
+        Upstream publishes no Linux CUDA binary - the release assets are
+        the CPU tarball and Windows cuBLAS zips - so the only way a Linux
+        machine gets a GPU engine is to build one, which is what this does:
+        fetch the release sources, configure with GGML_CUDA, and compile
+        whisper-server. It takes a few minutes once; the result is a plain
+        binary in the runtime directory like any other engine.
+
+        Requires the CUDA toolkit (nvcc) and cmake on the host. Raises
+        RuntimeError when either is missing or the build fails, which the
+        caller reports as an install failure.
+        """
+        runtime = _runtime_dir(self.config.config_dir)
+        src_dir = runtime / "whisper.cpp-src"
+        build_dir = runtime / "whisper.cpp-build"
+        out_dir = _cuda_dir(self.config.config_dir)
+        stage = _stage(progress, "engine")
+
+        nvcc = _cuda_toolkit()
+        if not nvcc:
+            raise RuntimeError("the CUDA toolkit (nvcc) is not installed")
+        cmake = shutil.which("cmake")
+        if not cmake:
+            raise RuntimeError("cmake is not installed")
+
+        # The sources are tagged with the version they were built from, so
+        # a release bump re-extracts rather than quietly compiling a stale
+        # checkout against a build directory that still thinks otherwise.
+        version_file = src_dir / ".whisper-cpp-version"
+        fresh = (version_file.exists()
+                 and version_file.read_text(encoding="utf-8").strip()
+                 == WHISPER_CPP_RELEASE)
+        if not fresh:
+            self._notify("Downloading the whisper.cpp sources...")
+            shutil.rmtree(src_dir, ignore_errors=True)
+            shutil.rmtree(build_dir, ignore_errors=True)
+            archive = runtime / f"whisper.cpp-{WHISPER_CPP_RELEASE}-src.tar.gz"
+            _download(SOURCE_URL, archive, stage)
+            _extract(archive, runtime)
+            archive.unlink(missing_ok=True)
+            # The source archive nests one directory deep: whisper.cpp-v1.9.1/.
+            top = next(p for p in runtime.iterdir()
+                       if (p / "CMakeLists.txt").exists())
+            top.rename(src_dir)
+            version_file.write_text(WHISPER_CPP_RELEASE, encoding="utf-8")
+
+        self._notify("Building the GPU speech engine (one-time compile)...")
+        configure = [cmake, "-S", str(src_dir), "-B", str(build_dir),
+                     "-DCMAKE_BUILD_TYPE=Release", "-DGGML_CUDA=ON",
+                     f"-DCMAKE_CUDA_COMPILER={nvcc}"]
+        _run_build_command(configure, "the CUDA engine would not configure")
+        if stage:
+            stage(0.4)
+        build = [cmake, "--build", str(build_dir), "--target", "whisper-server",
+                 "-j", str(usable_cores())]
+        _run_build_command(build, "the CUDA engine would not compile")
+        if stage:
+            stage(0.9)
+
+        built = build_dir / "bin" / "whisper-server"
+        if not built.exists():
+            raise RuntimeError("the CUDA build produced no whisper-server")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        # The build tree is disposable; the engine is not. whisper.cpp puts
+        # an absolute build-directory RUNPATH on its binaries, so the
+        # shared libraries have to come along, and start() points
+        # LD_LIBRARY_PATH - which outranks RUNPATH - at this directory.
+        for item in (build_dir / "bin").iterdir():
+            if item.is_file() and item.name.startswith("lib"):
+                shutil.copy2(item, out_dir / item.name)
+        # Installed under a temporary name and renamed, so a failed copy can
+        # never leave a half-written binary that looks like an engine.
+        staged = out_dir / (self._exe_name + ".new")
+        shutil.copy2(built, staged)
+        staged.chmod(0o755)
+        staged.rename(out_dir / self._exe_name)
 
     def _record_engine(self, kind: str) -> None:
         try:
@@ -822,16 +1004,35 @@ class LocalBackend:
                 "--host", "127.0.0.1",
                 "--port", str(self.config.local_server_port),
             ]
+            env = None
             if detect_accelerator() == "cpu":
                 # Left to itself whisper.cpp takes four threads whatever the
                 # machine has, which is short of the optimum on a desktop and
                 # past it on a two-core laptop. See usable_cores().
                 cmd += ["-t", str(usable_cores())]
+            elif self.installed_engine().startswith("cuda") \
+                    and sys.platform != "win32":
+                # The source-built engine links the ggml libraries it ships
+                # with (in runtime/cuda) and the CUDA runtime out of the
+                # toolkit. LD_LIBRARY_PATH outranks the binary's build-dir
+                # RUNPATH, so listing the engine's own directory first is
+                # what keeps it working after the build tree is gone; the
+                # toolkit dirs are there because /opt/cuda is installed on
+                # many distros and never added to ldconfig.
+                lib_dirs = [str(_cuda_dir(self.config.config_dir))]
+                nvcc = _cuda_toolkit()
+                if nvcc:
+                    lib_dirs += [str(p) for p in _cuda_lib_dirs(nvcc)]
+                if lib_dirs:
+                    env = dict(os.environ)
+                    existing = env.get("LD_LIBRARY_PATH", "")
+                    env["LD_LIBRARY_PATH"] = ":".join(
+                        lib_dirs + ([existing] if existing else []))
             # No console window for a background helper.
             try:
                 self._process = subprocess.Popen(
                     cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                    creationflags=no_console_flags(),
+                    creationflags=no_console_flags(), env=env,
                 )
             except Exception as e:
                 log(f"[BACKEND] could not start the server: {e}")
@@ -924,24 +1125,39 @@ class LocalBackend:
         so the old test went quiet the moment someone accepted a model from
         the settings window - which is precisely when the machine was left
         running a GPU model on the CPU engine with nothing saying so.
+
+        On Linux the GPU engine is built from source, so the offer exists
+        only where the toolkit and cmake that a build needs are present;
+        without them there is no upgrade to offer.
         """
-        # Only Windows has a CUDA engine to move up to. Upstream's Linux
-        # asset is CPU-only, so on Linux an NVIDIA card changes nothing that
-        # can be offered here, and offering it anyway would be a lie.
-        if sys.platform != "win32":
-            return False
         if not detect_accelerator().startswith("cuda"):
             return False
-        return not self.engine_is_gpu()
+        if self.engine_is_gpu():
+            return False
+        if sys.platform != "win32":
+            return bool(_cuda_toolkit()) and bool(shutil.which("cmake"))
+        return True
 
     def engine_summary(self) -> str:
         """What the speech engine runs on, in words, for the settings window."""
         engine = self.installed_engine()
         if engine.startswith("cuda"):
             return f"NVIDIA GPU ({engine})"
-        if detect_accelerator().startswith("cuda") and sys.platform == "win32":
-            return f"CPU, {usable_cores()} threads - GPU engine not installed"
+        if detect_accelerator().startswith("cuda"):
+            # A card is fitted but the engine is not. Worth saying - but only
+            # where it can be changed: without the toolkit there is nothing
+            # on Linux to build the engine with, and that is a dead end, not
+            # a button waiting to be pressed.
+            if sys.platform == "win32" or _cuda_toolkit():
+                return f"CPU, {usable_cores()} threads - GPU engine not installed"
         return f"CPU, {usable_cores()} threads"
+
+    def gpu_upgrade_note(self) -> str:
+        """What the GPU upgrade means in words, for the Install button."""
+        if sys.platform == "win32":
+            return "1.6GB, and makes the larger models usable"
+        return ("compiles the CUDA engine (needs the CUDA toolkit), and "
+                "makes the larger models usable")
 
     def describe(self) -> str:
         """One line for the diagnostics report."""

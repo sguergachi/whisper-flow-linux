@@ -1400,7 +1400,7 @@ class SettingsWindow(Adw.ApplicationWindow):
 
         if self.backend.needs_gpu_upgrade():
             row.set_subtitle(
-                summary + " - 1.6GB, and makes the larger models usable")
+                summary + " - " + self.backend.gpu_upgrade_note())
             button = Gtk.Button(label="Install GPU engine")
             button.add_css_class("suggested-action")
             button.set_valign(Gtk.Align.CENTER)

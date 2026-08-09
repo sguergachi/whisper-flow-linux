@@ -54,6 +54,13 @@ class TestWhisperFlowDaemon:
             patch("whisper_flow.daemon.Config") as mock_config_class,
             patch("whisper_flow.daemon.WhisperFlow") as mock_app_class,
             patch("whisper_flow.daemon.HotkeyManager") as mock_hotkey_manager_class,
+            # setup_hotkeys() prewarms the settings window, and on a machine
+            # with a display that really launches one - a resident settings
+            # process whose window-watch thread then leaks Popen calls into
+            # whichever later test happens to have the mock up.
+            patch.object(WhisperFlowDaemon, "_start_tool_window",
+                         return_value=False),
+            patch("whisper_flow.daemon.subprocess.Popen"),
         ):
             mock_config = Mock()
             mock_config.hotkey_transcribe = "ctrl+cmd"
@@ -275,12 +282,23 @@ class TestWhisperFlowDaemon:
         window on the developer's desktop.
         """
         monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")
+        # Popen is mocked below, which also swallows the nvidia-smi probe the
+        # daemon runs to learn the accelerator. On a machine that actually
+        # has nvidia-smi the probe dies on the mock instead, so pin the
+        # answer and skip the probe altogether.
+        monkeypatch.setattr(
+            "whisper_flow.backend.detect_accelerator", lambda: "cpu")
         with (
             patch("whisper_flow.daemon.Config") as mock_config_class,
             patch("whisper_flow.daemon.WhisperFlow") as mock_app_class,
             patch("whisper_flow.daemon.HotkeyManager") as mock_hotkey_manager_class,
             patch("whisper_flow.daemon.WhisperFlowDaemon.notify") as mock_notify,
             patch("whisper_flow.daemon.subprocess.Popen") as mock_popen,
+            # The window-watch thread that replaces a closed window calls
+            # prewarm_settings() from the background, and that is a second
+            # Popen on the mock - and a real window in later tests, when the
+            # patch is gone. The test is about one click, one window.
+            patch.object(WhisperFlowDaemon, "prewarm_settings"),
             patch("whisper_flow.daemon.threading.Thread"),
         ):
             mock_config = Mock()

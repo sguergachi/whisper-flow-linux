@@ -268,11 +268,241 @@ def test_windows_picks_the_engine_matching_the_driver(monkeypatch):
     assert backend_module._server_archive("cpu") == "whisper-blas-bin-x64.zip"
 
 
-def test_no_gpu_upgrade_is_offered_on_linux(local_backend, config, monkeypatch):
-    """There is no Linux CUDA engine to move up to, so offering one would lie."""
+def test_no_gpu_upgrade_is_offered_on_linux_without_a_toolkit(
+        local_backend, config, monkeypatch):
+    """No nvcc, no build, no offer: there is nothing to build the engine with."""
     monkeypatch.setattr(sys, "platform", "linux")
     monkeypatch.setattr(backend_module, "detect_accelerator", lambda: "cuda12")
+    monkeypatch.setattr(backend_module, "_cuda_toolkit", lambda: None)
+    assert backend_module.wanted_engine("cuda12") == "cpu"
+    _install_engine(local_backend, config)
     assert local_backend.needs_gpu_upgrade() is False
+    assert local_backend.setup_reason() is None
+
+
+def test_linux_with_a_toolkit_is_offered_the_gpu_engine(
+        local_backend, config, monkeypatch):
+    """The source-built engine is a real offer wherever it can be built."""
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(backend_module, "detect_accelerator", lambda: "cuda12")
+    monkeypatch.setattr(backend_module, "_cuda_toolkit",
+                        lambda: "/opt/cuda/bin/nvcc")
+    monkeypatch.setattr(backend_module.shutil, "which", lambda _: "/usr/bin/cmake")
+    assert backend_module.wanted_engine("cuda12") == "cuda12"
+    _install_engine(local_backend, config)
+    assert local_backend.needs_gpu_upgrade() is True
+    assert local_backend.setup_reason() == "gpu"
+
+
+def test_linux_without_cmake_is_not_offered_the_gpu_engine(
+        local_backend, config, monkeypatch):
+    """The toolkit alone cannot compile anything."""
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(backend_module, "detect_accelerator", lambda: "cuda12")
+    monkeypatch.setattr(backend_module, "_cuda_toolkit",
+                        lambda: "/opt/cuda/bin/nvcc")
+    monkeypatch.setattr(backend_module.shutil, "which", lambda _: None)
+    _install_engine(local_backend, config)
+    assert local_backend.needs_gpu_upgrade() is False
+
+
+# ------------------------------------------------------- Linux source build
+def test_linux_builds_the_cuda_engine_from_source(
+        local_backend, config, monkeypatch):
+    """Upstream ships no Linux CUDA binary, so the engine is compiled."""
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(backend_module, "detect_accelerator", lambda: "cuda12")
+    monkeypatch.setattr(backend_module, "_cuda_toolkit",
+                        lambda: "/opt/cuda/bin/nvcc")
+    monkeypatch.setattr(backend_module.shutil, "which", lambda _: "/usr/bin/cmake")
+
+    runtime = Path(config.config_dir) / "runtime"
+    src = runtime / "whisper.cpp-src"
+    src.mkdir(parents=True)
+    (src / "CMakeLists.txt").write_text("")
+    (src / ".whisper-cpp-version").write_text(
+        backend_module.WHISPER_CPP_RELEASE, encoding="utf-8")
+
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        if "--build" in cmd:
+            built = runtime / "whisper.cpp-build" / "bin" / "whisper-server"
+            built.parent.mkdir(parents=True, exist_ok=True)
+            built.write_text("")
+            # The real build links these out of its own bin directory.
+            (built.parent / "libggml-cuda.so").write_text("")
+            (built.parent / "libwhisper.so").write_text("")
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    def fake_download(url, dest, progress=None):
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text("")
+
+    monkeypatch.setattr(backend_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(backend_module, "_download", fake_download)
+
+    assert local_backend.install("ggml-large-v3-turbo") is True
+    assert (runtime / "cuda" / local_backend._exe_name).exists()
+    assert (runtime / "cuda" / "libggml-cuda.so").exists(), (
+        "the engine's libraries must come with it, or it dies with the "
+        "build tree")
+    assert local_backend.installed_engine() == "cuda12"
+    assert local_backend.engine_is_gpu()
+
+    configure, build = calls[:2]
+    assert "-DGGML_CUDA=ON" in configure
+    assert "-DCMAKE_CUDA_COMPILER=/opt/cuda/bin/nvcc" in configure
+    assert configure[0] == "/usr/bin/cmake"
+    assert build[1] == "--build"
+    assert "--target" in build and "whisper-server" in build
+
+
+def test_linux_without_a_toolkit_falls_back_to_the_cpu_engine(
+        local_backend, config, monkeypatch):
+    """No nvcc means nothing to build the engine with, so Linux stays CPU."""
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(backend_module, "detect_accelerator", lambda: "cuda12")
+    monkeypatch.setattr(backend_module, "_cuda_toolkit", lambda: None)
+    assert backend_module.wanted_engine("cuda12") == "cpu"
+    _install_engine(local_backend, config)
+    assert local_backend.needs_gpu_upgrade() is False
+    assert local_backend.setup_reason() is None
+
+
+def test_linux_cuda_install_without_a_toolkit_installs_the_cpu_engine(
+        local_backend, config, monkeypatch):
+    """The CPU fallback is a working engine, not an error."""
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(backend_module, "detect_accelerator", lambda: "cuda12")
+    monkeypatch.setattr(backend_module, "_cuda_toolkit", lambda: None)
+
+    def fake_download(url, dest, progress=None):
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text("")
+
+    def fake_extract(archive, into):
+        into.mkdir(parents=True, exist_ok=True)
+        (into / local_backend._exe_name).write_text("")
+
+    monkeypatch.setattr(backend_module, "_download", fake_download)
+    monkeypatch.setattr(backend_module, "_extract", fake_extract)
+    assert local_backend.install("ggml-large-v3-turbo") is True
+    assert local_backend.installed_engine() == "cpu"
+
+
+def test_linux_cuda_install_does_not_run_the_build_twice(
+        local_backend, config, monkeypatch):
+    """The settings window's Install button must be idempotent."""
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(backend_module, "detect_accelerator", lambda: "cuda12")
+    monkeypatch.setattr(backend_module, "_cuda_toolkit",
+                        lambda: "/opt/cuda/bin/nvcc")
+    monkeypatch.setattr(backend_module.shutil, "which", lambda _: "/usr/bin/cmake")
+
+    runtime = Path(config.config_dir) / "runtime"
+    cuda = runtime / "cuda"
+    cuda.mkdir(parents=True)
+    (cuda / local_backend._exe_name).write_text("")
+    local_backend._record_engine("cuda12")
+    (Path(config.config_dir) / "models").mkdir(parents=True)
+    (Path(config.config_dir) / "models" / "ggml-large-v3-turbo.bin").write_text("")
+
+    calls = []
+    monkeypatch.setattr(
+        backend_module.subprocess, "run",
+        lambda cmd, **kwargs: calls.append(list(cmd))
+        or types.SimpleNamespace(returncode=0, stdout="", stderr=""))
+
+    assert local_backend.install("ggml-large-v3-turbo") is True
+    assert calls == [], f"the engine was rebuilt: {calls}"
+
+
+def test_the_linux_cuda_engine_wins_over_the_flat_cpu_one(
+        local_backend, config, monkeypatch):
+    monkeypatch.setattr(sys, "platform", "linux")
+    runtime = Path(config.config_dir) / "runtime"
+    runtime.mkdir(parents=True)
+    (runtime / local_backend._exe_name).write_text("cpu")
+    cuda = runtime / "cuda"
+    cuda.mkdir()
+    (cuda / local_backend._exe_name).write_text("cuda")
+    local_backend._record_engine("cuda12")
+    assert local_backend.server_exe == cuda / local_backend._exe_name
+    assert local_backend.engine_is_gpu()
+
+
+def test_a_marker_pointing_at_a_missing_engine_does_not_win(
+        local_backend, config, monkeypatch):
+    """A marker says cuda12, but the engine was deleted: what runs is CPU."""
+    monkeypatch.setattr(sys, "platform", "linux")
+    runtime = Path(config.config_dir) / "runtime"
+    runtime.mkdir(parents=True)
+    (runtime / local_backend._exe_name).write_text("")
+    local_backend._record_engine("cuda12")
+    assert local_backend.installed_engine() == "cpu"
+    assert local_backend.server_exe == runtime / local_backend._exe_name
+
+
+def test_linux_cuda_start_finds_the_toolkit_libraries(
+        local_backend, config, monkeypatch, tmp_path):
+    """/opt/cuda is often never in ldconfig; the spawn must say where it is."""
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(backend_module, "detect_accelerator", lambda: "cuda12")
+    toolkit = tmp_path / "cuda"
+    (toolkit / "bin").mkdir(parents=True)
+    (toolkit / "lib64").mkdir()
+    monkeypatch.setattr(backend_module, "_cuda_toolkit",
+                        lambda: str(toolkit / "bin" / "nvcc"))
+
+    runtime = Path(config.config_dir) / "runtime"
+    cuda = runtime / "cuda"
+    cuda.mkdir(parents=True)
+    (cuda / local_backend._exe_name).write_text("")
+    local_backend._record_engine("cuda12")
+    model = Path(config.config_dir) / "models"
+    model.mkdir(parents=True)
+    (model / "ggml-large-v3-turbo.bin").write_text("")
+
+    spawned = {}
+
+    def fake_popen(cmd, **kwargs):
+        spawned.update(cmd=cmd, **kwargs)
+        return types.SimpleNamespace(poll=lambda: None)
+
+    monkeypatch.setattr(backend_module.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(local_backend, "_wait_until_ready",
+                        lambda *a, **k: True)
+
+    assert local_backend.start("ggml-large-v3-turbo") is not None
+    assert spawned["cmd"][0] == str(cuda / local_backend._exe_name)
+    assert not any(flag == "-t" for flag in spawned["cmd"])
+    lib_path = spawned["env"]["LD_LIBRARY_PATH"].split(":")
+    # The engine's own directory first: LD_LIBRARY_PATH outranks the
+    # binary's absolute build-dir RUNPATH, so this is what keeps the
+    # engine working once the build tree is gone.
+    assert lib_path[0] == str(cuda)
+    assert str(toolkit / "lib64") in lib_path
+
+
+def test_linux_cpu_start_does_not_carry_the_toolkit_env(
+        local_backend, config, monkeypatch):
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(backend_module, "detect_accelerator", lambda: "cpu")
+    _install_engine(local_backend, config)
+    spawned = {}
+
+    def fake_popen(cmd, **kwargs):
+        spawned.update(cmd=cmd, **kwargs)
+        return types.SimpleNamespace(poll=lambda: None)
+
+    monkeypatch.setattr(backend_module.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(local_backend, "_wait_until_ready",
+                        lambda *a, **k: True)
+    assert local_backend.start() is not None
+    assert spawned["env"] is None
+    assert "-t" in spawned["cmd"]
 
 
 def test_a_tarball_that_escapes_its_directory_is_refused(tmp_path):
@@ -361,6 +591,7 @@ def test_a_gpu_machine_fetches_the_cuda_engine_over_the_bundled_cpu_one(
 
     def fake_extract(archive, into):
         """Unpack what the real cuBLAS zip holds: the binary and cuBLAS."""
+        into.mkdir(parents=True, exist_ok=True)
         (into / local_backend._exe_name).write_text("cuda engine")
         (into / "cublas64_12.dll").write_text("")
 

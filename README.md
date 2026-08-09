@@ -43,11 +43,16 @@ because a model is only as fast as what it runs on.
 
 The installer ships the CPU engine and `base.en`, which keeps up with speech
 on any machine from a two-core laptop upwards. On a PC with an NVIDIA card,
-**Install GPU engine** on that page fetches the cuBLAS build — 1.6GB, with a
-progress bar. Until it is installed every model runs on the CPU, `large-v3-turbo`
-included, and that model on a CPU takes tens of seconds per sentence rather
-than a fraction of one. The page labels it `needs GPU` while that is the case
-and `GPU` once it is not.
+**Install GPU engine** on that page makes `large-v3-turbo` (and every other
+model) run on the GPU. Until it is installed every model runs on the CPU,
+`large-v3-turbo` included, and that model on a CPU takes tens of seconds per
+sentence rather than a fraction of one. The page labels it `needs GPU` while
+that is the case and `GPU` once it is not.
+
+How the GPU engine arrives depends on the platform: Windows fetches a prebuilt
+cuBLAS build (1.6GB, with a progress bar), while Linux compiles it from the
+whisper.cpp sources — a one-time build that needs the CUDA toolkit (`nvcc`)
+and `cmake` installed, which is why the offer only appears where they are.
 
 | Machine | Model | Why |
 |---|---|---|
@@ -102,14 +107,20 @@ that flag on download).
 - `ydotool` — typing into other apps on Wayland  
 - membership in the `input` group — global hotkeys  
   (`sudo usermod -aG input $USER`, then log out and back in)
+- the CUDA toolkit and `cmake` — but only if you want the GPU engine:
+  upstream publishes no Linux CUDA binary, so it is compiled on your
+  machine once, from the whisper.cpp sources
 
 ```bash
 # Debian/Ubuntu (gtk4-layer-shell is not packaged; see install.sh)
-sudo apt install python3-gi gir1.2-gtk-4.0 libadwaita-1-0 ydotool
+sudo apt install python3-gi gir1.2-gtk-4.0 libadwaita-1-0 ydotool cmake \
+    nvidia-cuda-toolkit
 # Arch
-sudo pacman -S python-gobject gtk4 libadwaita gtk4-layer-shell ydotool
+sudo pacman -S python-gobject gtk4 libadwaita gtk4-layer-shell ydotool \
+    cuda cmake
 # Fedora
-sudo dnf install python3-gobject gtk4 libadwaita gtk4-layer-shell ydotool
+sudo dnf install python3-gobject gtk4 libadwaita gtk4-layer-shell ydotool \
+    cmake cuda-toolkit
 ```
 
 ### From source (developers)

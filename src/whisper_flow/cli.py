@@ -203,7 +203,6 @@ def capture_test(
     of denoise or decode changes actually uses.
     """
     import threading
-    import time
 
     from . import audio_debug
 

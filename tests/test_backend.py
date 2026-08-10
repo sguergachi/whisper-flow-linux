@@ -479,6 +479,11 @@ def test_linux_cuda_start_finds_the_toolkit_libraries(
     assert spawned["cmd"][0] == str(cuda / local_backend._exe_name)
     assert not any(flag == "-t" for flag in spawned["cmd"])
     lib_path = spawned["env"]["LD_LIBRARY_PATH"].split(":")
+    # The value is Linux-style even on a Windows runner, where the
+    # simulated config dir renders as "D:/..." and its colon splits
+    # like a list separator.
+    if len(lib_path[0]) == 1 and lib_path[0].isalpha():
+        lib_path = [lib_path[0] + ":" + lib_path[1]] + lib_path[2:]
     # The engine's own directory first: LD_LIBRARY_PATH outranks the
     # binary's absolute build-dir RUNPATH, so this is what keeps the
     # engine working once the build tree is gone.

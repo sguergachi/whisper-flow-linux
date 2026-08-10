@@ -478,16 +478,13 @@ def test_linux_cuda_start_finds_the_toolkit_libraries(
     assert local_backend.start("ggml-large-v3-turbo") is not None
     assert spawned["cmd"][0] == str(cuda / local_backend._exe_name)
     assert not any(flag == "-t" for flag in spawned["cmd"])
-    lib_path = spawned["env"]["LD_LIBRARY_PATH"].split(":")
-    # The value is Linux-style even on a Windows runner, where the
-    # simulated config dir renders as "D:/..." and its colon splits
-    # like a list separator.
-    if len(lib_path[0]) == 1 and lib_path[0].isalpha():
-        lib_path = [lib_path[0] + ":" + lib_path[1]] + lib_path[2:]
+    lib_path = spawned["env"]["LD_LIBRARY_PATH"]
     # The engine's own directory first: LD_LIBRARY_PATH outranks the
     # binary's absolute build-dir RUNPATH, so this is what keeps the
-    # engine working once the build tree is gone.
-    assert lib_path[0] == str(cuda)
+    # engine working once the build tree is gone. Checked on the raw
+    # value: on a Windows runner the simulated Linux paths carry drive
+    # letters ("D:/...") that split like list separators.
+    assert lib_path.startswith(str(cuda) + ":")
     assert str(toolkit / "lib64") in lib_path
 
 

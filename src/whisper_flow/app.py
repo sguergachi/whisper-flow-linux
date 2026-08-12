@@ -10,7 +10,26 @@ from .config import Config
 from .logging import log, set_logging_enabled
 from .streaming import LiveTranscriber
 from .system import SystemManager
-from .transcription import LIVE_TIMEOUT, TranscriptionService
+from .transcription import (
+    LIVE_TIMEOUT,
+    TranscriptionService,
+    is_hallucination,
+)
+
+# The music-under-speech re-decode. A continuous music bed keeps the room
+# level up, so the clip looks usable to every SNR metric and rescue never
+# engages; Whisper then transcribes the music's vocals instead of the
+# speaker (a 2.6s "What does a control point mean?" came back as the four
+# words "This is the show."). Speech is dense: real dictation runs at
+# roughly 10-14 chars per second, while a music lyric taken for speech is
+# sparser. Below this pace, with a music-like clip, the first transcript is
+# not to be trusted and gets one steered re-decode.
+MUSIC_STEER_MAX_CHARS_PER_SEC = 8.5
+MUSIC_STEER_TEMPERATURE = 0.6
+MUSIC_STEER_PROMPT = (
+    "Transcribe only the speech spoken by the user, "
+    "ignoring any background music or singing."
+)
 
 
 class WhisperFlow:
@@ -51,6 +70,16 @@ class WhisperFlow:
         """
         text = self.transcription_service.transcribe_audio(audio_file)
         if text:
+            # A confident transcript is not proof it is the speech: under a
+            # continuous music bed Whisper can lock onto the music's vocals
+            # ("This is the show." for "What does a control point mean?").
+            # When the clip is music-like and the transcript is shorter than
+            # speech would be, one steered re-decode can recover the words.
+            steered = self._retry_steered_under_music(audio_file, text)
+            if steered:
+                self._finalize_audio_debug(transcript=text,
+                                           boost_transcript=steered)
+                return steered
             self._finalize_audio_debug(transcript=text)
             return text
 
@@ -322,6 +351,109 @@ class WhisperFlow:
                     pass
         except Exception as e:
             log(f"[RESCUE] retry failed: {e}")
+            return None
+
+    def _retry_steered_under_music(self, audio_file: str,
+                                   first_text: str) -> str | None:
+        """Re-decode a short transcript under background music, steered.
+
+        The case the SNR metrics cannot see: a continuous music bed (with or
+        without vocals) holds the room level up, so the clip reads as
+        usable, rescue never engages, and Whisper transcribes the music
+        instead of the speaker. Two signals point at it: the audio is
+        music-like (its level never rests - the gate is open most of the
+        clip and frames cluster around the median), and the transcript is
+        too short for the clip (real dictation runs ~10+ chars/second; a
+        music lyric read for speech is sparser).
+
+        The re-decode pairs the strongest cleanup the pipeline has -
+        speech-band rescue on the raw trimmed capture - with a decoder
+        prompt that says to ignore the music and a warmer temperature so
+        the greedy path that locked onto the vocals can be escaped. The
+        steered result is kept when it reads *more* speech-paced than the
+        first pass; otherwise the first stands.
+        """
+        config = getattr(self, "config", None)
+        if config is None:
+            return None
+        if not bool(getattr(config, "smart_voice_amplification", True)):
+            return None
+        try:
+            import numpy as np
+            import wave as _wave
+            from . import denoise as denoise_mod
+
+            last = audio_debug.last_dir(config.config_dir)
+            source = last / "raw_trimmed.wav"
+            if not source.is_file():
+                source = Path(audio_file)
+            untrimmed = last / "raw_untrimmed.wav"
+            with _wave.open(str(source), "rb") as wf:
+                rate = wf.getframerate()
+                pcm = np.frombuffer(wf.readframes(wf.getnframes()),
+                                    dtype=np.int16)
+            if pcm.size == 0 or rate <= 0:
+                return None
+            duration = pcm.size / rate
+
+            profile = denoise_mod.profile_signal(pcm, rate)
+            if not profile.music_like:
+                return None
+
+            # Speech pace. Short real phrases under music trigger this too -
+            # they cost one extra decode and their own transcript still wins
+            # the keep-rule below; a music lyric cannot pass the same bar.
+            pace = len(first_text) / duration
+            if pace >= MUSIC_STEER_MAX_CHARS_PER_SEC:
+                return None
+
+            # Floor on the full capture, like the café rescue: the pre-roll
+            # may have been speech, and the bed is what spectral subtraction
+            # should be told about.
+            floor = None
+            try:
+                raw_path = untrimmed if untrimmed.is_file() else source
+                with _wave.open(str(raw_path), "rb") as wf:
+                    raw = np.frombuffer(wf.readframes(wf.getnframes()),
+                                        dtype=np.int16)
+                hp, _ = denoise_mod.high_pass(raw, rate)
+                floor = denoise_mod.measure_floor(hp, rate)
+            except Exception:
+                pass
+
+            out = f"{audio_file}.music.wav"
+            try:
+                gain = rescue_wav(
+                    str(source), out,
+                    noise_ref_path=str(untrimmed) if untrimmed.is_file()
+                    else None,
+                    floor=float(floor) if floor else None,
+                )
+                if not gain:
+                    return None
+                steered = self.transcription_service.transcribe_audio(
+                    out,
+                    prompt=MUSIC_STEER_PROMPT,
+                    temperature=MUSIC_STEER_TEMPERATURE,
+                )
+                self._copy_debug_wav(out, "music_steer.wav")
+                if not steered or is_hallucination(steered):
+                    log("[MUSIC] steered re-decode came back blank or tagged")
+                    return None
+                if len(steered) / duration < pace:
+                    log(f"[MUSIC] steered re-decode ({len(steered)} chars) no "
+                        f"better than the first pass ({pace:.1f} ch/s)")
+                    return None
+                log(f"[MUSIC] steered re-decode recovered {len(steered)} chars "
+                    f"(first pass {len(first_text)} chars at {pace:.1f} ch/s)")
+                return steered
+            finally:
+                try:
+                    Path(out).unlink()
+                except Exception:
+                    pass
+        except Exception as e:
+            log(f"[MUSIC] steered retry failed: {e}")
             return None
 
     def _finalize_audio_debug(self, **kwargs) -> None:

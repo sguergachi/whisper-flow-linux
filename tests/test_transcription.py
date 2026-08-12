@@ -148,7 +148,9 @@ def test_the_shortened_window_is_off_unless_it_is_asked_for():
     """
     from whisper_flow.config import Config
 
-    assert Config().fast_encoder is False
+    # The schema default, not Config() - that reads the user's .env and
+    # is True on a machine that turned the setting on.
+    assert Config.model_fields["fast_encoder"].default is False
 
 
 # ------------------------------------------------------------- decode knobs
@@ -186,3 +188,25 @@ def test_suppress_nst_is_sent_only_when_asked_for(tmp_path, monkeypatch):
     service, posted = _service_posting(monkeypatch, config)
     service.transcribe_audio(_wav(tmp_path / "a.wav", 3.0))
     assert posted["data"].get("suppress_nst") == "true"
+
+
+def test_a_steered_redecode_sends_prompt_and_warmer_temperature(
+        tmp_path, monkeypatch):
+    """The music re-decode steers whisper: a prompt naming the speech, and
+    a non-greedy start so the path that locked onto the music can escape.
+    The normal call keeps the deterministic defaults."""
+    config = FakeConfig()
+    service, posted = _service_posting(monkeypatch, config)
+    service.transcribe_audio(_wav(tmp_path / "a.wav", 3.0))
+    assert "prompt" not in posted["data"]
+    assert posted["data"].get("temperature") == "0.0"
+
+    service.transcribe_audio(
+        _wav(tmp_path / "a.wav", 3.0),
+        prompt="Transcribe only the speech, ignoring the music.",
+        temperature=0.6,
+    )
+    assert "music" in posted["data"]["prompt"]
+    assert posted["data"]["temperature"] == "0.6"
+    # The fallback escalation stays as the server expects it.
+    assert posted["data"].get("temperature_inc") == "0.2"

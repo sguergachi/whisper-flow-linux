@@ -324,6 +324,59 @@ class TestWhisperFlowDaemon:
             assert argv[1:] == ["-m", "whisper_flow.settings_gtk"]
             mock_notify.assert_not_called()
 
+    def test_open_settings_debounces_rapid_clicks(self, temp_config_dir,
+                                                  monkeypatch):
+        """A click storm becomes one window, not one "show" per click.
+
+        The tray message loop stalls while the window process is started, so
+        clicks made in that window queue up and then all fire; each one used
+        to write another show and re-run the raise/acrylic work in the
+        settings process - the storm under which it was seen to die on
+        Windows. Clicks inside the debounce window must not reach it.
+        """
+        monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")
+        monkeypatch.setattr(
+            "whisper_flow.backend.detect_accelerator", lambda: "cpu")
+        with (
+            patch("whisper_flow.daemon.Config") as mock_config_class,
+            patch("whisper_flow.daemon.WhisperFlow") as mock_app_class,
+            patch("whisper_flow.daemon.HotkeyManager") as mock_hotkey_manager_class,
+            patch("whisper_flow.daemon.WhisperFlowDaemon.notify") as mock_notify,
+            patch("whisper_flow.daemon.subprocess.Popen") as mock_popen,
+            patch.object(WhisperFlowDaemon, "prewarm_settings"),
+            patch("whisper_flow.daemon.threading.Thread"),
+        ):
+            mock_config = Mock()
+            mock_config.hotkey_transcribe = "ctrl+cmd"
+            mock_config.hotkey_auto_transcribe = "ctrl+cmd+space"
+            mock_config.hotkey_command = "ctrl+cmd+alt"
+            mock_config_class.return_value = mock_config
+
+            mock_app = Mock()
+            mock_app_class.return_value = mock_app
+
+            mock_hotkey_manager = Mock()
+            mock_hotkey_manager_class.return_value = mock_hotkey_manager
+
+            mock_popen.return_value.poll.return_value = None
+
+            daemon = WhisperFlowDaemon(temp_config_dir)
+
+            # Eight clicks in the same second - the burst the log showed.
+            for _ in range(8):
+                daemon.open_settings(None, None)
+
+            mock_popen.assert_called_once()
+
+            # A deliberate re-raise a while later is a real request again: it
+            # tells the live window to show itself rather than starting
+            # another process.
+            daemon._last_settings_click = 0.0
+            daemon.open_settings(None, None)
+            assert mock_popen.call_count == 1
+            mock_popen.return_value.stdin.write.assert_called()
+            mock_notify.assert_not_called()
+
     def test_get_app_for_mode_transcribe(self, temp_config_dir):
         """Test getting app instance for transcribe mode."""
         with (

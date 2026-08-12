@@ -47,6 +47,65 @@ def _rms(samples, mask):
     return float(np.sqrt((values ** 2).mean())) if values.size else 0.0
 
 
+def _music_bed(seconds: float, rate: int = RATE) -> np.ndarray:
+    """A continuous bed with no gaps: the level never rests.
+
+    Music holds the room level up, so every 20ms frame sits near the median
+    and the clip reads as "voiced" throughout - the profile that makes the
+    pipeline trust a clip whose transcript is actually the music.
+    """
+    rng = np.random.default_rng(11)
+    t = np.arange(int(rate * seconds)) / rate
+    bed = (np.sin(2 * np.pi * 120 * t) * 0.6
+           + np.sin(2 * np.pi * 340 * t) * 0.4)
+    tremolo = 0.75 + 0.25 * np.sin(2 * np.pi * 1.7 * t)   # beat-like AM
+    return (bed * tremolo * 2200
+            + rng.normal(0, 180, t.size)).astype(np.int16)
+
+
+def _bursty_speech(seconds: float, rate: int = RATE) -> np.ndarray:
+    """Speech-shaped bursts with real gaps: the level histogram is bimodal.
+
+    The opposite of a music bed - there is actual silence between the words,
+    which is exactly what a continuous background never provides.
+    """
+    rng = np.random.default_rng(13)
+    out = np.zeros(int(rate * seconds), dtype=np.int16)
+    t = np.arange(int(rate * seconds)) / rate
+    for start, length in ((0.1, 0.5), (0.9, 0.6), (1.7, 0.5)):
+        span = (t >= start) & (t < start + length)
+        formants = sum(np.sin(2 * np.pi * hz * t[span])
+                       for hz in (140, 420, 900, 1800)) / 4
+        out[span] = (formants * np.hanning(span.sum()) * 3000).astype(np.int16)
+    out += rng.normal(0, 60, out.size).astype(np.int16)   # quiet room
+    return out
+
+
+def test_a_continuous_bed_is_marked_music_like():
+    """Steady level, no silence: the transcript must not be trusted at face
+    value, because this is the profile under which Whisper transcribes the
+    bed's vocals instead of the speaker."""
+    profile = denoise.profile_signal(_music_bed(2.6), RATE)
+    assert profile.music_like
+
+
+def test_speech_with_gaps_is_not_music_like():
+    """Real speech leaves silence between words; a music bed does not."""
+    profile = denoise.profile_signal(_bursty_speech(2.6), RATE)
+    assert not profile.music_like
+
+
+def test_a_quiet_room_is_not_music_like():
+    """Silence has nothing near a median *level* to cluster around."""
+    rng = np.random.default_rng(17)
+    quiet = rng.normal(0, 40, int(RATE * 2.6)).astype(np.int16)
+    assert not denoise.profile_signal(quiet, RATE).music_like
+
+
+def test_music_like_carries_through_the_empty_profile():
+    assert denoise.profile_signal(np.array([], dtype=np.int16), RATE).music_like is False
+
+
 def test_the_room_gets_quieter_and_the_voice_does_not(recording):
     noisy, voiced, voice_only = recording
     cleaned = denoise.clean(noisy, RATE, normalize=False)

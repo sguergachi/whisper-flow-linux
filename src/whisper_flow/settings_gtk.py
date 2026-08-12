@@ -484,28 +484,13 @@ def _gobject_pointer(obj) -> int:
 # Test meter and freezes the UI, and WDM-KS is exclusive kernel streaming
 # that fails whenever anything else holds the endpoint. Default recording
 # already prefers WASAPI; the dropdown must not offer the bad paths.
-_UNSUPPORTED_HOST_APIS = frozenset({
-    "directsound",
-    "wdm-ks",
-    "wdm ks",
-    "wdmks",
-})
+# The predicate lives in audio.py so capture and the dropdown agree.
 
 
 def _host_api_supported(api: str) -> bool:
-    """Whether this PortAudio host API is safe to offer for capture.
-
-    Empty/unknown (typical on Linux: ALSA, PulseAudio) is kept. Only the
-    known-bad Windows backends are filtered out.
-    """
-    if not api:
-        return True
-    key = api.lower().replace("windows ", "").strip()
-    if key in _UNSUPPORTED_HOST_APIS:
-        return False
-    if "directsound" in key or "wdm-ks" in key or "wdmks" in key:
-        return False
-    return True
+    """Whether this PortAudio host API is safe to offer for capture."""
+    from .audio import host_api_supported
+    return host_api_supported(api)
 
 
 def _list_input_devices() -> list[tuple[int, str]]:
@@ -550,6 +535,58 @@ def _list_input_devices() -> list[tuple[int, str]]:
     except Exception as e:
         log(f"[SETTINGS] could not list microphones: {e}")
         return []
+
+
+def _remap_unsupported_mic(index: int) -> int | None:
+    """Worker-thread: WASAPI/MME twin of a hidden DirectSound/WDM-KS index.
+
+    The dropdown does not list those backends, so a saved index from them
+    would otherwise stay selected as "(unsupported)". Recording rematches
+    the same way; this is so the row shows the device that will actually
+    open.
+    """
+    try:
+        import pyaudio
+        from .audio import rematch_capture_index
+
+        try:
+            pa = pyaudio.PyAudio()
+        except Exception as e:
+            log(f"[SETTINGS] could not rematch microphone {index}: {e}")
+            return None
+        try:
+            devices = []
+            for i in range(pa.get_device_count()):
+                try:
+                    info = pa.get_device_info_by_index(i)
+                    if int(info.get("maxInputChannels", 0)) <= 0:
+                        continue
+                    api = _host_api_name(pa, info)
+                    name = str(info.get("name", f"device {i}"))
+                    devices.append((i, name, api))
+                except Exception:
+                    continue
+            return rematch_capture_index(index, devices)
+        finally:
+            pa.terminate()
+    except Exception as e:
+        log(f"[SETTINGS] could not rematch microphone {index}: {e}")
+        return None
+
+
+def _list_devices_and_remap(
+        configured: int | None) -> tuple[list[tuple[int, str]], int | None]:
+    """Supported devices plus the index the dropdown should land on.
+
+    ``configured`` is rematched when it is missing from the supported
+    list (a saved DirectSound/WDM-KS row). None means Default.
+    """
+    devices = _list_input_devices()
+    if configured is None:
+        return devices, None
+    if any(i == configured for i, _ in devices):
+        return devices, configured
+    return devices, _remap_unsupported_mic(configured)
 
 
 @contextlib.contextmanager
@@ -821,6 +858,14 @@ class SettingsWindow(Adw.ApplicationWindow):
         self._show_t0 = _T0
         _mark("config and backend read")
         self._working = False
+        # One raise cycle and one backdrop re-apply at a time. A tray click
+        # storm (clicks queue while the daemon's message loop is blocked, then
+        # all arrive at once) used to schedule a fresh present + _finish_raise
+        # pair and a DWM acrylic re-apply per click - the window died under
+        # that churn on Windows (0xC0000005). Coalesced: the first click does
+        # the work, the rest find a cycle already in flight.
+        self._raise_pending = False
+        self._backdrop_pending = False
         self._rows: dict[str, Gtk.Widget] = {}
         # Stable ViewStack children that hold each PreferencesPage. Speech is
         # rebuilt in place inside its host so tab order never changes and the
@@ -828,6 +873,10 @@ class SettingsWindow(Adw.ApplicationWindow):
         # path access-violates on Windows once those pages have been shown).
         self._page_hosts: dict[str, Gtk.Box] = {}
         self._mic_display: dict[str, str] = {}
+        # ComboRow values, published on notify::selected. Dirty-poll and
+        # Save read this cache - reading ComboRow.get_selected() while the
+        # device popover is open re-enters GTK and freezes the window.
+        self._choice_values: dict[str, str] = {}
         self._mic_meter: _MicLevelStrip | None = None
         self._mic_test_button: Gtk.Button | None = None
         # Only True while the user has pressed Test. The meter never opens
@@ -931,10 +980,19 @@ class SettingsWindow(Adw.ApplicationWindow):
         self._raise_to_front()
         # Map re-applies acrylic; also nudge once on idle so a window that
         # was already mapped still gets a fresh composition attribute after
-        # a long prewarm sleep.
+        # a long prewarm sleep. One queued apply at a time: a click storm
+        # must not stack idle callbacks re-running the DWM calls.
         if sys.platform == "win32":
-            GLib.idle_add(self._ensure_win32_backdrop)
+            if not self._backdrop_pending:
+                self._backdrop_pending = True
+                GLib.idle_add(self._backdrop_idle)
         return False                    # idle_add: run once
+
+    def _backdrop_idle(self) -> bool:
+        """One coalesced acrylic re-apply, from the queue above."""
+        self._backdrop_pending = False
+        self._ensure_win32_backdrop()
+        return False
 
     def _raise_to_front(self) -> None:
         """Map, unminimize and take focus after a tray click.
@@ -944,6 +1002,10 @@ class SettingsWindow(Adw.ApplicationWindow):
         refuses focus-steal without an xdg-activation token the tray cannot
         hand us, so after present we ask the window manager (kdotool on KDE,
         wmctrl/xdotool elsewhere) to activate us by title.
+
+        The finish cycles are coalesced: a burst of tray clicks must not
+        stack idle/timeout pairs, each re-presenting and re-talking to the
+        compositor. One cycle per window-state change is what raising needs.
         """
         try:
             if bool(self.get_property("minimized")):
@@ -952,11 +1014,15 @@ class SettingsWindow(Adw.ApplicationWindow):
             pass
         self.set_visible(True)
         self.present()
+        if self._raise_pending:
+            return
+        self._raise_pending = True
         # Once the surface is mapped (and again a moment later for slow WMs).
         GLib.idle_add(self._finish_raise)
         GLib.timeout_add(120, self._finish_raise)
 
     def _finish_raise(self) -> bool:
+        self._raise_pending = False
         try:
             self.present()
             if sys.platform == "win32":
@@ -1544,6 +1610,11 @@ class SettingsWindow(Adw.ApplicationWindow):
                 # Device choice for an in-progress Test - never polled from
                 # the paint timer (that freezes the combo popover).
                 row.connect("notify::selected", self._on_mic_device_changed)
+            # Cache on change so dirty-poll and Save never call
+            # ComboRow.get_selected() - that freezes the open popover.
+            row.connect(
+                "notify::selected",
+                lambda r, *_a, key=field.key: self._cache_choice(key, r))
             if field.help:
                 row.set_subtitle(field.help)
             self._rows[field.key] = row
@@ -1654,46 +1725,45 @@ class SettingsWindow(Adw.ApplicationWindow):
     def _load_mics_in_background(self):
         """Fill the microphone dropdown once the window is up."""
         def work():
-            devices = _list_input_devices()
-            GLib.idle_add(self._apply_mics, devices)
+            devices, remapped = _list_devices_and_remap(
+                self.config.mic_device_index)
+            GLib.idle_add(self._apply_mics, devices, remapped)
 
         threading.Thread(target=work, daemon=True,
                          name="whisper-flow-mic-list").start()
 
-    def _apply_mics(self, devices: list) -> bool:
+    def _apply_mics(self, devices: list, remapped=None) -> bool:
         """Swap in the real device list, keeping whatever is selected.
 
         One idle callback for the whole swap, so the dirty poll never sees a
         dropdown mid-rebuild and offers to save a change nobody made.
 
-        The selection is read off the row rather than out of `_current`.
+        The selection is read off the cache rather than out of `_current`.
         `_current` is the saved baseline the dirty poll diffs against, not
         live widget state, so restoring from it would silently undo a choice
         made while the enumeration was still running - and the reason that
         enumeration is on a thread at all is that it is slow enough for
         someone to get there first.
+
+        A saved DirectSound/WDM-KS index is rematched to its WASAPI (or
+        MME) twin. The unsupported row is never offered and never kept
+        selected - picking it is what froze Test and opened a backend
+        that cannot be used.
         """
         row = self._rows.get("mic_device_index")
         if row is None:
             return False
-        # get_selected() answers GTK_INVALID_LIST_POSITION when nothing is
-        # selected, and get_string() of that is None rather than an error.
-        position = row.get_selected()
-        display = (row.get_model().get_string(position)
-                   if position < row.get_model().get_n_items() else None)
-        selected = self._mic_display.get(display, "") if display else ""
+        selected = self._choice_values.get("mic_device_index", "")
 
         self._mic_display = {"Default": ""}
         for index, name in devices:
             self._mic_display[f"{index}: {name}"] = str(index)
-        # A device that is configured but no longer listed keeps its row, or
-        # selecting it would silently fall back to Default. That covers both
-        # unplugged hardware and a saved DirectSound/WDM-KS index after those
-        # APIs were removed from the list - without a row, the user could not
-        # see they need to pick WASAPI.
         if selected and selected not in self._mic_display.values():
-            self._mic_display[f"{selected}: (unsupported - pick WASAPI)"] = (
-                selected)
+            if (remapped is not None
+                    and str(remapped) in self._mic_display.values()):
+                selected = str(remapped)
+            else:
+                selected = ""
 
         displays = list(self._mic_display)
         row.set_model(Gtk.StringList.new(displays))
@@ -1701,6 +1771,18 @@ class SettingsWindow(Adw.ApplicationWindow):
             if self._mic_display[display] == selected:
                 row.set_selected(i)
                 break
+        # Rematch is not a user edit: treat the twin as the saved baseline
+        # so opening settings does not look dirty. A choice the user made
+        # while the list was loading (Default, another row) is left dirty.
+        saved = ("" if self.config.mic_device_index is None
+                 else str(self.config.mic_device_index))
+        if (selected
+                and remapped is not None
+                and selected == str(remapped)
+                and selected != saved
+                and self._current.get("mic_device_index") == saved):
+            self._current["mic_device_index"] = selected
+        self._choice_values["mic_device_index"] = selected
         return False
 
     # -------------------------------------------------------- mic meter
@@ -1787,22 +1869,37 @@ class SettingsWindow(Adw.ApplicationWindow):
             name="whisper-flow-mic-meter")
         self._mic_meter_thread.start()
 
+    def _cache_choice(self, key: str, row) -> None:
+        """Remember a ComboRow value from notify::selected.
+
+        This is the only place dirty-poll and Save are allowed to learn a
+        choice from. Reading the row later, especially while its popover
+        is open, re-enters GTK and freezes the settings window.
+        """
+        try:
+            model = row.get_model()
+            if model is None:
+                return
+            position = row.get_selected()
+            if position >= model.get_n_items():
+                return
+            display = model.get_string(position) or ""
+        except Exception:
+            return
+        if key == "mic_device_index":
+            self._choice_values[key] = (
+                self._mic_display.get(display, display) if display else "")
+        else:
+            self._choice_values[key] = display
+
     def _selected_mic_device(self):
         """Index the Device row is showing, or None for the platform default.
 
-        Main-thread only: it reads the ComboRow. The capture thread never
+        Reads the cache, never the ComboRow. The capture thread never
         calls this; it reads the copy `_mic_want_device` published on Test
         and on selection-changed.
         """
-        row = self._rows.get("mic_device_index")
-        if row is None:
-            return None
-        position = row.get_selected()
-        model = row.get_model()
-        if model is None or position >= model.get_n_items():
-            return None
-        display = model.get_string(position)
-        raw = self._mic_display.get(display, "") if display else ""
+        raw = self._choice_values.get("mic_device_index", "")
         if not raw:
             return None
         try:
@@ -1993,6 +2090,7 @@ class SettingsWindow(Adw.ApplicationWindow):
                 continue
             if field.kind == "choice":
                 raw = "" if value is None else str(value)
+                self._choice_values[field.key] = raw
                 model = row.get_model()
                 for i in range(model.get_n_items()):
                     display = model.get_string(i)
@@ -2064,6 +2162,7 @@ class SettingsWindow(Adw.ApplicationWindow):
             if field.kind == "bool":
                 row.set_active(bool(raw))
             elif field.kind == "choice":
+                self._choice_values[field.key] = "" if raw is None else str(raw)
                 model = row.get_model()
                 for i in range(model.get_n_items()):
                     display = model.get_string(i)
@@ -2088,10 +2187,7 @@ class SettingsWindow(Adw.ApplicationWindow):
             if field.kind == "bool":
                 values[field.key] = bool(row.get_active())
             elif field.kind == "choice":
-                display = row.get_model().get_string(row.get_selected())
-                values[field.key] = (self._mic_display.get(display, display)
-                                     if field.key == "mic_device_index"
-                                     else display)
+                values[field.key] = self._choice_values.get(field.key, "")
             elif field.kind in ("int", "float") and field.key in _SPIN:
                 number = row.get_value()
                 values[field.key] = (str(int(number)) if field.kind == "int"
@@ -2215,41 +2311,53 @@ class SettingsWindow(Adw.ApplicationWindow):
         self._toast("Changes discarded")
 
     def _on_save(self):
-        """Validate on the UI thread; write .env and restart off it.
+        """Return from the click immediately; write and restart off-thread.
 
-        The whole Save path is async after reading widget values: disk and
-        systemctl must never run under a button-clicked handler. Write and
-        restart failures are reported separately so a permission error does
-        not look like a successful save, and a restart failure still offers
-        Retry after the file is on disk.
+        Disk, PortAudio and systemctl must never run under a button-clicked
+        handler, and ComboRow must not be read here either - that freezes
+        the device popover on Windows. Values come from the notify cache.
+        Write and restart failures are reported separately so a permission
+        error does not look like a successful save, and a restart failure
+        still offers Retry after the file is on disk.
         """
         if self._working:
             return
-        try:
-            values = self._values()
-            problem = settings_def.validate(values)
-            if problem:
-                self._toast(problem)
-                return
-            updates = settings_def.updates_from(values, self._current)
-            model = self._selected_model()
-            if model and model != self._current_model:
-                updates["WHISPER_FLOW_MODEL_NAME"] = model
-        except Exception as e:
-            log(f"[SETTINGS] save prepare failed: {e}")
-            self._toast(f"Could not read settings: {_format_error(e)}")
-            return
-        if not updates:
-            self._toast("Nothing changed")
-            return
-
-        env_path = Path(self.config.config_dir) / ".env"
         self._working = True
         self._banner.set_revealed(False)
         if self._mic_meter_active:
             self._stop_mic_test()
         # Honest until the write lands - "Saved" only after success.
         self._toast("Saving...")
+        GLib.idle_add(self._begin_save)
+
+    def _begin_save(self) -> bool:
+        """Validate cached values, then write .env and restart off-thread."""
+        try:
+            values = self._values()
+            problem = settings_def.validate(values)
+            if problem:
+                self._working = False
+                self._toast(problem)
+                try:
+                    self._refresh_dirty()
+                except Exception:
+                    pass
+                return False
+            updates = settings_def.updates_from(values, self._current)
+            model = self._selected_model()
+            if model and model != self._current_model:
+                updates["WHISPER_FLOW_MODEL_NAME"] = model
+        except Exception as e:
+            log(f"[SETTINGS] save prepare failed: {e}")
+            self._working = False
+            self._toast(f"Could not read settings: {_format_error(e)}")
+            return False
+        if not updates:
+            self._working = False
+            self._toast("Nothing changed")
+            return False
+
+        env_path = Path(self.config.config_dir) / ".env"
 
         def work():
             try:
@@ -2301,6 +2409,7 @@ class SettingsWindow(Adw.ApplicationWindow):
             )
 
         _run_in_background("save", work, done)
+        return False
 
     def _save_write_failed(self, detail: str) -> None:
         """Write never landed: keep edits dirty and tell the user why."""

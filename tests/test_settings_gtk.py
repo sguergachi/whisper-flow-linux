@@ -34,6 +34,10 @@ if scenario == "mic_race":
     # lands. Without one the placeholder holds only "Default" and the window
     # this tests cannot be entered.
     os.environ["MIC_DEVICE_INDEX"] = "0"    # the name settings_def writes
+elif scenario == "mic_remap":
+    # Saved DirectSound index from the Windows screenshot. The real list
+    # will not include 12; rematch must land on the WASAPI twin.
+    os.environ["MIC_DEVICE_INDEX"] = "12"
 
 import gi
 gi.require_version("Gtk", "4.0")
@@ -61,8 +65,21 @@ def _devices():
 # the real function builds and got "Built-in mic".
 _real_list_input_devices = settings_gtk._list_input_devices
 settings_gtk._list_input_devices = _devices
+# A saved unsupported index rematches on a worker. Tests that do not
+# stub this would open the real audio system.
+settings_gtk._remap_unsupported_mic = lambda index: None
 # Save restarts the daemon by default; tests must not kill a real process.
 settings_gtk.restart.restart_daemon = lambda: (True, "ok")
+if scenario == "mic_remap":
+    settings_gtk._list_input_devices = lambda: [
+        (0, "Microsoft Sound Mapper - Input (MME)"),
+        (1, "Microphone (Logi USB Headset) (MME)"),
+        (2, "Microphone (2- Realtek(R) Audio) (MME)"),
+        (17, "Microphone (2- Realtek(R) Audio) (WASAPI)"),
+        (18, "Microphone (Logi USB Headset) (WASAPI)"),
+    ]
+    settings_gtk._remap_unsupported_mic = (
+        lambda index: 18 if index == 12 else None)
 Gtk.init()
 w = settings_gtk.SettingsWindow()
 w.config.config_dir = config_dir
@@ -208,7 +225,10 @@ elif scenario == "cancel":
 elif scenario == "invalid":
     w._rows["hotkey_transcribe"].set_text("super++alt")
     w._on_save()
-    assert "empty key name" in w._last_toast_title
+    # Validation runs on idle so the click handler never blocks.
+    assert pump(lambda: "empty key name" in (w._last_toast_title or "")), (
+        w._last_toast_title)
+    assert not w._working
 elif scenario == "cleared":
     assert pump(mics_listed), "the microphone list never arrived"
     mic = mic_row()
@@ -314,6 +334,30 @@ elif scenario == "prewarm_shows":
     # Tray click must raise even when the window was already open.
     w.show_for_click()
     assert w.get_visible()
+elif scenario == "show_storm":
+    # The tray click storm the Windows log showed: ~20 shows in a couple of
+    # seconds, because clicks queue while the daemon's message loop is
+    # stalled and then all arrive at once. The window must survive it, and
+    # the raise work must be coalesced - one present/finish cycle per state
+    # change, not one per click (which is the churn the settings process
+    # died under with 0xC0000005).
+    finished = []
+    orig_finish = w._finish_raise
+
+    def counting():
+        finished.append(1)
+        return orig_finish()
+
+    w._finish_raise = counting
+    for _ in range(20):
+        w.show_for_click()
+    assert pump(lambda: w.get_visible()), "the window never came up"
+    # Let the 120ms slow-WM retry fire as well.
+    pump(lambda: False, seconds=0.4)
+    assert w.get_visible()
+    assert len(finished) == 2, (
+        f"the raise cycle ran {len(finished)} times for 20 clicks "
+        f"(expect one idle + one 120ms retry)")
 elif scenario == "prewarm_rereads":
     # The .env is written after this window was built, which is the ordinary
     # case for one built at login: the daemon downloads a model or writes a
@@ -401,6 +445,46 @@ elif scenario == "mic_host_api":
     assert settings_gtk._host_api_supported("ALSA")
     assert not settings_gtk._host_api_supported("DirectSound")
     assert not settings_gtk._host_api_supported("WDM-KS")
+elif scenario == "mic_remap":
+    # Device 12 is the saved DirectSound row. It must not stay selected
+    # as "(unsupported - pick WASAPI)"; the WASAPI twin (18) is picked.
+    def remapped():
+        model = mic_row().get_model()
+        return any("WASAPI" in (model.get_string(i) or "")
+                   for i in range(model.get_n_items()))
+    assert pump(remapped), "the rematched microphone list never arrived"
+    mic = mic_row()
+    model = mic.get_model()
+    labels = [model.get_string(i) for i in range(model.get_n_items())]
+    assert not any("unsupported" in (label or "").lower() for label in labels), (
+        labels)
+    chosen = model.get_string(mic.get_selected())
+    assert chosen is not None and chosen.startswith("18:"), chosen
+    assert w._choice_values.get("mic_device_index") == "18"
+    # Rematch is not a user edit: opening settings is not dirty.
+    w._refresh_dirty()
+    assert not w._banner.get_revealed(), "rematch looked like an unsaved change"
+elif scenario == "save_no_combo_read":
+    # Dirty-poll and Save used to call ComboRow.get_selected(). With the
+    # device popover open that re-enters GTK and freezes the window.
+    w.present()
+    assert pump(lambda: w.get_visible())
+    assert pump(mics_listed), "the microphone list never arrived"
+    mic = mic_row()
+    reads = []
+    orig = mic.get_selected
+
+    def counting():
+        reads.append(1)
+        return orig()
+
+    mic.get_selected = counting
+    w._refresh_dirty()
+    w._on_save()
+    assert pump(lambda: not w._working), "async save never finished"
+    assert reads == [], (
+        f"ComboRow.get_selected was called {len(reads)} times from "
+        f"dirty-poll or Save; that freezes the open device list")
 elif scenario == "mic_selected":
     # Which device is in use, in the open list. Replacing the factory to stop
     # it ellipsizing the names also dropped the tick the stock one draws, so
@@ -736,6 +820,18 @@ def test_the_device_list_says_which_audio_api_each_entry_is(tmp_path):
     assert "OK" in result.stdout, result.stderr
 
 
+def test_an_unsupported_saved_device_is_rematched_to_wasapi(tmp_path):
+    """A saved DirectSound index must not stay selected as unsupported."""
+    result = _run(tmp_path, "mic_remap")
+    assert "OK" in result.stdout, result.stderr
+
+
+def test_save_and_dirty_poll_do_not_read_the_device_combo(tmp_path):
+    """ComboRow.get_selected while the popover is open freezes GTK."""
+    result = _run(tmp_path, "save_no_combo_read")
+    assert "OK" in result.stdout, result.stderr
+
+
 def test_the_open_device_list_shows_which_one_is_selected(tmp_path):
     """The factory that stops the names being ellipsized also dropped the tick.
 
@@ -792,6 +888,13 @@ def test_a_window_built_in_advance_stays_off_screen(tmp_path):
 def test_the_click_puts_the_prewarmed_window_up(tmp_path):
     result = _run(tmp_path, "prewarm_shows")
     assert "OK" in result.stdout, result.stderr
+
+
+def test_a_click_storm_is_one_raise_cycle(tmp_path):
+    """Twenty rapid tray clicks survive, and coalesce to one raise cycle."""
+    result = _run(tmp_path, "show_storm")
+    assert "OK" in result.stdout, result.stderr
+    assert "for 20 clicks" not in result.stdout
 
 
 def test_a_prewarmed_window_re_reads_the_config_when_it_is_shown(tmp_path):

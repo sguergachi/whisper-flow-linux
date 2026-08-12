@@ -458,6 +458,193 @@ def test_a_recording_that_transcribes_is_not_retried(tmp_path):
     assert len(attempts) == 1        # the retry costs a pass; do not spend it
 
 
+def _write_music_capture(tmp_path):
+    """A continuous (music-like) raw capture, as the recorder leaves it."""
+    import wave
+
+    import numpy as np
+
+    from whisper_flow import audio_debug
+
+    rng = np.random.default_rng(11)
+    rate = 16000
+    seconds = 2.6
+    t = np.arange(int(rate * seconds)) / rate
+    bed = (np.sin(2 * np.pi * 120 * t) * 0.6
+           + np.sin(2 * np.pi * 340 * t) * 0.4)
+    tremolo = 0.75 + 0.25 * np.sin(2 * np.pi * 1.7 * t)
+    sig = (bed * tremolo * 2200
+           + rng.normal(0, 180, t.size)).astype(np.int16)
+    last = audio_debug.last_dir(tmp_path)
+    last.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(last / "raw_trimmed.wav"), "wb") as f:
+        f.setnchannels(1)
+        f.setsampwidth(2)
+        f.setframerate(rate)
+        f.writeframes(sig.tobytes())
+    return rate, seconds
+
+
+def test_a_music_short_transcript_is_redecoded_steered(monkeypatch, tmp_path):
+    """The real failure: 'What does a control point mean?' came back as the
+    four words 'This is the show.' - whisper transcribed the music's vocals.
+    The clip is music-like and the transcript is too short for the speech,
+    so one steered re-decode must recover the words."""
+    from whisper_flow import app as app_module
+    from whisper_flow import audio_debug
+
+    rate, seconds = _write_music_capture(tmp_path)
+    attempts = []
+
+    class Service:
+        def transcribe_audio(self, path, **kw):
+            attempts.append((path, kw))
+            if len(attempts) == 1:
+                return "This is the show."
+            return "What does a control point mean?"
+
+    config = Mock()
+    config.config_dir = tmp_path
+    config.smart_voice_amplification = True
+    flow = app_module.WhisperFlow.__new__(app_module.WhisperFlow)
+    flow.transcription_service = Service()
+    flow.config = config
+
+    result = flow._transcribe_allowing_for_a_whisper("/tmp/x.wav")
+    assert result == "What does a control point mean?"
+    assert len(attempts) == 2
+    _, kwargs = attempts[1]
+    assert kwargs.get("temperature") == 0.6
+    assert "music" in (kwargs.get("prompt") or "")
+    # The steered audio is written beside the source and cleaned up.
+    assert not (tmp_path / "x.wav.music.wav").exists()
+    # And the rescue copy is kept for the audio-debug folder.
+    assert (audio_debug.last_dir(tmp_path) / "music_steer.wav").exists()
+
+
+def test_speech_paced_transcripts_never_pay_for_a_redecode(tmp_path):
+    """A normal-length transcript is speech whatever the bed sounds like."""
+    from whisper_flow import app as app_module
+
+    _write_music_capture(tmp_path)
+    attempts = []
+
+    class Service:
+        def transcribe_audio(self, path, **kw):
+            attempts.append(path)
+            return "I'm not going to go to the beach."
+
+    config = Mock()
+    config.config_dir = tmp_path
+    config.smart_voice_amplification = True
+    flow = app_module.WhisperFlow.__new__(app_module.WhisperFlow)
+    flow.transcription_service = Service()
+    flow.config = config
+
+    result = flow._transcribe_allowing_for_a_whisper("/tmp/x.wav")
+    assert result == "I'm not going to go to the beach."
+    assert len(attempts) == 1
+
+
+def test_no_redecode_for_a_short_transcript_without_a_music_bed(tmp_path):
+    """'This is the show.' in a quiet room is a short phrase, not music:
+    the bursty level profile must not trigger the steered pass."""
+    import wave
+
+    import numpy as np
+
+    from whisper_flow import app as app_module
+    from whisper_flow import audio_debug
+
+    rate = 16000
+    seconds = 2.6
+    rng = np.random.default_rng(13)
+    out = np.zeros(int(rate * seconds), dtype=np.int16)
+    t = np.arange(int(rate * seconds)) / rate
+    for start, length in ((0.1, 0.5), (0.9, 0.6), (1.7, 0.5)):
+        span = (t >= start) & (t < start + length)
+        formants = sum(np.sin(2 * np.pi * hz * t[span])
+                       for hz in (140, 420, 900, 1800)) / 4
+        out[span] = (formants * np.hanning(span.sum()) * 3000).astype(np.int16)
+    out += rng.normal(0, 60, out.size).astype(np.int16)
+    last = audio_debug.last_dir(tmp_path)
+    last.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(last / "raw_trimmed.wav"), "wb") as f:
+        f.setnchannels(1)
+        f.setsampwidth(2)
+        f.setframerate(rate)
+        f.writeframes(out.tobytes())
+
+    attempts = []
+
+    class Service:
+        def transcribe_audio(self, path, **kw):
+            attempts.append(path)
+            return "This is the show."
+
+    config = Mock()
+    config.config_dir = tmp_path
+    config.smart_voice_amplification = True
+    flow = app_module.WhisperFlow.__new__(app_module.WhisperFlow)
+    flow.transcription_service = Service()
+    flow.config = config
+
+    result = flow._transcribe_allowing_for_a_whisper("/tmp/x.wav")
+    assert result == "This is the show."
+    assert len(attempts) == 1
+
+
+def test_a_weaker_steered_result_does_not_replace_the_first(tmp_path):
+    """The steered pass only wins when it reads more speech-paced; otherwise
+    the first transcript stands rather than being swapped for a guess."""
+    from whisper_flow import app as app_module
+
+    rate, seconds = _write_music_capture(tmp_path)
+    attempts = []
+
+    class Service:
+        def transcribe_audio(self, path, **kw):
+            attempts.append(path)
+            if len(attempts) == 1:
+                return "This is the show."
+            return "Yes."
+
+    config = Mock()
+    config.config_dir = tmp_path
+    config.smart_voice_amplification = True
+    flow = app_module.WhisperFlow.__new__(app_module.WhisperFlow)
+    flow.transcription_service = Service()
+    flow.config = config
+
+    result = flow._transcribe_allowing_for_a_whisper("/tmp/x.wav")
+    assert result == "This is the show."
+    assert len(attempts) == 2        # it did try, and it chose to keep
+
+
+def test_the_music_steer_skips_when_smart_voice_is_off(tmp_path):
+    """The re-decode runs on rescue-processed audio, which is smart voice."""
+    from whisper_flow import app as app_module
+
+    _write_music_capture(tmp_path)
+    attempts = []
+
+    class Service:
+        def transcribe_audio(self, path, **kw):
+            attempts.append(path)
+            return "This is the show."
+
+    config = Mock()
+    config.config_dir = tmp_path
+    config.smart_voice_amplification = False
+    flow = app_module.WhisperFlow.__new__(app_module.WhisperFlow)
+    flow.transcription_service = Service()
+    flow.config = config
+
+    result = flow._transcribe_allowing_for_a_whisper("/tmp/x.wav")
+    assert result == "This is the show."
+    assert len(attempts) == 1
+
+
 def test_cold_open_silence_is_skipped_before_boosting_the_raw(tmp_path):
     """A cold-opened stream starts with ~0.4s of exact digital silence. The
     raw boost retry must cut that silence before amplifying: boosting it

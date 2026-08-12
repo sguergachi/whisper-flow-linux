@@ -147,12 +147,18 @@ class TranscriptionService:
             self.local_url = config.local_whisper_url.rstrip("/")
 
     def transcribe_audio(self, audio_path: str, max_retries: int = 3,
-                         timeout: float = FINAL_TIMEOUT) -> str | None:
+                         timeout: float = FINAL_TIMEOUT,
+                         prompt: str | None = None,
+                         temperature: float | None = None) -> str | None:
         """Transcribe audio file.
 
         Args:
             audio_path: Path to the recorded audio file
             max_retries: Maximum number of retry attempts
+            prompt: Optional initial prompt handed to Whisper, used to steer
+                a re-decode away from background music and towards speech
+            temperature: Optional decode temperature for the re-decode; the
+                normal path stays at the deterministic default
 
         Returns:
             Transcribed text or None if failed/blank
@@ -169,7 +175,8 @@ class TranscriptionService:
                         "No whisper server configured. Point WHISPER_FLOW_LOCAL_WHISPER_URL "
                         "at one, or let the app manage one (it does by default).",
                     )
-                text = self._transcribe_local(audio_path, timeout)
+                text = self._transcribe_local(
+                    audio_path, timeout, prompt=prompt, temperature=temperature)
 
                 text = _normalize(text)
                 if text and text != "[BLANK_AUDIO]" and not is_hallucination(text):
@@ -194,11 +201,15 @@ class TranscriptionService:
         return None
 
     def _transcribe_local(self, audio_path: str,
-                          timeout: float = FINAL_TIMEOUT) -> str:
+                          timeout: float = FINAL_TIMEOUT,
+                          prompt: str | None = None,
+                          temperature: float | None = None) -> str:
         """Transcribe audio using local whisper.cpp server.
 
         Args:
             audio_path: Path to the audio file
+            prompt: Optional initial prompt for the decoder (steering)
+            temperature: Optional decode temperature override
 
         Returns:
             Transcribed text
@@ -217,6 +228,13 @@ class TranscriptionService:
             "temperature_inc": "0.2",
             "no_speech_thold": str(self.config.no_speech_thold),
         }
+        # A re-decode steered away from background music: the prompt biases
+        # the language model towards speech, and a warmer start lets it
+        # escape the greedy path that locked onto the music's vocals.
+        if temperature is not None:
+            data["temperature"] = str(temperature)
+        if prompt:
+            data["prompt"] = prompt
         # Decode knobs from settings; the defaults match what the app always
         # sent, so a fresh install behaves exactly as before.
         if getattr(self.config, "beam_size", 1) > 1:

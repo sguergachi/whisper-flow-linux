@@ -214,3 +214,16 @@ def test_systemctl_os_error_is_reported(monkeypatch):
 
     assert ok is False
     assert "systemctl" in detail.lower() or "No such file" in detail
+
+
+def test_wait_for_exit_returns_immediately_when_the_pid_is_gone():
+    """A ctypes WaitForSingleObject held the GIL for the whole timeout.
+
+    Sleep-and-probe must notice a dead pid on the first check, not after
+    the full wait - Save runs this on a worker and a GIL hold freezes GTK.
+    """
+    import time
+
+    t0 = time.monotonic()
+    assert restart._wait_for_exit(2**30, timeout=5.0) is True
+    assert time.monotonic() - t0 < 1.0

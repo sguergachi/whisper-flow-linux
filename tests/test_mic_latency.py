@@ -29,9 +29,14 @@ def recorder():
 
 
 # ------------------------------------------------------------ device choice
-def test_an_explicit_device_always_wins(recorder, monkeypatch):
+def test_an_explicit_supported_device_wins(recorder, monkeypatch):
     monkeypatch.setattr(sys, "platform", "win32")
     recorder.config.mic_device_index = 7
+    recorder.pa.get_device_count.return_value = 8
+    recorder.pa.get_device_info_by_index.return_value = {
+        "name": "Headset", "hostApi": 2, "maxInputChannels": 1}
+    recorder.pa.get_host_api_info_by_index.return_value = {
+        "name": "Windows WASAPI"}
     assert recorder._input_device_index() == 7
 
 
@@ -397,6 +402,67 @@ def test_an_unnameable_default_falls_back_to_the_first_input(
     _reported_machine(recorder, wasapi_default=21, default_input_name="")
     recorder.pa.get_default_input_device_info.side_effect = OSError("no default")
     assert recorder._input_device_index() == 17
+
+
+def test_rematch_replaces_directsound_and_wdmks_with_wasapi():
+    """The dropdown hid those backends; a saved index must not keep using them."""
+    from whisper_flow.audio import rematch_capture_index
+
+    devices = [
+        (0, "Microsoft Sound Mapper - Input", "MME"),
+        (1, "Microphone (Logi USB Headset)", "MME"),
+        (2, "Microphone (2- Realtek(R) Audio)", "MME"),
+        (12, "Microphone (Logi USB Headset)", "Windows DirectSound"),
+        (17, "Microphone (2- Realtek(R) Audio)", "WASAPI"),
+        (18, "Microphone (Logi USB Headset)", "WASAPI"),
+        (21, "Microphone (Logi USB Headset)", "WDM-KS"),
+    ]
+    assert rematch_capture_index(12, devices) == 18
+    assert rematch_capture_index(21, devices) == 18
+    assert rematch_capture_index(18, devices) == 18
+    assert rematch_capture_index(1, devices) == 1
+    assert rematch_capture_index(99, devices) is None
+
+
+def test_a_configured_directsound_device_is_not_opened(
+        recorder, monkeypatch):
+    """The saved index was 12 on the machine that produced the screenshot:
+    DirectSound, labelled '(unsupported - pick WASAPI)'. Opening it is
+    what froze Test; recording must take the WASAPI twin instead.
+    """
+    monkeypatch.setattr(sys, "platform", "win32")
+    recorder.config.mic_device_index = 12
+    _reported_machine(
+        recorder, wasapi_default=21,
+        default_input_name="Microphone (Logi USB Headset)")
+    # DirectSound row the settings list hid.
+    original = recorder.pa.get_device_info_by_index.side_effect
+
+    def info(index):
+        if index == 12:
+            return {"name": "Microphone (Logi USB Headset)",
+                    "hostApi": 1, "maxInputChannels": 1,
+                    "defaultSampleRate": 48000.0}
+        return original(index)
+
+    recorder.pa.get_device_info_by_index.side_effect = info
+    recorder.pa.get_host_api_info_by_index.side_effect = lambda i: {
+        0: {"name": "MME", "defaultInputDevice": 0},
+        1: {"name": "Windows DirectSound", "defaultInputDevice": -1},
+        2: {"name": "Windows WASAPI", "defaultInputDevice": 21},
+        3: {"name": "Windows WDM-KS", "defaultInputDevice": 21},
+    }[i]
+    assert recorder._input_device_index() == 18
+
+
+def test_a_vanished_configured_device_falls_through_to_wasapi(
+        recorder, monkeypatch):
+    monkeypatch.setattr(sys, "platform", "win32")
+    recorder.config.mic_device_index = 99
+    _reported_machine(
+        recorder, wasapi_default=18,
+        default_input_name="Microphone (Logi USB Headset)")
+    assert recorder._input_device_index() == 18
 
 
 # ------------------------------------------------- MME truncates device names

@@ -110,6 +110,18 @@ SECOND_PASS_SNR_DB = 12.0
 SECOND_PASS_PEAK = 1200.0
 SECOND_PASS_SPEECH_P90 = 800.0
 
+# Continuous-background (music) detection, used to distrust a transcript
+# that reads shorter than the clip's speech. Music fills the gaps speech
+# leaves, so the level histogram clusters around the median: half the frames
+# within ~3.5 dB of it, and no long quiet stretches. Clean speech is bursty
+# and bimodal; a quiet room has nothing above its floor. The metric is the
+# gate, the transcript's pace is the trigger: a normal-length result is
+# speech whatever the bed sounds like, and never pays for a re-decode.
+MUSIC_STEADY_FRAC = 0.50       # frames within the ±3.5 dB band of the median
+MUSIC_STEADY_BAND_FRAC = 0.35  # the band itself, as a fraction of the median
+MUSIC_VOICED_FRAC = 0.55       # no long silences: the bed never stops
+MUSIC_MIN_SPEECH_P90 = SPEECH_P90_WHISPER
+
 
 @dataclass(frozen=True)
 class VoicePlan:
@@ -142,6 +154,7 @@ class SignalProfile:
     bass_ratio: float
     low_snr: bool
     is_whisper: bool        # quiet voice that needs gate-then-lift
+    music_like: bool = False  # continuous bed that never lets the room rest
 
 
 def high_pass(samples: np.ndarray, rate: int, state=None, cutoff_hz: float = HIGHPASS_HZ):
@@ -624,6 +637,23 @@ def profile_signal(samples: np.ndarray, rate: int,
         and use_floor < WHISPER_MAX_FLOOR
     )
 
+    # Continuous background (music or a singing bed): the level never rests.
+    # Speech leaves gaps for its floor; music fills them, so most frames sit
+    # near the median level and most of the clip counts as "voiced". Used to
+    # distrust a transcript that is too short for the clip - whisper locking
+    # onto the music's vocals is exactly how a 2.6s question came back as a
+    # four-word lyric. Quiet rooms fail voiced_frac (nothing crosses the
+    # soft line), and a dead clip fails speech_p90.
+    music_like = False
+    if voiced_frac >= MUSIC_VOICED_FRAC and speech_p90 >= MUSIC_MIN_SPEECH_P90:
+        if levels.size:
+            med = float(np.median(levels))
+            if med > 0:
+                band = med * MUSIC_STEADY_BAND_FRAC
+                near = levels[np.abs(levels - med) <= band]
+                steady = float(near.size / levels.size)
+                music_like = steady >= MUSIC_STEADY_FRAC
+
     return SignalProfile(
         floor=use_floor,
         snr_db=snr,
@@ -634,6 +664,7 @@ def profile_signal(samples: np.ndarray, rate: int,
         bass_ratio=bass,
         low_snr=low,
         is_whisper=is_whisper,
+        music_like=music_like,
     )
 
 

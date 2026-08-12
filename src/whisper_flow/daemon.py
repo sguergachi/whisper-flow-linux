@@ -35,6 +35,17 @@ from .version import build_version
 # looked exactly like "command does nothing".
 PUSH_TO_TALK_MODES = ("transcribe",)
 
+# How long a Settings tray click suppresses the next one. Opening the tool
+# window holds the tray callback for the 0.4s liveness probe (and more if a
+# process has to be started), during which the message loop is stalled and
+# further clicks queue behind it; without the debounce a user clicking away
+# at a tray item that seems slow produced bursts of 6-8 open_settings calls
+# in the same second, each writing another "show" and re-running the raise
+# and DWM-acrylic work - the storm under which the settings window was seen
+# to die (0xC0000005) and vanish. One click per debounce window is enough:
+# the window raises itself.
+SETTINGS_CLICK_DEBOUNCE_S = 1.5
+
 def _pystray():
     """Import pystray at the point of use.
 
@@ -158,6 +169,7 @@ class WhisperFlowDaemon:
         self._setup_shown = False
         self._setup_lock = threading.Lock()
         self._last_failure = None
+        self._last_settings_click = 0.0
 
         # Initialize WhisperFlow instances for different modes
         log("[DAEMON] Creating WhisperFlow instances...")
@@ -1475,8 +1487,20 @@ class WhisperFlowDaemon:
         It cannot run here: pystray owns this process's event loop and GTK
         insists on its own. The tray callback has to return immediately or
         the icon stops responding, and spawning is all this does.
+
+        Rapid repeats are dropped rather than forwarded: opening the window
+        blocks this thread for the 0.4s liveness probe, so clicks made while
+        it is blocked queue up and then all fire - and each one used to write
+        another "show", re-raise, and re-apply DWM acrylic in the settings
+        process. A window that was just asked for raises itself; a second
+        click a second and a half later is someone asking again.
         """
         log("[DAEMON] Settings menu item clicked")
+        now = time.time()
+        if now - self._last_settings_click < SETTINGS_CLICK_DEBOUNCE_S:
+            log("[DAEMON] Settings click ignored (already being opened)")
+            return
+        self._last_settings_click = now
         if not self._open_settings_window():
             self.notify(f"Config directory: {self.config.config_dir}")
 

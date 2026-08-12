@@ -116,28 +116,46 @@ def respawn_command() -> list[str]:
     return [sys.executable, "-m", "whisper_flow.cli", "daemon", "--foreground"]
 
 
-def _wait_for_exit(pid: int, timeout: float = 10.0) -> bool:
-    """Block until the process is gone. False if it outlasted the timeout."""
+def _pid_alive(pid: int) -> bool:
+    """Whether ``pid`` still exists. A failed query counts as gone."""
     if sys.platform == "win32":
         import ctypes
-        SYNCHRONIZE = 0x100000
-        handle = ctypes.windll.kernel32.OpenProcess(SYNCHRONIZE, False, pid)
+        # PROCESS_QUERY_LIMITED_INFORMATION is enough to read the exit
+        # code. WaitForSingleObject was used here first; ctypes holds the
+        # GIL for the whole wait, so a 0.8s Save restart froze every
+        # Python callback in the settings window.
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        handle = ctypes.windll.kernel32.OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
         if not handle:
-            return True             # already gone
+            return False
         try:
-            return ctypes.windll.kernel32.WaitForSingleObject(
-                handle, int(timeout * 1000)) == 0
+            exit_code = ctypes.c_ulong()
+            ok = ctypes.windll.kernel32.GetExitCodeProcess(
+                handle, ctypes.byref(exit_code))
+            return bool(ok) and exit_code.value == STILL_ACTIVE
         finally:
             ctypes.windll.kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)             # sig 0: existence check, no signal sent
+        return True
+    except OSError:
+        return False
 
+
+def _wait_for_exit(pid: int, timeout: float = 10.0) -> bool:
+    """Block until the process is gone. False if it outlasted the timeout.
+
+    Sleeps between probes so the GIL is released; a ctypes wait that
+    held it froze the settings window on Save.
+    """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        try:
-            os.kill(pid, 0)         # sig 0: existence check, no signal sent
-        except OSError:
+        if not _pid_alive(pid):
             return True
-        time.sleep(0.1)
-    return False
+        time.sleep(0.05)
+    return not _pid_alive(pid)
 
 
 def restart_daemon() -> tuple[bool, str]:

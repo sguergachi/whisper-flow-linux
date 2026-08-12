@@ -99,6 +99,70 @@ def _same_device(a: str, b: str) -> bool:
     return a[:MME_NAME_LIMIT] == b[:MME_NAME_LIMIT]
 
 
+# Windows host APIs we will not open for capture. PortAudio still lists
+# them (one physical mic becomes four rows), but DirectSound hangs the
+# settings Test meter and freezes the UI, and WDM-KS is exclusive kernel
+# streaming that fails whenever anything else holds the endpoint.
+UNSUPPORTED_HOST_APIS = frozenset({
+    "directsound",
+    "wdm-ks",
+    "wdm ks",
+    "wdmks",
+})
+
+
+def host_api_supported(api: str) -> bool:
+    """Whether this PortAudio host API is safe to open for capture.
+
+    Empty/unknown (typical on Linux: ALSA, PulseAudio) is kept. Only the
+    known-bad Windows backends are filtered out.
+    """
+    if not api:
+        return True
+    key = api.lower().replace("windows ", "").strip()
+    if key in UNSUPPORTED_HOST_APIS:
+        return False
+    if "directsound" in key or "wdm-ks" in key or "wdmks" in key:
+        return False
+    return True
+
+
+def rematch_capture_index(
+        index: int,
+        devices: list[tuple[int, str, str]]) -> int | None:
+    """A supported capture index for ``index``, or None if none exists.
+
+    ``devices`` is ``(index, name, api_name)`` for every input. Returns
+    ``index`` when that row is already a supported API (WASAPI, MME,
+    ALSA, …). DirectSound and WDM-KS are replaced by the same physical
+    microphone on WASAPI, then any other supported API. A vanished
+    index, or one with no supported twin, returns None so the caller
+    can fall through to the WASAPI default pick rather than opening a
+    backend that hangs or takes exclusive access.
+    """
+    by_index = {i: (name, api) for i, name, api in devices}
+    if index not in by_index:
+        return None
+    name, api = by_index[index]
+    if host_api_supported(api):
+        return index
+    wasapi = None
+    other = None
+    for i, candidate, candidate_api in devices:
+        if i == index or not host_api_supported(candidate_api):
+            continue
+        if not _same_device(candidate, name):
+            continue
+        if "wasapi" in candidate_api.lower():
+            wasapi = i
+            break
+        if other is None:
+            other = i
+    if wasapi is not None:
+        return wasapi
+    return other
+
+
 def trim_silence(frames: list, vad, sample_rate: int, frame_ms: int,
                  pad_ms: int = TRIM_PAD_MS) -> list:
     """Drop leading and trailing frames that hold no speech.
@@ -216,10 +280,20 @@ class AudioRecorder:
         application can reach; below it is the audio engine and kernel
         streaming, which need a driver.
 
-        A device set explicitly in config always wins.
+        A device set explicitly in config wins only when it is a supported
+        capture API. A saved DirectSound or WDM-KS index is rematched to
+        the same microphone on WASAPI; opening those backends hangs the
+        settings meter and fails exclusive capture.
         """
         if self.config.mic_device_index is not None:
-            return self.config.mic_device_index
+            remapped = self._remap_configured_device(
+                self.config.mic_device_index)
+            if remapped is not None:
+                return remapped
+            # Gone, or unsupported with no twin. On Windows fall through
+            # to the WASAPI pick; elsewhere the platform default.
+            if sys.platform != "win32" or self.pa is None:
+                return None
         if sys.platform != "win32" or self.pa is None:
             return None
         try:
@@ -271,6 +345,42 @@ class AudioRecorder:
         except Exception as e:
             log(f"[AUDIO] could not pick a WASAPI device: {e}")
         return None
+
+    def _remap_configured_device(self, index: int) -> int | None:
+        """Keep ``index`` if it is a supported capture device; else rematch.
+
+        None means the configured row is gone or on DirectSound/WDM-KS
+        with no WASAPI/MME twin, so the caller should auto-pick.
+        Fail open (return ``index``) only when the audio system itself
+        cannot be queried - better a saved device than silence.
+        """
+        if self.pa is None:
+            return index
+        try:
+            devices = []
+            for i in range(self.pa.get_device_count()):
+                try:
+                    info = self.pa.get_device_info_by_index(i)
+                    if int(info.get("maxInputChannels", 0)) <= 0:
+                        continue
+                    api = str(
+                        self.pa.get_host_api_info_by_index(
+                            info["hostApi"]).get("name", ""))
+                    devices.append((i, str(info.get("name", "")), api))
+                except Exception:
+                    continue
+            remapped = rematch_capture_index(index, devices)
+            if remapped is None:
+                log(f"[AUDIO] configured device {index} is unsupported "
+                    f"or gone; picking a WASAPI device instead")
+                return None
+            if remapped != index:
+                log(f"[AUDIO] configured device {index} is not a "
+                    f"supported capture API; using {remapped}")
+            return remapped
+        except Exception as e:
+            log(f"[AUDIO] could not check configured device {index}: {e}")
+            return index
 
     def _first_input_on(self, host_api: int) -> int | None:
         """An input device served by this host API, or None.

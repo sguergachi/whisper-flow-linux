@@ -274,54 +274,60 @@ def pill_rects(width: int, height: int, exponent: float,
     return rects
 
 
-def extended_pill_rects(width: int, height: int, extension: int,
-                        exponent: float, inset: int = 0,
-                        cap: float = 1.12) -> list[tuple[int, int, int, int]]:
-    """Rows tracing the pill grown its stop button, as wl_region rects.
+def notched_pill_rects(width: int, height: int, notch_w: int, notch_h: int,
+                       exponent: float, inset: int = 0,
+                       notch_r: float = 8.0,
+                       cap: float = 1.12) -> list[tuple[int, int, int, int]]:
+    """Rows tracing the pill grown its stop notch, as wl_region rects.
 
-    The mirror of _extended_pill_points in hud_app: the pill's top cap and
-    straight sides, but instead of the bottom cap the sides continue down by
-    `extension` and close over a rounded bottom - the button is the pill's
-    own lower half. If this drifts from what is drawn, the blur shows
-    outside the glass.
-
-    The inset pulls the shape in on every side, but must not shorten the
-    extension: the row range is the whole height and the corners sit on the
-    inset bottom edge.
+    The mirror of _notched_pill_points in hud_app: the pill's capsule plus a
+    short centred tab under the bottom edge. If this drifts from what is
+    drawn, the blur shows outside the glass or leaves the notch unfrosted.
     """
     import math
 
-    width -= 2 * inset
-    if width <= 0:
-        return []
-    b = height / 2.0
-    rx = min(b * cap, width / 2.0)
-    rb = min(b, extension, width / 2.0)
-    total = height + extension - inset   # the bottom edge of the blur
-    rects = []
-    # The pill's top cap: the superelliptical rows, narrowing to nothing at
-    # the very top.
-    for y in range(int(math.floor(b))):
-        dy = abs(y + 0.5 - b) / b
-        f = (1.0 - dy ** exponent) ** (1.0 / exponent)
-        x0 = int(math.ceil(rx * (1.0 - f)))
-        w = width - 2 * x0
-        if w > 0:
-            rects.append((x0 + inset, y + inset, w, 1))
-    # Everything below the cap is the full width, down to the rounded
-    # bottom corners.
-    for y in range(int(math.floor(b)), total):
-        dy = total - (y + 0.5)           # distance below the corner centres
-        if dy < rb:
-            d = rb - dy
+    # Pill body first (inset on every side), then the notch under it.
+    rects = pill_rects(width, height, exponent, inset, cap)
+    if notch_w <= 0 or notch_h <= 0:
+        return rects
+
+    # Notch is centred under the pill; inset pulls its sides and bottom in
+    # the same way as the pill so the staircase stays under the stroke.
+    nw = max(0, notch_w - 2 * inset)
+    if nw <= 0:
+        return rects
+    rb = min(notch_r, notch_h, nw / 2.0)
+    nl = (width - notch_w) // 2 + inset
+    # Rows from the pill's bottom edge down through the notch height.
+    # y=0 of the notch is at surface y=height; we start just under the
+    # pill's bottom inset so the join stays continuous under the stroke.
+    for i in range(notch_h - inset):
+        y = height + i
+        # Distance from the notch's bottom edge (inset bottom).
+        dist_from_bottom = (notch_h - inset) - (i + 0.5)
+        if dist_from_bottom < rb:
+            d = rb - dist_from_bottom
             dx = rb - math.sqrt(max(0.0, rb * rb - d * d))
             x0 = int(math.ceil(dx))
         else:
             x0 = 0
-        w = width - 2 * x0
+        w = nw - 2 * x0
         if w > 0:
-            rects.append((x0 + inset, y + inset, w, 1))
+            rects.append((nl + x0, y, w, 1))
     return rects
+
+
+def extended_pill_rects(width: int, height: int, extension: int,
+                        exponent: float, inset: int = 0,
+                        cap: float = 1.12) -> list[tuple[int, int, int, int]]:
+    """Deprecated full-width extension; kept for any external callers.
+
+    Prefer notched_pill_rects: the stop control is a centred notch, not a
+    second full-width bar under the pill.
+    """
+    return notched_pill_rects(
+        width, height, width, extension, exponent, inset,
+        notch_r=min(height / 2.0, extension, width / 2.0), cap=cap)
 
 
 def enable_blur(wl_display: int, wl_surface: int,

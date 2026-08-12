@@ -301,20 +301,19 @@ def test_the_stop_suffix_matches_on_both_sides():
         "the only path the daemon can watch")
 
 
-def test_the_stop_button_is_the_pill_grown_not_a_floating_tab():
-    """The button is the capsule's own lower half - one outline, no gap.
+def test_the_stop_button_is_a_notch_grown_from_the_pill():
+    """The stop control is a centred notch on the capsule - one outline.
 
-    A tab drawn below the pill reads as a separate control floating beside
-    the HUD; the stop button must read as part of it. The outline is one
-    continuous path that grows the pill's straight sides down past its
-    bottom cap.
+    A full-width slab under the pill reads as a second bar; a floating tab
+    with a gap reads as a separate control. The notch is one continuous
+    path that opens the pill's bottom centre and drops a short rounded tab.
     """
     source = _hud_app_source()
-    assert "_extended_pill(cr, x, y, w, HEIGHT, STOP_BTN_H)" in source, (
-        "the stop button must be drawn as one extended capsule with the "
+    assert "_notched_pill(cr, x, y, w, HEIGHT, STOP_NOTCH_W, STOP_NOTCH_H)" in source, (
+        "the stop control must be drawn as one notched capsule with the "
         "pill - not as a separate shape hanging below it")
     assert "STOP_GAP" not in source, (
-        "any air between the pill and the button makes it a floating tab")
+        "any air between the pill and the notch makes it a floating tab")
 
 
 # ------------------------------------------------------- the stop button

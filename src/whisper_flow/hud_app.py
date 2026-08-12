@@ -103,7 +103,7 @@ else:
     enable_blur = _wayland_blur.enable_blur
     enable_blur_rows = _wayland_blur.enable_blur_rows
     pill_rects = _wayland_blur.pill_rects
-    extended_pill_rects = _wayland_blur.extended_pill_rects
+    notched_pill_rects = _wayland_blur.notched_pill_rects
 # The processing sweep's arithmetic. Out here so it can be tested without a
 # desktop; see hud_anim.
 _anim = _load_sibling("hud_anim")
@@ -161,18 +161,23 @@ PROCESS_RING_R = 1.55       # spinner radius, in dot radii
 PROCESS_TINT = 0.75         # how far the bars move towards PROCESS_RGB
 # The timings live in hud_anim, which is where they can be tested.
 
-# The stop button. The single-press modes (auto-transcribe) end on silence,
-# so they are the ones that need a mouse-visible way out. The pill grows it
-# out of its own bottom: the capsule's sides continue straight down past the
-# bottom cap and close over a rounded bottom, so the button is the pill's
-# lower half - one piece of glass, not a control hanging next to it. Only
-# shown while actually recording - once the pill is processing there is
-# nothing left to stop, and it shrinks back to just the pill.
+# The stop control. The single-press modes (auto-transcribe) end on silence,
+# so they need a mouse-visible way out. A compact notch grows from the
+# bottom centre of the pill - one continuous outline with the capsule, not a
+# full-width slab under it and not a floating tab. Only while recording:
+# once the pill is processing there is nothing left to stop, and it shrinks
+# back to just the pill.
 STOP_SUFFIX = ".stop"
-STOP_LABEL = "Stop transcription"
-STOP_BTN_H = 22              # how far the capsule grows at the bottom
+STOP_LABEL = "Stop"
+STOP_NOTCH_H = 20            # how far the notch hangs below the pill
+# Narrower than the pill so the silhouette stays a capsule with a tab, not
+# a second full-width bar. Sized to fit the stop glyph + short label.
+STOP_NOTCH_W = max(72, min(WIDTH - 48, round(104 * SIZE_SCALE)))
+STOP_NOTCH_R = 8.0           # bottom corner radius of the notch
 STOP_FONT_PX = 10.0
-STOP_GLYPH = 8               # the stop square's size
+STOP_GLYPH = 7               # the stop square's size
+# Back-compat alias used by older comments/tests that still say "button height".
+STOP_BTN_H = STOP_NOTCH_H
 
 STROKE_W = 1.0              # outline width in surface-local units
 STROKE_RGB = (0.42, 0.43, 0.47)
@@ -376,45 +381,52 @@ def _squircle(cr, x, y, w, h, n=SQUIRCLE_N, cap=CAP_EXT, steps=SQUIRCLE_STEPS):
     cr.close_path()
 
 
-def _extended_pill_points(x, y, w, h, ext, n=SQUIRCLE_N, cap=CAP_EXT,
-                          steps=SQUIRCLE_STEPS):
-    """The capsule with a straight-sided extension grown out of its bottom.
+def _notched_pill_points(x, y, w, h, nw, nh, nr=STOP_NOTCH_R,
+                         n=SQUIRCLE_N, cap=CAP_EXT, steps=SQUIRCLE_STEPS):
+    """Capsule with a centred notch grown out of its bottom edge.
 
-    The pill's own top cap and its straight sides, but instead of rounding
-    back into a bottom cap the sides continue straight down by `ext` and
-    close over a rounded bottom whose corners match the pill's own radius -
-    the pill has grown a button out of itself, so there is no seam or gap
-    between the two. The extension starts at the cap's base, which is what
-    lets the sides run straight: a shape joined below the pill's rounded
-    bottom would pinch against the cap curve.
+    The pill keeps its top cap and sides. Its bottom opens in the middle and
+    drops a short rounded tab - one continuous outline, so the stop control
+    reads as glass grown from the pill rather than a second bar under it or
+    a floating chip. The notch is narrower than the pill on purpose: a
+    full-width extension turns the silhouette into a slab.
 
     Separate from _squircle_points so the region cut on Windows is cut from
     the very same geometry the pill is drawn with.
     """
     b = h / 2.0
     rx = min(b * cap, w / 2.0)
-    rb = min(b, ext, w / 2.0)
+    rb = min(nr, nh, nw / 2.0)
     cy = y + b
-    bottom = y + h + ext
+    bottom = y + h
+    notch_bottom = bottom + nh
+    mid = x + w / 2.0
+    nl = mid - nw / 2.0
+    nright = mid + nw / 2.0
     e = 2.0 / n
     pts = []
-    # Right cap, top to its rightmost point: the capsule's top half.
+    # Right cap, top half: capsule's upper right.
     for i in range(steps // 2 + 1):
         t = -math.pi / 2 + math.pi * i / steps
         ct, st = math.cos(t), math.sin(t)
         pts.append((x + w - rx + rx * math.copysign(abs(ct) ** e, ct),
                     cy + b * math.copysign(abs(st) ** e, st)))
-    # Down the right side, which the pill's bottom cap used to claim.
-    pts.append((x + w, bottom - rb))
+    # Down the right side to the pill's bottom, then left to the notch.
+    pts.append((x + w, bottom))
+    pts.append((nright, bottom))
+    # Drop into the notch, round its bottom, climb back out.
+    pts.append((nright, notch_bottom - rb))
     for i in range(1, steps // 4 + 1):
         t = math.pi / 2 * i / (steps // 4)
-        pts.append((x + w - rb + rb * math.cos(t),
-                    bottom - rb + rb * math.sin(t)))
-    pts.append((x + rb, bottom))
+        pts.append((nright - rb + rb * math.cos(t),
+                    notch_bottom - rb + rb * math.sin(t)))
+    pts.append((nl + rb, notch_bottom))
     for i in range(1, steps // 4 + 1):
         t = math.pi / 2 + math.pi / 2 * i / (steps // 4)
-        pts.append((x + rb + rb * math.cos(t),
-                    bottom - rb + rb * math.sin(t)))
+        pts.append((nl + rb + rb * math.cos(t),
+                    notch_bottom - rb + rb * math.sin(t)))
+    pts.append((nl, bottom))
+    pts.append((x, bottom))
     # Up the left side, then the left cap's top half.
     pts.append((x, cy))
     for i in range(1, steps // 2 + 1):
@@ -425,10 +437,10 @@ def _extended_pill_points(x, y, w, h, ext, n=SQUIRCLE_N, cap=CAP_EXT,
     return pts
 
 
-def _extended_pill(cr, x, y, w, h, ext, n=SQUIRCLE_N, cap=CAP_EXT,
-                   steps=SQUIRCLE_STEPS):
-    """Append the extended capsule's outline to a context."""
-    pts = _extended_pill_points(x, y, w, h, ext, n, cap, steps)
+def _notched_pill(cr, x, y, w, h, nw, nh, nr=STOP_NOTCH_R,
+                  n=SQUIRCLE_N, cap=CAP_EXT, steps=SQUIRCLE_STEPS):
+    """Append the notched capsule's outline to a context."""
+    pts = _notched_pill_points(x, y, w, h, nw, nh, nr, n, cap, steps)
     cr.move_to(*pts[0])
     for px, py in pts[1:]:
         cr.line_to(px, py)
@@ -859,10 +871,10 @@ class HudWindow(Gtk.Window):
         region built from what we assumed the size was would be wrong on
         every display that is not at 100%.
 
-        With the stop button the window is the extended capsule: the pill's
-        sides run straight down into the button, and one outline covers the
-        pair, so a window that covered the whole rectangle would put an
-        opaque slab under both.
+        With the stop notch the window is the notched capsule: the pill keeps
+        its silhouette and a short tab drops from the bottom centre. One
+        outline covers both, so a window that covered the whole rectangle
+        would put an opaque slab under the open corners beside the notch.
         """
         # Not with a material: a region does not clip one, so cutting the
         # window would leave the acrylic rectangular and the content capsule
@@ -879,13 +891,16 @@ class HudWindow(Gtk.Window):
                 return
             bleed = self.SHAPE_BLEED
             if self.stop_button and not self.processing:
-                # The window is the extended capsule. The drawn geometry is
+                # The window is the notched capsule. The drawn geometry is
                 # logical and this cut is physical, so scale it like GDK does.
                 scale = self._monitor_scale()
                 pill_h = round(HEIGHT * scale)
-                shapes = [_extended_pill_points(
+                notch_w = round(STOP_NOTCH_W * scale)
+                notch_h = (h - pill_h) + 2 * bleed
+                shapes = [_notched_pill_points(
                     -bleed, -bleed, w + 2 * bleed, pill_h + 2 * bleed,
-                    (h - pill_h) + 2 * bleed)]
+                    notch_w + 2 * bleed, notch_h,
+                    STOP_NOTCH_R * scale)]
             else:
                 shapes = [_squircle_points(-bleed, -bleed,
                                            w + 2 * bleed, h + 2 * bleed)]
@@ -1061,28 +1076,30 @@ class HudWindow(Gtk.Window):
 
     # ------------------------------------------------------- resident mode
     def _window_height(self):
-        """How tall the whole overlay is: the pill, grown its stop button
-        when this recording has one. The button is only there while there is
-        a recording to stop."""
+        """How tall the whole overlay is: the pill, plus its stop notch when
+        this recording has one. The notch is only there while there is a
+        recording to stop."""
         if self.stop_button and not self.processing:
-            return HEIGHT + STOP_BTN_H
+            return HEIGHT + STOP_NOTCH_H
         return HEIGHT
 
     def _stop_rect(self):
-        """The button's rectangle: the pill's grown lower half."""
-        return (0, HEIGHT, WIDTH, HEIGHT + STOP_BTN_H)
+        """The notch's hit rectangle: centred under the pill."""
+        x0 = (WIDTH - STOP_NOTCH_W) / 2.0
+        return (x0, HEIGHT, x0 + STOP_NOTCH_W, HEIGHT + STOP_NOTCH_H)
 
     def _blur_rows(self):
         """Rows tracing everything the glass covers - one shape, whether
-        that shape is the pill alone or the pill grown its button."""
+        that shape is the pill alone or the pill grown its stop notch."""
         if self.stop_button and not self.processing:
-            return extended_pill_rects(
-                WIDTH, HEIGHT, STOP_BTN_H, SQUIRCLE_N, BLUR_INSET)
+            return notched_pill_rects(
+                WIDTH, HEIGHT, STOP_NOTCH_W, STOP_NOTCH_H,
+                SQUIRCLE_N, BLUR_INSET, STOP_NOTCH_R)
         return pill_rects(WIDTH, HEIGHT, SQUIRCLE_N, BLUR_INSET)
 
     def _window_resize(self):
         """Fit the window to what this recording needs: pill only, or pill
-        plus the stop button. Also moves the blur and the Win32 cut with it,
+        plus the stop notch. Also moves the blur and the Win32 cut with it,
         so the shape on screen and the shape the compositor blurs never
         disagree."""
         height = self._window_height()
@@ -1246,15 +1263,20 @@ class HudWindow(Gtk.Window):
         moved = abs(dx) + abs(dy)
         self._drag_origin = None
         if moved < DRAG_SLOP:
-            # A tap. Only the two affordances do anything: the stop button,
+            # A tap. Only the two affordances do anything: the stop notch,
             # which ends the recording, and the close X, which dismisses the
-            # pill. Anywhere else would make the pill vanish or stop whenever
-            # a drag came up a pixel short.
+            # pill and aborts the transcription with it. Anywhere else would
+            # make the pill vanish or stop whenever a drag came up a pixel
+            # short.
             sx, sy = self._drag_start_xy
             if self._in_stop_button(sx, sy):
                 self._request_stop()
                 return
-            if sx >= WIDTH - 34 * SIZE_SCALE:
+            if sy <= HEIGHT and sx >= WIDTH - 34 * SIZE_SCALE:
+                # Closing the HUD while a recording is live must not leave
+                # the mic listening with nothing on screen to stop it.
+                if self.stop_button and not self.processing:
+                    self._request_stop()
                 self.quit()
             return
         _save_position(self._connector, *self._pos)
@@ -1402,20 +1424,19 @@ class HudWindow(Gtk.Window):
 
         Everywhere else, the squircle: continuous curvature into the caps,
         which is the shape this overlay is meant to have. With the stop
-        button up, the capsule grows its straight-sided lower half - the
-        same outline machinery, extended, so the button is unmistakably the
-        same piece of glass.
+        notch up, the capsule grows a short centred tab from its bottom -
+        the same outline machinery, notched, so the control is unmistakably
+        the same piece of glass rather than a second bar under it.
         """
         if self._style == "accent-acrylic":
             _round_rect(cr, x, y, w, h, DWM_CORNER_RADIUS)
         elif self.stop_button and not self.processing:
-            # The window is the pill grown its button: the pill occupies the
-            # top HEIGHT, the button the STOP_BTN_H below it, and the two are
-            # one outline. h is the whole window, so it must be decomposed
-            # rather than handed to the capsule as if it were a pill - a
-            # pill 60 tall with a 22-tall extension would reach past the
-            # window and square off its bottom corners below it.
-            _extended_pill(cr, x, y, w, HEIGHT, STOP_BTN_H)
+            # The window is the pill grown its notch: the pill occupies the
+            # top HEIGHT, the notch the STOP_NOTCH_H below its centre, and
+            # the two are one outline. h is the whole window, so it must be
+            # decomposed rather than handed to the capsule as if it were a
+            # pill.
+            _notched_pill(cr, x, y, w, HEIGHT, STOP_NOTCH_W, STOP_NOTCH_H)
         else:
             _squircle(cr, x, y, w, h)
 
@@ -1431,7 +1452,7 @@ class HudWindow(Gtk.Window):
         the glass - and it has to be here for the cache to hold all of it.
 
         The outline is the whole silhouette: the pill alone, or the pill
-        grown its stop button, whichever this recording is showing.
+        grown its stop notch, whichever this recording is showing.
         """
         inner = STROKE_W / 2
         material = (ACRYLIC_TINT_ALPHA if self._style == "accent-acrylic"
@@ -1640,40 +1661,56 @@ class HudWindow(Gtk.Window):
         cr.restore()
 
     def _draw_stop_button(self, cr, a):
-        """The button: the pill's grown lower half, and its label.
+        """The stop notch's interior: inset well, hover lift, glyph + label.
 
         The chrome - material, sheen, rim, outline - is already the whole
-        extended capsule; this adds only what makes the lower half read as
-        a button: a faint seam where the pill ends, a hover glow, and the
-        stop glyph with its label.
+        notched capsule; this only makes the tab read as a pressable inset
+        control rather than empty glass.
         """
         hov = self.stop_hover
+        x0, y0, x1, y1 = self._stop_rect()
+        nw, nh = x1 - x0, y1 - y0
+        # Slightly inset from the outline so the well sits inside the glass.
+        pad = 1.5
+        well_r = max(2.0, STOP_NOTCH_R - 1.5)
+
+        # Inset well: a darker fill so the notch reads recessed into the
+        # glass, not a second flat slab of the same material.
+        cr.set_source_rgba(0, 0, 0, (0.22 + 0.06 * hov) * a)
+        _round_rect(cr, x0 + pad, y0 + pad * 0.5, nw - 2 * pad, nh - pad,
+                    well_r)
+        cr.fill()
 
         if hov > 0.01:
-            corner = min(STOP_BTN_H, HEIGHT / 2, WIDTH / 2)
             cr.set_source_rgba(1, 1, 1, 0.10 * hov * a)
-            _round_rect(cr, 0, HEIGHT, WIDTH, STOP_BTN_H, corner)
+            _round_rect(cr, x0 + pad, y0 + pad * 0.5, nw - 2 * pad, nh - pad,
+                        well_r)
             cr.fill()
 
-        # The seam where the pill's contents end and the button begins.
+        # Soft top lip: the light catches the upper edge of an inset button.
         cr.set_line_width(1.0)
-        cr.set_source_rgba(0, 0, 0, 0.22 * a)
-        cr.move_to(4, HEIGHT + 0.5)
-        cr.line_to(WIDTH - 4, HEIGHT + 0.5)
+        cr.set_source_rgba(1, 1, 1, 0.10 * a)
+        cr.move_to(x0 + well_r, y0 + pad + 0.5)
+        cr.line_to(x1 - well_r, y0 + pad + 0.5)
+        cr.stroke()
+        cr.set_source_rgba(0, 0, 0, 0.28 * a)
+        cr.move_to(x0 + well_r, y0 + pad + 1.5)
+        cr.line_to(x1 - well_r, y0 + pad + 1.5)
         cr.stroke()
 
-        # The stop glyph and the label, both in the pill's white. The group
-        # is centred as one unit, glyph + gap + text.
+        # Stop glyph + short label, centred as one unit inside the well.
         layout = self._stop_label_layout(cr)
         tw, th = layout.get_pixel_size()
-        gx = (WIDTH - (STOP_GLYPH + 7) - tw) / 2
-        gy = HEIGHT + (STOP_BTN_H - STOP_GLYPH) / 2
+        gap = 6
+        total = STOP_GLYPH + gap + tw
+        gx = x0 + (nw - total) / 2
+        gy = y0 + (nh - STOP_GLYPH) / 2
         cr.set_source_rgba(1, 1, 1, (0.82 + 0.18 * hov) * a)
-        _round_rect(cr, gx, gy, STOP_GLYPH, STOP_GLYPH, 2)
+        _round_rect(cr, gx, gy, STOP_GLYPH, STOP_GLYPH, 1.8)
         cr.fill()
 
         cr.set_source_rgba(1, 1, 1, (0.88 + 0.12 * hov) * a)
-        cr.move_to(gx + STOP_GLYPH + 7, HEIGHT + (STOP_BTN_H - th) / 2.0)
+        cr.move_to(gx + STOP_GLYPH + gap, y0 + (nh - th) / 2.0)
         PangoCairo.show_layout(cr, layout)
 
     def _stop_label_layout(self, cr):

@@ -396,16 +396,18 @@ elif scenario == "reset":
     assert win.level_pos == 0
     assert win.peak == hud_app.PEAK_FLOOR
 elif scenario == "stop_button":
-    # The auto-transcribe modes grow the pill's own capsule with the stop
-    # button: the lower half of the same piece of glass, not a control
-    # floating next to it.
+    # The auto-transcribe modes grow a centred stop notch from the pill:
+    # same piece of glass, not a full-width slab and not a floating tab.
     win.begin_show("", "", stop_button=True)
     assert win.stop_button
     assert win._window_height() > hud_app.HEIGHT
-    assert win._in_stop_button(10, hud_app.HEIGHT + 5)
-    assert win._in_stop_button(hud_app.WIDTH - 10, hud_app.HEIGHT + 5)
+    mid = hud_app.WIDTH / 2
+    assert win._in_stop_button(mid, hud_app.HEIGHT + 5)
+    # The open corners beside the notch are not the button.
+    assert not win._in_stop_button(10, hud_app.HEIGHT + 5)
+    assert not win._in_stop_button(hud_app.WIDTH - 10, hud_app.HEIGHT + 5)
     assert not win._in_stop_button(10, 5)   # the pill itself is not the button
-    # The button is gone once there is nothing left to stop.
+    # The notch is gone once there is nothing left to stop.
     win.begin_processing()
     assert win._window_height() == hud_app.HEIGHT
 elif scenario == "stop_request":
@@ -416,6 +418,23 @@ elif scenario == "stop_request":
     win.level_file = path
     win._request_stop()
     assert os.path.exists(path + hud_app.STOP_SUFFIX)
+    os.unlink(path)
+    os.unlink(path + hud_app.STOP_SUFFIX)
+elif scenario == "close_aborts":
+    # Dismissing the HUD while recording must ask the daemon to stop —
+    # otherwise the mic keeps listening with nothing on screen.
+    import os
+    import tempfile
+    fd, path = tempfile.mkstemp(suffix=".levels")
+    os.close(fd)
+    win.begin_show(path, "", stop_button=True)
+    win.level_file = path
+    # Tap the close X (right side of the pill, not the notch).
+    win._drag_origin = (0, 0)
+    win._drag_start_xy = (hud_app.WIDTH - 10, hud_app.HEIGHT / 2)
+    win._on_drag_end(None, 0, 0)
+    assert os.path.exists(path + hud_app.STOP_SUFFIX), (
+        "closing the HUD must request a stop so transcription aborts")
     os.unlink(path)
     os.unlink(path + hud_app.STOP_SUFFIX)
 print("OK")
@@ -485,6 +504,17 @@ def test_pressing_the_stop_button_asks_the_daemon(tmp_path):
         [sys.executable, "-c", _GTK_CHILD,
          str(__import__("pathlib").Path(__file__).resolve().parents[1]),
          "stop_request"],
+        capture_output=True, text=True, check=False, timeout=60)
+    assert "OK" in result.stdout, result.stderr
+
+
+@pytest.mark.skipif(not _gtk_available(), reason="needs GTK4 and a display")
+def test_closing_the_hud_aborts_transcription(tmp_path):
+    import subprocess
+    result = subprocess.run(
+        [sys.executable, "-c", _GTK_CHILD,
+         str(__import__("pathlib").Path(__file__).resolve().parents[1]),
+         "close_aborts"],
         capture_output=True, text=True, check=False, timeout=60)
     assert "OK" in result.stdout, result.stderr
 

@@ -17,6 +17,7 @@ from unittest.mock import Mock
 import pytest
 
 from whisper_flow import hud_anim
+from whisper_flow import wayland_blur
 
 
 # ------------------------------------------------------------ the animation
@@ -301,19 +302,38 @@ def test_the_stop_suffix_matches_on_both_sides():
         "the only path the daemon can watch")
 
 
-def test_the_stop_button_is_a_notch_grown_from_the_pill():
-    """The stop control is a centred notch on the capsule - one outline.
+def test_the_stop_button_extrudes_from_an_intact_pill():
+    """The pill stays a pill; auto-transcribe grows a small tab under it.
 
-    A full-width slab under the pill reads as a second bar; a floating tab
-    with a gap reads as a separate control. The notch is one continuous
-    path that opens the pill's bottom centre and drops a short rounded tab.
+    Hold-to-talk has no tab at all. Auto-transcribe hangs a compact stop
+    button from the pill's bottom centre - tucked in, not a notch carved
+    into the capsule and not a floating chip with a gap.
     """
     source = _hud_app_source()
-    assert "_notched_pill(cr, x, y, w, HEIGHT, STOP_NOTCH_W, STOP_NOTCH_H)" in source, (
-        "the stop control must be drawn as one notched capsule with the "
-        "pill - not as a separate shape hanging below it")
+    assert "_notched_pill" not in source
+    assert "STOP_NOTCH" not in source
     assert "STOP_GAP" not in source, (
-        "any air between the pill and the notch makes it a floating tab")
+        "any air between the pill and the tab makes it a floating chip")
+    assert "STOP_OVERLAP" in source
+    assert "_draw_stop_button(cr, a)" in source
+    # The outline path is always the capsule; the tab is its own shape.
+    assert "_squircle(cr, x, y, w, h)" in source
+    # Compact: a second full-width bar was the thing this replaced.
+    assert "STOP_BTN_W = 28" in source
+    assert "STOP_BTN_H = 20" in source
+
+
+def test_the_blur_region_is_the_pill_plus_a_hanging_tab():
+    """The frost follows both pieces of glass, as two capsules, not a notch."""
+    pill = wayland_blur.pill_rects(200, 40, 2.3, 2)
+    tab = wayland_blur.rows_translated(
+        wayland_blur.pill_rects(28, 20, 2.3, 2), 86, 36)
+    assert pill
+    assert tab
+    assert min(y for _, y, _, _ in tab) >= 36
+    assert max(y for _, y, _, _ in pill) < 40
+    # The tab is a narrow centred capsule, not a full-width slab.
+    assert max(x + w for x, _, w, _ in tab) <= 86 + 28
 
 
 # ------------------------------------------------------- the stop button

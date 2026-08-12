@@ -274,60 +274,10 @@ def pill_rects(width: int, height: int, exponent: float,
     return rects
 
 
-def notched_pill_rects(width: int, height: int, notch_w: int, notch_h: int,
-                       exponent: float, inset: int = 0,
-                       notch_r: float = 8.0,
-                       cap: float = 1.12) -> list[tuple[int, int, int, int]]:
-    """Rows tracing the pill grown its stop notch, as wl_region rects.
-
-    The mirror of _notched_pill_points in hud_app: the pill's capsule plus a
-    short centred tab under the bottom edge. If this drifts from what is
-    drawn, the blur shows outside the glass or leaves the notch unfrosted.
-    """
-    import math
-
-    # Pill body first (inset on every side), then the notch under it.
-    rects = pill_rects(width, height, exponent, inset, cap)
-    if notch_w <= 0 or notch_h <= 0:
-        return rects
-
-    # Notch is centred under the pill; inset pulls its sides and bottom in
-    # the same way as the pill so the staircase stays under the stroke.
-    nw = max(0, notch_w - 2 * inset)
-    if nw <= 0:
-        return rects
-    rb = min(notch_r, notch_h, nw / 2.0)
-    nl = (width - notch_w) // 2 + inset
-    # Rows from the pill's bottom edge down through the notch height.
-    # y=0 of the notch is at surface y=height; we start just under the
-    # pill's bottom inset so the join stays continuous under the stroke.
-    for i in range(notch_h - inset):
-        y = height + i
-        # Distance from the notch's bottom edge (inset bottom).
-        dist_from_bottom = (notch_h - inset) - (i + 0.5)
-        if dist_from_bottom < rb:
-            d = rb - dist_from_bottom
-            dx = rb - math.sqrt(max(0.0, rb * rb - d * d))
-            x0 = int(math.ceil(dx))
-        else:
-            x0 = 0
-        w = nw - 2 * x0
-        if w > 0:
-            rects.append((nl + x0, y, w, 1))
-    return rects
-
-
-def extended_pill_rects(width: int, height: int, extension: int,
-                        exponent: float, inset: int = 0,
-                        cap: float = 1.12) -> list[tuple[int, int, int, int]]:
-    """Deprecated full-width extension; kept for any external callers.
-
-    Prefer notched_pill_rects: the stop control is a centred notch, not a
-    second full-width bar under the pill.
-    """
-    return notched_pill_rects(
-        width, height, width, extension, exponent, inset,
-        notch_r=min(height / 2.0, extension, width / 2.0), cap=cap)
+def rows_translated(rows: list[tuple[int, int, int, int]],
+                    dx: int, dy: int) -> list[tuple[int, int, int, int]]:
+    """A shape's rows moved to another place on the surface."""
+    return [(x + dx, y + dy, w, h) for x, y, w, h in rows]
 
 
 def enable_blur(wl_display: int, wl_surface: int,

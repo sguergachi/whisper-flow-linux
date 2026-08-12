@@ -396,18 +396,21 @@ elif scenario == "reset":
     assert win.level_pos == 0
     assert win.peak == hud_app.PEAK_FLOOR
 elif scenario == "stop_button":
-    # The auto-transcribe modes grow a centred stop notch from the pill:
-    # same piece of glass, not a full-width slab and not a floating tab.
+    # Hold-to-talk is just the pill. Auto-transcribe hangs a small stop
+    # tab from the pill's bottom centre.
+    win.begin_show("")
+    assert not win.stop_button
+    assert win._window_height() == hud_app.HEIGHT
     win.begin_show("", "", stop_button=True)
     assert win.stop_button
     assert win._window_height() > hud_app.HEIGHT
     mid = hud_app.WIDTH / 2
     assert win._in_stop_button(mid, hud_app.HEIGHT + 5)
-    # The open corners beside the notch are not the button.
+    # The open corners beside the tab are not the button.
     assert not win._in_stop_button(10, hud_app.HEIGHT + 5)
     assert not win._in_stop_button(hud_app.WIDTH - 10, hud_app.HEIGHT + 5)
     assert not win._in_stop_button(10, 5)   # the pill itself is not the button
-    # The notch is gone once there is nothing left to stop.
+    # The tab is gone once there is nothing left to stop.
     win.begin_processing()
     assert win._window_height() == hud_app.HEIGHT
 elif scenario == "stop_request":
@@ -429,7 +432,7 @@ elif scenario == "close_aborts":
     os.close(fd)
     win.begin_show(path, "", stop_button=True)
     win.level_file = path
-    # Tap the close X (right side of the pill, not the notch).
+    # Tap the close X (right side of the pill, not the stop tab).
     win._drag_origin = (0, 0)
     win._drag_start_xy = (hud_app.WIDTH - 10, hud_app.HEIGHT / 2)
     win._on_drag_end(None, 0, 0)

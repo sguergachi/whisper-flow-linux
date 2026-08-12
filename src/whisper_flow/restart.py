@@ -11,9 +11,11 @@ Where systemd supervises the daemon this is just a unit restart.
 """
 
 import os
+import re
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 from .logging import log
 from .paths import pid_file
@@ -50,11 +52,67 @@ def daemon_pid() -> int | None:
         return None
 
 
+def _desktop_exec() -> str | None:
+    """The Exec= path from the first-run desktop entry, if still on disk.
+
+    First-run integration writes a stable AppImage path into
+    ~/.local/share/applications/whisper-flow.desktop. Useful when APPIMAGE
+    is missing (extracted runs) but the menu entry still points at the
+    right file.
+    """
+    data_home = os.environ.get("XDG_DATA_HOME") or str(
+        Path.home() / ".local" / "share")
+    desktop = Path(data_home) / "applications" / "whisper-flow.desktop"
+    try:
+        text = desktop.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    for line in text.splitlines():
+        if not line.startswith("Exec="):
+            continue
+        # Exec="/path/with spaces/app.AppImage"  or  Exec=/path/app.AppImage
+        raw = line[5:].strip()
+        match = re.match(r'^"([^"]+)"|^(\S+)', raw)
+        if not match:
+            continue
+        path = match.group(1) or match.group(2)
+        if path and Path(path).is_file():
+            return path
+    return None
+
+
+def frozen_binary() -> str:
+    """Stable path of the frozen app binary, if this is a frozen build.
+
+    Under AppImage, ``sys.executable`` is the FUSE mount
+    (``/tmp/.mount_*/whisper-flow``). That path dies the moment the
+    process that held the mount is killed - which is exactly what Save
+    does to the daemon before respawning it. The AppImage runtime
+    exports ``APPIMAGE`` as the real file; that path survives.
+    """
+    if not getattr(sys, "frozen", False):
+        return sys.executable
+    # Prefer the real AppImage file over the mount.
+    try:
+        from .desktop_install import appimage_path
+        img = appimage_path()
+        if img:
+            return img
+    except Exception:
+        pass
+    if os.path.isfile(sys.executable):
+        return sys.executable
+    desktop = _desktop_exec()
+    if desktop:
+        return desktop
+    return sys.executable
+
+
 def respawn_command() -> list[str]:
     """How to start a fresh daemon from this process."""
     if getattr(sys, "frozen", False):
         # The one executable, with no arguments, is the daemon.
-        return [sys.executable]
+        return [frozen_binary()]
     return [sys.executable, "-m", "whisper_flow.cli", "daemon", "--foreground"]
 
 
@@ -142,6 +200,17 @@ def _restart_daemon() -> tuple[bool, str]:
         return False, result.stderr.decode(errors="replace").strip() or \
             "systemctl refused to start the daemon"
 
+    # Resolve the binary *before* killing the daemon. Under AppImage the
+    # mount path in sys.executable can vanish the moment the process that
+    # held the FUSE mount exits; APPIMAGE / the desktop entry do not.
+    cmd = respawn_command()
+    if not cmd or not os.path.isfile(cmd[0]):
+        return False, (
+            f"cannot find the daemon binary to restart "
+            f"({cmd[0] if cmd else 'empty command'}). "
+            f"Start WhisperFlow from the AppImage again."
+        )
+
     pid = daemon_pid()
     if pid:
         try:
@@ -162,7 +231,7 @@ def _restart_daemon() -> tuple[bool, str]:
         if sys.platform == "win32":
             flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
         subprocess.Popen(
-            respawn_command(),
+            cmd,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             stdin=subprocess.DEVNULL,
             start_new_session=sys.platform != "win32",

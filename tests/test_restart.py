@@ -49,6 +49,9 @@ def test_a_running_daemon_is_stopped_then_respawned(monkeypatch):
     popen = Mock()
     monkeypatch.setattr(restart.subprocess, "Popen", popen)
     monkeypatch.setattr(sys, "frozen", False, raising=False)
+    # Source path: command[0] is this interpreter, which exists.
+    monkeypatch.setattr(restart, "respawn_command", lambda: [
+        sys.executable, "-m", "whisper_flow.cli", "daemon", "--foreground"])
 
     ok, _detail = restart.restart_daemon()
 
@@ -56,6 +59,79 @@ def test_a_running_daemon_is_stopped_then_respawned(monkeypatch):
     kill.assert_called_once_with(4321, 15)
     assert popen.call_args[0][0] == [
         sys.executable, "-m", "whisper_flow.cli", "daemon", "--foreground"]
+
+
+def test_frozen_respawn_prefers_the_appimage_file(monkeypatch, tmp_path):
+    """sys.executable under AppImage is the FUSE mount; it dies with the daemon."""
+    img = tmp_path / "WhisperFlow.AppImage"
+    img.write_bytes(b"ELF")
+    mount = tmp_path / ".mount_dead" / "whisper-flow"
+    mount.parent.mkdir()
+    # Mount path deliberately does NOT exist - that is the Save race.
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "executable", str(mount))
+    monkeypatch.setenv("APPIMAGE", str(img))
+
+    assert restart.respawn_command() == [str(img.resolve())]
+
+
+def test_frozen_respawn_falls_back_to_desktop_entry(monkeypatch, tmp_path):
+    img = tmp_path / "WhisperFlow.AppImage"
+    img.write_bytes(b"ELF")
+    data = tmp_path / "share"
+    apps = data / "applications"
+    apps.mkdir(parents=True)
+    (apps / "whisper-flow.desktop").write_text(
+        f'[Desktop Entry]\nExec="{img}"\n', encoding="utf-8")
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "executable", "/tmp/.mount_gone/whisper-flow")
+    monkeypatch.delenv("APPIMAGE", raising=False)
+    monkeypatch.setenv("XDG_DATA_HOME", str(data))
+
+    assert restart.respawn_command() == [str(img)]
+
+
+def test_restart_resolves_binary_before_killing_daemon(monkeypatch, tmp_path):
+    """Killing first unmounted the AppImage; resolve while the path still exists."""
+    img = tmp_path / "WhisperFlow.AppImage"
+    img.write_bytes(b"ELF")
+    order = []
+
+    monkeypatch.setattr(restart, "systemd_unit_active", lambda: False)
+    monkeypatch.setattr(restart, "daemon_pid", lambda: 99)
+    monkeypatch.setattr(restart, "_wait_for_exit", lambda *a, **k: True)
+    monkeypatch.setattr(restart, "respawn_command", lambda: order.append("cmd") or [str(img)])
+    monkeypatch.setattr(
+        restart.os, "kill",
+        lambda pid, sig: order.append(("kill", pid)))
+    popen = Mock(side_effect=lambda *a, **k: order.append("popen"))
+    monkeypatch.setattr(restart.subprocess, "Popen", popen)
+
+    ok, _ = restart.restart_daemon()
+
+    assert ok
+    assert order[0] == "cmd"
+    assert order[1] == ("kill", 99)
+    assert order[2] == "popen"
+
+
+def test_restart_fails_clearly_when_binary_is_gone(monkeypatch):
+    monkeypatch.setattr(restart, "systemd_unit_active", lambda: False)
+    monkeypatch.setattr(restart, "daemon_pid", lambda: None)
+    monkeypatch.setattr(
+        restart, "respawn_command",
+        lambda: ["/tmp/.mount_WhispeaEGLho/whisper-flow"])
+    kill = Mock()
+    monkeypatch.setattr(restart.os, "kill", kill)
+    popen = Mock()
+    monkeypatch.setattr(restart.subprocess, "Popen", popen)
+
+    ok, detail = restart.restart_daemon()
+
+    assert ok is False
+    assert "cannot find the daemon binary" in detail
+    kill.assert_not_called()
+    popen.assert_not_called()
 
 
 def test_respawn_hides_the_console_on_windows(monkeypatch):
@@ -67,6 +143,7 @@ def test_respawn_hides_the_console_on_windows(monkeypatch):
     monkeypatch.setattr(sys, "platform", "win32")
     popen = Mock()
     monkeypatch.setattr(restart.subprocess, "Popen", popen)
+    monkeypatch.setattr(restart, "respawn_command", lambda: [sys.executable])
 
     ok, _detail = restart.restart_daemon()
 
@@ -82,6 +159,8 @@ def test_no_running_daemon_just_starts_one(monkeypatch):
     monkeypatch.setattr(restart.os, "kill", kill)
     popen = Mock()
     monkeypatch.setattr(restart.subprocess, "Popen", popen)
+    monkeypatch.setattr(restart, "respawn_command", lambda: [
+        sys.executable, "-m", "whisper_flow.cli", "daemon", "--foreground"])
 
     ok, _detail = restart.restart_daemon()
 
@@ -104,6 +183,8 @@ def test_a_stubborn_daemon_still_gets_a_replacement(monkeypatch):
     popen = Mock()
     monkeypatch.setattr(restart.subprocess, "Popen", popen)
     monkeypatch.setattr(sys, "frozen", False, raising=False)
+    monkeypatch.setattr(restart, "respawn_command", lambda: [
+        sys.executable, "-m", "whisper_flow.cli", "daemon", "--foreground"])
 
     ok, _detail = restart.restart_daemon()
 

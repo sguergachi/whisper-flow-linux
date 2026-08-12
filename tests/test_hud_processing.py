@@ -318,22 +318,24 @@ def test_the_stop_button_extrudes_from_an_intact_pill():
     assert "_draw_stop_button(cr, a)" in source
     # The outline path is always the capsule; the tab is its own shape.
     assert "_squircle(cr, x, y, w, h)" in source
-    # Compact: a second full-width bar was the thing this replaced.
-    assert "STOP_BTN_W = 28" in source
-    assert "STOP_BTN_H = 20" in source
+    # Round-rect tab, not a square blob and not a second full-width bar.
+    assert "_bottom_round_rect(cr, x0, y0, bw, bh, STOP_BTN_R)" in source
+    assert "STOP_BTN_W = 42" in source
+    assert "STOP_BTN_H = 24" in source
+    assert "STOP_BTN_R = 8.0" in source
 
 
 def test_the_blur_region_is_the_pill_plus_a_hanging_tab():
-    """The frost follows both pieces of glass, as two capsules, not a notch."""
+    """The frost follows both pieces of glass: capsule plus a round-rect tab."""
     pill = wayland_blur.pill_rects(200, 40, 2.3, 2)
     tab = wayland_blur.rows_translated(
-        wayland_blur.pill_rects(28, 20, 2.3, 2), 86, 36)
+        wayland_blur.rounded_rect_rows(42, 26, 8.0, 2), 79, 32)
     assert pill
     assert tab
-    assert min(y for _, y, _, _ in tab) >= 36
+    assert min(y for _, y, _, _ in tab) >= 32
     assert max(y for _, y, _, _ in pill) < 40
-    # The tab is a narrow centred capsule, not a full-width slab.
-    assert max(x + w for x, _, w, _ in tab) <= 86 + 28
+    # The tab is a narrow centred round-rect, not a full-width slab.
+    assert max(x + w for x, _, w, _ in tab) <= 79 + 42
 
 
 # ------------------------------------------------------- the stop button

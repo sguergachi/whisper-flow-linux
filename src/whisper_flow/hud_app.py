@@ -103,6 +103,7 @@ else:
     enable_blur = _wayland_blur.enable_blur
     enable_blur_rows = _wayland_blur.enable_blur_rows
     pill_rects = _wayland_blur.pill_rects
+    rounded_rect_rows = _wayland_blur.rounded_rect_rows
     rows_translated = _wayland_blur.rows_translated
 # The processing sweep's arithmetic. Out here so it can be tested without a
 # desktop; see hud_anim.
@@ -166,11 +167,13 @@ PROCESS_TINT = 0.75         # how far the bars move towards PROCESS_RGB
 # stop tab extrudes from its bottom centre. Only while recording: once the
 # pill is processing there is nothing left to stop, and it shrinks back.
 STOP_SUFFIX = ".stop"
-# Small enough to read as a button, not a second bar. Tucks a few pixels
-# into the pill so it grows out of the capsule instead of floating under it.
-STOP_BTN_W = 28
-STOP_BTN_H = 20
-STOP_OVERLAP = 4
+# A compact round-rect tab, not a square and not a second capsule. The top
+# tucks under the pill; only the bottom corners are rounded, so the visible
+# bit is a curved lip grown out of the glass.
+STOP_BTN_W = 42
+STOP_BTN_H = 24
+STOP_OVERLAP = 5
+STOP_BTN_R = 8.0
 STOP_BTN_X = int((WIDTH - STOP_BTN_W) / 2)
 STOP_GLYPH = 7
 
@@ -383,6 +386,34 @@ def _round_rect(cr, x, y, w, h, r):
     cr.arc(x + w - r, y + h - r, r, 0, math.pi / 2)
     cr.arc(x + r, y + h - r, r, math.pi / 2, math.pi)
     cr.arc(x + r, y + r, r, math.pi, 3 * math.pi / 2)
+    cr.close_path()
+
+
+def _bottom_round_rect_points(x, y, w, h, r, steps=16):
+    """Round-rect with a flat top and curved bottom corners.
+
+    The stop tab's top sits under the pill, so those corners must not
+    bulge out as a second cap. The bottom is the only edge that shows.
+    """
+    r = min(r, w / 2, h / 2)
+    pts = [(x, y), (x + w, y)]
+    cx, cy = x + w - r, y + h - r
+    for i in range(steps + 1):
+        t = (math.pi / 2) * i / steps
+        pts.append((cx + r * math.cos(t), cy + r * math.sin(t)))
+    cx, cy = x + r, y + h - r
+    for i in range(1, steps + 1):
+        t = math.pi / 2 + (math.pi / 2) * i / steps
+        pts.append((cx + r * math.cos(t), cy + r * math.sin(t)))
+    return pts
+
+
+def _bottom_round_rect(cr, x, y, w, h, r):
+    """Append a tab: square top, rounded bottom. See _bottom_round_rect_points."""
+    pts = _bottom_round_rect_points(x, y, w, h, r)
+    cr.move_to(*pts[0])
+    for px, py in pts[1:]:
+        cr.line_to(px, py)
     cr.close_path()
 
 
@@ -825,11 +856,12 @@ class HudWindow(Gtk.Window):
                 shapes = [
                     _squircle_points(-bleed, -bleed,
                                      w + 2 * bleed, HEIGHT * scale + 2 * bleed),
-                    _squircle_points(
+                    _bottom_round_rect_points(
                         STOP_BTN_X * scale - bleed,
                         (HEIGHT - STOP_OVERLAP) * scale - bleed,
                         STOP_BTN_W * scale + 2 * bleed,
-                        STOP_BTN_H * scale + 2 * bleed),
+                        STOP_BTN_H * scale + 2 * bleed,
+                        STOP_BTN_R * scale),
                 ]
             else:
                 shapes = [_squircle_points(-bleed, -bleed,
@@ -1024,7 +1056,8 @@ class HudWindow(Gtk.Window):
         rows = pill_rects(WIDTH, HEIGHT, SQUIRCLE_N, BLUR_INSET)
         if self.stop_button and not self.processing:
             rows += rows_translated(
-                pill_rects(STOP_BTN_W, STOP_BTN_H, SQUIRCLE_N, BLUR_INSET),
+                rounded_rect_rows(STOP_BTN_W, STOP_BTN_H, STOP_BTN_R,
+                                  BLUR_INSET),
                 STOP_BTN_X, HEIGHT - STOP_OVERLAP)
         return rows
 
@@ -1588,17 +1621,17 @@ class HudWindow(Gtk.Window):
         cr.restore()
 
     def _draw_stop_button(self, cr, a):
-        """The small tab extruding from the pill's bottom centre.
+        """The round-rect tab tucked under the pill's bottom centre.
 
-        Same glass as the pill - material, sheen, outline, hover lift - so
-        the tab reads as grown from the capsule. Drawn under the pill; the
-        overlap hides the join and the stop square sits in the hanging half.
+        Flat top sits under the capsule; the bottom corners are the only
+        curve that shows. Same glass as the pill so it reads as grown from
+        it, not a chip floating underneath.
         """
         x0, y0, x1, y1 = self._stop_rect()
         bw, bh = x1 - x0, y1 - y0
         hov = self.stop_hover
 
-        _squircle(cr, x0, y0, bw, bh)
+        _bottom_round_rect(cr, x0, y0, bw, bh, STOP_BTN_R)
         material = (ACRYLIC_TINT_ALPHA if self._style == "accent-acrylic"
                     else MATERIAL_ALPHA)
         cr.set_source_rgba(*MATERIAL_RGB, material * a)
@@ -1612,13 +1645,20 @@ class HudWindow(Gtk.Window):
         cr.set_source(sheen)
         cr.fill()
 
+        # Stroke only the hanging lip. The flat top lives under the pill
+        # and must not draw a second rim across the capsule.
         inner = STROKE_W / 2
-        _squircle(cr, x0 + inner, y0 + inner, bw - 2 * inner, bh - 2 * inner)
+        cr.save()
+        cr.rectangle(x0 - 2, HEIGHT, bw + 4, bh)
+        cr.clip()
+        _bottom_round_rect(cr, x0 + inner, y0 + inner,
+                           bw - 2 * inner, bh - 2 * inner, STOP_BTN_R)
         cr.set_line_width(STROKE_W)
         cr.set_source_rgba(*STROKE_RGB, a)
         cr.stroke()
+        cr.restore()
 
-        # Stop square, centred in the part that hangs below the pill.
+        # Stop mark, centred in the part that hangs below the pill.
         hang_top = HEIGHT
         hang_h = y1 - hang_top
         gx = x0 + (bw - STOP_GLYPH) / 2

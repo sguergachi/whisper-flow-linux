@@ -29,6 +29,17 @@ CODE_ALIASES = {
     ecodes.KEY_RIGHTSHIFT: ecodes.KEY_LEFTSHIFT,
 }
 
+# Binding keys use the left code; hardware may have sent either side.
+# Synthetic releases must clear BOTH, or the compositor keeps the right-side
+# Super held while we type - Meta+B becomes power profile, Meta+W overview,
+# Meta+D desktop, etc. That is how "super+alt dictation locked the desktop".
+MODIFIER_SIDES = {
+    ecodes.KEY_LEFTMETA: (ecodes.KEY_LEFTMETA, ecodes.KEY_RIGHTMETA),
+    ecodes.KEY_LEFTCTRL: (ecodes.KEY_LEFTCTRL, ecodes.KEY_RIGHTCTRL),
+    ecodes.KEY_LEFTALT: (ecodes.KEY_LEFTALT, ecodes.KEY_RIGHTALT),
+    ecodes.KEY_LEFTSHIFT: (ecodes.KEY_LEFTSHIFT, ecodes.KEY_RIGHTSHIFT),
+}
+
 PROXY_NAME = "whisper-flow-keyboard-proxy"
 BUS_VIRTUAL = 0x06  # uinput devices; see linux/input.h BUS_VIRTUAL
 
@@ -370,12 +381,23 @@ class EvdevHotkeyListener:
         the combination is complete, so the compositor has seen at least two
         keys go down - it reads as Super+Alt being released, not as a bare
         Super tap, which is what opens the launcher.
+
+        Each logical modifier is released on both physical sides. Bindings
+        store LEFTMETA/LEFTALT; if the keyboard actually sent RIGHTMETA (or
+        the dual-HID path did), releasing only the left code leaves Super
+        stuck held. The next typed character then fires Meta+letter global
+        shortcuts (power profile, Overview, Peek at Desktop, …) instead of
+        landing as text - and the desktop looks "locked" until Super is
+        released for real.
         """
         for code in keys:
-            if code in self._key_state and code not in self._muted:
-                self._muted.add(code)
+            logical = CODE_ALIASES.get(code, code)
+            if logical not in self._key_state or logical in self._muted:
+                continue
+            self._muted.add(logical)
+            for side in MODIFIER_SIDES.get(logical, (logical,)):
                 try:
-                    self._uinput.write(ecodes.EV_KEY, code, 0)
+                    self._uinput.write(ecodes.EV_KEY, side, 0)
                     self._uinput.syn()
                 except Exception:
                     pass

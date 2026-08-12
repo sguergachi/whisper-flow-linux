@@ -154,7 +154,10 @@ def test_modifiers_are_released_to_the_compositor_while_held(listener):
         f[1] for f in listener.forwarded
         if len(f) == 3 and f[0] == "synthetic" and f[2] == 0
     }
-    assert released == {ecodes.KEY_LEFTMETA, ecodes.KEY_LEFTALT}
+    # Both physical sides of each modifier: hardware may have sent the right
+    # key while the binding only names the left one.
+    assert {ecodes.KEY_LEFTMETA, ecodes.KEY_RIGHTMETA,
+            ecodes.KEY_LEFTALT, ecodes.KEY_RIGHTALT} <= released
 
     # A second key goes down before the synthetic releases, so the compositor
     # sees Super+Alt rather than a bare Super tap opening the launcher.
@@ -164,6 +167,33 @@ def test_modifiers_are_released_to_the_compositor_while_held(listener):
     # Auto-repeat must not re-assert them as held.
     listener.forwarded.clear()
     listener._handle_key(FakeEvent(ecodes.KEY_LEFTMETA, 2))
+    assert listener.forwarded == []
+
+
+def test_right_meta_is_cleared_when_the_binding_names_super(listener):
+    """KN85 / many boards send RIGHTMETA; releasing only LEFTMETA stuck Super.
+
+    KDE then treats every typed letter as Meta+letter (power profile,
+    Overview, desktop peek, …) for the rest of the hold.
+    """
+    listener.register_hotkey(
+        "transcribe", "cmd+alt", lambda: None, lambda: None,
+        release_modifiers=True,
+    )
+    # Hardware sends the right-side Super; binding still matches via alias.
+    listener._handle_key(FakeEvent(ecodes.KEY_RIGHTMETA, 1))
+    listener._handle_key(FakeEvent(ecodes.KEY_LEFTALT, 1))
+
+    synthetic_ups = [
+        f[1] for f in listener.forwarded
+        if len(f) == 3 and f[0] == "synthetic" and f[2] == 0
+    ]
+    assert ecodes.KEY_RIGHTMETA in synthetic_ups
+    assert ecodes.KEY_LEFTMETA in synthetic_ups
+
+    # Auto-repeat on the right key must stay muted too.
+    listener.forwarded.clear()
+    listener._handle_key(FakeEvent(ecodes.KEY_RIGHTMETA, 2))
     assert listener.forwarded == []
 
 

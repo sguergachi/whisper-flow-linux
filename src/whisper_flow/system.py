@@ -381,7 +381,16 @@ class SystemManager:
                 return False
             return system_win.type_text(sanitized)
         if self._is_wayland():
-            return self._ydotool_type(sanitized) or self._wtype_type(sanitized)
+            if self._ydotool_type(sanitized) or self._wtype_type(sanitized):
+                return True
+            # Live finalize used to stop here. A multi-sentence tail (~500
+            # chars) timed out ydotool's old 15s budget on KDE, wtype is
+            # rejected by compositors without virtual-keyboard, and the
+            # whole transcript was dropped with nothing on the clipboard.
+            log("[PASTE] direct typing failed, falling back to the clipboard")
+            if not self.copy_to_clipboard(sanitized):
+                return False
+            return self._send_paste_keystroke()
         if shutil.which("xdotool"):
             result = subprocess.run(
                 ["xdotool", "type", "--clearmodifiers", "--", sanitized],
@@ -521,6 +530,19 @@ class SystemManager:
         except Exception:
             pass
 
+    @staticmethod
+    def _ydotool_type_timeout(text: str) -> float:
+        """Seconds ydotool is allowed to spend injecting `text`.
+
+        ydotool types keystroke-by-keystroke. A fixed 15s budget was enough
+        for a short live chunk and too short for a closing multi-sentence
+        tail (~500 chars timed out on KDE). Scale with length, capped so a
+        stuck daemon cannot hang the recording thread forever.
+        """
+        # ~40ms per character plus a few seconds of fixed overhead; floor
+        # keeps short strings from racing the helper's own startup.
+        return max(15.0, min(120.0, 5.0 + 0.04 * len(text)))
+
     def _ydotool_type(self, text: str) -> bool:
         self._release_modifiers()
         with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
@@ -531,14 +553,16 @@ class SystemManager:
                 ["ydotool", "type", "--file", tmp],
                 check=False,
                 capture_output=True,
-                timeout=15,
+                timeout=self._ydotool_type_timeout(text),
             )
             if result.returncode != 0:
                 log(f"[PASTE] ydotool type failed: "
                     f"{result.stderr.decode(errors='replace')}")
             return result.returncode == 0
         except subprocess.TimeoutExpired:
-            log("[PASTE] ydotool type timed out")
+            log(f"[PASTE] ydotool type timed out after "
+                f"{self._ydotool_type_timeout(text):.0f}s "
+                f"({len(text)} chars)")
             return False
         except Exception as e:
             log(f"[PASTE] ydotool type error: {e}")

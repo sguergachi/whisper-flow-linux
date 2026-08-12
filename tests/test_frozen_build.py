@@ -316,6 +316,15 @@ def test_the_speech_server_cannot_outlive_the_daemon():
     assert "stop_strays" in backend, (
         "a server left by an earlier run still holds the port, and the "
         "readiness check will happily connect to it and report success")
+    assert "stop_managed_strays" in backend, (
+        "CPU and CUDA engines live in different directories; clearing only the "
+        "engine about to start leaves the other one thrashing the same port")
+    assert "stop_port_whisper_servers" in backend, (
+        "a hand-built whisper-server on our port is invisible to path match "
+        "and must still be cleared before we claim the port")
+    # Linux used to early-return 0 from stop_strays; the real walk must exist.
+    assert "_stop_strays_linux" in backend, (
+        "Linux must reap orphan servers the same way Windows does")
 
 
 def test_a_velopack_hook_exits_instead_of_becoming_the_daemon():

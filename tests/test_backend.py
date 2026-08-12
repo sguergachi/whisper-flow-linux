@@ -794,3 +794,76 @@ def test_a_model_in_use_that_is_not_in_the_catalogue_still_gets_a_row(
     assert sum(row["current"] for row in rows) == 1
     # The catalogue is still offered, so a better model is a click away.
     assert set(MODELS) <= {row["name"] for row in rows}
+
+
+# --------------------------------------------------------------- stray servers
+def test_cmdline_port_match_recognises_whisper_server_flags():
+    # Port flag only; the caller also requires "whisper-server" in argv.
+    assert backend_module._cmdline_listens_on_port(
+        ["whisper-server", "-m", "m.bin", "--port", "8082"], 8082)
+    assert backend_module._cmdline_listens_on_port(
+        ["whisper-server", "--port=8082"], 8082)
+    assert not backend_module._cmdline_listens_on_port(
+        ["whisper-server", "--port", "9"], 8082)
+
+
+def test_path_match_accepts_deleted_binary_suffix():
+    wanted = "/home/x/.config/whisper-flow/runtime/cuda/whisper-server"
+    assert backend_module._path_matches_server(wanted, wanted)
+    assert backend_module._path_matches_server(wanted + " (deleted)", wanted)
+    assert not backend_module._path_matches_server(
+        "/home/x/Dev/whisper.cpp/build/bin/whisper-server", wanted)
+
+
+def test_stop_strays_is_not_a_linux_noop(monkeypatch):
+    """Linux used to return 0 immediately; orphans then owned the port."""
+    if not sys.platform.startswith("linux"):
+        pytest.skip("linux /proc walk")
+    # A path nothing is running must still complete the walk and return 0,
+    # proving the Linux branch ran rather than the old early-return.
+    assert backend_module.stop_strays("/tmp/no-such-whisper-server-for-test") == 0
+
+
+def test_stop_managed_strays_checks_cpu_and_cuda_paths(tmp_path, monkeypatch):
+    seen = []
+
+    def fake_stop(path, keep_pid=None):
+        seen.append(str(path))
+        return 0
+
+    monkeypatch.setattr(backend_module, "stop_strays", fake_stop)
+    backend_module.stop_managed_strays(tmp_path)
+    # Both engine locations are always considered, whether the files exist.
+    joined = " ".join(seen)
+    assert "runtime" in joined
+    assert any(p.endswith("whisper-server") or p.endswith("whisper-server.exe")
+               for p in seen)
+    assert any("cuda" in p for p in seen)
+
+
+def test_start_clears_managed_and_port_strays_before_spawn(
+        local_backend, config, monkeypatch):
+    """Regression: orphans made GPU large-v3-turbo ~40x slower on Linux."""
+    calls = []
+
+    def note_managed(config_dir, keep_pid=None):
+        calls.append(("managed", str(config_dir)))
+        return 0
+
+    def note_port(port, keep_pid=None):
+        calls.append(("port", port))
+        return 0
+
+    class Boom:
+        def __init__(self, *a, **k):
+            raise OSError("do not really start")
+
+    _install_engine(local_backend, config)
+    monkeypatch.setattr(backend_module, "stop_managed_strays", note_managed)
+    monkeypatch.setattr(backend_module, "stop_port_whisper_servers", note_port)
+    monkeypatch.setattr(backend_module.subprocess, "Popen", Boom)
+    monkeypatch.setattr(backend_module, "detect_accelerator", lambda: "cpu")
+
+    assert local_backend.start() is None
+    assert calls[0] == ("managed", str(config.config_dir))
+    assert calls[1] == ("port", config.local_server_port)

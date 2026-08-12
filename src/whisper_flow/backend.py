@@ -423,20 +423,8 @@ def _download(url: str, dest: Path, progress=None) -> None:
     tmp.replace(dest)
 
 
-def stop_strays(exe_path, keep_pid: int | None = None) -> int:
-    """Kill any copy of our server left behind by an earlier run.
-
-    Matched by executable path, never by name: another application ships a
-    whisper-server too, and killing that one would be inexcusable.
-
-    Without this a second server is started while the first still holds the
-    port. The new one cannot bind, exits, and the readiness check connects
-    to the *orphan* and reports success - so the daemon believes it owns a
-    server it never started and cannot stop, and two models sit in memory
-    competing for the same cores.
-    """
-    if sys.platform != "win32":
-        return 0
+def _stop_strays_win(exe_path, keep_pid: int | None = None) -> int:
+    """Windows: kill leftover servers whose image path matches `exe_path`."""
     stopped = 0
     try:
         import ctypes
@@ -488,6 +476,203 @@ def stop_strays(exe_path, keep_pid: int | None = None) -> int:
         kernel32.CloseHandle(snapshot)
     except Exception as e:
         log(f"[BACKEND] could not look for stray servers: {e}")
+    return stopped
+
+
+def _linux_exe_path(pid: int) -> str | None:
+    """Resolved path of `/proc/<pid>/exe`, or None if unreadable."""
+    try:
+        return str(Path(f"/proc/{pid}/exe").resolve())
+    except (OSError, ValueError):
+        return None
+
+
+def _linux_cmdline0(pid: int) -> str | None:
+    """argv[0] for a process, used when /proc/pid/exe is gone (deleted)."""
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return None
+    if not raw:
+        return None
+    return raw.split(b"\0", 1)[0].decode(errors="replace") or None
+
+
+def _kill_pid(pid: int, label: str) -> bool:
+    """SIGTERM then SIGKILL a process. Returns True if we sent a signal."""
+    import signal
+
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        log(f"[BACKEND] no permission to stop {label} pid {pid}")
+        return False
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            log(f"[BACKEND] stopped a stray server, pid {pid}")
+            return True
+        time.sleep(0.05)
+    try:
+        os.kill(pid, signal.SIGKILL)
+        log(f"[BACKEND] force-stopped a stray server, pid {pid}")
+        return True
+    except ProcessLookupError:
+        log(f"[BACKEND] stopped a stray server, pid {pid}")
+        return True
+    except PermissionError:
+        return False
+
+
+def _path_matches_server(path: str | None, wanted: str) -> bool:
+    """True when `path` is our server binary (including a deleted copy)."""
+    if not path:
+        return False
+    if path == wanted or path == wanted + " (deleted)":
+        return True
+    # argv[0] sometimes keeps the pre-delete path without the suffix.
+    try:
+        return str(Path(path).resolve()) == wanted
+    except OSError:
+        return False
+
+
+def _stop_strays_linux(exe_path, keep_pid: int | None = None) -> int:
+    """Linux: kill leftover servers whose executable path matches `exe_path`.
+
+    Matches on /proc/pid/exe (and argv[0] when the binary was replaced),
+    never on the bare name: a hand-built whisper-server elsewhere on the
+    machine is not ours to kill.
+    """
+    try:
+        wanted = str(Path(exe_path).resolve())
+    except OSError:
+        wanted = os.path.abspath(str(exe_path))
+    stopped = 0
+    try:
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            pid = int(entry.name)
+            if pid in (keep_pid, os.getpid()):
+                continue
+            # Prefer the kernel's view of the binary; fall back to argv[0]
+            # when the link is gone (binary replaced after the process started).
+            if not (_path_matches_server(_linux_exe_path(pid), wanted)
+                    or _path_matches_server(_linux_cmdline0(pid), wanted)):
+                continue
+            if _kill_pid(pid, "server"):
+                stopped += 1
+    except Exception as e:
+        log(f"[BACKEND] could not look for stray servers: {e}")
+    return stopped
+
+
+def stop_strays(exe_path, keep_pid: int | None = None) -> int:
+    """Kill any copy of our server left behind by an earlier run.
+
+    Matched by executable path, never by name: another application ships a
+    whisper-server too, and killing that one would be inexcusable.
+
+    Without this a second server is started while the first still holds the
+    port. The new one cannot bind, exits, and the readiness check connects
+    to the *orphan* and reports success - so the daemon believes it owns a
+    server it never started and cannot stop, and two models sit in memory
+    competing for the same cores (and on a GPU, for the same VRAM).
+
+    Linux used to be a no-op here. Four orphan servers on one port were
+    measured turning a 0.7s large-v3-turbo pass into a 25s one.
+    """
+    if sys.platform == "win32":
+        return _stop_strays_win(exe_path, keep_pid=keep_pid)
+    if sys.platform.startswith("linux"):
+        return _stop_strays_linux(exe_path, keep_pid=keep_pid)
+    return 0
+
+
+def stop_managed_strays(config_dir, keep_pid: int | None = None) -> int:
+    """Kill orphans of every engine we install under runtime/, not only one.
+
+    The CUDA binary lives in runtime/cuda/; the CPU one in runtime/. A
+    CPU→GPU upgrade (or a daemon restart that picks a different engine)
+    leaves the other path still listening on the same port. stop_strays of
+    only the engine about to start would miss it.
+    """
+    runtime = _runtime_dir(Path(config_dir))
+    name = "whisper-server.exe" if sys.platform == "win32" else "whisper-server"
+    candidates = [
+        runtime / name,
+        runtime / "cuda" / name,
+    ]
+    stopped = 0
+    seen: set[str] = set()
+    for path in candidates:
+        key = os.path.normcase(os.path.abspath(str(path)))
+        if key in seen:
+            continue
+        seen.add(key)
+        stopped += stop_strays(path, keep_pid=keep_pid)
+    return stopped
+
+
+def _linux_cmdline(pid: int) -> list[str] | None:
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return None
+    if not raw:
+        return None
+    return [p.decode(errors="replace") for p in raw.split(b"\0") if p]
+
+
+def _cmdline_listens_on_port(args: list[str], port: int) -> bool:
+    """True when argv looks like whisper-server --port <port>."""
+    token = str(port)
+    for i, arg in enumerate(args):
+        if arg == "--port" and i + 1 < len(args) and args[i + 1] == token:
+            return True
+        if arg == f"--port={token}":
+            return True
+    return False
+
+
+def stop_port_whisper_servers(port: int, keep_pid: int | None = None) -> int:
+    """Kill whisper-server processes still bound to our listen port.
+
+    Path-matched stop_strays misses a hand-built binary (e.g. under
+    ~/Dev/whisper.cpp) that was started on the same port. Leaving it up
+    means our child fails to bind, the readiness check answers on the
+    foreign process, and two CUDA models thrash the same GPU.
+
+    Only processes whose cmdline contains whisper-server *and* our --port
+    are touched. An unrelated service on the same port is left alone.
+    Linux only: Windows already reaps by image path via stop_strays.
+    """
+    if not sys.platform.startswith("linux"):
+        return 0
+    stopped = 0
+    try:
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            pid = int(entry.name)
+            if pid in (keep_pid, os.getpid()):
+                continue
+            args = _linux_cmdline(pid)
+            if not args:
+                continue
+            if not any("whisper-server" in a for a in args):
+                continue
+            if not _cmdline_listens_on_port(args, port):
+                continue
+            if _kill_pid(pid, "port-holder"):
+                stopped += 1
+    except Exception as e:
+        log(f"[BACKEND] could not free port {port}: {e}")
     return stopped
 
 
@@ -994,8 +1179,14 @@ class LocalBackend:
 
             # Clear anything a previous run left holding the port, or the
             # server started below cannot bind and the readiness check ends
-            # up connecting to the orphan instead.
-            stop_strays(self.server_exe)
+            # up connecting to the orphan instead. Every managed engine path
+            # is cleared - not only the one about to start - so a CPU→GPU
+            # upgrade cannot leave the old binary listening and thrashing
+            # VRAM / RAM alongside the new one. Then free the port of any
+            # other whisper-server still bound there (hand-built binaries
+            # under a different path).
+            stop_managed_strays(self.config.config_dir)
+            stop_port_whisper_servers(self.config.local_server_port)
 
             cmd = [
                 str(self.server_exe),
@@ -1042,6 +1233,15 @@ class LocalBackend:
             _adopt_into_job(self._job, self._process)
 
             if self._wait_until_ready():
+                # Ready means the port accepts connections. If our child
+                # already exited, that is an orphan (or a foreign server)
+                # answering - the exact failure stop_strays exists to prevent.
+                # Refuse rather than pretend we own a process we do not.
+                if self._process is not None and self._process.poll() is not None:
+                    log("[BACKEND] server exited after start; port is held by "
+                        "something else - not claiming it as ours")
+                    self._process = None
+                    return None
                 log(f"[BACKEND] server ready on {self.url}")
                 return self.url
             log("[BACKEND] server did not become ready")

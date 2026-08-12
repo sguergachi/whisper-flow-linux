@@ -20,6 +20,10 @@ def test_ydotool_type_timeout_scales_with_text_length():
 def test_type_text_falls_back_to_clipboard_when_direct_type_fails(
         tmp_path, monkeypatch):
     """Live finalize used to drop the whole tail when ydotool timed out."""
+    # This is the Linux path. On the Windows runner IS_WINDOWS is True at
+    # import, so type_text would go to SendInput and never hit the
+    # clipboard fallback this is pinning.
+    monkeypatch.setattr("whisper_flow.system.IS_WINDOWS", False)
     manager = SystemManager(Config(config_dir=tmp_path))
     monkeypatch.setattr(manager, "_is_wayland", lambda: True)
     monkeypatch.setattr(manager, "_ydotool_type", lambda text: False)
@@ -37,6 +41,7 @@ def test_type_text_falls_back_to_clipboard_when_direct_type_fails(
 
 def test_type_text_does_not_touch_clipboard_when_ydotool_works(
         tmp_path, monkeypatch):
+    monkeypatch.setattr("whisper_flow.system.IS_WINDOWS", False)
     manager = SystemManager(Config(config_dir=tmp_path))
     monkeypatch.setattr(manager, "_is_wayland", lambda: True)
     monkeypatch.setattr(manager, "_ydotool_type", lambda text: True)

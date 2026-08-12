@@ -454,7 +454,8 @@ def test_a_recording_that_transcribes_is_not_retried(tmp_path):
 
     flow = app_module.WhisperFlow.__new__(app_module.WhisperFlow)
     flow.transcription_service = Service()
-    assert flow._transcribe_allowing_for_a_whisper("/tmp/x.wav") == "first time"
+    assert flow._transcribe_allowing_for_a_whisper(
+        str(tmp_path / "x.wav")) == "first time"
     assert len(attempts) == 1        # the retry costs a pass; do not spend it
 
 
@@ -510,7 +511,8 @@ def test_a_music_short_transcript_is_redecoded_steered(monkeypatch, tmp_path):
     flow.transcription_service = Service()
     flow.config = config
 
-    result = flow._transcribe_allowing_for_a_whisper("/tmp/x.wav")
+    source = tmp_path / "x.wav"
+    result = flow._transcribe_allowing_for_a_whisper(str(source))
     assert result == "What does a control point mean?"
     assert len(attempts) == 2
     _, kwargs = attempts[1]
@@ -541,7 +543,7 @@ def test_speech_paced_transcripts_never_pay_for_a_redecode(tmp_path):
     flow.transcription_service = Service()
     flow.config = config
 
-    result = flow._transcribe_allowing_for_a_whisper("/tmp/x.wav")
+    result = flow._transcribe_allowing_for_a_whisper(str(tmp_path / "x.wav"))
     assert result == "I'm not going to go to the beach."
     assert len(attempts) == 1
 
@@ -589,7 +591,7 @@ def test_no_redecode_for_a_short_transcript_without_a_music_bed(tmp_path):
     flow.transcription_service = Service()
     flow.config = config
 
-    result = flow._transcribe_allowing_for_a_whisper("/tmp/x.wav")
+    result = flow._transcribe_allowing_for_a_whisper(str(tmp_path / "x.wav"))
     assert result == "This is the show."
     assert len(attempts) == 1
 
@@ -616,7 +618,7 @@ def test_a_weaker_steered_result_does_not_replace_the_first(tmp_path):
     flow.transcription_service = Service()
     flow.config = config
 
-    result = flow._transcribe_allowing_for_a_whisper("/tmp/x.wav")
+    result = flow._transcribe_allowing_for_a_whisper(str(tmp_path / "x.wav"))
     assert result == "This is the show."
     assert len(attempts) == 2        # it did try, and it chose to keep
 
@@ -640,7 +642,7 @@ def test_the_music_steer_skips_when_smart_voice_is_off(tmp_path):
     flow.transcription_service = Service()
     flow.config = config
 
-    result = flow._transcribe_allowing_for_a_whisper("/tmp/x.wav")
+    result = flow._transcribe_allowing_for_a_whisper(str(tmp_path / "x.wav"))
     assert result == "This is the show."
     assert len(attempts) == 1
 

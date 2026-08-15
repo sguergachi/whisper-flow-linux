@@ -1,5 +1,6 @@
 """Unit tests for the WhisperFlow daemon."""
 
+import sys
 import time
 from unittest.mock import Mock, patch
 
@@ -1028,6 +1029,30 @@ class TestDaemonStability:
 
         manager._last_notified.pop.assert_called_once_with("hello", None)
         manager.notify.assert_called_once_with("hello")
+
+
+class TestSingleInstance:
+    """A second daemon must not start and steal (or fail to steal) the grab."""
+
+    def test_a_second_linux_daemon_is_refused(self, tmp_path, monkeypatch):
+        if sys.platform == "win32":
+            pytest.skip("Linux flock path")
+        from whisper_flow import paths
+
+        monkeypatch.setattr(paths, "lock_file", lambda: tmp_path / "daemon.lock")
+        monkeypatch.setattr(daemon_module, "_lock_file", lambda: tmp_path / "daemon.lock")
+
+        first = WhisperFlowDaemon.__new__(WhisperFlowDaemon)
+        first._instance_lock = None
+        second = WhisperFlowDaemon.__new__(WhisperFlowDaemon)
+        second._instance_lock = None
+
+        assert first._acquire_single_instance() is True
+        assert second._acquire_single_instance() is False
+
+        first._instance_lock.close()
+        assert second._acquire_single_instance() is True
+        second._instance_lock.close()
 
 
 class TestTrayMenu:

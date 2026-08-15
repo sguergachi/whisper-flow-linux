@@ -24,6 +24,7 @@ from .config import Config
 from .hotkey_manager import HotkeyManager, HotkeyMode
 from .hud import HUD, STOP_SUFFIX
 from .logging import log, recent_log, set_logging_enabled
+from .paths import lock_file as _lock_file
 from .paths import pid_file as _pid_file
 from .version import build_version
 
@@ -170,6 +171,7 @@ class WhisperFlowDaemon:
         self._setup_lock = threading.Lock()
         self._last_failure = None
         self._last_settings_click = 0.0
+        self._instance_lock = None
 
         # Initialize WhisperFlow instances for different modes
         log("[DAEMON] Creating WhisperFlow instances...")
@@ -1737,13 +1739,18 @@ Use 'whisper-flow stop' to exit daemon
     def _acquire_single_instance(self) -> bool:
         """Refuse to start if another copy is already running.
 
-        Two daemons means two hotkey listeners: one press starts two
-        recordings, and both type their transcript into the same window. On
-        Windows a named mutex is the reliable check - a stale PID file is not,
-        because PIDs are reused aggressively there.
+        Two daemons means two hotkey listeners. On Linux the second copy
+        cannot grab the keyboards the first already holds, so it sits in
+        the tray with dead hotkeys and overwrites the pid file - stop then
+        kills the broken one and leaves the live one untracked. On Windows
+        a named mutex is the check: a stale PID file is not, because PIDs
+        are reused aggressively there.
         """
-        if sys.platform != "win32":
-            return True
+        if sys.platform == "win32":
+            return self._acquire_windows_instance()
+        return self._acquire_linux_instance()
+
+    def _acquire_windows_instance(self) -> bool:
         try:
             import ctypes
             kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -1762,6 +1769,37 @@ Use 'whisper-flow stop' to exit daemon
             return True
         except Exception:
             return True  # never let the check itself stop the app
+
+    def _acquire_linux_instance(self) -> bool:
+        """flock a lock file. Released automatically when this process dies."""
+        import fcntl
+
+        path = _lock_file()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fd = open(path, "a+")
+        except OSError as e:
+            log(f"[DAEMON] Could not open instance lock: {e}")
+            return True
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            fd.close()
+            log("[DAEMON] Another instance is already running; exiting")
+            return False
+        except OSError as e:
+            log(f"[DAEMON] Could not lock instance: {e}")
+            fd.close()
+            return True
+        try:
+            fd.seek(0)
+            fd.truncate()
+            fd.write(str(os.getpid()))
+            fd.flush()
+        except OSError:
+            pass
+        self._instance_lock = fd
+        return True
 
     @staticmethod
     def _check_platform_support() -> str | None:

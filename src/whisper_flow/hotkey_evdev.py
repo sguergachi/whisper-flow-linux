@@ -1,5 +1,6 @@
 """Keyboard hotkey listener using evdev with uinput proxy for Wayland."""
 
+import errno
 import logging
 import os
 import queue
@@ -9,6 +10,8 @@ import time
 
 import evdev
 from evdev import ecodes
+
+from .logging import log as app_log
 
 log = logging.getLogger(__name__)
 
@@ -57,6 +60,25 @@ RESCAN_SECONDS = 3.0
 DEBUG_KEYS = os.environ.get("WHISPER_FLOW_HOTKEY_DEBUG") == "1"
 
 
+def _grab_error(failures: list[tuple[str, BaseException]]) -> str:
+    """Why start() could see keyboards and still grab none of them.
+
+    The usual case is EBUSY: another whisper-flow already holds EVIOCGRAB,
+    or a remapper (keyd, kanata). The old message named neither, so the
+    tray just said the keyboards could not be grabbed.
+    """
+    if not failures:
+        return "Cannot grab any keyboard devices"
+    busy = any(getattr(e, "errno", None) == errno.EBUSY for _, e in failures)
+    if busy:
+        return (
+            "Cannot grab the keyboard: another program already has it "
+            "(another whisper-flow, keyd, or kanata)"
+        )
+    detail = "; ".join(f"{path}: {err}" for path, err in failures[:3])
+    return f"Cannot grab any keyboard devices ({detail})"
+
+
 class EvdevHotkeyListener:
     """Reads keyboard events via evdev, forwarding all events through uinput
     so the compositor continues to receive keyboard input.
@@ -81,6 +103,7 @@ class EvdevHotkeyListener:
         # (binding_name, frozenset of held codes) already reported as almost
         # matching - cleared when no binding key is held.
         self._near_miss_logged: set = set()
+        self._grab_failures: list[tuple[str, BaseException]] = []
         # Cancel is not a binding: bindings resolve most-specific-wins, so a
         # lone Escape could never fire while a push-to-talk combination is
         # held - which is the whole point of a cancel key. Set by the manager.
@@ -162,7 +185,7 @@ class EvdevHotkeyListener:
             if self._uinput:
                 self._uinput.close()
                 self._uinput = None
-            raise RuntimeError("Cannot grab any keyboard devices")
+            raise RuntimeError(_grab_error(self._grab_failures))
 
         self._running = True
         self._dispatch_thread = threading.Thread(
@@ -275,16 +298,22 @@ class EvdevHotkeyListener:
     def _open_devices(self) -> bool:
         """Grab every keyboard currently present. True if any were grabbed."""
         opened = []
+        failures: list[tuple[str, BaseException]] = []
         for path, _ in self._find_keyboard_devices():
             try:
                 dev = evdev.InputDevice(path)
                 dev.grab()
                 opened.append(dev)
-            except Exception:
-                continue                    # in use elsewhere, or just vanished
+            except Exception as e:
+                failures.append((path, e))
+                continue
         self._kbd_devices = opened
+        self._grab_failures = failures
         if opened:
             log.info("grabbed %d keyboard(s)", len(opened))
+        elif failures:
+            for path, e in failures:
+                app_log(f"[HOTKEY] could not grab {path}: {e}")
         return bool(opened)
 
     def _forward(self, event):

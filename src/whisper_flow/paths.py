@@ -16,3 +16,13 @@ def pid_file() -> Path:
     stop/status commands that already look here.
     """
     return Path.home() / ".config" / "whisper-flow" / "daemon.pid"
+
+
+def lock_file() -> Path:
+    """Exclusive lock so a second daemon cannot start.
+
+    The pid file is not enough: a second copy overwrites it, then fails to
+    grab the keyboards the first copy already holds, and `whisper-flow stop`
+    kills the broken one. The lock is released when the process dies.
+    """
+    return pid_file().with_name("daemon.lock")

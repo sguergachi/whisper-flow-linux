@@ -336,6 +336,77 @@ def test_debug_logging_is_off_unless_asked_for():
     assert hotkey_evdev.DEBUG_KEYS is False
 
 
+def test_a_busy_keyboard_names_the_other_grabber():
+    """EBUSY is the second-daemon case; the tray used to just say 'cannot grab'."""
+    import errno
+
+    from whisper_flow.hotkey_evdev import _grab_error
+
+    err = OSError(errno.EBUSY, "Device or resource busy")
+    msg = _grab_error([("/dev/input/event4", err)])
+    assert "another program already has it" in msg
+    assert "whisper-flow" in msg
+
+
+def test_a_permission_error_is_quoted_rather_than_called_busy():
+    import errno
+
+    from whisper_flow.hotkey_evdev import _grab_error
+
+    err = OSError(errno.EACCES, "Permission denied")
+    msg = _grab_error([("/dev/input/event4", err)])
+    assert "Permission denied" in msg
+    assert "another program already has it" not in msg
+
+
+def test_open_devices_records_why_grab_failed(monkeypatch):
+    import errno
+
+    from whisper_flow import hotkey_evdev
+
+    listener = hotkey_evdev.EvdevHotkeyListener()
+
+    class Busy:
+        def __init__(self, path):
+            self.path = path
+
+        def grab(self):
+            raise OSError(errno.EBUSY, "Device or resource busy")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(listener, "_find_keyboard_devices",
+                        lambda: [("/dev/input/event4", {})])
+    monkeypatch.setattr(hotkey_evdev.evdev, "InputDevice", Busy)
+    assert listener._open_devices() is False
+    assert listener._grab_failures
+    assert listener._grab_failures[0][0] == "/dev/input/event4"
+    assert listener._grab_failures[0][1].errno == errno.EBUSY
+
+
+def test_start_refuses_when_every_keyboard_is_busy(monkeypatch):
+    import errno
+
+    from whisper_flow import hotkey_evdev
+
+    listener = hotkey_evdev.EvdevHotkeyListener()
+    monkeypatch.setattr(listener, "_find_keyboard_devices",
+                        lambda: [("/dev/input/event4", {ecodes.EV_KEY: [1]})])
+
+    def fake_open():
+        listener._grab_failures = [
+            ("/dev/input/event4", OSError(errno.EBUSY, "Device or resource busy")),
+        ]
+        return False
+
+    monkeypatch.setattr(listener, "_open_devices", fake_open)
+    monkeypatch.setattr(hotkey_evdev.evdev.UInput, "from_device",
+                        lambda *a, **k: Mock(close=Mock()))
+    with pytest.raises(RuntimeError, match="another program already has it"):
+        listener.start()
+
+
 def test_escape_fires_even_during_a_held_combination(listener):
     """Escape cancels a recording, so it cannot be subject to
     most-specific-wins: held push-to-talk keys would always outrank it."""

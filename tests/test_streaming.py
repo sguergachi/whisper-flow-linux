@@ -316,6 +316,28 @@ def test_quiesce_before_a_pass_has_ever_run_is_harmless():
     assert typed == ["hello there"]
 
 
+def test_a_whisper_loop_is_typed_only_once():
+    """Live agreement used to treat each new copy as freshly settled words.
+
+    Consecutive passes that grow by repeating the same sentence agree on the
+    extras, so they were typed. The closing transcript is often a single
+    copy; by then the earlier copies are already in the window.
+    """
+    sentence = (
+        "I want to be able to modify the waveform by hand, tune it, look up "
+        "examples like Dial Kit online and Falcon Kit or Falcon GX online"
+    )
+    typed = []
+    lt = _transcriber(typed)
+    lt._commit(sentence)
+    lt._commit(f"{sentence} {sentence}")
+    lt._commit(f"{sentence} {sentence} {sentence}")
+    lt.finalize(f"{sentence} {sentence} {sentence} {sentence}")
+    result = "".join(typed)
+    assert result == sentence, result
+    assert result.count("waveform") == 1
+
+
 def test_words_that_could_not_be_typed_are_not_counted_as_committed():
     """Committed means the user has them, and finalize subtracts it.
 

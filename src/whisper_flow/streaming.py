@@ -19,6 +19,7 @@ import time
 import wave
 
 from .logging import log
+from .transcription import collapse_repetition
 
 # Trailing words carry no right-hand context yet, so they are the ones whisper
 # keeps re-punctuating. Committing everything except the last one costs a little
@@ -164,6 +165,11 @@ class LiveTranscriber:
             self._commit_locked(text)
 
     def _commit_locked(self, text: str):
+        # Collapse before agreement, not after. Two passes that each grew
+        # by another copy of the same sentence agree on the extras, and
+        # those extras get typed. The closing pass is often a single copy;
+        # by then the earlier copies are already in the window.
+        text = collapse_repetition(text)
         words = text.split()
         agreed = _common_prefix(self._prev, words)
         self._prev = words
@@ -253,7 +259,7 @@ class LiveTranscriber:
             self._closed = True
             if not final_text:
                 return
-            words = final_text.split()
+            words = collapse_repetition(final_text).split()
             if len(words) > len(self._committed):
                 self._send(words[len(self._committed):])
                 self._committed = words

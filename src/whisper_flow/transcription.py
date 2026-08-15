@@ -23,6 +23,95 @@ def _normalize(text: str | None) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+# Punctuation is not part of the loop: "hand." and "hand" are the same word
+# to the decoder, and requiring an exact match left the second copy typed.
+_TOKEN_NOISE = re.compile(r"[^\w']+", re.UNICODE)
+
+
+def _token_key(word: str) -> str:
+    """Word identity for loop detection: case and punctuation do not count."""
+    return _TOKEN_NOISE.sub("", word).casefold()
+
+
+def _repeat_threshold(unit_len: int) -> int:
+    """How many consecutive copies count as a decoder loop, not speech.
+
+    "no no no" is something people say. A ten-word sentence said twice in
+    a row, while the mic is still open on silence, is not.
+    """
+    if unit_len <= 1:
+        return 4
+    if unit_len <= 3:
+        return 3
+    return 2
+
+
+def collapse_repetition(text: str | None) -> str:
+    """Drop the extra copies when Whisper gets stuck on a phrase.
+
+    The decoder fills leftover audio - a pause, the padded 30s window - by
+    repeating the last clause. Live transcription then types every new copy
+    the moment two passes agree on it, so a sentence said once lands on
+    screen five times and cannot be untyped. The closing pass is often
+    clean; the damage is already in the window.
+
+    A short word said a few times is left alone. A longer phrase said
+    enough times to trip the threshold is kept once (twice for a single
+    word, so "no no" survives).
+    """
+    if not text:
+        return ""
+    words = text.split()
+    collapsed = _collapse_word_loop(words)
+    if len(collapsed) < len(words):
+        log(f"Repetition loop collapsed: {len(words)} → {len(collapsed)} words")
+        return " ".join(collapsed)
+    return text
+
+
+def _collapse_word_loop(words: list[str]) -> list[str]:
+    """Replace each run of a repeated phrase with the first copy (or two).
+
+    Smallest period first: "Thank you." four times is a two-word unit, not
+    a four-word pair kept as two copies. No length cap - a 38s dictation
+    easily loops a 40+ word sentence.
+    """
+    n = len(words)
+    if n < 2:
+        return words
+    keys = [_token_key(w) for w in words]
+    out: list[str] = []
+    i = 0
+    while i < n:
+        remaining = n - i
+        best_len = 0
+        best_copies = 0
+        for unit_len in range(1, remaining // 2 + 1):
+            thresh = _repeat_threshold(unit_len)
+            if remaining < unit_len * thresh:
+                continue
+            unit = keys[i:i + unit_len]
+            if not any(unit):
+                continue
+            copies = 1
+            pos = i + unit_len
+            while pos + unit_len <= n and keys[pos:pos + unit_len] == unit:
+                copies += 1
+                pos += unit_len
+            if copies >= thresh:
+                best_len = unit_len
+                best_copies = copies
+                break
+        if best_len:
+            keep = 2 if best_len == 1 else 1
+            out.extend(words[i:i + best_len] * keep)
+            i += best_len * best_copies
+        else:
+            out.append(words[i])
+            i += 1
+    return out
+
+
 # Non-speech tags Whisper invents on over-amplified room noise / music beds.
 # Treat as blank so the caller can retry milder processing. The greedy pass
 # labels a voice-over-music clip "[MUSIC]", and a re-roll at higher
@@ -178,7 +267,7 @@ class TranscriptionService:
                 text = self._transcribe_local(
                     audio_path, timeout, prompt=prompt, temperature=temperature)
 
-                text = _normalize(text)
+                text = collapse_repetition(_normalize(text))
                 if text and text != "[BLANK_AUDIO]" and not is_hallucination(text):
                     return text
                 if text and is_hallucination(text):

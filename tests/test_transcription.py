@@ -11,6 +11,7 @@ from whisper_flow.transcription import (
     AUDIO_CTX_MIN,
     TranscriptionService,
     audio_context,
+    collapse_repetition,
     is_hallucination,
     wav_duration,
 )
@@ -21,6 +22,55 @@ def test_hallucination_tags_are_rejected():
     assert is_hallucination("[Music]")
     assert is_hallucination("BLANK_AUDIO")
     assert not is_hallucination("How are random errors detected?")
+
+
+# A 38s live take on 2026-08-14 typed this sentence over and over while the
+# key was still held. The closing pass was a single copy; live had already
+# committed the extras.
+_LOOPED_SENTENCE = (
+    "I want to be able to modify the waveform by hand, tune it, look up "
+    "examples like Dial Kit online and Falcon Kit or Falcon GX online and "
+    "rebuild the lab to be intuitive and simple but tunable so I can"
+)
+
+
+def test_a_repeated_sentence_collapses_to_one_copy():
+    assert collapse_repetition(" ".join([_LOOPED_SENTENCE] * 5)) == _LOOPED_SENTENCE
+
+
+def test_real_dictation_is_not_collapsed():
+    """The 20:54 closing transcript, said once, must come through intact."""
+    assert collapse_repetition(_LOOPED_SENTENCE) == _LOOPED_SENTENCE
+
+
+def test_a_short_phrase_said_twice_is_kept():
+    """'thank you thank you' is speech. Three copies of it is a loop."""
+    twice = "thank you thank you"
+    assert collapse_repetition(twice) == twice
+    assert collapse_repetition("thank you thank you thank you") == "thank you"
+
+
+def test_no_no_no_is_left_alone():
+    assert collapse_repetition("no no no") == "no no no"
+    assert collapse_repetition("bye bye bye bye") == "bye bye"
+
+
+def test_punctuation_does_not_hide_a_loop():
+    looped = "Hello there world. Hello there world. Hello there world."
+    assert collapse_repetition(looped) == "Hello there world."
+
+
+def test_a_loop_after_real_speech_keeps_the_prefix():
+    prefix = "Okay so the next thing is"
+    sentence = "rebuild the lab to be intuitive and simple"
+    text = f"{prefix} {sentence} {sentence} {sentence}"
+    assert collapse_repetition(text) == f"{prefix} {sentence}"
+
+
+def test_a_looped_thank_you_is_still_a_hallucination():
+    collapsed = collapse_repetition("Thank you. Thank you. Thank you. Thank you.")
+    assert collapsed == "Thank you."
+    assert is_hallucination(collapsed)
 
 
 class FakeConfig:
@@ -210,3 +260,35 @@ def test_a_steered_redecode_sends_prompt_and_warmer_temperature(
     assert posted["data"]["temperature"] == "0.6"
     # The fallback escalation stays as the server expects it.
     assert posted["data"].get("temperature_inc") == "0.2"
+
+
+def test_a_looped_server_transcript_is_collapsed_before_return(
+        tmp_path, monkeypatch):
+    """The paste path used to type every copy the decoder invented."""
+    config = FakeConfig()
+    service, posted = _service_posting(monkeypatch, config)
+
+    def fake_post(url, files=None, data=None, timeout=None):
+        posted["url"] = url
+        posted["data"] = data
+        response = Mock()
+        response.json.return_value = {"text": (_LOOPED_SENTENCE + " ") * 4}
+        return response
+
+    monkeypatch.setattr(transcription_module.requests, "post", fake_post)
+    assert service.transcribe_audio(_wav(tmp_path / "a.wav", 3.0)) == (
+        _LOOPED_SENTENCE)
+
+
+def test_a_looped_filler_is_rejected_as_a_hallucination(
+        tmp_path, monkeypatch):
+    """Collapse first, then the existing tag check still catches 'Thank you.'"""
+    service, _posted = _service_posting(monkeypatch, FakeConfig())
+
+    def fake_post(url, files=None, data=None, timeout=None):
+        response = Mock()
+        response.json.return_value = {"text": "Thank you. Thank you. Thank you."}
+        return response
+
+    monkeypatch.setattr(transcription_module.requests, "post", fake_post)
+    assert service.transcribe_audio(_wav(tmp_path / "a.wav", 3.0)) is None

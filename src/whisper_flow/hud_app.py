@@ -1070,6 +1070,12 @@ class HudWindow(Gtk.Window):
         if height == self.get_height():
             return
         self.set_default_size(WIDTH, height)
+        # Pin the min and max too. set_default_size alone does not reliably
+        # shrink an already-mapped, non-resizable window on Windows, so after
+        # an auto-transcribe session the window stayed tall and the pill with
+        # it. With min == max there is nowhere else for it to go.
+        self.set_size_request(WIDTH, height)
+        self.area.set_content_width(WIDTH)
         self.area.set_content_height(height)
         self._chrome = None
         self._chrome_size = None
@@ -1410,7 +1416,11 @@ class HudWindow(Gtk.Window):
         window is taller, and the tab is drawn (and blurred) separately, so
         the chrome never reaches past the pill's own edge.
         """
-        pill_h = HEIGHT if self.stop_button else h
+        # Always the pill's own height, never the window's. The window can
+        # be taller than HEIGHT - the hanging stop button - and if it has
+        # not shrunk back yet, drawing the chrome to the window's height
+        # grows the capsule over the tab instead of leaving the tab hanging.
+        pill_h = HEIGHT
         inner = STROKE_W / 2
         material = (ACRYLIC_TINT_ALPHA if self._style == "accent-acrylic"
                     else MATERIAL_ALPHA)

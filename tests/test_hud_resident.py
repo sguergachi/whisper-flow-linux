@@ -667,6 +667,23 @@ def test_nothing_is_drawn_before_the_pill_has_been_placed():
         "through by the time the pill is where it belongs")
 
 
+def test_the_capsule_chrome_is_always_the_pills_own_height():
+    """The pill is the top HEIGHT of the window, always.
+
+    The window grows to hold the hanging stop button, and if it has not
+    shrunk back yet when the next recording starts, the chrome drawn to the
+    window's height grows the capsule over the tab instead of leaving the
+    tab hanging below it. The chrome must never depend on the window height.
+    """
+    source = _hud_app_source()
+    paint = source.split("def _paint_chrome(", 1)[1].split("\n    def ", 1)[0]
+    assert "pill_h = HEIGHT" in paint, (
+        "the chrome must always be the pill's own HEIGHT, never the window's")
+    assert "pill_h = h" not in paint and "else h" not in paint, (
+        "a chrome drawn to the window height grows the capsule over the "
+        "stop tab whenever the window is still tall")
+
+
 def test_the_hold_cannot_strand_the_pill_off_screen():
     """Every platform and path has to end with something visible.
 

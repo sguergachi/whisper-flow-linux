@@ -170,7 +170,7 @@ STOP_SUFFIX = ".stop"
 # A compact round-rect tab, not a square and not a second capsule. The top
 # tucks under the pill; only the bottom corners are rounded, so the visible
 # bit is a curved lip grown out of the glass.
-STOP_BTN_W = 42
+STOP_BTN_W = 52
 STOP_BTN_H = 24
 STOP_OVERLAP = 5
 STOP_BTN_R = 8.0

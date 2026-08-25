@@ -864,7 +864,7 @@ def _type_via_sendinput(text: str) -> bool:
         # Even Ctrl+V via SendInput can be blocked by UIPI. The text is
         # already on the clipboard, so the user can paste manually; log
         # that and report failure so the caller can notify.
-        log(f"[WIN] both WM_PASTE and Ctrl+V blocked; text left on clipboard")
+        log("[WIN] both WM_PASTE and Ctrl+V blocked; text left on clipboard")
         return False
 
 

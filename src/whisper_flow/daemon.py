@@ -1351,6 +1351,13 @@ class WhisperFlowDaemon:
 
         url = self.backend.start(model)
         if not url:
+            # Startup is the only place a silent failure becomes "No whisper
+            # server configured" on the first real dictation, which reads as
+            # typing being broken rather than transcription. Surface it now
+            # while the log still holds the server's stderr tail.
+            log(f"[BACKEND] failed to start {model} ({self.backend.installed_engine()}); "
+                f"see whisper-server log and try a smaller model in Settings")
+            self.notify("Speech engine failed to start - open Settings to pick a smaller model")
             return
         self._backend_model = model
         self._backend_engine = self.backend.installed_engine()

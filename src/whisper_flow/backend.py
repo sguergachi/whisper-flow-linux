@@ -1219,14 +1219,29 @@ class LocalBackend:
                     existing = env.get("LD_LIBRARY_PATH", "")
                     env["LD_LIBRARY_PATH"] = ":".join(
                         lib_dirs + ([existing] if existing else []))
-            # No console window for a background helper.
+            # No console window for a background helper. Capture stderr to a temp
+            # file so a crash (missing DLL, OOM, bad model) leaves a trace
+            # instead of the opaque "did not become ready" that shipped before.
+            import tempfile as _tf
+            _stderr_path = None
+            _stderr_file = None
+            try:
+                fd, _stderr_path = _tf.mkstemp(prefix="whisper-server-", suffix=".log")
+                _stderr_file = open(fd, "w", encoding="utf-8", errors="replace")
+            except Exception:
+                _stderr_path = None
             try:
                 self._process = subprocess.Popen(
-                    cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    cmd, stdout=subprocess.DEVNULL, stderr=_stderr_file or subprocess.DEVNULL,
                     creationflags=no_console_flags(), env=env,
                 )
             except Exception as e:
                 log(f"[BACKEND] could not start the server: {e}")
+                if _stderr_file:
+                    try:
+                        _stderr_file.close()
+                    except Exception:
+                        pass
                 return None
 
             # Before it has done anything: from here on it dies with us.
@@ -1241,10 +1256,64 @@ class LocalBackend:
                     log("[BACKEND] server exited after start; port is held by "
                         "something else - not claiming it as ours")
                     self._process = None
+                    if _stderr_file:
+                        try:
+                            _stderr_file.close()
+                        except Exception:
+                            pass
                     return None
                 log(f"[BACKEND] server ready on {self.url}")
+                if _stderr_file:
+                    try:
+                        _stderr_file.close()
+                    except Exception:
+                        pass
                 return self.url
-            log("[BACKEND] server did not become ready")
+            # Not ready: log why (exit code + last stderr) so a Windows
+            # CUDA/missing-VC-redist/OOM failure is diagnosable without a
+            # separate repro.
+            code = None
+            try:
+                code = self._process.poll() if self._process else None
+            except Exception:
+                pass
+            tail = ""
+            if _stderr_file:
+                try:
+                    _stderr_file.close()
+                    if _stderr_path and Path(_stderr_path).exists():
+                        tail = Path(_stderr_path).read_text(encoding="utf-8", errors="replace")[-4000:]
+                        # Keep the file for the diagnostics report; remove old ones.
+                        # The daemon's diagnostics include recent_log, not this,
+                        # but the path is logged so the file can be found.
+                except Exception:
+                    pass
+            log(f"[BACKEND] server did not become ready (exit={code}) cmd={' '.join(cmd)}")
+            if tail.strip():
+                # Trim to last lines to avoid flooding the log with binary.
+                lines = tail.strip().splitlines()[-20:]
+                log("[BACKEND] server stderr tail:\n" + "\n".join(lines))
+                log(f"[BACKEND] server stderr kept at {_stderr_path}")
+            else:
+                log(f"[BACKEND] server stderr empty; see {_stderr_path or '(no file)'}")
+                # Common Windows cause: missing CUDA DLLs or VC redist.
+                if sys.platform == "win32" and self.installed_engine().startswith("cuda"):
+                    log("[BACKEND] hint: cuda engine needs MSVC redist and NVIDIA driver; "
+                        "try CPU engine if VRAM is <4GB or driver is old")
+            # Don't leave a dead process around to hold the port half-open.
+            try:
+                if self._process and self._process.poll() is None:
+                    self._process.terminate()
+                    try:
+                        self._process.wait(timeout=3)
+                    except Exception:
+                        try:
+                            self._process.kill()
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            self._process = None
             return None
 
     @property

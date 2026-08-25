@@ -135,7 +135,11 @@ def test_a_dead_server_is_not_followed_by_a_gpu_offer(daemon):
         with patch.object(daemon, "notify") as notify:
             daemon._start_managed_backend()
     opened.assert_not_called()
-    notify.assert_not_called()
+    # Startup failure is now surfaced (was silent "No whisper server
+    # configured" only on first dictation); the GPU upsell is still suppressed.
+    assert notify.call_count == 1
+    assert "failed to start" in notify.call_args[0][0].lower()
+    assert "gpu" not in notify.call_args[0][0].lower()
 
 
 def test_nothing_is_offered_when_the_model_is_already_right(daemon):

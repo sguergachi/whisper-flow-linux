@@ -897,8 +897,11 @@ class SettingsWindow(Adw.ApplicationWindow):
         self._mic_meter_stop = threading.Event()
         self._mic_meter_thread: threading.Thread | None = None
         self._model_checks: dict[str, Gtk.CheckButton] = {}
-        self._download_buttons: list[Gtk.Button] = []
+        self._download_buttons: dict[str, Gtk.Button] = {}
+        self._cancel_buttons: dict[str, Gtk.Button] = {}
         self._progress_bars: dict[str, Gtk.ProgressBar] = {}
+        self._download_cancel: threading.Event | None = None
+        self._downloading_model: str | None = None
         self._last_toast_title = ""
         self._last_error_dialog = None
         self._blur = None
@@ -1478,8 +1481,16 @@ class SettingsWindow(Adw.ApplicationWindow):
                 button.add_css_class("flat")
                 button.connect("clicked",
                                lambda _b, m=name: self._start_download(m))
-                self._download_buttons.append(button)
+                self._download_buttons[name] = button
                 suffix.append(button)
+                cancel = Gtk.Button(icon_name="window-close-symbolic")
+                cancel.add_css_class("flat")
+                cancel.set_tooltip_text("Cancel download")
+                cancel.set_visible(False)
+                cancel.connect("clicked",
+                               lambda _b, m=name: self._cancel_download(m))
+                self._cancel_buttons[name] = cancel
+                suffix.append(cancel)
                 bar = Gtk.ProgressBar()
                 bar.add_css_class("model-progress")
                 bar.set_visible(False)
@@ -1520,8 +1531,16 @@ class SettingsWindow(Adw.ApplicationWindow):
             button.add_css_class("suggested-action")
             button.set_valign(Gtk.Align.CENTER)
             button.connect("clicked", lambda _b: self._start_engine_download())
-            self._download_buttons.append(button)
+            self._download_buttons["engine"] = button
             row.add_suffix(button)
+            cancel = Gtk.Button(icon_name="window-close-symbolic")
+            cancel.add_css_class("flat")
+            cancel.set_valign(Gtk.Align.CENTER)
+            cancel.set_tooltip_text("Cancel download")
+            cancel.set_visible(False)
+            cancel.connect("clicked", lambda _b: self._cancel_download("engine"))
+            self._cancel_buttons["engine"] = cancel
+            row.add_suffix(cancel)
             bar = Gtk.ProgressBar()
             bar.add_css_class("model-progress")
             bar.set_visible(False)
@@ -1541,17 +1560,33 @@ class SettingsWindow(Adw.ApplicationWindow):
         if self._working:
             return
         self._working = True
-        for button in self._download_buttons:
-            button.set_sensitive(False)
+        self._downloading_model = "engine"
+        self._download_cancel = threading.Event()
+        # Hide this Download, show X; disable the others.
+        for key, btn in self._download_buttons.items():
+            if key == "engine":
+                btn.set_visible(False)
+            else:
+                btn.set_sensitive(False)
+        cancel = self._cancel_buttons.get("engine")
+        if cancel:
+            cancel.set_visible(True)
+        # Keep the other cancel buttons hidden.
+        for key, btn in self._cancel_buttons.items():
+            if key != "engine":
+                btn.set_visible(False)
         bar = self._progress_bars.get("engine")
         if bar:
             bar.set_visible(True)
+            bar.set_fraction(0.0)
 
         model = self._current_model or self._selected_model() or None
+        cancel_evt = self._download_cancel
 
         def work():
             try:
-                ok = self.backend.install(model, progress=self._on_progress)
+                ok = self.backend.install(model, progress=self._on_progress,
+                                          cancel_event=cancel_evt)
                 err = None
             except Exception as e:
                 log(f"[SETTINGS] engine download failed: {e}")
@@ -1563,14 +1598,25 @@ class SettingsWindow(Adw.ApplicationWindow):
 
     def _engine_download_done(self, ok: bool, err: str | None = None):
         self._working = False
-        for button in self._download_buttons:
-            button.set_sensitive(True)
+        self._download_cancel = None
+        self._downloading_model = None
+        for btn in self._download_buttons.values():
+            btn.set_visible(True)
+            btn.set_sensitive(True)
+        for btn in self._cancel_buttons.values():
+            btn.set_visible(False)
         if not ok:
-            if err:
+            if err and "cancelled" in err.lower():
+                self._toast("Download cancelled")
+            elif err:
                 self._toast(f"Could not install the GPU engine: {err}")
             else:
                 self._toast("Could not install the GPU engine - check the "
                             "connection.")
+            # Hide stale bar on failure/cancel.
+            bar = self._progress_bars.get("engine")
+            if bar:
+                bar.set_visible(False)
             return
         self._rebuild_speech_page()
         self._restart_daemon(toast_start="Installed. Restarting...",
@@ -2473,19 +2519,41 @@ class SettingsWindow(Adw.ApplicationWindow):
 
         _run_in_background("restart", work, done)
 
+    def _cancel_download(self, model: str):
+        """Ask the current download to stop; the button becomes X while downloading."""
+        evt = self._download_cancel
+        if evt is None or self._downloading_model != model:
+            return
+        evt.set()
+        self._toast("Cancelling download...")
+
     def _start_download(self, model: str):
         if self._working:
             return
         self._working = True
-        for button in self._download_buttons:
-            button.set_sensitive(False)
+        self._downloading_model = model
+        self._download_cancel = threading.Event()
+        for key, btn in self._download_buttons.items():
+            if key == model:
+                btn.set_visible(False)
+            else:
+                btn.set_sensitive(False)
+        cancel = self._cancel_buttons.get(model)
+        if cancel:
+            cancel.set_visible(True)
+        for key, btn in self._cancel_buttons.items():
+            if key != model:
+                btn.set_visible(False)
         bar = self._progress_bars.get(model)
         if bar:
             bar.set_visible(True)
+            bar.set_fraction(0.0)
+        cancel_evt = self._download_cancel
 
         def work():
             try:
-                ok = self.backend.install(model, progress=self._on_progress)
+                ok = self.backend.install(model, progress=self._on_progress,
+                                          cancel_event=cancel_evt)
                 err = None
             except Exception as e:
                 log(f"[SETTINGS] download failed: {e}")
@@ -2497,13 +2565,26 @@ class SettingsWindow(Adw.ApplicationWindow):
 
     def _download_done(self, model: str, ok: bool, err: str | None = None):
         self._working = False
-        for button in self._download_buttons:
-            button.set_sensitive(True)
+        self._download_cancel = None
+        self._downloading_model = None
+        for btn in self._download_buttons.values():
+            btn.set_visible(True)
+            btn.set_sensitive(True)
+        for btn in self._cancel_buttons.values():
+            btn.set_visible(False)
+        # Hide the bar for the finished model on failure/cancel; on success
+        # the whole Speech page rebuilds anyway.
+        if not ok:
+            bar = self._progress_bars.get(model)
+            if bar:
+                bar.set_visible(False)
         if ok:
             # Rebuild so the new model gains a radio and loses the button.
             self._rebuild_speech_page()
             self._model_checks[model].set_active(True)
             self._toast(f"Got {model.replace('ggml-', '')} - Save to use it.")
+        elif err and "cancelled" in err.lower():
+            self._toast("Download cancelled")
         elif err:
             self._toast_error(f"Download failed: {err}")
         else:
@@ -2540,7 +2621,8 @@ class SettingsWindow(Adw.ApplicationWindow):
         # The old page's widgets are about to be dropped; holding references
         # to them means a later download re-enables buttons that are no
         # longer on screen, and writes progress into a bar nobody can see.
-        self._download_buttons = []
+        self._download_buttons = {}
+        self._cancel_buttons = {}
         self._progress_bars = {}
         self._model_checks = {}
 

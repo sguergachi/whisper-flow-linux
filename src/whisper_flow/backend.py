@@ -398,29 +398,41 @@ def _stage(progress, name: str):
     return lambda fraction: progress(name, fraction)
 
 
-def _download(url: str, dest: Path, progress=None) -> None:
+def _download(url: str, dest: Path, progress=None, cancel_event=None) -> None:
     """Download to a temporary name, then move: a partial file is never used."""
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(dest.suffix + ".part")
-    with urllib.request.urlopen(url, timeout=60) as response:
-        total = int(response.headers.get("Content-Length", 0))
-        done = 0
-        last_report = 0.0
-        with open(tmp, "wb") as f:
-            while True:
-                chunk = response.read(1 << 20)
-                if not chunk:
-                    break
-                f.write(chunk)
-                done += len(chunk)
-                # Often enough for a progress bar to look continuous;
-                # callers that only want notifications throttle further.
-                if progress and total and time.monotonic() - last_report > 0.25:
-                    last_report = time.monotonic()
-                    progress(done / total)
-        if progress and total:
-            progress(1.0)
-    tmp.replace(dest)
+    try:
+        with urllib.request.urlopen(url, timeout=60) as response:
+            total = int(response.headers.get("Content-Length", 0))
+            done = 0
+            last_report = 0.0
+            with open(tmp, "wb") as f:
+                while True:
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise RuntimeError("download cancelled")
+                    chunk = response.read(1 << 20)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    done += len(chunk)
+                    # Often enough for a progress bar to look continuous;
+                    # callers that only want notifications throttle further.
+                    if progress and total and time.monotonic() - last_report > 0.25:
+                        last_report = time.monotonic()
+                        progress(done / total)
+            if progress and total:
+                progress(1.0)
+        tmp.replace(dest)
+    except BaseException:
+        # Cancelled or failed: remove the partial so a later retry does not
+        # think it is complete, and so disk does not fill with .part files.
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except Exception:
+            pass
+        raise
 
 
 def _stop_strays_win(exe_path, keep_pid: int | None = None) -> int:
@@ -972,7 +984,7 @@ class LocalBackend:
 
     # ------------------------------------------------------------- install
     def install(self, model: str | None = None, force_download: bool = False,
-                progress=None) -> bool:
+                progress=None, cancel_event=None) -> bool:
         """Fetch the engine and model into the user's data directory.
 
         `force_download` ignores anything bundled, which is how the GPU
@@ -1015,6 +1027,8 @@ class LocalBackend:
                       else self.model_path(model).exists())
 
         try:
+            if cancel_event is not None and cancel_event.is_set():
+                raise RuntimeError("download cancelled")
             if not have_exe:
                 if sys.platform != "win32" and wanted.startswith("cuda"):
                     # Upstream ships no Linux CUDA binary; build one. Raises
@@ -1031,7 +1045,8 @@ class LocalBackend:
                     runtime = _runtime_dir(self.config.config_dir)
                     archive_path = runtime / archive
                     _download(f"{RELEASE_URL}/{archive}", archive_path,
-                              _stage(progress, "engine"))
+                              _stage(progress, "engine"),
+                              cancel_event=cancel_event)
                     # Extract into a staging directory so the flattening
                     # below cannot reach engines that already live in the
                     # runtime directory (the Linux CUDA build in runtime/cuda).
@@ -1072,11 +1087,15 @@ class LocalBackend:
                         last_notice[0] = time.monotonic()
                         self._notify(f"Speech model {int(fraction * 100)}%")
 
-                _download(f"{MODEL_URL}/{model}.bin", downloaded_model, report)
+                _download(f"{MODEL_URL}/{model}.bin", downloaded_model, report,
+                          cancel_event=cancel_event)
 
             self._notify("Speech model ready")
             return True
         except Exception as e:
+            if cancel_event is not None and cancel_event.is_set():
+                log(f"[BACKEND] install cancelled: {e}")
+                return False
             log(f"[BACKEND] install failed: {e}")
             self._notify(f"Could not set up the speech model: {e}")
             return False

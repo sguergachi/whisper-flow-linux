@@ -336,7 +336,7 @@ def test_linux_builds_the_cuda_engine_from_source(
             (built.parent / "libwhisper.so").write_text("")
         return types.SimpleNamespace(returncode=0, stdout="", stderr="")
 
-    def fake_download(url, dest, progress=None):
+    def fake_download(url, dest, progress=None, cancel_event=None, **_kw):
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text("")
 
@@ -378,7 +378,7 @@ def test_linux_cuda_install_without_a_toolkit_installs_the_cpu_engine(
     monkeypatch.setattr(backend_module, "detect_accelerator", lambda: "cuda12")
     monkeypatch.setattr(backend_module, "_cuda_toolkit", lambda: None)
 
-    def fake_download(url, dest, progress=None):
+    def fake_download(url, dest, progress=None, cancel_event=None, **_kw):
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text("")
 
@@ -586,7 +586,7 @@ def test_a_gpu_machine_fetches_the_cuda_engine_over_the_bundled_cpu_one(
 
     fetched = []
 
-    def fake_download(url, dest, progress=None):
+    def fake_download(url, dest, progress=None, cancel_event=None, **_kw):
         fetched.append(url)
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text("")

@@ -811,6 +811,26 @@ def _atomic_type_events(text: str, held: tuple, *, paste: bool = False) -> list:
     return events
 
 
+def _paste_via_message() -> bool:
+    """Paste by sending WM_PASTE to the focused control.
+
+    UIPI blocks SendInput from a lower integrity level but SendMessage
+    WM_PASTE is not synthetic input - it is a direct window message and
+    is not blocked the same way. When the typed text is already on the
+    clipboard, this is the fallback that actually reaches an elevated
+    editor or terminal where Ctrl+V via SendInput is refused.
+    """
+    try:
+        hwnd = focused_control()
+        if not hwnd or not _user32.IsWindow(wintypes.HWND(hwnd)):
+            return False
+        _send_message(hwnd, WM_PASTE, 0, 0)
+        return True
+    except Exception as e:
+        log(f"[WIN] WM_PASTE failed: {e}")
+        return False
+
+
 def _type_via_sendinput(text: str) -> bool:
     """Last-resort typing through the synthetic keyboard.
 
@@ -831,9 +851,21 @@ def _type_via_sendinput(text: str) -> bool:
             f"falling back to the clipboard")
         if not copy_to_clipboard(text):
             return False
+        # Try WM_PASTE via message first: it is not blocked by UIPI the
+        # same way synthetic Ctrl+V is, so an elevated window that refused
+        # Unicode injection can still be pasted into.
+        if _paste_via_message():
+            _note(f"pasted {len(text)} character(s) via WM_PASTE")
+            return True
         paste_events = _atomic_type_events(text, held, paste=True)
         _note(f"pasted {len(text)} character(s) via SendInput")
-        return _send(paste_events)
+        if _send(paste_events):
+            return True
+        # Even Ctrl+V via SendInput can be blocked by UIPI. The text is
+        # already on the clipboard, so the user can paste manually; log
+        # that and report failure so the caller can notify.
+        log(f"[WIN] both WM_PASTE and Ctrl+V blocked; text left on clipboard")
+        return False
 
 
 def type_text(text: str) -> bool:

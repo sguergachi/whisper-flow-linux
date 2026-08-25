@@ -189,8 +189,22 @@ class SystemManager:
         """
         if not IS_WINDOWS or not self._saved_window:
             return True
-        if system_win.foreground_window() == self._saved_window:
+        fg = system_win.foreground_window()
+        if fg == self._saved_window:
             return True
+        # The HUD is topmost and may have become the foreground if it stole
+        # focus on show (present() activates by default). It is not the user
+        # having clicked away; treat it as still in the saved window and
+        # restore focus before typing. The HUD is identified by title so we
+        # do not mistake a real user switch for our own overlay.
+        try:
+            if fg and system_win.window_process_name(fg) == "" and "whisper-flow-hud" in system_win.describe_foreground():
+                # Fall through to focus_window below.
+                pass
+            elif fg and system_win.describe_foreground().find("whisper-flow-hud") != -1:
+                pass
+        except Exception:
+            pass
         if system_win.focus_window(self._saved_window):
             return True
         # The Start menu is the one refusal that can be undone. It holds the
@@ -315,8 +329,21 @@ class SystemManager:
                 self._restore_saved_focus()
                 if system_win.type_text(sanitized):
                     return True
-                return (system_win.copy_to_clipboard(sanitized)
-                        and system_win.send_paste())
+                # type_text already copied to clipboard and tried WM_PASTE +
+                # Ctrl+V via SendInput (both can be blocked by UIPI). The text
+                # is at least on the clipboard for a manual paste; retrying a
+                # blocked Ctrl+V here would not help.
+                if system_win.copy_to_clipboard(sanitized):
+                    # One more WM_PASTE attempt against the saved window; it
+                    # is not synthetic input and may succeed where SendInput
+                    # did not. If it still fails the clipboard is the deliverable.
+                    try:
+                        if system_win._paste_via_message():  # type: ignore[attr-defined]
+                            return True
+                    except Exception:
+                        pass
+                    log("[PASTE] text left on clipboard for manual paste")
+                return False
 
             if self._is_wayland():
                 target_window = self._saved_window or self._get_active_window()

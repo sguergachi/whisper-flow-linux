@@ -491,6 +491,18 @@ class HudWindow(Gtk.Window):
             LayerShell.set_exclusive_zone(self, -1)
         else:
             self.set_decorated(False)
+            # Must not steal keyboard focus: typing is in progress and the
+            # pill is just an indicator. Without this, present() makes the
+            # HUD the foreground window and SendInput types into it instead
+            # of the window the user was dictating into.
+            try:
+                self.set_focus_on_map(False)
+            except Exception:
+                pass
+            try:
+                self.set_hide_on_close(False)
+            except Exception:
+                pass
             # Invisible, but EnumWindows finds the window by it.
             self.set_title("whisper-flow-hud")
 
@@ -791,6 +803,23 @@ class HudWindow(Gtk.Window):
             if not self._hwnd:
                 print("[HUD] no HWND yet", flush=True)
                 return
+            # WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW: never become the foreground
+            # window. Without this, present() steals focus and SendInput types
+            # into the HUD instead of the app the user was dictating into.
+            try:
+                user32 = ctypes.windll.user32
+                GWL_EXSTYLE = -20
+                WS_EX_NOACTIVATE = 0x08000000
+                WS_EX_TOOLWINDOW = 0x00000080
+                user32.GetWindowLongPtrW.restype = ctypes.c_void_p
+                user32.GetWindowLongPtrW.argtypes = [ctypes.c_void_p, ctypes.c_int]
+                user32.SetWindowLongPtrW.restype = ctypes.c_void_p
+                user32.SetWindowLongPtrW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
+                ex = int(user32.GetWindowLongPtrW(ctypes.c_void_p(self._hwnd), GWL_EXSTYLE) or 0)
+                user32.SetWindowLongPtrW(ctypes.c_void_p(self._hwnd), GWL_EXSTYLE,
+                                         ctypes.c_void_p(ex | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW))
+            except Exception as e:
+                print(f"[HUD] could not set NOACTIVATE: {e}", flush=True)
             self._raise_win32()
             # Before the first position, and so before the map that follows:
             # the map is the move this exists to overrule.

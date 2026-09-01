@@ -1641,8 +1641,19 @@ class WhisperFlowDaemon:
                             except Exception:
                                 has_vcr = True  # assume present if check fails
                         if not has_vcr:
-                            log("[BACKEND] VCRedist missing — GPU engine would crash, not auto-installing; ask user to install VC++ Redist")
-                            self.notify("GPU engine needs Visual C++ Redistributable — install it from Microsoft, then retry GPU engine in Settings")
+                            log("[BACKEND] VCRedist missing — trying silent install before GPU engine")
+                            try:
+                                import whisper_flow.backend as _be2
+                                if _be2._ensure_vcredist_silent():
+                                    log("[BACKEND] VCRedist silent install succeeded, proceeding with GPU engine")
+                                    has_vcr = True
+                                else:
+                                    log("[BACKEND] VCRedist silent install failed, will notify")
+                            except Exception as _e:
+                                log(f"[BACKEND] VCRedist silent check failed: {_e}")
+                            if not has_vcr:
+                                log("[BACKEND] VCRedist missing — GPU engine would crash, not auto-installing; ask user to install VC++ Redist")
+                                self.notify("GPU engine needs Visual C++ Redistributable — install it from https://aka.ms/vs/17/release/vc_redist.x64.exe then retry GPU engine in Settings")
                         else:
                             def _bg_gpu_install():
                                 try:

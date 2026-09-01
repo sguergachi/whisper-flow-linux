@@ -249,8 +249,16 @@ class WhisperFlowDaemon:
                             if now - self._last_backend_revive >= throttle:
                                 self._last_backend_revive = now
                                 if dead:
+                                    # Try to get stderr tail for diagnosis
+                                    try:
+                                        spath = getattr(self.backend, "_stderr_path", None)
+                                        if spath and __import__("pathlib").Path(spath).exists():
+                                            tail = __import__("pathlib").Path(spath).read_text(encoding="utf-8", errors="replace").strip().splitlines()[-20:]
+                                            if tail:
+                                                log("[BACKEND] server stderr tail on crash: " + " | ".join(tail[-5:]))
+                                    except Exception:
+                                        pass
                                     log(f"[DAEMON] backend process dead (exit={proc.poll()} 0x{(proc.poll() or 0) & 0xFFFFFFFF:08X}), auto-healing on CPU")
-                                    # Track medium crashes to force base after 2 failures
                                     try:
                                         cur = getattr(self, "_backend_model", None) or self.backend.working_model()
                                         if cur == "ggml-medium.en-q8_0":
@@ -1559,7 +1567,7 @@ class WhisperFlowDaemon:
                 try:
                     import whisper_flow.envfile as _ef
                     from pathlib import Path as _P
-                    _ef.set(_P(self.config.config_dir) / ".env", {"WHISPER_FLOW_MODEL_NAME": actual})
+                    _ef.set_values(_P(self.config.config_dir) / ".env", {"WHISPER_FLOW_MODEL_NAME": actual})
                     self.config.model_name = actual
                     log(f"[DAEMON] persisted fallback to {actual} for next boot")
                 except Exception as e:

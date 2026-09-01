@@ -841,6 +841,7 @@ class LocalBackend:
         self.config = config
         self._notify = notify or (lambda msg: None)
         self._process = None
+        self._stderr_path = None
         self._last_started_model = None
         self._lock = threading.Lock()
         # Held for the life of this process; closing it kills the server.
@@ -1415,7 +1416,7 @@ class LocalBackend:
             try:
                 from pathlib import Path as _P
                 import whisper_flow.envfile as _ef
-                _ef.set(_P(self.config.config_dir) / ".env", {"WHISPER_FLOW_MODEL_NAME": fallback_model})
+                _ef.set_values(_P(self.config.config_dir) / ".env", {"WHISPER_FLOW_MODEL_NAME": fallback_model})
             except Exception:
                 pass
         except Exception:
@@ -1440,7 +1441,7 @@ class LocalBackend:
             try:
                 from pathlib import Path as _P
                 import whisper_flow.envfile as _ef
-                _ef.set(_P(self.config.config_dir) / ".env", {"WHISPER_FLOW_MODEL_NAME": fallback_model})
+                _ef.set_values(_P(self.config.config_dir) / ".env", {"WHISPER_FLOW_MODEL_NAME": fallback_model})
             except Exception:
                 pass
         except Exception:
@@ -1554,10 +1555,9 @@ class LocalBackend:
                     self._process = None
                     return None
                 log(f"[BACKEND] server ready on {self.url}")
-                # Successful start — clean up the now-empty stderr file
+                # Keep stderr file for watchdog to diagnose later crashes (don't delete)
                 try:
-                    if _stderr_path:
-                        Path(_stderr_path).unlink(missing_ok=True)
+                    self._stderr_path = _stderr_path
                 except Exception:
                     pass
                 return self.url
@@ -1580,6 +1580,10 @@ class LocalBackend:
                 # Keep the file for the diagnostics report; it will be cleaned on next start/stop
             else:
                 log(f"[BACKEND] server did not become ready (exit={code} 0x{(code or 0) & 0xFFFFFFFF:08X}) cmd={' '.join(cmd)}")
+            try:
+                self._stderr_path = _stderr_path
+            except Exception:
+                pass
             return None
 
     @property

@@ -1516,7 +1516,13 @@ class WhisperFlowDaemon:
             log(f"[DAEMON] backend start before recording failed: {e}")
             return False
         if url:
-            actual = self.backend.working_model() or model
+            # If fallback happened, _last_started_model holds the actual model started (e.g. base instead of medium)
+            actual = getattr(self.backend, "_last_started_model", None) or self.backend.working_model() or model
+            # Clear it after use
+            try:
+                self.backend._last_started_model = None
+            except Exception:
+                pass
             self._backend_model = actual
             self._backend_engine = self.backend.installed_engine()
             self._use_backend_url(url)

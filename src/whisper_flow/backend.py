@@ -398,7 +398,7 @@ def _stage(progress, name: str):
     return lambda fraction: progress(name, fraction)
 
 
-def _download(url: str, dest: Path, progress=None) -> None:
+def _download(url: str, dest: Path, progress=None, cancel_event=None) -> None:
     """Download to a temporary name, then move: a partial file is never used."""
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(dest.suffix + ".part")
@@ -413,6 +413,8 @@ def _download(url: str, dest: Path, progress=None) -> None:
                     break
                 f.write(chunk)
                 done += len(chunk)
+                if cancel_event and cancel_event.is_set():
+                    raise RuntimeError("cancelled")
                 # Often enough for a progress bar to look continuous;
                 # callers that only want notifications throttle further.
                 if progress and total and time.monotonic() - last_report > 0.25:
@@ -768,6 +770,7 @@ class LocalBackend:
         self.config = config
         self._notify = notify or (lambda msg: None)
         self._process = None
+        self._last_started_model = None
         self._lock = threading.Lock()
         # Held for the life of this process; closing it kills the server.
         self._job = _kill_on_exit_job()
@@ -972,7 +975,7 @@ class LocalBackend:
 
     # ------------------------------------------------------------- install
     def install(self, model: str | None = None, force_download: bool = False,
-                progress=None) -> bool:
+                progress=None, cancel_event=None) -> bool:
         """Fetch the engine and model into the user's data directory.
 
         `force_download` ignores anything bundled, which is how the GPU
@@ -983,6 +986,9 @@ class LocalBackend:
         occasional notification, which is enough for a background upgrade
         and not enough for someone watching a download they just started.
         """
+        if cancel_event and cancel_event.is_set():
+            log("[BACKEND] install cancelled before start")
+            return False
         accelerator = detect_accelerator()
         model = model or recommended_model(accelerator)
         log(f"[BACKEND] accelerator={accelerator} model={model}")
@@ -1020,7 +1026,7 @@ class LocalBackend:
                     # Upstream ships no Linux CUDA binary; build one. Raises
                     # on a missing toolkit or a failed compile, and the
                     # failure lands in the notification below.
-                    self._build_cuda_engine(progress)
+                    self._build_cuda_engine(progress, cancel_event=cancel_event)
                 else:
                     archive = _server_archive(accelerator)
                     # Name what is actually being fetched. On Linux that is the
@@ -1031,7 +1037,7 @@ class LocalBackend:
                     runtime = _runtime_dir(self.config.config_dir)
                     archive_path = runtime / archive
                     _download(f"{RELEASE_URL}/{archive}", archive_path,
-                              _stage(progress, "engine"))
+                              _stage(progress, "engine"), cancel_event=cancel_event)
                     # Extract into a staging directory so the flattening
                     # below cannot reach engines that already live in the
                     # runtime directory (the Linux CUDA build in runtime/cuda).
@@ -1072,7 +1078,7 @@ class LocalBackend:
                         last_notice[0] = time.monotonic()
                         self._notify(f"Speech model {int(fraction * 100)}%")
 
-                _download(f"{MODEL_URL}/{model}.bin", downloaded_model, report)
+                _download(f"{MODEL_URL}/{model}.bin", downloaded_model, report, cancel_event=cancel_event)
 
             self._notify("Speech model ready")
             return True
@@ -1081,7 +1087,7 @@ class LocalBackend:
             self._notify(f"Could not set up the speech model: {e}")
             return False
 
-    def _build_cuda_engine(self, progress=None) -> None:
+    def _build_cuda_engine(self, progress=None, cancel_event=None) -> None:
         """Compile whisper.cpp with the CUDA backend into runtime/cuda/.
 
         Upstream publishes no Linux CUDA binary - the release assets are
@@ -1101,6 +1107,8 @@ class LocalBackend:
         out_dir = _cuda_dir(self.config.config_dir)
         stage = _stage(progress, "engine")
 
+        if cancel_event and cancel_event.is_set():
+            raise RuntimeError("cancelled")
         nvcc = _cuda_toolkit()
         if not nvcc:
             raise RuntimeError("the CUDA toolkit (nvcc) is not installed")
@@ -1295,16 +1303,57 @@ class LocalBackend:
                 fallback_model = self._cpu_fallback_model(None)
                 if not fallback_model:
                     return None
+        # If the CPU fallback is medium but medium also crashes on CPU (as in
+        # the 0.4.294 log where medium crashed even on CPU), prefer base.
+        # Download base if not present instead of reusing a known-crashing medium.
+        if fallback_model == "ggml-medium.en-q8_0" and model == "ggml-medium.en-q8_0":
+            # Check if medium has been tried and failed on CPU before; prefer base
+            base_candidate = "ggml-base.en-q8_0"
+            if base_candidate != fallback_model:
+                # If base is not installed, try to get it (download)
+                if not self.is_installed(base_candidate):
+                    # Prefer base even if it needs download
+                    fallback_model = base_candidate
+                else:
+                    fallback_model = base_candidate
+        self._last_started_model = fallback_model
+        try:
+            self.config.model_name = fallback_model
+            # Persist so working_model() returns the fallback next time, not the crashing medium
+            try:
+                from pathlib import Path as _P
+                import whisper_flow.envfile as _ef
+                _ef.set(_P(self.config.config_dir) / ".env", {"WHISPER_FLOW_MODEL_NAME": fallback_model})
+            except Exception:
+                pass
+        except Exception:
+            pass
         log(f"[BACKEND] GPU start failed for {model}, trying CPU fallback with {fallback_model}")
         self._quarantine_faulty_engine()
         if not self.ensure_cpu_engine():
             return None
-        # If fallback model still not installed, try to use whatever is there
+        # If fallback model not installed, download it (e.g. base when only medium was present)
         if not self.is_installed(fallback_model):
-            fallback_model = self._cpu_fallback_model(None)
-            if not fallback_model or not self.is_installed(fallback_model):
-                log("[BACKEND] no installed CPU model for fallback")
-                return None
+            log(f"[BACKEND] fallback model {fallback_model} not installed, downloading")
+            # Try to install it (download). Respect cancel if any (None here)
+            if not self.install(fallback_model):
+                # Try any installed CPU model as last resort
+                fallback_model = self._cpu_fallback_model(None)
+                if not fallback_model or not self.is_installed(fallback_model):
+                    log("[BACKEND] no installed CPU model for fallback after download attempt")
+                    return None
+                log(f"[BACKEND] using alternate fallback {fallback_model}")
+        try:
+            self.config.model_name = fallback_model
+            try:
+                from pathlib import Path as _P
+                import whisper_flow.envfile as _ef
+                _ef.set(_P(self.config.config_dir) / ".env", {"WHISPER_FLOW_MODEL_NAME": fallback_model})
+            except Exception:
+                pass
+        except Exception:
+            pass
+        self._last_started_model = fallback_model
         return self.start(fallback_model)
 
     # --------------------------------------------------------------- serve

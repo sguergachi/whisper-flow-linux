@@ -105,7 +105,6 @@ jobs:
             mingw-w64-ucrt-x86_64-gcc
             mingw-w64-ucrt-x86_64-python-pydantic
             mingw-w64-ucrt-x86_64-python-pydantic-core
-            mingw-w64-ucrt-x86_64-python-pydantic-settings
             mingw-w64-ucrt-x86_64-python-webrtcvad
             mingw-w64-ucrt-x86_64-python-numpy
             mingw-w64-ucrt-x86_64-python-pillow
@@ -140,8 +139,7 @@ jobs:
           # for 3.14. Use the pacman-provided pydantic and pin pip to it.
           pyd_ver=$(pacman -Q mingw-w64-ucrt-x86_64-python-pydantic | awk '{print $2}' | cut -d- -f1)
           core_ver=$(pacman -Q mingw-w64-ucrt-x86_64-python-pydantic-core | awk '{print $2}' | cut -d- -f1)
-          settings_ver=$(pacman -Q mingw-w64-ucrt-x86_64-python-pydantic-settings | awk '{print $2}' | cut -d- -f1)
-          printf "pydantic==%s\npydantic-core==%s\npydantic-settings==%s\n" "$pyd_ver" "$core_ver" "$settings_ver" > /tmp/c.txt
+          printf "pydantic==%s\npydantic-core==%s\n" "$pyd_ver" "$core_ver" > /tmp/c.txt
           pip install -c /tmp/c.txt -e . pytest
 
       - name: Test
@@ -345,7 +343,6 @@ jobs:
             mingw-w64-ucrt-x86_64-gcc
             mingw-w64-ucrt-x86_64-python-pydantic
             mingw-w64-ucrt-x86_64-python-pydantic-core
-            mingw-w64-ucrt-x86_64-python-pydantic-settings
             mingw-w64-ucrt-x86_64-python-webrtcvad
             mingw-w64-ucrt-x86_64-python-numpy
             mingw-w64-ucrt-x86_64-python-pillow
@@ -379,8 +376,7 @@ jobs:
           sed -i "/velopack/d" pyproject.toml
           pyd_ver=$(pacman -Q mingw-w64-ucrt-x86_64-python-pydantic | awk '{print $2}' | cut -d- -f1)
           core_ver=$(pacman -Q mingw-w64-ucrt-x86_64-python-pydantic-core | awk '{print $2}' | cut -d- -f1)
-          settings_ver=$(pacman -Q mingw-w64-ucrt-x86_64-python-pydantic-settings | awk '{print $2}' | cut -d- -f1)
-          printf "pydantic==%s\npydantic-core==%s\npydantic-settings==%s\n" "$pyd_ver" "$core_ver" "$settings_ver" > /tmp/c.txt
+          printf "pydantic==%s\npydantic-core==%s\n" "$pyd_ver" "$core_ver" > /tmp/c.txt
           pip install -c /tmp/c.txt -e .
           # velopack ships a stable-ABI extension: the win_amd64 wheel loads
           # on MSYS2's CPython too; only pip's tag check disagrees.

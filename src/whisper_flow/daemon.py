@@ -233,23 +233,43 @@ class WhisperFlowDaemon:
 
                 # Backend health: if the server died (GPU 0xC0000005), revive it
                 # on CPU so the next hotkey doesn't record 5s of speech only to
-                # drop it with "No whisper server configured".
+                # drop it with "No whisper server configured". Auto-heal instantly
+                # on dead process, throttled for missing-url case.
                 if not self.is_recording and not self.is_processing:
                     try:
                         url = (self.config.local_whisper_url or "").strip()
                         proc = getattr(self.backend, "_process", None)
                         dead = proc is not None and proc.poll() is not None
-                        if dead or (not url and self.backend.working_model()):
-                            # Throttle: try at most every 10s, not every 2s
+                        needs_revive = dead or (not url and self.backend.working_model())
+                        if needs_revive:
+                            now = time.time()
+                            throttle = 0 if dead else 10
                             if not hasattr(self, "_last_backend_revive"):
                                 self._last_backend_revive = 0.0
-                            if time.time() - self._last_backend_revive > 10:
-                                self._last_backend_revive = time.time()
+                            if now - self._last_backend_revive >= throttle:
+                                self._last_backend_revive = now
                                 if dead:
-                                    log(f"[DAEMON] backend process dead (exit={proc.poll()} 0x{(proc.poll() or 0) & 0xFFFFFFFF:08X}), reviving")
+                                    log(f"[DAEMON] backend process dead (exit={proc.poll()} 0x{(proc.poll() or 0) & 0xFFFFFFFF:08X}), auto-healing on CPU")
                                 self._ensure_backend_running()
                     except Exception as e:
-                        log(f"[DAEMON] backend watchdog failed: {e}")
+                        log(f"[DAEMON] backend watchdog failed (auto-heal will retry): {e}")
+
+                # Hotkey/hud auto-heal: if listener died, restart it without crashing daemon
+                if not self.is_recording:
+                    try:
+                        hm = getattr(self, "hotkey_manager", None)
+                        if hm and hasattr(hm, "is_alive"):
+                            try:
+                                if not hm.is_alive():
+                                    log("[DAEMON] hotkey manager dead, auto-healing")
+                                    try:
+                                        hm.start()
+                                    except Exception as he:
+                                        log(f"[DAEMON] hotkey auto-heal failed: {he}")
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
 
                 # Log status only when it changes; at a 2s interval a constant
                 # heartbeat buries every real message in the journal.
@@ -823,12 +843,50 @@ class WhisperFlowDaemon:
         except Exception as e:
             log(f"[DAEMON] HUD stop watcher gave up: {e}")
 
+    def _healing_transcribe(self, app, func_name: str = "transcribe_audio"):
+        """Wrap transcribe_audio to auto-heal backend crashes mid-dictation.
+
+        If the whisper-server died (0xC0000005) between hotkey press and the
+        final pass, the original call raises 'No whisper server configured' and
+        the 5s of speech is lost. This wrapper revives on CPU and retries once,
+        so the *current* dictation is saved, not just the next one.
+        """
+        orig = getattr(app.transcription_service, func_name)
+
+        def healing(*args, **kwargs):
+            try:
+                result = orig(*args, **kwargs)
+                if result is not None:
+                    return result
+                if app.transcription_service.local_url:
+                    return None
+                raise RuntimeError("No whisper server configured (auto-heal check)")
+            except Exception as e:
+                msg = str(e)
+                is_no_server = "No whisper server" in msg or "No whisper server configured" in msg
+                is_conn = "Cannot reach" in msg or "Connection" in msg or "Failed to connect" in msg
+                if not (is_no_server or is_conn):
+                    raise
+                log(f"[DAEMON] transcribe failed with '{e}' — auto-healing backend and retrying once")
+                healed = self._ensure_backend_running()
+                if not healed:
+                    log("[DAEMON] auto-heal could not revive backend")
+                    raise
+                return orig(*args, **kwargs)
+
+        return healing
+
     def _record_audio_thread(self, mode: str):
         """Handle audio recording in a separate thread with timeout protection."""
         log(f"[DAEMON] Recording thread started for mode: {mode}")
+        app_for_mode = None
+        orig_transcribe = None
         try:
             app = self._get_app_for_mode(mode)
+            app_for_mode = app
             log(f"[DAEMON] Using app instance for mode: {mode}")
+            orig_transcribe = app.transcription_service.transcribe_audio
+            app.transcription_service.transcribe_audio = self._healing_transcribe(app)
 
             if mode in ("auto_transcribe", "command"):
                 # Single-press: record until silence (or Escape / max duration).
@@ -896,6 +954,11 @@ class WhisperFlowDaemon:
             self._report_failure(f"Recording error ({mode}): {e}",
                                  traceback.format_exc())
         finally:
+            if app_for_mode and orig_transcribe:
+                try:
+                    app_for_mode.transcription_service.transcribe_audio = orig_transcribe
+                except Exception:
+                    pass
             log(f"[DAEMON] Recording thread finishing for mode: {mode}")
             self._stop_recording()
             # Again, after the last of the text has been typed: the closing
@@ -1974,68 +2037,91 @@ Use 'whisper-flow stop' to exit daemon
             log(f"[DAEMON] Unsupported platform: {unsupported}")
             self.notify(f"whisper-flow needs Windows 11 22H2 or later: {unsupported}")
             return
-        try:
-            self.is_running = True
-            log("[DAEMON] Worker process started")
+        crash_count = 0
+        while True:
+            try:
+                self.is_running = True
+                log(f"[DAEMON] Worker process started (attempt {crash_count + 1})")
 
-            # Write PID file so parent process can verify startup
-            pid_file = _pid_file()
-            pid_file.parent.mkdir(parents=True, exist_ok=True)
-            pid_file.write_text(str(os.getpid()))
+                # Write PID file so parent process can verify startup
+                pid_file = _pid_file()
+                pid_file.parent.mkdir(parents=True, exist_ok=True)
+                pid_file.write_text(str(os.getpid()))
 
-            # Start watchdog for health monitoring
-            self._start_watchdog()
+                # Start watchdog for health monitoring
+                self._start_watchdog()
 
-            # Set up hotkeys
-            self.setup_hotkeys()
+                # Set up hotkeys
+                self.setup_hotkeys()
 
-            # And a transcription backend, if one is installed
-            self._start_managed_backend()
+                # And a transcription backend, if one is installed
+                self._start_managed_backend()
 
-            if foreground:
-                # Foreground mode: try tray, then keep hotkeys alive without a
-                # tray. Never fall through to the interactive CLI under
-                # systemd: input() hits EOF immediately and used to stop the
-                # whole daemon - which is exactly "hotkeys do nothing".
-                log("[DAEMON] Running in foreground mode")
-                try:
-                    self.tray_icon = _pystray().Icon(
-                        "whisper-flow",
-                        self.create_tray_icon(),
-                        "WhisperFlow Daemon",
-                        self.setup_tray_menu(),
-                    )
-                    log("[DAEMON] Tray icon created successfully")
-                    self.tray_icon.run()
-                except Exception as e:
-                    log(f"[DAEMON] Tray setup failed: {e}")
-                    if sys.stdin.isatty():
-                        self.run_notification_mode()
-                    else:
-                        log("[DAEMON] no TTY; staying up headless with hotkeys")
+                if foreground:
+                    # Foreground mode: try tray, then keep hotkeys alive without a
+                    # tray. Never fall through to the interactive CLI under
+                    # systemd: input() hits EOF immediately and used to stop the
+                    # whole daemon - which is exactly "hotkeys do nothing".
+                    log("[DAEMON] Running in foreground mode")
+                    try:
+                        self.tray_icon = _pystray().Icon(
+                            "whisper-flow",
+                            self.create_tray_icon(),
+                            "WhisperFlow Daemon",
+                            self.setup_tray_menu(),
+                        )
+                        log("[DAEMON] Tray icon created successfully")
+                        self.tray_icon.run()
+                    except Exception as e:
+                        log(f"[DAEMON] Tray setup failed: {e}")
+                        if sys.stdin.isatty():
+                            self.run_notification_mode()
+                        else:
+                            log("[DAEMON] no TTY; staying up headless with hotkeys")
+                            self.run_headless_mode()
+                else:
+                    # Background mode: try tray, fallback to headless
+                    log("[DAEMON] Running in background mode")
+                    try:
+                        self.tray_icon = _pystray().Icon(
+                            "whisper-flow",
+                            self.create_tray_icon(),
+                            "WhisperFlow Daemon",
+                            self.setup_tray_menu(),
+                        )
+                        log("[DAEMON] Background tray icon created successfully")
+                        self.tray_icon.run()
+                    except Exception as e:
+                        log(f"[DAEMON] Tray setup failed in background mode: {e}")
                         self.run_headless_mode()
-            else:
-                # Background mode: try tray, fallback to headless
-                log("[DAEMON] Running in background mode")
-                try:
-                    self.tray_icon = _pystray().Icon(
-                        "whisper-flow",
-                        self.create_tray_icon(),
-                        "WhisperFlow Daemon",
-                        self.setup_tray_menu(),
-                    )
-                    log("[DAEMON] Background tray icon created successfully")
-                    self.tray_icon.run()
-                except Exception as e:
-                    log(f"[DAEMON] Tray setup failed in background mode: {e}")
-                    self.run_headless_mode()
 
-        except Exception as e:
-            log(f"[DAEMON] Worker error: {e}")
-            self.notify(f"❌ Daemon error: {e}")
-        finally:
-            log("[DAEMON] Worker process finishing")
-            self._cleanup()
+            except Exception as e:
+                crash_count += 1
+                log(f"[DAEMON] Worker crashed (auto-heal {crash_count}): {e}\n{traceback.format_exc()}")
+                try:
+                    self.notify(f"Recovered from error — restarting (attempt {crash_count})")
+                except Exception:
+                    pass
+                try:
+                    self._cleanup()
+                except Exception:
+                    pass
+                if crash_count > 5:
+                    log("[DAEMON] too many crashes, giving up auto-heal")
+                    break
+                backoff = min(2 ** crash_count, 30)
+                log(f"[DAEMON] auto-heal restarting in {backoff}s")
+                time.sleep(backoff)
+                continue
+            else:
+                break
+            finally:
+                if crash_count == 0:
+                    log("[DAEMON] Worker process finishing")
+                    try:
+                        self._cleanup()
+                    except Exception:
+                        pass
 
     def _cleanup(self):
         """Clean up resources and stop all components."""

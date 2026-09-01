@@ -1548,12 +1548,22 @@ class WhisperFlowDaemon:
             return False
         if url:
             # If fallback happened, _last_started_model holds the actual model started (e.g. base instead of medium)
-            actual = getattr(self.backend, "_last_started_model", None) or self.backend.working_model() or model
+            actual = getattr(self.backend, "_last_started_model", None) or model
             # Clear it after use
             try:
                 self.backend._last_started_model = None
             except Exception:
                 pass
+            # If we forced base, persist it so next boot doesn't try medium again
+            if actual == "ggml-base.en-q8_0":
+                try:
+                    import whisper_flow.envfile as _ef
+                    from pathlib import Path as _P
+                    _ef.set(_P(self.config.config_dir) / ".env", {"WHISPER_FLOW_MODEL_NAME": actual})
+                    self.config.model_name = actual
+                    log(f"[DAEMON] persisted fallback to {actual} for next boot")
+                except Exception as e:
+                    log(f"[DAEMON] could not persist fallback model: {e}")
             self._backend_model = actual
             self._backend_engine = self.backend.installed_engine()
             self._use_backend_url(url)

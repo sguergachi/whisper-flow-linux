@@ -1279,7 +1279,12 @@ class LocalBackend:
         for path in sorted(_model_dir(self.config.config_dir).glob("*.bin")):
             if path.stem not in GPU_MODELS:
                 return path.stem
-        return self.bundled_model()
+        # No installed CPU model — return base as a download candidate so
+        # start_with_fallback will fetch it instead of reusing a crashing medium
+        # (as in 0.4.295 log where medium crashed every 12s even on CPU)
+        if self.bundled_model():
+            return self.bundled_model()
+        return "ggml-base.en-q8_0"
 
     def _quarantine_faulty_engine(self) -> None:
         """Move a crashing GPU binary aside so the bundled CPU engine can run.

@@ -1630,7 +1630,7 @@ class WhisperFlowDaemon:
                         has_vcr = True
                         if __import__("sys").platform == "win32":
                             try:
-                                import ctypes, pathlib as _P
+                                import pathlib as _P
                                 # Check System32 and SysWOW64 for vcruntime
                                 sys32 = _P.Path(r"C:\Windows\System32\vcruntime140.dll")
                                 wow64 = _P.Path(r"C:\Windows\SysWOW64\vcruntime140.dll")

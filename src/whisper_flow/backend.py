@@ -1371,6 +1371,16 @@ class LocalBackend:
         url = self.start(model)
         if url:
             return url
+        # If the requested model is base and not installed, try to download it directly
+        # (happens when daemon forces fallback to base but base wasn't bundled)
+        if model == "ggml-base.en-q8_0" and not self.is_installed(model):
+            log(f"[BACKEND] {model} not installed, downloading fallback")
+            if self.install(model):
+                url2 = self.start(model)
+                if url2:
+                    return url2
+            log(f"[BACKEND] failed to download {model}")
+            return None
         # Only fall back if the failure looks GPU-related
         if not self.engine_is_gpu() and not detect_accelerator().startswith("cuda"):
             return None

@@ -250,6 +250,14 @@ class WhisperFlowDaemon:
                                 self._last_backend_revive = now
                                 if dead:
                                     log(f"[DAEMON] backend process dead (exit={proc.poll()} 0x{(proc.poll() or 0) & 0xFFFFFFFF:08X}), auto-healing on CPU")
+                                    # Track medium crashes to force base after 2 failures
+                                    try:
+                                        cur = getattr(self, "_backend_model", None) or self.backend.working_model()
+                                        if cur == "ggml-medium.en-q8_0":
+                                            self._medium_crash = getattr(self, "_medium_crash", 0) + 1
+                                            log(f"[DAEMON] medium crash count {self._medium_crash}")
+                                    except Exception:
+                                        pass
                                 self._ensure_backend_running()
                     except Exception as e:
                         log(f"[DAEMON] backend watchdog failed (auto-heal will retry): {e}")
@@ -1510,6 +1518,29 @@ class WhisperFlowDaemon:
             return False
         if not model:
             return False
+        # Auto-heal: if medium keeps crashing on CPU (as in 0.4.295 log), force base
+        # which is 10x smaller and never crashes on CPU. This breaks the infinite
+        # 0xC0000005 loop where medium restarts every 12s even after quarantine.
+        try:
+            if model == "ggml-medium.en-q8_0" and not self.backend.engine_is_gpu():
+                # Check crash count: if medium has died twice, switch to base
+                cnt = getattr(self, "_medium_crash", 0)
+                # Also detect if we are in the crash loop (watchdog has revived recently)
+                if cnt >= 1 or (hasattr(self, "_last_backend_revive") and (__import__("time").time() - self._last_backend_revive) < 30):
+                    base = "ggml-base.en-q8_0"
+                    if self.backend.model_path(base).exists() or self.backend.bundled_model() == base:
+                        log(f"[DAEMON] medium has crashed repeatedly on CPU, forcing fallback to {base}")
+                        model = base
+                    else:
+                        # Try to download base synchronously (78 MB, fast)
+                        log(f"[DAEMON] medium unstable, downloading {base} for stability")
+                        try:
+                            if self.backend.install(base):
+                                model = base
+                        except Exception as ie:
+                            log(f"[DAEMON] base download failed: {ie}")
+        except Exception as e:
+            log(f"[DAEMON] forced base check failed: {e}")
         try:
             url = self._backend_start(model)
         except Exception as e:

@@ -398,41 +398,29 @@ def _stage(progress, name: str):
     return lambda fraction: progress(name, fraction)
 
 
-def _download(url: str, dest: Path, progress=None, cancel_event=None) -> None:
+def _download(url: str, dest: Path, progress=None) -> None:
     """Download to a temporary name, then move: a partial file is never used."""
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(dest.suffix + ".part")
-    try:
-        with urllib.request.urlopen(url, timeout=60) as response:
-            total = int(response.headers.get("Content-Length", 0))
-            done = 0
-            last_report = 0.0
-            with open(tmp, "wb") as f:
-                while True:
-                    if cancel_event is not None and cancel_event.is_set():
-                        raise RuntimeError("download cancelled")
-                    chunk = response.read(1 << 20)
-                    if not chunk:
-                        break
-                    f.write(chunk)
-                    done += len(chunk)
-                    # Often enough for a progress bar to look continuous;
-                    # callers that only want notifications throttle further.
-                    if progress and total and time.monotonic() - last_report > 0.25:
-                        last_report = time.monotonic()
-                        progress(done / total)
-            if progress and total:
-                progress(1.0)
-        tmp.replace(dest)
-    except BaseException:
-        # Cancelled or failed: remove the partial so a later retry does not
-        # think it is complete, and so disk does not fill with .part files.
-        try:
-            if tmp.exists():
-                tmp.unlink()
-        except Exception:
-            pass
-        raise
+    with urllib.request.urlopen(url, timeout=60) as response:
+        total = int(response.headers.get("Content-Length", 0))
+        done = 0
+        last_report = 0.0
+        with open(tmp, "wb") as f:
+            while True:
+                chunk = response.read(1 << 20)
+                if not chunk:
+                    break
+                f.write(chunk)
+                done += len(chunk)
+                # Often enough for a progress bar to look continuous;
+                # callers that only want notifications throttle further.
+                if progress and total and time.monotonic() - last_report > 0.25:
+                    last_report = time.monotonic()
+                    progress(done / total)
+        if progress and total:
+            progress(1.0)
+    tmp.replace(dest)
 
 
 def _stop_strays_win(exe_path, keep_pid: int | None = None) -> int:
@@ -984,7 +972,7 @@ class LocalBackend:
 
     # ------------------------------------------------------------- install
     def install(self, model: str | None = None, force_download: bool = False,
-                progress=None, cancel_event=None) -> bool:
+                progress=None) -> bool:
         """Fetch the engine and model into the user's data directory.
 
         `force_download` ignores anything bundled, which is how the GPU
@@ -1027,8 +1015,6 @@ class LocalBackend:
                       else self.model_path(model).exists())
 
         try:
-            if cancel_event is not None and cancel_event.is_set():
-                raise RuntimeError("download cancelled")
             if not have_exe:
                 if sys.platform != "win32" and wanted.startswith("cuda"):
                     # Upstream ships no Linux CUDA binary; build one. Raises
@@ -1045,8 +1031,7 @@ class LocalBackend:
                     runtime = _runtime_dir(self.config.config_dir)
                     archive_path = runtime / archive
                     _download(f"{RELEASE_URL}/{archive}", archive_path,
-                              _stage(progress, "engine"),
-                              cancel_event=cancel_event)
+                              _stage(progress, "engine"))
                     # Extract into a staging directory so the flattening
                     # below cannot reach engines that already live in the
                     # runtime directory (the Linux CUDA build in runtime/cuda).
@@ -1087,15 +1072,11 @@ class LocalBackend:
                         last_notice[0] = time.monotonic()
                         self._notify(f"Speech model {int(fraction * 100)}%")
 
-                _download(f"{MODEL_URL}/{model}.bin", downloaded_model, report,
-                          cancel_event=cancel_event)
+                _download(f"{MODEL_URL}/{model}.bin", downloaded_model, report)
 
             self._notify("Speech model ready")
             return True
         except Exception as e:
-            if cancel_event is not None and cancel_event.is_set():
-                log(f"[BACKEND] install cancelled: {e}")
-                return False
             log(f"[BACKEND] install failed: {e}")
             self._notify(f"Could not set up the speech model: {e}")
             return False
@@ -1186,6 +1167,146 @@ class LocalBackend:
         except OSError as e:
             log(f"[BACKEND] could not record the engine kind: {e}")
 
+    def _cpu_fallback_model(self, failed_model: str | None = None) -> str | None:
+        """A CPU-friendly model that is actually on disk, or None.
+
+        GPU failures often involve large-v3-turbo (needs VRAM, unusable on CPU).
+        Pick the largest CPU model that is already present so the fallback does
+        not need a multi-hundred-MB download to keep the app working.
+        """
+        candidates: list[str | None] = [
+            recommended_model("cpu"),
+            "ggml-base.en-q8_0",
+            "ggml-tiny.en-q8_0",
+            self.bundled_model(),
+            failed_model,
+        ]
+        seen: set[str] = set()
+        for name in candidates:
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            if name in GPU_MODELS:
+                continue
+            if self.model_path(name).exists():
+                return name
+        # Any installed CPU model at all
+        for path in sorted(_model_dir(self.config.config_dir).glob("*.bin")):
+            if path.stem not in GPU_MODELS:
+                return path.stem
+        return self.bundled_model()
+
+    def _quarantine_faulty_engine(self) -> None:
+        """Move a crashing GPU binary aside so the bundled CPU engine can run.
+
+        On Windows the GPU and CPU engines share the same path
+        (runtime/whisper-server.exe) — the GPU download overwrites the CPU
+        one. Deleting/moving it exposes the bundled CPU engine that shipped
+        with the installer, which is the fastest way to get the app working
+        again without a download. The faulty file is kept as .cuda-failed
+        for diagnosis.
+        """
+        try:
+            exe = _runtime_dir(self.config.config_dir) / self._exe_name
+            if exe.exists():
+                backup = exe.with_suffix(exe.suffix + ".cuda-failed")
+                # Don't overwrite a previous backup silently
+                if backup.exists():
+                    try:
+                        backup.unlink()
+                    except OSError:
+                        pass
+                exe.rename(backup)
+                log(f"[BACKEND] quarantined faulty engine to {backup}")
+            cuda_exe = _cuda_dir(self.config.config_dir) / self._exe_name
+            if cuda_exe.exists():
+                backup = cuda_exe.with_suffix(cuda_exe.suffix + ".cuda-failed")
+                if backup.exists():
+                    try:
+                        backup.unlink()
+                    except OSError:
+                        pass
+                cuda_exe.rename(backup)
+                log(f"[BACKEND] quarantined faulty CUDA engine to {backup}")
+            # Mark as CPU so installed_engine() stops preferring the now-missing GPU path
+            self._record_engine("cpu")
+        except Exception as e:
+            log(f"[BACKEND] could not quarantine faulty engine: {e}")
+
+    def ensure_cpu_engine(self) -> bool:
+        """Make sure a CPU engine is available, downloading if needed.
+
+        Returns True if a CPU engine is now present (bundled or downloaded).
+        """
+        # Already have a working CPU engine
+        if self.server_exe.exists() and not self.engine_is_gpu():
+            return True
+        # Bundled CPU engine counts — quarantine will already have exposed it
+        if bundled_dir() and (bundled_dir() / "engine" / self._exe_name).exists():
+            return True
+        # Try to download the CPU engine without regard to accelerator
+        try:
+            archive = "whisper-blas-bin-x64.zip" if sys.platform == "win32" else "whisper-bin-ubuntu-x64.tar.gz"
+            self._notify("GPU engine failed — downloading CPU engine...")
+            runtime = _runtime_dir(self.config.config_dir)
+            archive_path = runtime / archive
+            _download(f"{RELEASE_URL}/{archive}", archive_path)
+            staging = runtime / ".extract"
+            shutil.rmtree(staging, ignore_errors=True)
+            _extract(archive_path, staging)
+            archive_path.unlink(missing_ok=True)
+            found = next(staging.rglob(self._exe_name), None)
+            if found is None:
+                raise RuntimeError(f"{self._exe_name} not found in {archive}")
+            for item in found.parent.iterdir():
+                shutil.move(str(item), runtime)
+            shutil.rmtree(staging, ignore_errors=True)
+            if sys.platform != "win32":
+                (_runtime_dir(self.config.config_dir) / self._exe_name).chmod(0o755)
+            self._record_engine("cpu")
+            log("[BACKEND] CPU engine installed as fallback")
+            return True
+        except Exception as e:
+            log(f"[BACKEND] could not install CPU fallback engine: {e}")
+            return False
+
+    def start_with_fallback(self, model: str | None = None) -> str | None:
+        """Start GPU model if possible, otherwise fall back to a CPU model.
+
+        This is the "app has to work always" path: a machine where the CUDA
+        engine crashes with 0xC0000005 (missing MSVC redist / driver / VRAM)
+        must still transcribe via the CPU engine instead of leaving the user
+        with 'No whisper server configured' after every hotkey.
+        """
+        url = self.start(model)
+        if url:
+            return url
+        # Only fall back if the failure looks GPU-related
+        if not self.engine_is_gpu() and not detect_accelerator().startswith("cuda"):
+            return None
+        fallback_model = self._cpu_fallback_model(model)
+        if not fallback_model:
+            log("[BACKEND] no CPU fallback model available")
+            return None
+        if fallback_model == model:
+            # Same model failed on GPU — quarantine and retry same file on CPU
+            # only if the model is CPU-friendly; GPU-only models must switch.
+            if model in GPU_MODELS:
+                fallback_model = self._cpu_fallback_model(None)
+                if not fallback_model:
+                    return None
+        log(f"[BACKEND] GPU start failed for {model}, trying CPU fallback with {fallback_model}")
+        self._quarantine_faulty_engine()
+        if not self.ensure_cpu_engine():
+            return None
+        # If fallback model still not installed, try to use whatever is there
+        if not self.is_installed(fallback_model):
+            fallback_model = self._cpu_fallback_model(None)
+            if not fallback_model or not self.is_installed(fallback_model):
+                log("[BACKEND] no installed CPU model for fallback")
+                return None
+        return self.start(fallback_model)
+
     # --------------------------------------------------------------- serve
     def start(self, model: str | None = None) -> str | None:
         """Start the server if it is not already up. Returns its URL."""
@@ -1238,9 +1359,10 @@ class LocalBackend:
                     existing = env.get("LD_LIBRARY_PATH", "")
                     env["LD_LIBRARY_PATH"] = ":".join(
                         lib_dirs + ([existing] if existing else []))
-            # No console window for a background helper. Capture stderr to a temp
-            # file so a crash (missing DLL, OOM, bad model) leaves a trace
-            # instead of the opaque "did not become ready" that shipped before.
+            # No console window for a background helper. Keep stderr in a
+            # temp file so a native crash (0xC0000005) leaves evidence — with
+            # DEVNULL the user's report just says "server did not become ready"
+            # and the real reason (missing VCRedist / CUDA DLL) is lost.
             import tempfile as _tf
             _stderr_path = None
             _stderr_file = None
@@ -1248,20 +1370,30 @@ class LocalBackend:
                 fd, _stderr_path = _tf.mkstemp(prefix="whisper-server-", suffix=".log")
                 _stderr_file = open(fd, "w", encoding="utf-8", errors="replace")
             except Exception:
-                _stderr_path = None
+                _stderr_file = subprocess.DEVNULL  # type: ignore[assignment]
             try:
                 self._process = subprocess.Popen(
-                    cmd, stdout=subprocess.DEVNULL, stderr=_stderr_file or subprocess.DEVNULL,
+                    cmd, stdout=subprocess.DEVNULL, stderr=_stderr_file,
                     creationflags=no_console_flags(), env=env,
                 )
             except Exception as e:
                 log(f"[BACKEND] could not start the server: {e}")
-                if _stderr_file:
-                    try:
-                        _stderr_file.close()
-                    except Exception:
-                        pass
+                # Clean up the temp stderr we opened for the failed spawn
+                try:
+                    if _stderr_file not in (None, subprocess.DEVNULL):
+                        _stderr_file.close()  # type: ignore[union-attr]
+                    if _stderr_path:
+                        Path(_stderr_path).unlink(missing_ok=True)
+                except Exception:
+                    pass
                 return None
+            finally:
+                # Popen dup'd the fd; close our copy so the file isn't held open
+                try:
+                    if _stderr_file not in (None, subprocess.DEVNULL):
+                        _stderr_file.close()  # type: ignore[union-attr]
+                except Exception:
+                    pass
 
             # Before it has done anything: from here on it dies with us.
             _adopt_into_job(self._job, self._process)
@@ -1275,64 +1407,34 @@ class LocalBackend:
                     log("[BACKEND] server exited after start; port is held by "
                         "something else - not claiming it as ours")
                     self._process = None
-                    if _stderr_file:
-                        try:
-                            _stderr_file.close()
-                        except Exception:
-                            pass
                     return None
                 log(f"[BACKEND] server ready on {self.url}")
-                if _stderr_file:
-                    try:
-                        _stderr_file.close()
-                    except Exception:
-                        pass
-                return self.url
-            # Not ready: log why (exit code + last stderr) so a Windows
-            # CUDA/missing-VC-redist/OOM failure is diagnosable without a
-            # separate repro.
-            code = None
-            try:
-                code = self._process.poll() if self._process else None
-            except Exception:
-                pass
-            tail = ""
-            if _stderr_file:
+                # Successful start — clean up the now-empty stderr file
                 try:
-                    _stderr_file.close()
-                    if _stderr_path and Path(_stderr_path).exists():
-                        tail = Path(_stderr_path).read_text(encoding="utf-8", errors="replace")[-4000:]
-                        # Keep the file for the diagnostics report; remove old ones.
-                        # The daemon's diagnostics include recent_log, not this,
-                        # but the path is logged so the file can be found.
+                    if _stderr_path:
+                        Path(_stderr_path).unlink(missing_ok=True)
                 except Exception:
                     pass
-            log(f"[BACKEND] server did not become ready (exit={code}) cmd={' '.join(cmd)}")
-            if tail.strip():
-                # Trim to last lines to avoid flooding the log with binary.
-                lines = tail.strip().splitlines()[-20:]
-                log("[BACKEND] server stderr tail:\n" + "\n".join(lines))
-                log(f"[BACKEND] server stderr kept at {_stderr_path}")
+                return self.url
+            # Failure: log exit code + stderr tail so the report is actionable
+            code = self._process.poll() if self._process else None
+            stderr_tail = ""
+            if _stderr_path:
+                try:
+                    text = Path(_stderr_path).read_text(encoding="utf-8", errors="replace").strip()
+                    if text:
+                        stderr_tail = "\n".join(text.splitlines()[-20:])
+                    else:
+                        stderr_tail = "(empty — native crash before logging; missing VCRedist/CUDA DLL?)"
+                    log(f"[BACKEND] server did not become ready (exit={code} 0x{(code or 0) & 0xFFFFFFFF:08X}) cmd={' '.join(cmd)}")
+                    log(f"[BACKEND] server stderr ({_stderr_path}): {stderr_tail[:2000]}")
+                    if code == -1073741819 or code == 3221225477 or (code is not None and (code & 0xFFFFFFFF) == 0xC0000005):
+                        log("[BACKEND] hint: cuda engine needs MSVC redist and NVIDIA driver; try CPU engine if VRAM is <4GB or driver is old")
+                except Exception as e:
+                    log(f"[BACKEND] server did not become ready (exit={code}) cmd={' '.join(cmd)} stderr unreadable: {e}")
+                # Keep the file for the diagnostics report; it will be cleaned on next start/stop
             else:
-                log(f"[BACKEND] server stderr empty; see {_stderr_path or '(no file)'}")
-                # Common Windows cause: missing CUDA DLLs or VC redist.
-                if sys.platform == "win32" and self.installed_engine().startswith("cuda"):
-                    log("[BACKEND] hint: cuda engine needs MSVC redist and NVIDIA driver; "
-                        "try CPU engine if VRAM is <4GB or driver is old")
-            # Don't leave a dead process around to hold the port half-open.
-            try:
-                if self._process and self._process.poll() is None:
-                    self._process.terminate()
-                    try:
-                        self._process.wait(timeout=3)
-                    except Exception:
-                        try:
-                            self._process.kill()
-                        except Exception:
-                            pass
-            except Exception:
-                pass
-            self._process = None
+                log(f"[BACKEND] server did not become ready (exit={code} 0x{(code or 0) & 0xFFFFFFFF:08X}) cmd={' '.join(cmd)}")
             return None
 
     @property

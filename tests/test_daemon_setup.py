@@ -130,6 +130,8 @@ def test_a_dead_server_is_not_followed_by_a_gpu_offer(daemon):
     """Nothing works yet, so an upsell would be the wrong conversation."""
     daemon.backend.working_model.return_value = "ggml-small.en"
     daemon.backend.start.return_value = None
+    # start_with_fallback will be tried first and returns a Mock; ensure it also fails
+    daemon.backend.start_with_fallback.return_value = None
     daemon.backend.setup_reason.return_value = "gpu"
     with patch.object(daemon, "_open_settings_window") as opened:
         with patch.object(daemon, "notify") as notify:

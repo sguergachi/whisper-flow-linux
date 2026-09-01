@@ -230,7 +230,8 @@ def capture_test(
         backend = LocalBackend(flow_app.config)
         if flow_app.config.manage_local_server:
             model = backend.working_model()
-            url = backend.start(model) if model else None
+            start_fn = getattr(backend, "start_with_fallback", backend.start)
+            url = start_fn(model) if model else None
             if url:
                 flow_app.config.local_whisper_url = url
                 flow_app.transcription_service.local_url = url.rstrip("/")

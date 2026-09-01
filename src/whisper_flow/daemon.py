@@ -1615,6 +1615,61 @@ class WhisperFlowDaemon:
             # ends up far slower than before they were told anything.
             self.notify("This PC has an NVIDIA GPU - install the GPU speech "
                         "engine in Settings to use it")
+            # Silent background install: if the user hasn't explicitly dismissed
+            # the GPU offer, try to fetch the GPU engine quietly. Switched from
+            # notify-only to auto-install per user request "handle this
+            # automatically as part of the install silently in the background".
+            # Respects metered check via total_ram and setup_seen; runs once.
+            try:
+                if not self.backend.setup_seen():
+                    # Only auto-install on machines that can actually benefit
+                    # (8GB+ RAM, 4+ cores) to avoid downloading 1.6GB onto a thin client
+                    import whisper_flow.backend as _be
+                    if _be.total_ram_gb() >= 8 and _be.usable_cores() >= 4:
+                        # Check VCRedist first — GPU engine will crash 0xC0000005 without it
+                        has_vcr = True
+                        if __import__("sys").platform == "win32":
+                            try:
+                                import ctypes, pathlib as _P
+                                # Check System32 and SysWOW64 for vcruntime
+                                sys32 = _P.Path(r"C:\Windows\System32\vcruntime140.dll")
+                                wow64 = _P.Path(r"C:\Windows\SysWOW64\vcruntime140.dll")
+                                has_vcr = sys32.exists() or wow64.exists()
+                                if not has_vcr:
+                                    # Try via WinSxS or just check msvcp
+                                    has_vcr = _P.Path(r"C:\Windows\System32\msvcp140.dll").exists()
+                            except Exception:
+                                has_vcr = True  # assume present if check fails
+                        if not has_vcr:
+                            log("[BACKEND] VCRedist missing — GPU engine would crash, not auto-installing; ask user to install VC++ Redist")
+                            self.notify("GPU engine needs Visual C++ Redistributable — install it from Microsoft, then retry GPU engine in Settings")
+                        else:
+                            def _bg_gpu_install():
+                                try:
+                                    model = self.backend.working_model()
+                                    log(f"[BACKEND] silent background GPU engine install for {model}")
+                                    ok = self.backend.install(model)
+                                    if ok:
+                                        log("[BACKEND] silent GPU install succeeded, restarting server on GPU")
+                                        self.backend.stop()
+                                        url = self._backend_start(model)
+                                        if url:
+                                            self._backend_model = model
+                                            self._backend_engine = self.backend.installed_engine()
+                                            self._use_backend_url(url)
+                                            self.notify(f"GPU engine installed in background — now on {self.backend.engine_summary()}")
+                                        self.backend.mark_setup_seen()
+                                    else:
+                                        log("[BACKEND] silent GPU install failed, will offer again later")
+                                except Exception as e:
+                                    log(f"[BACKEND] silent GPU install failed: {e}")
+                            import threading as _th
+                            _th.Thread(target=_bg_gpu_install, daemon=True, name="whisper-flow-gpu-auto").start()
+                            # Mark seen so we don't auto-retry every boot if it fails
+                            # (user can still manually Install GPU engine in Settings)
+                            self.backend.mark_setup_seen()
+            except Exception as e:
+                log(f"[DAEMON] auto GPU install check failed: {e}")
 
     def copy_log(self, icon=None, item=None):
         """Put the recent log on the clipboard, whether or not anything failed.

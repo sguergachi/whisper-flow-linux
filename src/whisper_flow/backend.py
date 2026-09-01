@@ -162,6 +162,26 @@ def detect_accelerator() -> str:
     return _accelerator
 
 
+def _is_vcredist_available() -> bool:
+    """Check if MSVC VCRedist is present (needed for both CPU and GPU whisper-server)."""
+    # Use platform.system() not sys.platform — tests mock sys.platform to win32 on Linux
+    if platform.system() != "Windows":
+        return True
+    if sys.platform != "win32":
+        return True
+    try:
+        import pathlib as _P
+        # Check common locations
+        candidates = [
+            _P.Path(r"C:\Windows\System32\vcruntime140.dll"),
+            _P.Path(r"C:\Windows\System32\vcruntime140_1.dll"),
+            _P.Path(r"C:\Windows\System32\msvcp140.dll"),
+            _P.Path(r"C:\Windows\SysWOW64\vcruntime140.dll"),
+        ]
+        return any(c.exists() for c in candidates)
+    except Exception:
+        return True  # assume present if check fails
+
 def no_console_flags() -> int:
     """creationflags so a console-subsystem child does not flash a prompt.
 
@@ -1022,6 +1042,10 @@ class LocalBackend:
 
         try:
             if not have_exe:
+                if sys.platform == "win32" and not _is_vcredist_available():
+                    log("[BACKEND] VCRedist missing — whisper-server would crash 0xC0000005")
+                    self._notify("Speech engine needs Microsoft Visual C++ Redistributable — install from https://aka.ms/vs/17/release/vc_redist.x64.exe then retry")
+                    return False
                 if sys.platform != "win32" and wanted.startswith("cuda"):
                     # Upstream ships no Linux CUDA binary; build one. Raises
                     # on a missing toolkit or a failed compile, and the
@@ -1408,9 +1432,13 @@ class LocalBackend:
                     existing = env.get("LD_LIBRARY_PATH", "")
                     env["LD_LIBRARY_PATH"] = ":".join(
                         lib_dirs + ([existing] if existing else []))
+            if sys.platform == "win32" and not _is_vcredist_available():
+                log("[BACKEND] VCRedist missing — whisper-server.exe will crash 0xC0000005")
+                log("[BACKEND] hint: install Microsoft Visual C++ Redistributable from https://aka.ms/vs/17/release/vc_redist.x64.exe")
+                # Don't try to start — it will just crash and spam the log every 12s
+                # Let the caller fall back or notify
+                return None
             # No console window for a background helper. Keep stderr in a
-            # temp file so a native crash (0xC0000005) leaves evidence — with
-            # DEVNULL the user's report just says "server did not become ready"
             # and the real reason (missing VCRedist / CUDA DLL) is lost.
             import tempfile as _tf
             _stderr_path = None

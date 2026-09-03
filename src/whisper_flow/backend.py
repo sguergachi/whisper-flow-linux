@@ -415,6 +415,45 @@ def total_ram_gb() -> float:
     return 0.0
 
 
+def machine_facts() -> str:
+    """One line naming the hardware a crash report needs: CPU, RAM, free disk.
+
+    The 0xC0000005 loop survived pristine binaries, clean directories and
+    every model — which leaves the machine itself (CPU dispatch fault, bad
+    RAM, starved memory/disk). Without these facts the next report is
+    another blind round-trip.
+    """
+    import platform as _plat
+    cpu = (_plat.processor() or _plat.machine() or "?").strip() or "?"
+    ram = avail = 0.0
+    try:
+        ram = total_ram_gb()
+        if sys.platform == "win32":
+            import ctypes
+            import ctypes.wintypes
+
+            class _S(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.wintypes.DWORD),
+                    ("dwMemoryLoad", ctypes.wintypes.DWORD),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            st = _S()
+            st.dwLength = ctypes.sizeof(_S)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
+                avail = st.ullAvailPhys / (1024 ** 3)
+    except Exception:
+        pass
+    return f"cpu={cpu} ram_total={ram:.1f}GB ram_avail={avail:.1f}GB"
+
+
 def recommended_model(accelerator: str) -> str:
     """The largest model this machine can run without falling behind speech.
 
@@ -1387,6 +1426,16 @@ class LocalBackend:
                     self._notify(f"Downloading the {kind} speech engine...")
                     runtime = _runtime_dir(self.config.config_dir)
                     archive_path = runtime / archive
+                    try:
+                        free_gb = shutil.disk_usage(runtime).free / (1024 ** 3)
+                        log(f"[BACKEND] free disk at {runtime}: {free_gb:.1f}GB")
+                        if free_gb < 3.0:
+                            raise RuntimeError(
+                                f"only {free_gb:.1f}GB free — the GPU engine needs ~3GB to download and unpack")
+                    except RuntimeError:
+                        raise
+                    except Exception as e:
+                        log(f"[BACKEND] disk check skipped: {e}")
                     log(f"[BACKEND] downloading {kind} engine {RELEASE_URL}/{archive} "
                         f"({WHISPER_CPP_RELEASE}) to {archive_path}")
                     _download(f"{RELEASE_URL}/{archive}", archive_path,
@@ -1756,6 +1805,15 @@ class LocalBackend:
             stop_managed_strays(self.config.config_dir)
             stop_port_whisper_servers(self.config.local_server_port)
 
+            try:
+                exe = Path(self.server_exe)
+                st = exe.stat()
+                origin = ("downloaded" if str(exe).startswith(
+                    str(_runtime_dir(self.config.config_dir))) else "bundled")
+                log(f"[BACKEND] engine {exe} ({origin}, {st.st_size // 1024}KB) "
+                    f"model {model} | {machine_facts()}")
+            except Exception as e:
+                log(f"[BACKEND] engine facts failed: {e}")
             cmd = [
                 str(self.server_exe),
                 "-m", str(self.model_path(model)),

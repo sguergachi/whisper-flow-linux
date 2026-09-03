@@ -1092,7 +1092,11 @@ class LocalBackend:
                 self._engine_marker.unlink(missing_ok=True)
             except OSError:
                 pass
-            ok = self.ensure_cpu_engine()
+            # Force a real download into flat runtime/ (downloaded wins over
+            # bundled in server_exe). Delegating to ensure_cpu_engine() here
+            # is a no-op when the crashing binary IS the bundled one — it
+            # just answers "a CPU engine is present" and restarts it.
+            ok = self._download_fresh_cpu_engine()
             if ok:
                 log(f"[BACKEND] fresh CPU engine ready: {self.server_exe} "
                     f"({self.installed_engine()})")
@@ -1606,13 +1610,30 @@ class LocalBackend:
         # Bundled CPU engine counts — quarantine will already have exposed it
         if bundled_dir() and (bundled_dir() / "engine" / self._exe_name).exists():
             return True
+        return self._download_fresh_cpu_engine()
+
+    def _download_fresh_cpu_engine(self) -> bool:
+        """Download the current CPU release unconditionally.
+
+        Unlike ensure_cpu_engine(), this never answers "already present":
+        after repeated native crashes the bytes on disk are the suspect —
+        including the bundled copy — so a pristine download is the point.
+        A downloaded copy wins over bundled in server_exe.
+        """
         # Try to download the CPU engine without regard to accelerator
         try:
             archive = "whisper-blas-bin-x64.zip" if sys.platform == "win32" else "whisper-bin-ubuntu-x64.tar.gz"
-            self._notify("GPU engine failed — downloading CPU engine...")
+            self._notify("Downloading CPU engine...")
             runtime = _runtime_dir(self.config.config_dir)
             archive_path = runtime / archive
-            _download(f"{RELEASE_URL}/{archive}", archive_path)
+            url = f"{RELEASE_URL}/{archive}"
+            log(f"[BACKEND] downloading fresh CPU engine {url}")
+            _download(url, archive_path)
+            try:
+                log(f"[BACKEND] engine archive downloaded: "
+                    f"{archive_path.stat().st_size // 1_000_000}MB")
+            except OSError:
+                pass
             _unpack_engine(archive_path, runtime, self._exe_name, "cpu")
             if sys.platform != "win32":
                 try:
@@ -1620,10 +1641,10 @@ class LocalBackend:
                 except OSError:
                     pass
             self._record_engine("cpu")
-            log("[BACKEND] CPU engine installed as fallback")
+            log("[BACKEND] fresh CPU engine installed")
             return True
         except Exception as e:
-            log(f"[BACKEND] could not install CPU fallback engine: {e}")
+            log(f"[BACKEND] could not download fresh CPU engine: {e}")
             return False
 
     def start_with_fallback(self, model: str | None = None) -> str | None:

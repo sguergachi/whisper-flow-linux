@@ -993,3 +993,31 @@ def test_second_install_over_an_existing_engine_does_not_fail(
 
     assert local_backend.install("ggml-base.en-q8_0") is True
     assert (runtime / "bench.exe").read_text() == "new"
+
+
+def test_reinstall_forces_a_fresh_download_even_when_bundled_exists(
+        local_backend, config, monkeypatch):
+    """The bundled copy can be the crashing one; 'present' is not 'healthy'."""
+    monkeypatch.setattr(sys, "platform", "win32")
+    _bundled_cpu_engine(local_backend, config, monkeypatch)
+    monkeypatch.setattr(backend_module, "detect_accelerator", lambda: "cpu")
+
+    def fake_download(url, dest, progress=None, cancel_event=None, **_kw):
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text("x" * 100)
+
+    def fake_extract(archive, into):
+        into.mkdir(parents=True, exist_ok=True)
+        (into / local_backend._exe_name).write_text("fresh cpu engine")
+
+    monkeypatch.setattr(backend_module, "_download", fake_download)
+    monkeypatch.setattr(backend_module, "_extract", fake_extract)
+
+    # ensure() is satisfied by bundled and downloads nothing...
+    assert local_backend.ensure_cpu_engine() is True
+    runtime = Path(config.config_dir) / "runtime"
+    assert not (runtime / local_backend._exe_name).exists()
+    # ...but reinstall (post-crash) fetches pristine bytes that win.
+    assert local_backend._reinstall_cpu_engine() is True
+    assert (runtime / local_backend._exe_name).read_text() == "fresh cpu engine"
+    assert local_backend.server_exe == runtime / local_backend._exe_name

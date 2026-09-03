@@ -93,13 +93,13 @@ def _model_dir(config_dir: Path) -> Path:
 
 
 def _cuda_dir(config_dir: Path) -> Path:
-    """Where the source-built Linux CUDA engine lives (runtime/cuda/).
+    """Where the CUDA engine lives (runtime/cuda/).
 
-    Separate from the flat runtime directory because the Linux CUDA build
-    cannot sit beside the CPU build there: the flat layout expects one
-    whisper-server and one set of libraries, and the two builds would
-    clobber each other whenever either was refreshed. On Windows the
-    cuBLAS engine unpacks flat like the CPU one and this is never used.
+    Separate from the flat runtime directory because the two builds cannot
+    share one: the flat layout expects one whisper-server and one set of
+    libraries, and on Windows the loader resolves DLLs from the exe's own
+    directory first — so cuBLAS DLLs beside the CPU binary poisoned it
+    into a 0xC0000005 for every model. Each kind owns its directory.
     """
     return _runtime_dir(config_dir) / "cuda"
 
@@ -497,6 +497,95 @@ def _extract(archive: Path, into: Path) -> None:
     else:
         with zipfile.ZipFile(archive) as z:
             z.extractall(into)
+
+
+# Filename prefixes that belong to the CUDA engine. A CPU binary resolves
+# its dependencies from its own directory first, so one of these left
+# behind by the other engine poisons it into a native crash. Matched
+# case-insensitively; openblas (CPU) is deliberately not among them.
+_CUDA_LIB_PREFIXES = ("cublas", "cudart", "nvrtc", "nvtool", "npp",
+                      "cufft", "curand", "cusolver", "cusparse", "cudnn",
+                      "ggml-cuda", "libggml-cuda")
+
+
+def _is_cuda_lib(name: str) -> bool:
+    return name.lower().startswith(_CUDA_LIB_PREFIXES)
+
+
+def _unpack_engine(archive_path: Path, target: Path, exe_name: str,
+                   kind: str) -> int:
+    """Unpack an engine archive into its own directory. Returns file count.
+
+    Each engine kind owns its directory outright: the CUDA build lives in
+    runtime/cuda/, the CPU build flat in runtime/. Sharing one directory
+    mixed cuBLAS DLLs beside the CPU binary, and Windows resolves DLLs from
+    the executable's directory first — so the CPU server loaded CUDA
+    libraries and died with 0xC0000005 after model init, for every model.
+
+    Files already in the target are overwritten (a running server binary is
+    left alone with a warning and reported, since Windows locks it).
+    Subdirectories in the archive are merged, not moved, so a previous
+    half-unpacked set can never abort the install with "already exists".
+    """
+    staging = target.parent / ".extract"
+    shutil.rmtree(staging, ignore_errors=True)
+    _extract(archive_path, staging)
+    try:
+        archive_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+    found = next(staging.rglob(exe_name), None)
+    if found is None:
+        raise RuntimeError(f"{exe_name} not found in {archive_path.name}")
+    src_root = found.parent
+    if kind == "cpu":
+        # Evict CUDA libraries a previous layout left beside the CPU binary.
+        try:
+            for stale in list(target.glob("*")):
+                if stale.is_file() and _is_cuda_lib(stale.name):
+                    try:
+                        stale.unlink()
+                        log(f"[BACKEND] removed stale {stale.name} from the CPU engine dir")
+                    except OSError as e:
+                        log(f"[BACKEND] could not remove stale {stale.name}: {e}")
+        except OSError:
+            pass
+    else:
+        # The CUDA directory is exclusively ours: start clean so no stale
+        # CPU-plan file or half of a failed download survives beside the
+        # new set. A locked file (a running server) is left with a warning.
+        if target.exists():
+            for stale in list(target.glob("*")):
+                try:
+                    if stale.is_file() or stale.is_symlink():
+                        stale.unlink()
+                    elif stale.is_dir():
+                        shutil.rmtree(stale)
+                except OSError as e:
+                    log(f"[BACKEND] could not clear {stale}: {e}")
+    target.mkdir(parents=True, exist_ok=True)
+    count, total, failures = 0, 0, []
+    for src in sorted(src_root.rglob("*")):
+        if not src.is_file():
+            continue
+        dest = target / src.relative_to(src_root)
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dest)         # overwrites; raises on a locked exe
+            count += 1
+            try:
+                total += dest.stat().st_size
+            except OSError:
+                pass
+        except OSError as e:
+            failures.append(f"{src.name}: {e}")
+    shutil.rmtree(staging, ignore_errors=True)
+    log(f"[BACKEND] unpacked {count} files ({total // 1_000_000}MB) to {target}")
+    if failures:
+        raise RuntimeError("could not install " + "; ".join(failures[:3]))
+    if not (target / exe_name).exists() and next(target.rglob(exe_name), None) is None:
+        raise RuntimeError(f"{exe_name} missing after unpack to {target}")
+    return count
 
 
 def _run_build_command(cmd: list[str], message: str) -> None:
@@ -970,33 +1059,33 @@ class LocalBackend:
             pass
 
     def _reinstall_cpu_engine(self) -> bool:
-        """Delete the suspect engine and fetch a pristine CPU copy.
+        """Delete the suspect CPU engine and fetch a pristine copy.
 
-        Removes runtime/whisper-server*, runtime/cuda/whisper-server* and the
-        engine marker, so server_exe falls back to the bundled copy (if any)
-        or nothing — then ensure_cpu_engine() downloads the current CPU
-        release. A stale bundled build that faults on this CPU is exactly
-        what this replaces.
+        Removes the flat runtime binary (the CUDA directory is left alone —
+        it may hold a good GPU engine) and the engine marker, then
+        ensure_cpu_engine() downloads the current CPU release, evicting any
+        CUDA libraries the old shared layout left beside it. A stale build
+        that faults on this CPU is exactly what this replaces.
         """
         try:
             runtime = _runtime_dir(self.config.config_dir)
             name = self._exe_name
-            for candidate in (runtime / name, _cuda_dir(self.config.config_dir) / name):
-                try:
-                    if candidate.exists():
-                        candidate.unlink()
-                        log(f"[BACKEND] removed suspect engine {candidate}")
-                except OSError as e:
-                    log(f"[BACKEND] could not remove {candidate}: {e}")
-            # Also drop the cuBLAS DLLs a GPU download left behind: a CPU
-            # binary must never resolve CUDA shims from its own directory.
             try:
-                for extra in runtime.glob("cublas64_*.dll"):
-                    extra.unlink()
-                    log(f"[BACKEND] removed leftover {extra.name}")
-                for extra in runtime.glob("cudart64_*.dll"):
-                    extra.unlink()
-                    log(f"[BACKEND] removed leftover {extra.name}")
+                if (runtime / name).exists():
+                    (runtime / name).unlink()
+                    log(f"[BACKEND] removed suspect engine {runtime / name}")
+            except OSError as e:
+                log(f"[BACKEND] could not remove {runtime / name}: {e}")
+            # Evict every CUDA library the old shared layout may have left
+            # beside the CPU binary (the loader prefers the exe's own dir).
+            try:
+                for extra in list(runtime.glob("*")):
+                    if extra.is_file() and _is_cuda_lib(extra.name):
+                        try:
+                            extra.unlink()
+                            log(f"[BACKEND] removed leftover {extra.name}")
+                        except OSError as e:
+                            log(f"[BACKEND] could not remove {extra.name}: {e}")
             except OSError:
                 pass
             try:
@@ -1046,8 +1135,14 @@ class LocalBackend:
         return downloaded
 
     def _engine_exe(self, kind: str) -> Path:
-        """Where a given engine kind's binary lives."""
-        if sys.platform != "win32" and kind.startswith("cuda"):
+        """Where a given engine kind's binary lives.
+
+        Each kind owns its directory: CUDA in runtime/cuda/, CPU flat in
+        runtime/. Sharing one directory mixed cuBLAS DLLs beside the CPU
+        binary, which Windows then preferred over the right libraries and
+        crashed with 0xC0000005 for every model.
+        """
+        if kind.startswith("cuda"):
             return _cuda_dir(self.config.config_dir) / self._exe_name
         return _runtime_dir(self.config.config_dir) / self._exe_name
 
@@ -1081,9 +1176,14 @@ class LocalBackend:
         if recorded in ("cpu", "cuda11", "cuda12"):
             if self._engine_exe(recorded).exists():
                 return recorded
-        # Installed before the marker existed. cuBLAS ships its own libraries
-        # beside the binary and the CPU build has none, so the directory says
-        # what it is without needing to have been told.
+        # A binary in the CUDA directory means CUDA on any platform (it is
+        # the only thing ever unpacked there since engines were separated).
+        if cuda.exists():
+            return "cuda12"
+        # Legacy installs (before the split) shared one directory on Windows.
+        # cuBLAS ships its own libraries beside the binary and the CPU build
+        # has none, so the directory says what it is without needing to
+        # have been told.
         names = {path.name.lower() for path in flat.parent.glob("*")}
         if any(name.startswith("cublas64_12") for name in names):
             return "cuda12"
@@ -1091,8 +1191,6 @@ class LocalBackend:
             return "cuda11"
         if any(name.startswith(("ggml-cuda", "cudart64_")) for name in names):
             return "cuda12"     # a CUDA build of unknown vintage; not the CPU one
-        if sys.platform != "win32" and cuda.exists():
-            return "cuda12"     # the source-built Linux engine, pre-marker
         return "cpu"
 
     def engine_is_gpu(self) -> bool:
@@ -1238,7 +1336,6 @@ class LocalBackend:
         log(f"[BACKEND] accelerator={accelerator} model={model}")
 
         wanted = wanted_engine(accelerator)
-        downloaded_exe = _runtime_dir(self.config.config_dir) / self._exe_name
         downloaded_model = _model_dir(self.config.config_dir) / f"{model}.bin"
         # The engine this machine wants does not always live in the flat
         # runtime directory: on Linux the source-built CUDA engine has its
@@ -1295,26 +1392,21 @@ class LocalBackend:
                             f"{archive_path.stat().st_size // 1_000_000}MB")
                     except OSError:
                         pass
-                    # Extract into a staging directory so the flattening
-                    # below cannot reach engines that already live in the
-                    # runtime directory (the Linux CUDA build in runtime/cuda).
-                    staging = runtime / ".extract"
-                    shutil.rmtree(staging, ignore_errors=True)
-                    _extract(archive_path, staging)
-                    archive_path.unlink(missing_ok=True)
-                    # The archives nest the binaries a directory deep, and the
-                    # shared libraries beside them have to stay beside them:
-                    # the Linux build finds them through RUNPATH=$ORIGIN.
-                    found = next(staging.rglob(self._exe_name), None)
-                    if found is None:
-                        raise RuntimeError(
-                            f"{self._exe_name} not found in {archive}")
-                    for item in found.parent.iterdir():
-                        shutil.move(str(item), runtime)
-                    shutil.rmtree(staging, ignore_errors=True)
+                    # Each engine kind unpacks into its own directory
+                    # (CUDA: runtime/cuda/, CPU: flat runtime/) so their
+                    # DLL sets can never mix. The shared libraries stay
+                    # beside their binary: the Linux build finds them
+                    # through RUNPATH=$ORIGIN, Windows from the exe dir.
+                    target = (self._engine_exe(wanted).parent
+                              if wanted.startswith("cuda") else runtime)
+                    _unpack_engine(archive_path, target, self._exe_name,
+                                   "cuda" if wanted.startswith("cuda") else "cpu")
                     if sys.platform != "win32":
                         # A tarball's mode bits do not survive every extraction path.
-                        downloaded_exe.chmod(0o755)
+                        try:
+                            (target / self._exe_name).chmod(0o755)
+                        except OSError:
+                            pass
                 # Last, and only once the binary is in place: the marker is
                 # read as "this engine is that kind", so it must never be
                 # there describing an engine that failed to unpack.
@@ -1521,18 +1613,12 @@ class LocalBackend:
             runtime = _runtime_dir(self.config.config_dir)
             archive_path = runtime / archive
             _download(f"{RELEASE_URL}/{archive}", archive_path)
-            staging = runtime / ".extract"
-            shutil.rmtree(staging, ignore_errors=True)
-            _extract(archive_path, staging)
-            archive_path.unlink(missing_ok=True)
-            found = next(staging.rglob(self._exe_name), None)
-            if found is None:
-                raise RuntimeError(f"{self._exe_name} not found in {archive}")
-            for item in found.parent.iterdir():
-                shutil.move(str(item), runtime)
-            shutil.rmtree(staging, ignore_errors=True)
+            _unpack_engine(archive_path, runtime, self._exe_name, "cpu")
             if sys.platform != "win32":
-                (_runtime_dir(self.config.config_dir) / self._exe_name).chmod(0o755)
+                try:
+                    (runtime / self._exe_name).chmod(0o755)
+                except OSError:
+                    pass
             self._record_engine("cpu")
             log("[BACKEND] CPU engine installed as fallback")
             return True

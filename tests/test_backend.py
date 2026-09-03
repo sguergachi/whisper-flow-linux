@@ -655,9 +655,11 @@ def test_the_gpu_offer_survives_downloading_a_model(
     assert local_backend.needs_gpu_upgrade() is True, (
         "a downloaded model was mistaken for a downloaded engine")
 
-    runtime = Path(config.config_dir) / "runtime"
-    runtime.mkdir(parents=True, exist_ok=True)
-    (runtime / local_backend._exe_name).write_text("")
+    # CUDA engines live in runtime/cuda/ since the directory split (a flat
+    # cuBLAS DLL beside the CPU binary poisoned it into 0xC0000005 crashes).
+    cuda = Path(config.config_dir) / "runtime" / "cuda"
+    cuda.mkdir(parents=True, exist_ok=True)
+    (cuda / local_backend._exe_name).write_text("")
     local_backend._record_engine("cuda12")
     assert local_backend.needs_gpu_upgrade() is False
 
@@ -908,3 +910,86 @@ def test_crash_counter_resets_for_a_different_engine_file(
     exe.write_text("a different, longer engine binary")
     assert local_backend.note_crash(3221225477) is False
     assert local_backend._crash_count == 1
+
+
+# ------------------------------------------- engine directory separation
+def test_cuda_and_cpu_engines_unpack_into_separate_directories(
+        local_backend, config, monkeypatch):
+    """cuBLAS DLLs beside the CPU binary poisoned it into 0xC0000005 crashes."""
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(backend_module, "detect_accelerator", lambda: "cuda12")
+
+    def fake_download(url, dest, progress=None, cancel_event=None, **_kw):
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text("")
+
+    def fake_extract(archive, into):
+        # Real archives keep the binary and its DLLs side by side, one
+        # directory deep.
+        into.mkdir(parents=True, exist_ok=True)
+        (into / local_backend._exe_name).write_text("cuda engine")
+        (into / "cublas64_12.dll").write_text("")
+
+    monkeypatch.setattr(backend_module, "_download", fake_download)
+    monkeypatch.setattr(backend_module, "_extract", fake_extract)
+
+    assert local_backend.install("ggml-base.en-q8_0") is True
+    cuda = Path(config.config_dir) / "runtime" / "cuda"
+    assert (cuda / local_backend._exe_name).exists()
+    assert (cuda / "cublas64_12.dll").exists()
+    # Nothing from the CUDA set may land beside the CPU binary.
+    flat = Path(config.config_dir) / "runtime"
+    assert not (flat / "cublas64_12.dll").exists()
+    assert local_backend.installed_engine() == "cuda12"
+
+
+def test_cpu_unpack_evicts_stale_cuda_dlls(
+        local_backend, config, monkeypatch):
+    """Legacy shared-layout dirs hold the DLLs that crashed every model."""
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(backend_module, "detect_accelerator", lambda: "cpu")
+    runtime = Path(config.config_dir) / "runtime"
+    runtime.mkdir(parents=True)
+    (runtime / "cublas64_12.dll").write_text("stale")
+    (runtime / "cudart64_12.dll").write_text("stale")
+
+    def fake_download(url, dest, progress=None, cancel_event=None, **_kw):
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text("")
+
+    def fake_extract(archive, into):
+        into.mkdir(parents=True, exist_ok=True)
+        (into / local_backend._exe_name).write_text("cpu engine")
+
+    monkeypatch.setattr(backend_module, "_download", fake_download)
+    monkeypatch.setattr(backend_module, "_extract", fake_extract)
+
+    assert local_backend.install("ggml-base.en-q8_0") is True
+    assert not (runtime / "cublas64_12.dll").exists()
+    assert not (runtime / "cudart64_12.dll").exists()
+    assert (runtime / local_backend._exe_name).exists()
+
+
+def test_second_install_over_an_existing_engine_does_not_fail(
+        local_backend, config, monkeypatch):
+    """Re-installing (e.g. retrying the GPU download) must overwrite."""
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(backend_module, "detect_accelerator", lambda: "cpu")
+    runtime = Path(config.config_dir) / "runtime"
+    runtime.mkdir(parents=True)
+    (runtime / "bench.exe").write_text("old")
+
+    def fake_download(url, dest, progress=None, cancel_event=None, **_kw):
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text("")
+
+    def fake_extract(archive, into):
+        into.mkdir(parents=True, exist_ok=True)
+        (into / "bench.exe").write_text("new")
+        (into / local_backend._exe_name).write_text("cpu engine")
+
+    monkeypatch.setattr(backend_module, "_download", fake_download)
+    monkeypatch.setattr(backend_module, "_extract", fake_extract)
+
+    assert local_backend.install("ggml-base.en-q8_0") is True
+    assert (runtime / "bench.exe").read_text() == "new"

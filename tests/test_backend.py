@@ -867,3 +867,44 @@ def test_start_clears_managed_and_port_strays_before_spawn(
     assert local_backend.start() is None
     assert calls[0] == ("managed", str(config.config_dir))
     assert calls[1] == ("port", config.local_server_port)
+
+
+# ------------------------------------------------- crash-driven engine refresh
+def test_non_native_exits_do_not_count_as_engine_crashes(
+        local_backend, config, monkeypatch):
+    """Only 0xC0000005 implicates the bytes on disk; exit 1 must not."""
+    _install_engine(local_backend, config)
+    monkeypatch.setattr(backend_module, "detect_accelerator", lambda: "cpu")
+    assert local_backend.note_crash(1) is False
+    assert local_backend._crash_count == 0
+
+
+def test_three_native_crashes_trigger_a_fresh_engine_download(
+        local_backend, config, monkeypatch):
+    """The bundled bytes are the prime suspect after repeated 0xC0000005."""
+    _install_engine(local_backend, config)
+    monkeypatch.setattr(backend_module, "detect_accelerator", lambda: "cpu")
+    calls = []
+    monkeypatch.setattr(
+        LocalBackend, "_reinstall_cpu_engine",
+        lambda self: calls.append(1) or True)
+    assert local_backend.note_crash(3221225477) is False
+    assert local_backend.note_crash(3221225477) is False
+    assert local_backend.note_crash(3221225477) is True
+    assert calls == [1]
+
+
+def test_crash_counter_resets_for_a_different_engine_file(
+        local_backend, config, monkeypatch):
+    """A fresh download gets a clean slate; only the same bytes accumulate."""
+    _install_engine(local_backend, config)
+    monkeypatch.setattr(backend_module, "detect_accelerator", lambda: "cpu")
+    monkeypatch.setattr(
+        LocalBackend, "_reinstall_cpu_engine", lambda self: True)
+    local_backend.note_crash(3221225477)
+    local_backend.note_crash(3221225477)
+    # Engine file replaced (new size): counter restarts from 1, no reinstall.
+    exe = Path(config.config_dir) / "runtime" / local_backend._exe_name
+    exe.write_text("a different, longer engine binary")
+    assert local_backend.note_crash(3221225477) is False
+    assert local_backend._crash_count == 1

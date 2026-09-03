@@ -2902,9 +2902,18 @@ def main() -> int:
     config = None
     try:
         config = Config()
-        set_logging_enabled(config.logging_enabled)
+        # Always print here: this process's stdout is piped to the daemon,
+        # which drains it into the tray log. Backend downloads (engine/model)
+        # run in this process, so without this their progress and failures
+        # are invisible — a failed "Install GPU engine" click leaves no trace
+        # in the log the tray offers. The daemon's own print setting is
+        # untouched; this only affects this tool process.
+        set_logging_enabled(True)
     except Exception:
-        pass                    # a bad config must not cost us the window
+        try:
+            set_logging_enabled(True)
+        except Exception:
+            pass                # a bad config must not cost us the window
 
     # Started before the click, to be shown when it comes. Only when the
     # daemon says so: run by hand, stdin is inherited and reaches end of

@@ -231,10 +231,13 @@ class WhisperFlowDaemon:
                         )
                         # Don't force stop here, just log warning
 
-                # Backend health: if the server died (GPU 0xC0000005), revive it
-                # on CPU so the next hotkey doesn't record 5s of speech only to
-                # drop it with "No whisper server configured". Auto-heal instantly
-                # on dead process, throttled for missing-url case.
+                # Backend health: if the server died (0xC0000005), revive it so
+                # the next hotkey doesn't record 5s of speech only to drop it
+                # with "No whisper server configured". Deaths are reported to
+                # the backend, which re-downloads a fresh engine after several
+                # consecutive native crashes of the same bytes. A circuit
+                # breaker backs off when revives keep failing, instead of
+                # restart-spamming every 2s forever.
                 if not self.is_recording and not self.is_processing:
                     try:
                         url = (self.config.local_whisper_url or "").strip()
@@ -243,30 +246,51 @@ class WhisperFlowDaemon:
                         needs_revive = dead or (not url and self.backend.working_model())
                         if needs_revive:
                             now = time.time()
-                            throttle = 0 if dead else 10
                             if not hasattr(self, "_last_backend_revive"):
                                 self._last_backend_revive = 0.0
-                            if now - self._last_backend_revive >= throttle:
-                                self._last_backend_revive = now
-                                if dead:
-                                    # Try to get stderr tail for diagnosis
-                                    try:
-                                        spath = getattr(self.backend, "_stderr_path", None)
-                                        if spath and __import__("pathlib").Path(spath).exists():
-                                            tail = __import__("pathlib").Path(spath).read_text(encoding="utf-8", errors="replace").strip().splitlines()[-20:]
-                                            if tail:
-                                                log("[BACKEND] server stderr tail on crash: " + " | ".join(tail[-5:]))
-                                    except Exception:
-                                        pass
-                                    log(f"[DAEMON] backend process dead (exit={proc.poll()} 0x{(proc.poll() or 0) & 0xFFFFFFFF:08X}), auto-healing on CPU")
-                                    try:
-                                        cur = getattr(self, "_backend_model", None) or self.backend.working_model()
-                                        if cur == "ggml-medium.en-q8_0":
-                                            self._medium_crash = getattr(self, "_medium_crash", 0) + 1
-                                            log(f"[DAEMON] medium crash count {self._medium_crash}")
-                                    except Exception:
-                                        pass
-                                self._ensure_backend_running()
+                            if not hasattr(self, "_revive_backoff_until"):
+                                self._revive_backoff_until = 0.0
+                            if not hasattr(self, "_revive_failures"):
+                                self._revive_failures = []
+                            # Drop failures older than 5 minutes.
+                            self._revive_failures = [
+                                ts for ts in self._revive_failures
+                                if now - ts < 300]
+                            if now < self._revive_backoff_until:
+                                pass  # circuit open: wait before retrying
+                            else:
+                                throttle = 0 if dead else 10
+                                if now - self._last_backend_revive >= throttle:
+                                    self._last_backend_revive = now
+                                    if dead:
+                                        code = proc.poll()
+                                        try:
+                                            spath = getattr(self.backend, "_stderr_path", None)
+                                            if spath and __import__("pathlib").Path(spath).exists():
+                                                lines = __import__("pathlib").Path(spath).read_text(encoding="utf-8", errors="replace").strip().splitlines()
+                                                tail = "\n".join(lines[-20:])
+                                                if tail.strip():
+                                                    log(f"[BACKEND] server output at crash ({spath}):\n{tail[:2000]}")
+                                        except Exception:
+                                            pass
+                                        log(f"[DAEMON] backend process dead (exit={code} 0x{(code or 0) & 0xFFFFFFFF:08X}), reviving")
+                                        try:
+                                            refreshed = self.backend.note_crash(code)
+                                            if refreshed:
+                                                log("[BACKEND] fresh engine downloaded after repeated crashes")
+                                        except Exception as e:
+                                            log(f"[DAEMON] crash tracking failed: {e}")
+                                    revived = self._ensure_backend_running()
+                                    self._revive_failures.append(now)
+                                    if not revived and len(self._revive_failures) >= 5:
+                                        # Circuit breaker: this is not a blip.
+                                        # Back off for a minute and say so once.
+                                        self._revive_backoff_until = now + 60
+                                        log("[DAEMON] backend keeps failing — backing off revives for 60s")
+                                        try:
+                                            self.notify("Speech engine keeps crashing — open Settings to pick another model, or check the log")
+                                        except Exception:
+                                            pass
                     except Exception as e:
                         log(f"[DAEMON] backend watchdog failed (auto-heal will retry): {e}")
 
@@ -1526,52 +1550,27 @@ class WhisperFlowDaemon:
             return False
         if not model:
             return False
-        # Auto-heal: if medium keeps crashing on CPU (as in 0.4.295 log), force base
-        # which is 10x smaller and never crashes on CPU. This breaks the infinite
-        # 0xC0000005 loop where medium restarts every 12s even after quarantine.
-        try:
-            if model == "ggml-medium.en-q8_0" and not self.backend.engine_is_gpu():
-                # Check crash count: if medium has died twice, switch to base
-                cnt = getattr(self, "_medium_crash", 0)
-                # Also detect if we are in the crash loop (watchdog has revived recently)
-                if cnt >= 1 or (hasattr(self, "_last_backend_revive") and (__import__("time").time() - self._last_backend_revive) < 30):
-                    base = "ggml-base.en-q8_0"
-                    if self.backend.model_path(base).exists() or self.backend.bundled_model() == base:
-                        log(f"[DAEMON] medium has crashed repeatedly on CPU, forcing fallback to {base}")
-                        model = base
-                    else:
-                        # Try to download base synchronously (78 MB, fast)
-                        log(f"[DAEMON] medium unstable, downloading {base} for stability")
-                        try:
-                            if self.backend.install(base):
-                                model = base
-                        except Exception as ie:
-                            log(f"[DAEMON] base download failed: {ie}")
-        except Exception as e:
-            log(f"[DAEMON] forced base check failed: {e}")
+        # Respect the user's model choice here. Model switching belongs to
+        # start_with_fallback (used when start() itself fails), not to every
+        # revive: silently rewriting medium to base is why the settings page
+        # said one thing while the daemon ran another. Repeated native
+        # crashes are handled by backend.note_crash, which refreshes the
+        # engine bytes instead of second-guessing the model.
         try:
             url = self._backend_start(model)
         except Exception as e:
             log(f"[DAEMON] backend start before recording failed: {e}")
             return False
         if url:
-            # If fallback happened, _last_started_model holds the actual model started (e.g. base instead of medium)
+            # If fallback happened, _last_started_model holds the actual model
+            # started. The backend already persists a genuine GPU->CPU model
+            # switch to .env itself; the daemon must not rewrite the user's
+            # choice on top of it.
             actual = getattr(self.backend, "_last_started_model", None) or model
-            # Clear it after use
             try:
                 self.backend._last_started_model = None
             except Exception:
                 pass
-            # If we forced base, persist it so next boot doesn't try medium again
-            if actual == "ggml-base.en-q8_0":
-                try:
-                    import whisper_flow.envfile as _ef
-                    from pathlib import Path as _P
-                    _ef.set_values(_P(self.config.config_dir) / ".env", {"WHISPER_FLOW_MODEL_NAME": actual})
-                    self.config.model_name = actual
-                    log(f"[DAEMON] persisted fallback to {actual} for next boot")
-                except Exception as e:
-                    log(f"[DAEMON] could not persist fallback model: {e}")
             self._backend_model = actual
             self._backend_engine = self.backend.installed_engine()
             self._use_backend_url(url)

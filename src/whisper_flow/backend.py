@@ -893,6 +893,12 @@ def _adopt_into_job(job, process) -> bool:
 class LocalBackend:
     """Downloads, starts and supervises a local whisper.cpp server."""
 
+    # After this many consecutive native crashes of the SAME engine file,
+    # stop trusting the bytes on disk (bundled builds go stale; downloads
+    # get truncated) and fetch a fresh CPU engine instead of restarting the
+    # same crashing binary forever.
+    _CRASH_REINSTALL_AFTER = 3
+
     def __init__(self, config, notify=None):
         self.config = config
         self._notify = notify or (lambda msg: None)
@@ -900,8 +906,118 @@ class LocalBackend:
         self._stderr_path = None
         self._last_started_model = None
         self._lock = threading.Lock()
+        # Consecutive 0xC0000005 deaths of the same engine file, and when the
+        # server last stayed up. Reset by any start that survives past a
+        # minute; the reinstall below resets the count.
+        self._crash_count = 0
+        self._crash_engine: str | None = None
+        self._last_healthy_at = 0.0
         # Held for the life of this process; closing it kills the server.
         self._job = _kill_on_exit_job()
+
+    def _engine_identity(self, path) -> str:
+        """What uniquely names an engine file: path + size + mtime."""
+        try:
+            st = Path(path).stat()
+            return f"{path}|{st.st_size}|{int(st.st_mtime)}"
+        except OSError:
+            return str(path)
+
+    def note_crash(self, code) -> bool:
+        """Record a server death. Returns True when the engine was refreshed.
+
+        Only native crashes (0xC0000005) count: a refused connection or a
+        missing model is not the binary's fault. After _CRASH_REINSTALL_AFTER
+        consecutive crashes of the same file, the bytes on disk are the prime
+        suspect (stale bundled build, truncated download, AVX mismatch), so
+        the engine is re-downloaded fresh rather than restarted again.
+        """
+        try:
+            crashed = code if isinstance(code, int) else -1
+            if (crashed & 0xFFFFFFFF) != 0xC0000005:
+                return False
+            try:
+                identity = self._engine_identity(self.server_exe)
+            except Exception:
+                identity = None
+            if identity != self._crash_engine:
+                self._crash_engine = identity
+                self._crash_count = 0
+            self._crash_count += 1
+            log(f"[BACKEND] native crash #{self._crash_count} of {self.server_exe}")
+            if self._crash_count < self._CRASH_REINSTALL_AFTER:
+                return False
+            log(f"[BACKEND] {self._crash_count} consecutive native crashes — "
+                f"re-downloading a fresh CPU engine instead of trusting these bytes")
+            self._notify("Speech engine keeps crashing — downloading a fresh copy...")
+            if self._reinstall_cpu_engine():
+                self._crash_count = 0
+                self._crash_engine = None
+                return True
+            log("[BACKEND] fresh engine download failed; will keep retrying the old one")
+            return False
+        except Exception as e:
+            log(f"[BACKEND] crash tracking failed: {e}")
+            return False
+
+    def note_healthy(self) -> None:
+        """Call when the server has stayed up long enough to trust the bytes."""
+        try:
+            self._crash_count = 0
+            self._crash_engine = None
+            self._last_healthy_at = time.monotonic()
+        except Exception:
+            pass
+
+    def _reinstall_cpu_engine(self) -> bool:
+        """Delete the suspect engine and fetch a pristine CPU copy.
+
+        Removes runtime/whisper-server*, runtime/cuda/whisper-server* and the
+        engine marker, so server_exe falls back to the bundled copy (if any)
+        or nothing — then ensure_cpu_engine() downloads the current CPU
+        release. A stale bundled build that faults on this CPU is exactly
+        what this replaces.
+        """
+        try:
+            runtime = _runtime_dir(self.config.config_dir)
+            name = self._exe_name
+            for candidate in (runtime / name, _cuda_dir(self.config.config_dir) / name):
+                try:
+                    if candidate.exists():
+                        candidate.unlink()
+                        log(f"[BACKEND] removed suspect engine {candidate}")
+                except OSError as e:
+                    log(f"[BACKEND] could not remove {candidate}: {e}")
+            # Also drop the cuBLAS DLLs a GPU download left behind: a CPU
+            # binary must never resolve CUDA shims from its own directory.
+            try:
+                for extra in runtime.glob("cublas64_*.dll"):
+                    extra.unlink()
+                    log(f"[BACKEND] removed leftover {extra.name}")
+                for extra in runtime.glob("cudart64_*.dll"):
+                    extra.unlink()
+                    log(f"[BACKEND] removed leftover {extra.name}")
+            except OSError:
+                pass
+            try:
+                self._engine_marker.unlink(missing_ok=True)
+            except OSError:
+                pass
+            ok = self.ensure_cpu_engine()
+            if ok:
+                log(f"[BACKEND] fresh CPU engine ready: {self.server_exe} "
+                    f"({self.installed_engine()})")
+                # Prove the fresh bytes run before handing them to the daemon.
+                try:
+                    if not _is_engine_healthy(self.server_exe):
+                        log(f"[BACKEND] fresh engine {self.server_exe} "
+                            f"still fails --help; keeping it anyway and reporting")
+                except Exception:
+                    pass
+            return ok
+        except Exception as e:
+            log(f"[BACKEND] engine reinstall failed: {e}")
+            return False
 
     # ---------------------------------------------------------------- paths
     @property
@@ -1170,8 +1286,15 @@ class LocalBackend:
                     self._notify(f"Downloading the {kind} speech engine...")
                     runtime = _runtime_dir(self.config.config_dir)
                     archive_path = runtime / archive
+                    log(f"[BACKEND] downloading {kind} engine {RELEASE_URL}/{archive} "
+                        f"({WHISPER_CPP_RELEASE}) to {archive_path}")
                     _download(f"{RELEASE_URL}/{archive}", archive_path,
                               _stage(progress, "engine"), cancel_event=cancel_event)
+                    try:
+                        log(f"[BACKEND] engine archive downloaded: "
+                            f"{archive_path.stat().st_size // 1_000_000}MB")
+                    except OSError:
+                        pass
                     # Extract into a staging directory so the flattening
                     # below cannot reach engines that already live in the
                     # runtime directory (the Linux CUDA build in runtime/cuda).
@@ -1606,8 +1729,11 @@ class LocalBackend:
                         return None
             except Exception as e:
                 log(f"[BACKEND] engine health pre-flight failed: {e}")
-            # No console window for a background helper. Keep stderr in a
-            # and the real reason (missing VCRedist / CUDA DLL) is lost.
+            # No console window for a background helper. Keep stdout AND
+            # stderr in a temp file so a native crash (0xC0000005) leaves
+            # evidence. stdout matters: the server's "listening" line and
+            # fatal messages go there, and with DEVNULL the report just says
+            # "server did not become ready" with no reason at all.
             import tempfile as _tf
             _stderr_path = None
             _stderr_file = None
@@ -1618,7 +1744,7 @@ class LocalBackend:
                 _stderr_file = subprocess.DEVNULL  # type: ignore[assignment]
             try:
                 self._process = subprocess.Popen(
-                    cmd, stdout=subprocess.DEVNULL, stderr=_stderr_file,
+                    cmd, stdout=_stderr_file, stderr=_stderr_file,
                     creationflags=no_console_flags(), env=env,
                 )
             except Exception as e:
@@ -1671,9 +1797,15 @@ class LocalBackend:
                     else:
                         stderr_tail = "(empty — native crash before logging; missing VCRedist/CUDA DLL?)"
                     log(f"[BACKEND] server did not become ready (exit={code} 0x{(code or 0) & 0xFFFFFFFF:08X}) cmd={' '.join(cmd)}")
-                    log(f"[BACKEND] server stderr ({_stderr_path}): {stderr_tail[:2000]}")
+                    log(f"[BACKEND] server output ({_stderr_path}): {stderr_tail[:2000]}")
                     if code == -1073741819 or code == 3221225477 or (code is not None and (code & 0xFFFFFFFF) == 0xC0000005):
-                        log("[BACKEND] hint: cuda engine needs MSVC redist and NVIDIA driver; try CPU engine if VRAM is <4GB or driver is old")
+                        engine = self.installed_engine()
+                        if engine.startswith("cuda"):
+                            log("[BACKEND] hint: cuda engine needs MSVC redist and NVIDIA driver; try CPU engine if VRAM is <4GB or driver is old")
+                        else:
+                            log("[BACKEND] hint: CPU engine crashed \u2014 likely stale/corrupt binary or missing VCRedist; "
+                                "a fresh engine will be downloaded automatically after repeated crashes")
+                        self.note_crash(code)
                 except Exception as e:
                     log(f"[BACKEND] server did not become ready (exit={code}) cmd={' '.join(cmd)} stderr unreadable: {e}")
                 # Keep the file for the diagnostics report; it will be cleaned on next start/stop

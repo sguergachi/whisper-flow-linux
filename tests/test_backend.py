@@ -1167,3 +1167,80 @@ def test_readiness_gives_up_when_nothing_listens(
     config.local_server_port = port
     local_backend._process = None
     assert local_backend._wait_until_ready(timeout=1.0) is False
+
+
+def test_concurrent_installs_share_one_download(tmp_path, monkeypatch):
+    """Two threads installing at once must not write the same files twice."""
+    import threading
+
+    from whisper_flow import backend as backend_module
+    from whisper_flow.backend import LocalBackend
+
+    class Cfg:
+        config_dir = tmp_path
+        model_name = "ggml-base.en-q8_0"
+        local_server_port = 18080
+
+    backend = LocalBackend(Cfg())
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(backend_module, "detect_accelerator", lambda: "cpu")
+    started = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    def fake_download(url, dest, progress=None, cancel_event=None,
+                      keepalive=None, **_kw):
+        calls.append(url)
+        started.set()
+        assert release.wait(timeout=10)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text("x" * 100)
+
+    def fake_extract(archive, into):
+        into.mkdir(parents=True, exist_ok=True)
+        (into / backend._exe_name).write_text("cpu engine")
+
+    monkeypatch.setattr(backend_module, "_download", fake_download)
+    monkeypatch.setattr(backend_module, "_extract", fake_extract)
+
+    # Pre-place the model so only the engine download is exercised.
+    models = tmp_path / "models"
+    models.mkdir(parents=True)
+    (models / "ggml-base.en-q8_0.bin").write_text("x" * 100)
+
+    results = []
+    first = threading.Thread(
+        target=lambda: results.append(("first", backend.install("ggml-base.en-q8_0"))))
+    second = threading.Thread(
+        target=lambda: results.append(("second", backend.install("ggml-base.en-q8_0"))))
+    first.start()
+    assert started.wait(timeout=10)
+    second.start()
+    # Let the second thread arrive at the lock while the first downloads.
+    import time
+    time.sleep(1.0)
+    release.set()
+    first.join(timeout=10)
+    second.join(timeout=10)
+    # Second install waited on the lock, then saw the finished engine and
+    # no-op'd instead of downloading again.
+    assert sorted(results) == [("first", True), ("second", True)]
+    engine_downloads = [u for u in calls if "whisper-blas" in u]
+    assert len(engine_downloads) == 1
+
+
+def test_lock_waiter_gives_up_instead_of_corrupting(tmp_path):
+    """Past the timeout the waiter fails honestly; it never writes blind."""
+    from whisper_flow import backend as backend_module
+
+    lock = tmp_path / "install.lock"
+    lock.write_text("99999")  # holder that will never release or touch
+    import time
+    old = time.monotonic()
+    try:
+        with pytest.raises(backend_module.InstallBusyError):
+            backend_module._acquire_install_lock(
+                tmp_path, timeout=0.1)
+    finally:
+        # No waiting around: deadline math must hold even on coarse clocks.
+        assert time.monotonic() - old < 30

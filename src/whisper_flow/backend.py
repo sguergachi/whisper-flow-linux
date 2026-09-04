@@ -655,6 +655,7 @@ def _extract(archive: Path, into: Path) -> None:
 # case-insensitively; openblas (CPU) is deliberately not among them.
 _CUDA_LIB_PREFIXES = ("cublas", "cudart", "nvrtc", "nvtool", "npp",
                       "cufft", "curand", "cusolver", "cusparse", "cudnn",
+                      "nvblas",
                       "ggml-cuda", "libggml-cuda")
 
 
@@ -778,10 +779,13 @@ def _acquire_install_lock(config_dir, cancel_event=None,
     models/ dirs. Two overlapping downloads wrote the same .part file and
     the same unpack target: WinError 32 on the rename, half-unpacked
     engines, and poisoned DLL sets. The lock file serializes them; the
-    waiter retries every 0.5s, honours cancel_event, steals the lock when
-    its mtime proves the holder died (>30min old), and gives up after
-    `timeout` (best effort rather than deadlock). Returns the path to
-    unlink on release, or None when locking is impossible.
+    waiter retries every 0.5s, honours cancel_event, and steals the lock
+    when its mtime proves the holder died (holders touch it per downloaded
+    chunk, so anything older than 120s is dead). Past `timeout` it raises
+    InstallBusyError instead of proceeding unserialized — overlapping
+    writes corrupt; waiting callers retry later. Returns the path to
+    unlink on release, or None when locking is impossible (then the
+    caller proceeds best-effort, as before).
     """
     import time as _time
     path = _install_lock_path(Path(config_dir))
@@ -805,7 +809,7 @@ def _acquire_install_lock(config_dir, cancel_event=None,
             return None
         try:
             age = _time.monotonic() - path.stat().st_mtime
-            if age > 1800:
+            if age > 120:
                 try:
                     path.unlink()
                 except OSError:
@@ -816,8 +820,8 @@ def _acquire_install_lock(config_dir, cancel_event=None,
         if cancel_event is not None and cancel_event.is_set():
             raise RuntimeError("cancelled")
         if _time.monotonic() > deadline:
-            log("[BACKEND] install lock held too long; proceeding best-effort")
-            return None
+            raise InstallBusyError(
+                "another install is already running — try again when it finishes")
         _time.sleep(0.5)
 
 
@@ -830,8 +834,26 @@ def _release_install_lock(path) -> None:
         pass
 
 
-def _download(url: str, dest: Path, progress=None, cancel_event=None) -> None:
-    """Download to a temporary name, then move: a partial file is never used."""
+class InstallBusyError(RuntimeError):
+    """Another process/thread is already downloading; try again later."""
+
+
+def _touch(path) -> None:
+    """Refresh a lock file's mtime: proof its holder is alive."""
+    try:
+        if path is not None:
+            os.utime(Path(path), None)
+    except OSError:
+        pass
+
+
+def _download(url: str, dest: Path, progress=None, cancel_event=None,
+              keepalive=None) -> None:
+    """Download to a temporary name, then move: a partial file is never used.
+
+    `keepalive` is the install-lock path, touched per chunk so waiters can
+    tell a live 677MB download from a holder that died an hour ago.
+    """
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(dest.suffix + ".part")
     with urllib.request.urlopen(url, timeout=60) as response:
@@ -845,6 +867,7 @@ def _download(url: str, dest: Path, progress=None, cancel_event=None) -> None:
                     break
                 f.write(chunk)
                 done += len(chunk)
+                _touch(keepalive)
                 if cancel_event and cancel_event.is_set():
                     raise RuntimeError("cancelled")
                 # Often enough for a progress bar to look continuous;
@@ -1604,13 +1627,14 @@ class LocalBackend:
                                           cancel_event=cancel_event)
         try:
             return self._install_locked(model, force_download, progress,
-                                        cancel_event)
+                                        cancel_event, lock_path)
         finally:
             _release_install_lock(lock_path)
 
     def _install_locked(self, model: str | None = None,
                         force_download: bool = False,
-                        progress=None, cancel_event=None) -> bool:
+                        progress=None, cancel_event=None,
+                        lock_path=None) -> bool:
         """install() with the cross-process download mutex already held."""
         accelerator = detect_accelerator()
         model = model or recommended_model(accelerator)
@@ -1681,7 +1705,9 @@ class LocalBackend:
                     log(f"[BACKEND] downloading {kind} engine {RELEASE_URL}/{archive} "
                         f"({WHISPER_CPP_RELEASE}) to {archive_path}")
                     _download(f"{RELEASE_URL}/{archive}", archive_path,
-                              _stage(progress, "engine"), cancel_event=cancel_event)
+                              _stage(progress, "engine"),
+                              cancel_event=cancel_event,
+                              keepalive=lock_path)
                     try:
                         log(f"[BACKEND] engine archive downloaded: "
                             f"{archive_path.stat().st_size // 1_000_000}MB")
@@ -1722,7 +1748,9 @@ class LocalBackend:
                         last_notice[0] = time.monotonic()
                         self._notify(f"Speech model {int(fraction * 100)}%")
 
-                _download(f"{MODEL_URL}/{model}.bin", downloaded_model, report, cancel_event=cancel_event)
+                _download(f"{MODEL_URL}/{model}.bin", downloaded_model, report,
+                          cancel_event=cancel_event,
+                          keepalive=lock_path)
 
             self._notify("Speech model ready")
             return True
@@ -1914,11 +1942,11 @@ class LocalBackend:
         """
         lock_path = _acquire_install_lock(self.config.config_dir)
         try:
-            return self._fresh_cpu_locked()
+            return self._fresh_cpu_locked(lock_path)
         finally:
             _release_install_lock(lock_path)
 
-    def _fresh_cpu_locked(self) -> bool:
+    def _fresh_cpu_locked(self, lock_path=None) -> bool:
         # Try to download the CPU engine without regard to accelerator
         try:
             archive = "whisper-blas-bin-x64.zip" if sys.platform == "win32" else "whisper-bin-ubuntu-x64.tar.gz"
@@ -1927,7 +1955,7 @@ class LocalBackend:
             archive_path = runtime / archive
             url = f"{RELEASE_URL}/{archive}"
             log(f"[BACKEND] downloading fresh CPU engine {url}")
-            _download(url, archive_path)
+            _download(url, archive_path, keepalive=lock_path)
             try:
                 log(f"[BACKEND] engine archive downloaded: "
                     f"{archive_path.stat().st_size // 1_000_000}MB")
@@ -1960,11 +1988,11 @@ class LocalBackend:
             return False
         lock_path = _acquire_install_lock(self.config.config_dir)
         try:
-            return self._plain_locked()
+            return self._plain_locked(lock_path)
         finally:
             _release_install_lock(lock_path)
 
-    def _plain_locked(self) -> bool:
+    def _plain_locked(self, lock_path=None) -> bool:
         try:
             archive = _server_archive(detect_accelerator(), variant="plain")
             self._notify("Downloading compatibility engine...")
@@ -1972,7 +2000,7 @@ class LocalBackend:
             archive_path = runtime / archive
             url = f"{RELEASE_URL}/{archive}"
             log(f"[BACKEND] downloading plain engine {url}")
-            _download(url, archive_path)
+            _download(url, archive_path, keepalive=lock_path)
             try:
                 log(f"[BACKEND] engine archive downloaded: "
                     f"{archive_path.stat().st_size // 1_000_000}MB")
@@ -2238,10 +2266,21 @@ class LocalBackend:
                 _stderr_file = open(fd, "w", encoding="utf-8", errors="replace")
             except Exception:
                 _stderr_file = subprocess.DEVNULL  # type: ignore[assignment]
+            # Run with cwd set to the engine's own directory. DLL search
+            # order starts at the exe dir, but anything NOT shipped beside
+            # it falls through to cwd and PATH — and this process can be
+            # launched from anywhere (here: the app install dir). Pinning
+            # cwd to the engine dir makes resolution deterministic no
+            # matter who spawned us.
+            try:
+                engine_cwd = str(Path(cmd[0]).parent)
+            except Exception:
+                engine_cwd = None
             try:
                 self._process = subprocess.Popen(
                     cmd, stdout=_stderr_file, stderr=_stderr_file,
                     creationflags=no_console_flags(), env=env,
+                    cwd=engine_cwd,
                 )
             except Exception as e:
                 log(f"[BACKEND] could not start the server: {e}")

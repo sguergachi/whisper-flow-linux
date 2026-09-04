@@ -685,7 +685,7 @@ class WhisperFlowDaemon:
         # *before* opening the mic — otherwise 5s of speech is recorded and
         # then dropped with "No whisper server configured".
         try:
-            backend_ok = self._ensure_backend_running()
+            backend_ok = self._ensure_backend_running(allow_download=False)
         except Exception as e:
             log(f"[DAEMON] backend check before recording failed: {e}")
             backend_ok = False
@@ -918,7 +918,7 @@ class WhisperFlowDaemon:
                 if not (is_no_server or is_conn):
                     raise
                 log(f"[DAEMON] transcribe failed with '{e}' — auto-healing backend and retrying once")
-                healed = self._ensure_backend_running()
+                healed = self._ensure_backend_running(allow_download=False)
                 if not healed:
                     log("[DAEMON] auto-heal could not revive backend")
                     raise
@@ -987,7 +987,7 @@ class WhisperFlowDaemon:
                 # save this utterance instead of dropping 5s of speech.
                 if not self.config.local_whisper_url or (self.backend._process and self.backend._process.poll() is not None):
                     log("[DAEMON] recording failed and backend is down — trying one revive + retry")
-                    if self._ensure_backend_running():
+                    if self._ensure_backend_running(allow_download=False):
                         # Re-run just the transcription on the already-recorded
                         # file is not available here (app deleted it), so the
                         # retry will happen on the *next* hotkey. But we can
@@ -1514,7 +1514,8 @@ class WhisperFlowDaemon:
             self.notify(f"Speech model ready ({started_model.replace('ggml-', '')}, "
                         f"{self.backend.engine_summary()})")
 
-    def _backend_start(self, model: str | None) -> str | None:
+    def _backend_start(self, model: str | None,
+                       allow_download: bool = True) -> str | None:
         """Start with GPU→CPU fallback, handling mocked backends in tests.
 
         Mock objects create any attribute on access, so hasattr succeeds even
@@ -1524,7 +1525,12 @@ class WhisperFlowDaemon:
         # Prefer the fallback-aware path
         if hasattr(self.backend, "start_with_fallback"):
             try:
-                url = self.backend.start_with_fallback(model)
+                try:
+                    url = self.backend.start_with_fallback(
+                        model, allow_download=allow_download)
+                except TypeError:
+                    # Mock backends (and old callers) take only the model.
+                    url = self.backend.start_with_fallback(model)
                 if isinstance(url, str) and url.startswith("http"):
                     return url
                 # Mock or non-URL — try plain start as the test expects
@@ -1533,27 +1539,40 @@ class WhisperFlowDaemon:
                     pass
                 else:
                     # Real failure — still try plain start as second chance
-                    plain = self.backend.start(model)
+                    try:
+                        plain = self.backend.start(
+                            model, allow_download=allow_download)
+                    except TypeError:
+                        plain = self.backend.start(model)
                     if isinstance(plain, str) and plain.startswith("http"):
                         return plain
                     return url
             except Exception:
                 pass
         try:
-            url = self.backend.start(model)
+            try:
+                url = self.backend.start(model, allow_download=allow_download)
+            except TypeError:
+                url = self.backend.start(model)
             if isinstance(url, str) and url.startswith("http"):
                 return url
             return None if not isinstance(url, str) else url
         except Exception:
             return None
 
-    def _ensure_backend_running(self) -> bool:
+    def _ensure_backend_running(self, allow_download: bool = True) -> bool:
         """Make sure a transcription server is up before recording.
 
         Called on every hotkey press. If the server crashed after startup
         (the 0xC0000005 case in the user's log), this is where it gets
         revived on CPU instead of letting the next 5 seconds of speech be
         recorded and then dropped with 'No whisper server configured'.
+
+        With allow_download=False (the hotkey path) this never fetches
+        anything: a 677MB engine download on the recording path is what made
+        hotkeys look dead (no HUD, no mic for minutes). Missing files are
+        fetched by the watchdog/settings paths; recording still proceeds so
+        the closing pass can retry once the engine lands.
         """
         try:
             # Already have a URL and the process is alive
@@ -1569,6 +1588,13 @@ class WhisperFlowDaemon:
             return False
         if not model:
             return False
+        if not allow_download:
+            try:
+                if not self.backend.is_installed(model):
+                    log(f"[DAEMON] {model} not installed — no download on the hotkey path")
+                    return False
+            except Exception:
+                pass
         # Respect the user's model choice here. Model switching belongs to
         # start_with_fallback (used when start() itself fails), not to every
         # revive: silently rewriting medium to base is why the settings page
@@ -1576,7 +1602,7 @@ class WhisperFlowDaemon:
         # crashes are handled by backend.note_crash, which refreshes the
         # engine bytes instead of second-guessing the model.
         try:
-            url = self._backend_start(model)
+            url = self._backend_start(model, allow_download=allow_download)
         except Exception as e:
             log(f"[DAEMON] backend start before recording failed: {e}")
             return False

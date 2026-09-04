@@ -764,6 +764,72 @@ def _stage(progress, name: str):
     return lambda fraction: progress(name, fraction)
 
 
+def _install_lock_path(config_dir: Path) -> Path:
+    """Cross-process mutex for engine/model downloads."""
+    return Path(config_dir) / "install.lock"
+
+
+def _acquire_install_lock(config_dir, cancel_event=None,
+                          timeout: float = 1800.0):
+    """Hold the download mutex across processes AND threads.
+
+    The daemon (watchdog, hotkey heal, startup fallback) and the settings
+    window (its own process) all download into the same runtime/ and
+    models/ dirs. Two overlapping downloads wrote the same .part file and
+    the same unpack target: WinError 32 on the rename, half-unpacked
+    engines, and poisoned DLL sets. The lock file serializes them; the
+    waiter retries every 0.5s, honours cancel_event, steals the lock when
+    its mtime proves the holder died (>30min old), and gives up after
+    `timeout` (best effort rather than deadlock). Returns the path to
+    unlink on release, or None when locking is impossible.
+    """
+    import time as _time
+    path = _install_lock_path(Path(config_dir))
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    deadline = _time.monotonic() + timeout
+    while True:
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            try:
+                os.write(fd, str(os.getpid()).encode())
+            except OSError:
+                pass
+            os.close(fd)
+            return path
+        except FileExistsError:
+            pass
+        except OSError:
+            return None
+        try:
+            age = _time.monotonic() - path.stat().st_mtime
+            if age > 1800:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+                continue
+        except OSError:
+            continue                    # vanished between checks; retry
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError("cancelled")
+        if _time.monotonic() > deadline:
+            log("[BACKEND] install lock held too long; proceeding best-effort")
+            return None
+        _time.sleep(0.5)
+
+
+def _release_install_lock(path) -> None:
+    if path is None:
+        return
+    try:
+        Path(path).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def _download(url: str, dest: Path, progress=None, cancel_event=None) -> None:
     """Download to a temporary name, then move: a partial file is never used."""
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -1529,6 +1595,23 @@ class LocalBackend:
         if cancel_event and cancel_event.is_set():
             log("[BACKEND] install cancelled before start")
             return False
+        # Serialized across threads AND processes (daemon vs settings
+        # window): overlapping downloads wrote the same .part file and the
+        # same unpack target — WinError 32 on the rename and half-unpacked
+        # engines. The waiter re-checks have_exe/have_model after acquiring,
+        # so a duplicate request usually becomes a no-op.
+        lock_path = _acquire_install_lock(self.config.config_dir,
+                                          cancel_event=cancel_event)
+        try:
+            return self._install_locked(model, force_download, progress,
+                                        cancel_event)
+        finally:
+            _release_install_lock(lock_path)
+
+    def _install_locked(self, model: str | None = None,
+                        force_download: bool = False,
+                        progress=None, cancel_event=None) -> bool:
+        """install() with the cross-process download mutex already held."""
         accelerator = detect_accelerator()
         model = model or recommended_model(accelerator)
         log(f"[BACKEND] accelerator={accelerator} model={model}")
@@ -1829,6 +1912,13 @@ class LocalBackend:
         including the bundled copy — so a pristine download is the point.
         A downloaded copy wins over bundled in server_exe.
         """
+        lock_path = _acquire_install_lock(self.config.config_dir)
+        try:
+            return self._fresh_cpu_locked()
+        finally:
+            _release_install_lock(lock_path)
+
+    def _fresh_cpu_locked(self) -> bool:
         # Try to download the CPU engine without regard to accelerator
         try:
             archive = "whisper-blas-bin-x64.zip" if sys.platform == "win32" else "whisper-bin-ubuntu-x64.tar.gz"
@@ -1868,6 +1958,13 @@ class LocalBackend:
         if sys.platform != "win32":
             log("[BACKEND] no plain engine asset for this platform")
             return False
+        lock_path = _acquire_install_lock(self.config.config_dir)
+        try:
+            return self._plain_locked()
+        finally:
+            _release_install_lock(lock_path)
+
+    def _plain_locked(self) -> bool:
         try:
             archive = _server_archive(detect_accelerator(), variant="plain")
             self._notify("Downloading compatibility engine...")
@@ -1891,23 +1988,31 @@ class LocalBackend:
             log(f"[BACKEND] could not download plain engine: {e}")
             return False
 
-    def start_with_fallback(self, model: str | None = None) -> str | None:
+    def start_with_fallback(self, model: str | None = None,
+                            allow_download: bool = True) -> str | None:
         """Start GPU model if possible, otherwise fall back to a CPU model.
 
         This is the "app has to work always" path: a machine where the CUDA
         engine crashes with 0xC0000005 (missing MSVC redist / driver / VRAM)
         must still transcribe via the CPU engine instead of leaving the user
         with 'No whisper server configured' after every hotkey.
+
+        With allow_download=False (hotkey path) this only starts what is
+        already on disk and returns None otherwise — never a minutes-long
+        fetch between keypress and microphone.
         """
-        url = self.start(model)
+        url = self.start(model, allow_download=allow_download)
         if url:
             return url
         # If the requested model is base and not installed, try to download it directly
         # (happens when daemon forces fallback to base but base wasn't bundled)
         if model == "ggml-base.en-q8_0" and not self.is_installed(model):
+            if not allow_download:
+                log(f"[BACKEND] {model} not installed — no download on the hotkey path")
+                return None
             log(f"[BACKEND] {model} not installed, downloading fallback")
             if self.install(model):
-                url2 = self.start(model)
+                url2 = self.start(model, allow_download=allow_download)
                 if url2:
                     return url2
             log(f"[BACKEND] failed to download {model}")
@@ -1957,6 +2062,9 @@ class LocalBackend:
             return None
         # If fallback model not installed, download it (e.g. base when only medium was present)
         if not self.is_installed(fallback_model):
+            if not allow_download:
+                log(f"[BACKEND] fallback model {fallback_model} not installed — no download on the hotkey path")
+                return None
             log(f"[BACKEND] fallback model {fallback_model} not installed, downloading")
             # Try to install it (download). Respect cancel if any (None here)
             if not self.install(fallback_model):
@@ -1977,11 +2085,16 @@ class LocalBackend:
         except Exception:
             pass
         self._last_started_model = fallback_model
-        return self.start(fallback_model)
+        return self.start(fallback_model, allow_download=allow_download)
 
     # --------------------------------------------------------------- serve
-    def start(self, model: str | None = None) -> str | None:
-        """Start the server if it is not already up. Returns its URL."""
+    def start(self, model: str | None = None,
+              allow_download: bool = True) -> str | None:
+        """Start the server if it is not already up. Returns its URL.
+
+        With allow_download=False the pre-flight never fetches: a corrupt
+        model or an unhealthy engine is reported, not re-downloaded.
+        """
         with self._lock:
             if self._process and self._process.poll() is None:
                 return self.url
@@ -2043,6 +2156,8 @@ class LocalBackend:
             if sys.platform == "win32" and not _is_vcredist_available():
                 log("[BACKEND] VCRedist missing — whisper-server.exe will crash 0xC0000005")
                 log("[BACKEND] hint: install Microsoft Visual C++ Redistributable from https://aka.ms/vs/17/release/vc_redist.x64.exe")
+                if not allow_download:
+                    return None
                 # Try silent install once per process
                 if _ensure_vcredist_silent():
                     log("[BACKEND] VCRedist now available after silent install, continuing")
@@ -2052,6 +2167,9 @@ class LocalBackend:
             try:
                 mpath = self.model_path(model)
                 if not _verify_model_file(model, mpath):
+                    if not allow_download:
+                        log(f"[BACKEND] model {model} at {mpath} looks corrupt — no re-download on the hotkey path")
+                        return None
                     log(f"[BACKEND] model {model} at {mpath} appears corrupted/truncated, deleting and will re-download")
                     try:
                         mpath.unlink(missing_ok=True)
@@ -2072,6 +2190,9 @@ class LocalBackend:
             try:
                 eng = self.server_exe
                 if not _is_engine_healthy(eng):
+                    if not allow_download:
+                        log(f"[BACKEND] engine {eng} failed health check — no re-download on the hotkey path")
+                        return None
                     log(f"[BACKEND] engine {eng} failed health check, will re-download CPU engine")
                     # Try to re-download CPU engine
                     try:

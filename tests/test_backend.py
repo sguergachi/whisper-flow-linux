@@ -1104,3 +1104,18 @@ def test_plain_engine_download_goes_to_its_own_directory(
     assert local_backend.installed_engine() == "cpu-plain"
     assert local_backend.server_exe == plain / local_backend._exe_name
     assert "compatibility" in local_backend.engine_summary()
+
+
+def test_hotkey_path_never_downloads(local_backend, config, monkeypatch):
+    """A missing engine/model on Super+Alt must fail fast, not fetch GBs."""
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(backend_module, "detect_accelerator", lambda: "cuda12")
+
+    def boom(*a, **k):
+        raise AssertionError("no network on the hotkey path")
+
+    monkeypatch.setattr(backend_module, "_download", boom)
+    # Nothing installed: no exe, no model.
+    assert local_backend.start("ggml-base.en-q8_0", allow_download=False) is None
+    assert local_backend.start_with_fallback(
+        "ggml-base.en-q8_0", allow_download=False) is None

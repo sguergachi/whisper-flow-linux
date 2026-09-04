@@ -2304,7 +2304,20 @@ class LocalBackend:
             # Before it has done anything: from here on it dies with us.
             _adopt_into_job(self._job, self._process)
 
-            if self._wait_until_ready():
+            # Let the model load before first contact: base/small are up in
+            # seconds, medium wants longer, large much longer. A request
+            # landing mid-load is the worst moment to make contact.
+            try:
+                size_mb = self.model_path(model).stat().st_size / 1_000_000
+            except OSError:
+                size_mb = 0.0
+            if size_mb >= 1000:
+                quiet_period = 20.0
+            elif size_mb >= 300:
+                quiet_period = 12.0
+            else:
+                quiet_period = 4.0
+            if self._wait_until_ready(quiet_period=quiet_period):
                 # Ready means the port accepts connections. If our child
                 # already exited, that is an orphan (or a foreign server)
                 # answering - the exact failure stop_strays exists to prevent.
@@ -2356,7 +2369,8 @@ class LocalBackend:
     def url(self) -> str:
         return f"http://127.0.0.1:{self.config.local_server_port}"
 
-    def _wait_until_ready(self, timeout: float = 120.0) -> bool:
+    def _wait_until_ready(self, timeout: float = 120.0,
+                          quiet_period: float = 0.5) -> bool:
         """Loading a multi-gigabyte model into VRAM is not instant.
 
         Probed with a complete HTTP request, never a bare TCP open-close:
@@ -2364,13 +2378,23 @@ class LocalBackend:
         for an HTTP server (and a suspect for the post-ready native
         crashes), while a full request/response round-trip is the path
         every inference takes. Any HTTP status — even 404 — means alive.
+
+        Nothing touches the port for the first `quiet_period` seconds: a
+        request landing mid-load is the worst moment to make contact, so
+        the wait stays silent while the model almost certainly still is.
+        Afterwards at most one request per 3s — never a hammer loop.
         """
         import http.client
 
-        deadline = time.monotonic() + timeout
+        started = time.monotonic()
+        deadline = started + timeout
+        first_contact_at = started + max(0.0, quiet_period)
         while time.monotonic() < deadline:
             if self._process and self._process.poll() is not None:
                 return False        # it exited
+            if time.monotonic() < first_contact_at:
+                time.sleep(0.5)
+                continue
             conn = None
             try:
                 conn = http.client.HTTPConnection(
@@ -2387,7 +2411,7 @@ class LocalBackend:
                         conn.close()
                 except Exception:
                     pass
-            time.sleep(0.5)
+            time.sleep(3.0)
         return False
 
     def stop(self) -> None:

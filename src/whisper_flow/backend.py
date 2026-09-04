@@ -273,6 +273,86 @@ def _is_engine_healthy(engine_path: Path) -> bool:
         log(f"[BACKEND] engine health check failed for {engine_path}: {e}")
         return True
 
+
+def suppress_crash_dialogs() -> None:
+    """Stop Windows popping a fault dialog for every crashing child process.
+
+    A background daemon must never show "whisper-server.exe - Application
+    Error" modals: one appears per native crash, each holding the dead
+    process (and the user's attention) until clicked. SEM_NOGPFAULTERRORBOX
+    makes faults exit promptly with their status code instead, which is
+    also what the watchdog needs to see deaths immediately. Process-wide
+    and inherited by children, so call once at startup.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        SEM_FAILCRITICALERRORS = 0x0001
+        SEM_NOGPFAULTERRORBOX = 0x0002
+        ctypes.windll.kernel32.SetErrorMode(
+            SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX)
+    except Exception as e:
+        log(f"[BACKEND] could not suppress crash dialogs: {e}")
+
+
+_faulting_module_cache: dict = {}
+
+
+def faulting_module(exe_name: str) -> str | None:
+    """Faulting DLL of the newest Application-Error 1000 for ``exe_name``.
+
+    A 0xC0000005 alone never says WHERE: the same code comes from our own
+    binary, a poisoned side-by-side DLL, or a system library. Event 1000
+    names the faulting module (e.g. ggml.dll vs openblas.dll vs ntdll),
+    which is what decides the fix. Best effort, cached per process.
+    """
+    if sys.platform != "win32" or platform.system() != "Windows":
+        return None
+    key = exe_name.lower()
+    try:
+        import win32evtlog
+        import win32evtlogutil  # noqa: F401  (import registers message DLLs)
+    except ImportError:
+        return None
+    try:
+        hand = win32evtlog.OpenEventLog(None, "Application")
+    except Exception:
+        return None
+    try:
+        flags = (win32evtlog.EVENTLOG_BACKWARDS_READ
+                 | win32evtlog.EVENTLOG_SEQUENTIAL_READ)
+        # Newest first; stop at the first match (or after a bounded scan).
+        for _ in range(12):
+            try:
+                events = win32evtlog.ReadEventLog(hand, flags, 0)
+            except Exception:
+                break
+            if not events:
+                break
+            for ev in events:
+                try:
+                    if getattr(ev, "EventID", 0) & 0xFFFF != 1000:
+                        continue
+                    data = getattr(ev, "StringInserts", None) or ()
+                    blob = "\n".join(str(part) for part in data)
+                    if key not in blob.lower():
+                        continue
+                    for line in blob.splitlines():
+                        if line.lower().startswith("faulting module name"):
+                            mod = line.split(":", 1)[1].strip()
+                            _faulting_module_cache[key] = mod
+                            return mod
+                    return None
+                except Exception:
+                    continue
+    finally:
+        try:
+            win32evtlog.CloseEventLog(hand)
+        except Exception:
+            pass
+    return _faulting_module_cache.get(key)
+
 def _is_vcredist_available() -> bool:
     """Check if MSVC VCRedist is present (needed for both CPU and GPU whisper-server)."""
     # Use platform.system() not sys.platform — tests mock sys.platform to win32 on Linux
@@ -437,7 +517,9 @@ def machine_facts() -> str:
     """
     import platform as _plat
     cpu = (_plat.processor() or _plat.machine() or "?").strip() or "?"
-    drv = _driver_version or "none"
+    drv = (_driver_version
+           or os.environ.get("WHISPER_FLOW_DRIVER_VERSION", "").strip()
+           or "none")
     ram = avail = 0.0
     try:
         ram = total_ram_gb()
@@ -1106,9 +1188,16 @@ class LocalBackend:
                 identity = self._engine_identity(self.server_exe)
             except Exception:
                 identity = None
+            now = time.monotonic()
             if identity != self._crash_engine:
                 self._crash_engine = identity
                 self._crash_count = 0
+                self._crash_window_start = now
+            # Ancient crashes must not accumulate: three faults spread over
+            # days are three unrelated incidents, not a broken binary.
+            if now - getattr(self, "_crash_window_start", now) > 600:
+                self._crash_count = 0
+                self._crash_window_start = now
             self._crash_count += 1
             log(f"[BACKEND] native crash #{self._crash_count} of {self.server_exe}")
             if self._crash_count < self._CRASH_REINSTALL_AFTER:

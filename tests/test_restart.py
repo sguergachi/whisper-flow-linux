@@ -48,6 +48,7 @@ def test_a_running_daemon_is_stopped_then_respawned(monkeypatch):
     monkeypatch.setattr(restart.os, "kill", kill)
     popen = Mock()
     monkeypatch.setattr(restart.subprocess, "Popen", popen)
+    monkeypatch.setattr(restart, "_replacement_is_up", lambda old_pid: True)
     monkeypatch.setattr(sys, "frozen", False, raising=False)
     # Source path: command[0] is this interpreter, which exists.
     monkeypatch.setattr(restart, "respawn_command", lambda: [
@@ -106,6 +107,7 @@ def test_restart_resolves_binary_before_killing_daemon(monkeypatch, tmp_path):
         lambda pid, sig: order.append(("kill", pid)))
     popen = Mock(side_effect=lambda *a, **k: order.append("popen"))
     monkeypatch.setattr(restart.subprocess, "Popen", popen)
+    monkeypatch.setattr(restart, "_replacement_is_up", lambda old_pid: True)
 
     ok, _ = restart.restart_daemon()
 
@@ -125,6 +127,7 @@ def test_restart_fails_clearly_when_binary_is_gone(monkeypatch):
     monkeypatch.setattr(restart.os, "kill", kill)
     popen = Mock()
     monkeypatch.setattr(restart.subprocess, "Popen", popen)
+    monkeypatch.setattr(restart, "_replacement_is_up", lambda old_pid: True)
 
     ok, detail = restart.restart_daemon()
 
@@ -143,6 +146,7 @@ def test_respawn_hides_the_console_on_windows(monkeypatch):
     monkeypatch.setattr(sys, "platform", "win32")
     popen = Mock()
     monkeypatch.setattr(restart.subprocess, "Popen", popen)
+    monkeypatch.setattr(restart, "_replacement_is_up", lambda old_pid: True)
     monkeypatch.setattr(restart, "respawn_command", lambda: [sys.executable])
 
     ok, _detail = restart.restart_daemon()
@@ -159,6 +163,7 @@ def test_no_running_daemon_just_starts_one(monkeypatch):
     monkeypatch.setattr(restart.os, "kill", kill)
     popen = Mock()
     monkeypatch.setattr(restart.subprocess, "Popen", popen)
+    monkeypatch.setattr(restart, "_replacement_is_up", lambda old_pid: True)
     monkeypatch.setattr(restart, "respawn_command", lambda: [
         sys.executable, "-m", "whisper_flow.cli", "daemon", "--foreground"])
 
@@ -182,6 +187,7 @@ def test_a_stubborn_daemon_still_gets_a_replacement(monkeypatch):
     monkeypatch.setattr(restart.os, "kill", Mock())
     popen = Mock()
     monkeypatch.setattr(restart.subprocess, "Popen", popen)
+    monkeypatch.setattr(restart, "_replacement_is_up", lambda old_pid: True)
     monkeypatch.setattr(sys, "frozen", False, raising=False)
     monkeypatch.setattr(restart, "respawn_command", lambda: [
         sys.executable, "-m", "whisper_flow.cli", "daemon", "--foreground"])
@@ -227,3 +233,22 @@ def test_wait_for_exit_returns_immediately_when_the_pid_is_gone():
     t0 = time.monotonic()
     assert restart._wait_for_exit(2**30, timeout=5.0) is True
     assert time.monotonic() - t0 < 1.0
+
+
+def test_a_replacement_that_never_comes_up_is_reported_not_claimed(monkeypatch):
+    """Popen succeeding is not a restart: the tray never returned that way."""
+    monkeypatch.setattr(restart, "systemd_unit_active", lambda: False)
+    monkeypatch.setattr(restart, "daemon_pid", lambda: 4321)
+    monkeypatch.setattr(restart, "_wait_for_exit", lambda pid, timeout=10.0: True)
+    monkeypatch.setattr(restart.os, "kill", Mock())
+    popen = Mock()
+    monkeypatch.setattr(restart.subprocess, "Popen", popen)
+    monkeypatch.setattr(restart, "_replacement_is_up", lambda old_pid: False)
+    monkeypatch.setattr(restart, "respawn_command", lambda: [
+        sys.executable, "-m", "whisper_flow.cli", "daemon", "--foreground"])
+
+    ok, detail = restart.restart_daemon()
+
+    assert ok is False
+    assert "did not stay up" in detail
+    popen.assert_called_once()

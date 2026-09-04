@@ -237,8 +237,10 @@ def _restart_daemon() -> tuple[bool, str]:
             os.kill(pid, 15)
         except OSError as e:
             log(f"[SETTINGS] could not signal daemon {pid}: {e}")
-        # Short wait only - settings is still open and must stay responsive.
-        if not _wait_for_exit(pid, timeout=0.8):
+        # Wait for the old process to actually die: respawning while it still
+        # holds the single-instance mutex makes the replacement exit at once
+        # ("already running") and the tray never comes back.
+        if not _wait_for_exit(pid, timeout=3.0):
             log(f"[SETTINGS] daemon {pid} still running after SIGTERM; "
                 "starting a replacement anyway")
 
@@ -257,4 +259,26 @@ def _restart_daemon() -> tuple[bool, str]:
         )
     except Exception as e:
         return False, f"could not start the daemon: {e}"
-    return True, "daemon restarted"
+    # Popen succeeding only means a process started, not that the daemon
+    # stayed up: an instant exit (stale mutex, platform check) used to be
+    # reported as success while the tray never returned.
+    if _replacement_is_up(pid):
+        return True, "daemon restarted"
+    return False, ("the daemon did not stay up after restart "
+                   "(tray missing?) — launch WhisperFlow once by hand, "
+                   "then use Copy log from its tray menu")
+
+
+def _replacement_is_up(old_pid, timeout: float = 6.0) -> bool:
+    """Whether the pid file now points at a different, living process."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        new_pid = daemon_pid()
+        if new_pid and new_pid != old_pid and _pid_alive(new_pid):
+            # Give it another beat: a process that dies during startup would
+            # still look alive at this instant.
+            time.sleep(1.0)
+            if _pid_alive(daemon_pid() or 0):
+                return True
+        time.sleep(0.25)
+    return False

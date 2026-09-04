@@ -273,6 +273,16 @@ class WhisperFlowDaemon:
                                                     log(f"[BACKEND] server output at crash ({spath}):\n{tail[:2000]}")
                                         except Exception:
                                             pass
+                                        # Name the faulting module (Event 1000):
+                                        # 0xC0000005 in ggml.dll vs openblas.dll
+                                        # vs the exe itself decides the fix.
+                                        try:
+                                            from .backend import faulting_module as _fm
+                                            mod = _fm("whisper-server.exe")
+                                            if mod:
+                                                log(f"[BACKEND] faulting module: {mod}")
+                                        except Exception:
+                                            pass
                                         log(f"[DAEMON] backend process dead (exit={code} 0x{(code or 0) & 0xFFFFFFFF:08X}), reviving")
                                         try:
                                             refreshed = self.backend.note_crash(code)
@@ -1279,6 +1289,15 @@ class WhisperFlowDaemon:
         # should not pay it again while the user waits at a blank screen.
         env = dict(os.environ)
         env[backend_module.ACCELERATOR_ENV] = backend_module.detect_accelerator()
+        # The driver version rides along too: children that inherit the
+        # accelerator answer skip the nvidia-smi probe (and with it the
+        # version string), which left machine_facts reporting nvidia_drv=none
+        # after every settings-triggered restart.
+        try:
+            env["WHISPER_FLOW_DRIVER_VERSION"] = (
+                backend_module._driver_version or "")
+        except Exception:
+            pass
         # When the click happened, so the window can report what the user
         # actually waited through - process start included, which is a
         # real part of it in a frozen build and cannot be seen from
@@ -2147,6 +2166,14 @@ Use 'whisper-flow stop' to exit daemon
     def _run_worker(self, foreground: bool = False):
         """Run the worker process with health monitoring."""
         log(f"[DAEMON] Starting worker process (foreground={foreground})")
+        # No fault dialogs, ever: a crashing whisper-server must exit with
+        # its status code, not park a modal "Application Error" on the
+        # user's screen holding the dead process until clicked. Inherited
+        # by every child this process spawns.
+        try:
+            backend_module.suppress_crash_dialogs()
+        except Exception:
+            pass
         if not self._acquire_single_instance():
             log("[DAEMON] Another instance is already running; exiting")
             self.notify("whisper-flow is already running")

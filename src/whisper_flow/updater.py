@@ -7,10 +7,15 @@ report "not applicable" rather than pretending.
 Updates are delta by default: most of what ships is a speech model that does
 not change between versions, so a code-only release is a few megabytes
 rather than the ~160MB the full installer weighs.
+
+The flow is check -> download in the background -> apply on click. The
+download never blocks a hotkey and the apply never interrupts a dictation:
+both wait their turn, and every step retries instead of failing loudly.
 """
 
 import sys
 import threading
+import time
 
 from .logging import log
 
@@ -119,3 +124,218 @@ def check_in_background(notify=None) -> None:
 
     threading.Thread(target=work, daemon=True,
                      name="whisper-flow-update-check").start()
+
+
+# ------------------------------------------------------------------ state
+# Everything below is one shared state machine so the periodic checker, a
+# tray click and the apply step cannot trip over each other. All of it is a
+# no-op where updates are unavailable (Linux, source checkouts).
+
+_lock = threading.Lock()
+_checked_version: str | None = None   # newest version seen (downloaded or not)
+_pending_update = None                # velopack update object, downloaded
+_pending_version: str | None = None   # its version
+_downloading = False                  # a fetch is in flight right now
+_notified_version: str | None = None  # last version the user was told about
+_auto_started = False
+
+# Download attempts per version before giving up until the next check.
+_DOWNLOAD_RETRIES = 3
+_DOWNLOAD_BACKOFF = (5.0, 15.0, 30.0)
+
+
+def pending_version() -> str | None:
+    """Version of the fully-downloaded update waiting for a restart, if any."""
+    with _lock:
+        return _pending_version
+
+
+def is_downloading() -> bool:
+    """Whether a background fetch is currently in flight."""
+    with _lock:
+        return _downloading
+
+
+def _remember_checked(version: str | None) -> bool:
+    """Record a sighting. True when this version is new to us."""
+    global _checked_version
+    with _lock:
+        if not version or version == _checked_version:
+            return False
+        _checked_version = version
+        return True
+
+
+def download_in_background(notify=None, on_ready=None) -> str | None:
+    """Check once and fetch what is new, without blocking the caller.
+
+    Returns the downloaded version (or the already-pending one). Retries a
+    flaky download instead of failing loudly; quiet when already current.
+    Never raises.
+    """
+    global _downloading, _pending_update, _pending_version
+    if not available():
+        return pending_version()
+    with _lock:
+        if _downloading:
+            return _pending_version     # a fetch is already doing the work
+    try:
+        update = _manager().check_for_updates()
+    except Exception as e:
+        log(f"[UPDATE] check failed: {e}")
+        return pending_version()
+    if not update:
+        log("[UPDATE] already current")
+        return pending_version()
+    version = _version_of(update)
+    if not _remember_checked(version):
+        return pending_version()        # seen before; nothing new to fetch
+    with _lock:
+        if _pending_version == version:
+            return version              # downloaded while we were checking
+        _downloading = True
+    try:
+        if _fetch_with_retries(version, update, notify):
+            with _lock:
+                _pending_update = update
+                _pending_version = version
+            log(f"[UPDATE] {version} downloaded in the background")
+            if on_ready:
+                try:
+                    on_ready(version)
+                except Exception as e:
+                    log(f"[UPDATE] ready callback failed: {e}")
+            return version
+        return pending_version()
+    finally:
+        with _lock:
+            _downloading = False
+
+
+def _fetch_with_retries(version, update, notify) -> bool:
+    """Download, retrying a flaky connection. True when it landed."""
+    try:
+        manager = _manager()
+    except Exception as e:
+        log(f"[UPDATE] cannot build update manager: {e}")
+        return False
+    for attempt in range(_DOWNLOAD_RETRIES):
+        try:
+            if notify and attempt == 0:
+                try:
+                    notify(f"Downloading whisper-flow {version} in the background...")
+                except Exception:
+                    pass
+            manager.download_updates(update)
+            return True
+        except Exception as e:
+            log(f"[UPDATE] download attempt {attempt + 1} for {version} failed: {e}")
+            if attempt + 1 < _DOWNLOAD_RETRIES:
+                time.sleep(_DOWNLOAD_BACKOFF[
+                    min(attempt, len(_DOWNLOAD_BACKOFF) - 1)])
+    log(f"[UPDATE] giving up on {version} until the next check")
+    if notify:
+        try:
+            notify(f"Could not download whisper-flow {version} - will retry later")
+        except Exception:
+            pass
+    return False
+
+
+def apply_pending(notify=None) -> bool:
+    """Restart into the downloaded update. Returns False if there is none.
+
+    Uses the stored update object (no re-check, no re-download). On any
+    failure falls back to one fresh check-download-apply round before
+    giving up. Never raises.
+    """
+    global _pending_update, _pending_version
+    if not available():
+        return False
+    with _lock:
+        update = _pending_update
+        version = _pending_version
+    if update is None:
+        return False
+    try:
+        if notify:
+            try:
+                notify(f"Restarting into whisper-flow {version or ''}".rstrip())
+            except Exception:
+                pass
+        _manager().apply_updates_and_restart(update)
+        return True                     # does not return on success
+    except Exception as e:
+        log(f"[UPDATE] apply of {version} failed: {e}, trying one fresh round")
+    # The stored object went stale (or the restart was refused): one fresh
+    # round, then report honestly.
+    with _lock:
+        _pending_update = None
+        _pending_version = None
+    try:
+        fresh = _manager().check_for_updates()
+        if not fresh:
+            return False
+        _manager().download_updates(fresh)
+        _manager().apply_updates_and_restart(fresh)
+        return True
+    except Exception as e:
+        log(f"[UPDATE] fresh apply round failed: {e}")
+        if notify:
+            try:
+                notify(f"Update failed: {e}")
+            except Exception:
+                pass
+        return False
+
+
+def start_auto_update(notify=None, on_ready=None,
+                      first_delay: float = 60.0,
+                      interval: float = 6 * 3600.0) -> None:
+    """Download new releases in the background, forever, on one thread.
+
+    First check `first_delay` after startup (let the boot settle), then
+    every `interval`. Each new version is announced once via notify; the
+    on_ready callback fires when its download lands (so the tray can offer
+    "Update to X"). Never raises, never busy-loops, never runs twice.
+    """
+    global _auto_started
+    if not available():
+        return
+    with _lock:
+        if _auto_started:
+            return
+        _auto_started = True
+
+    def announce(version: str):
+        global _notified_version
+        with _lock:
+            if version == _notified_version:
+                return
+            _notified_version = version
+        if notify:
+            try:
+                notify(f"whisper-flow {version} downloaded — "
+                       f"right-click the tray and pick Update to restart into it")
+            except Exception as e:
+                log(f"[UPDATE] notify failed: {e}")
+
+    def loop():
+        log("[UPDATE] background updater started")
+        try:
+            time.sleep(first_delay)
+            while True:
+                try:
+                    download_in_background(
+                        notify=None,
+                        on_ready=lambda v: (announce(v),
+                                            on_ready(v) if on_ready else None),
+                    )
+                except Exception as e:
+                    log(f"[UPDATE] background round failed: {e}")
+                time.sleep(interval)
+        except Exception as e:
+            log(f"[UPDATE] background updater stopped: {e}")
+
+    threading.Thread(target=loop, daemon=True,
+                     name="whisper-flow-update-loop").start()

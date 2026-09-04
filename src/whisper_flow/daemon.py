@@ -171,6 +171,9 @@ class WhisperFlowDaemon:
         self._setup_lock = threading.Lock()
         self._last_failure = None
         self._last_settings_click = 0.0
+        # Set when Update is clicked mid-dictation: the restart waits until
+        # the current request finishes instead of killing the recording.
+        self._update_apply_deferred = False
         self._instance_lock = None
 
         # Initialize WhisperFlow instances for different modes
@@ -455,7 +458,10 @@ class WhisperFlowDaemon:
             pystray.MenuItem("Test setup", self.test_configuration),
             pystray.MenuItem("Copy last error", self.copy_last_error),
             pystray.MenuItem("Copy log", self.copy_log),
-            pystray.MenuItem("Check for updates", self.check_for_updates,
+            # The label follows the updater state: plain check normally,
+            # "Update to X" once a release is downloaded and waiting.
+            pystray.MenuItem(lambda item: self._update_label(),
+                             self.check_for_updates,
                              visible=updater.available()),
             pystray.MenuItem("Reload", self.reload_daemon),
             pystray.MenuItem("Exit", self.stop_daemon),
@@ -638,6 +644,22 @@ class WhisperFlowDaemon:
                 self.processing_lock.release()
             except RuntimeError:
                 pass
+        # A clicked Update waits out the dictation. Queued requests drain
+        # first (each finish re-checks the flag); the restart runs only
+        # once truly idle, so no recording is ever killed for an update.
+        if getattr(self, "_update_apply_deferred", False):
+            try:
+                queue_empty = self.request_queue.empty()
+            except Exception:
+                queue_empty = True
+            if queue_empty:
+                self._update_apply_deferred = False
+                log("[DAEMON] installing deferred update now that idle")
+                threading.Thread(
+                    target=self._apply_update_when_idle,
+                    daemon=True, name="whisper-flow-update-deferred",
+                ).start()
+                return
         # Process next item in queue
         self._process_next_in_queue()
 
@@ -1820,16 +1842,80 @@ class WhisperFlowDaemon:
         report += ["", "Recent log", recent_log(200) or "(nothing recorded)"]
         return "\n".join(report)
 
-    def check_for_updates(self, icon=None, item=None):
-        """Download and restart into a newer version, if there is one.
+    # ---------------------------------------------------------- updates
+    def _update_label(self) -> str:
+        """Tray text for the update row, following the updater state."""
+        try:
+            if updater.is_downloading():
+                return "Downloading update…"
+            version = updater.pending_version()
+            if version:
+                return f"Update to {version} (restart)"
+        except Exception:
+            pass
+        return "Check for updates"
 
-        On its own thread: this downloads, and a tray callback that does not
-        return promptly stops the icon responding.
+    def _refresh_tray_menu(self) -> None:
+        """Re-render the tray menu so the update row shows current state."""
+        try:
+            if self.tray_icon is not None:
+                self.tray_icon.update_menu()
+        except Exception:
+            pass                    # headless, or menu mid-rebuild: harmless
+
+    def _on_update_ready(self, version: str) -> None:
+        """A background download landed: offer it in the tray."""
+        log(f"[DAEMON] update {version} ready to install")
+        self._refresh_tray_menu()
+
+    def check_for_updates(self, icon=None, item=None):
+        """Apply a downloaded update, or fetch one in the background.
+
+        Right-click → Update restarts into the new build. Never mid-dictation:
+        while recording or processing, the restart waits for the current
+        request to finish. A tray callback that does not return promptly
+        stops the icon responding, so the work runs on its own thread.
         """
         threading.Thread(
-            target=lambda: updater.apply_now(notify=self.notify),
+            target=self._update_clicked,
             daemon=True, name="whisper-flow-update",
         ).start()
+
+    def _update_clicked(self) -> None:
+        """What a click on the update row does, off the tray thread."""
+        try:
+            if updater.pending_version():
+                self._apply_update_when_idle()
+                return
+            if updater.is_downloading():
+                self.notify("Update still downloading — a moment…")
+                return
+            # Nothing waiting: check now, download in the background, and
+            # flip the tray row to "Update to X" when it lands.
+            version = updater.download_in_background(
+                notify=self.notify, on_ready=self._on_update_ready)
+            if version and updater.pending_version():
+                self._refresh_tray_menu()
+            elif not updater.pending_version():
+                self.notify("whisper-flow is up to date")
+        except Exception as e:
+            log(f"[DAEMON] update click failed: {e}")
+
+    def _apply_update_when_idle(self) -> None:
+        """Restart into the downloaded build, waiting out any dictation."""
+        try:
+            if self._is_processing():
+                # Restarting now would kill the recording in flight. Park
+                # the request; _finish_processing picks it up when idle.
+                self._update_apply_deferred = True
+                self.notify("Update will install when this dictation finishes")
+                return
+            self.notify("Restarting to install the update…")
+            if not updater.apply_pending(notify=self.notify):
+                self.notify("Could not install the update — will retry later")
+                self._refresh_tray_menu()
+        except Exception as e:
+            log(f"[DAEMON] update apply failed: {e}")
 
     def copy_last_error(self, icon=None, item=None):
         """Put the most recent failure report back on the clipboard.
@@ -2229,6 +2315,16 @@ Use 'whisper-flow stop' to exit daemon
 
                 # And a transcription backend, if one is installed
                 self._start_managed_backend()
+
+                # New releases download themselves in the background; the
+                # tray row flips to "Update to X" when one lands. No-op
+                # where updates are unavailable (Linux, source checkouts).
+                try:
+                    updater.start_auto_update(
+                        notify=self.notify,
+                        on_ready=self._on_update_ready)
+                except Exception as e:
+                    log(f"[DAEMON] background updater failed to start: {e}")
 
                 if foreground:
                     # Foreground mode: try tray, then keep hotkeys alive without a

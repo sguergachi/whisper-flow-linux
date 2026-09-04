@@ -116,3 +116,174 @@ def test_the_update_feed_points_at_the_rolling_release():
 ])
 def test_the_version_is_read_from_whatever_shape_arrives(shape, expected):
     assert updater._version_of(shape) == expected
+
+
+# ------------------------------------------------- background auto-update
+@pytest.fixture
+def _clean_updater_state(monkeypatch):
+    """Isolate the updater's global state machine per test."""
+    monkeypatch.setattr(updater, "available", lambda: True)
+    updater._checked_version = None
+    updater._pending_update = None
+    updater._pending_version = None
+    updater._downloading = False
+    updater._notified_version = None
+    updater._auto_started = False
+    yield
+    updater._checked_version = None
+    updater._pending_update = None
+    updater._pending_version = None
+    updater._downloading = False
+    updater._notified_version = None
+    updater._auto_started = False
+
+
+def test_background_download_stores_pending_and_fires_ready(
+        monkeypatch, _clean_updater_state):
+    manager = Mock()
+    update = Mock(target_full_release=Mock(version="0.5.0"))
+    manager.check_for_updates.return_value = update
+    monkeypatch.setattr(updater, "_manager", lambda: manager)
+
+    ready = []
+    assert updater.download_in_background(
+        notify=Mock(), on_ready=ready.append) == "0.5.0"
+    manager.download_updates.assert_called_once_with(update)
+    assert updater.pending_version() == "0.5.0"
+    assert ready == ["0.5.0"]
+
+
+def test_second_sighting_of_the_same_version_fetches_nothing(
+        monkeypatch, _clean_updater_state):
+    manager = Mock()
+    update = Mock(target_full_release=Mock(version="0.5.0"))
+    manager.check_for_updates.return_value = update
+    monkeypatch.setattr(updater, "_manager", lambda: manager)
+
+    assert updater.download_in_background() == "0.5.0"
+    assert updater.download_in_background() == "0.5.0"
+    manager.download_updates.assert_called_once_with(update)
+
+
+def test_a_flaky_download_is_retried_not_reported(
+        monkeypatch, _clean_updater_state):
+    manager = Mock()
+    update = Mock(target_full_release=Mock(version="0.5.0"))
+    manager.check_for_updates.return_value = update
+    manager.download_updates.side_effect = [OSError("reset"), None]
+    monkeypatch.setattr(updater, "_manager", lambda: manager)
+    monkeypatch.setattr(updater, "_DOWNLOAD_BACKOFF", (0.0, 0.0, 0.0))
+
+    told = []
+    assert updater.download_in_background(notify=told.append) == "0.5.0"
+    assert manager.download_updates.call_count == 2
+    assert updater.pending_version() == "0.5.0"
+
+
+def test_a_dead_download_reports_once_and_gives_up(
+        monkeypatch, _clean_updater_state):
+    manager = Mock()
+    update = Mock(target_full_release=Mock(version="0.5.0"))
+    manager.check_for_updates.return_value = update
+    manager.download_updates.side_effect = OSError("offline")
+    monkeypatch.setattr(updater, "_manager", lambda: manager)
+    monkeypatch.setattr(updater, "_DOWNLOAD_BACKOFF", (0.0, 0.0, 0.0))
+
+    told = []
+    assert updater.download_in_background(notify=told.append) is None
+    assert manager.download_updates.call_count == 3
+    assert updater.pending_version() is None
+
+
+def test_apply_uses_the_pending_object_without_rechecking(
+        monkeypatch, _clean_updater_state):
+    manager = Mock()
+    update = Mock(target_full_release=Mock(version="0.5.0"))
+    manager.check_for_updates.return_value = update
+    monkeypatch.setattr(updater, "_manager", lambda: manager)
+    updater.download_in_background()
+
+    manager.check_for_updates.reset_mock()
+    assert updater.apply_pending(notify=Mock()) is True
+    manager.check_for_updates.assert_not_called()
+    manager.apply_updates_and_restart.assert_called_once_with(update)
+
+
+def test_apply_with_nothing_pending_reports_false(
+        monkeypatch, _clean_updater_state):
+    manager = Mock()
+    monkeypatch.setattr(updater, "_manager", lambda: manager)
+    assert updater.apply_pending(notify=Mock()) is False
+    manager.apply_updates_and_restart.assert_not_called()
+
+
+def test_a_stale_pending_object_falls_back_to_a_fresh_round(
+        monkeypatch, _clean_updater_state):
+    manager = Mock()
+    stale = Mock(target_full_release=Mock(version="0.5.0"))
+    fresh = Mock(target_full_release=Mock(version="0.5.1"))
+    manager.check_for_updates.return_value = stale
+    monkeypatch.setattr(updater, "_manager", lambda: manager)
+    updater.download_in_background()
+
+    manager.apply_updates_and_restart.side_effect = [
+        OSError("stale"), None]
+    manager.check_for_updates.return_value = fresh
+    assert updater.apply_pending(notify=Mock()) is True
+    manager.download_updates.assert_called_with(fresh)
+    assert updater.pending_version() is None      # cleared, then applied
+
+
+def test_concurrent_downloads_share_one_fetch(
+        monkeypatch, _clean_updater_state):
+    import threading
+    manager = Mock()
+    update = Mock(target_full_release=Mock(version="0.5.0"))
+    manager.check_for_updates.return_value = update
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_download(u):
+        started.set()
+        assert release.wait(timeout=5)
+
+    manager.download_updates.side_effect = slow_download
+    monkeypatch.setattr(updater, "_manager", lambda: manager)
+
+    first = threading.Thread(
+        target=lambda: updater.download_in_background())
+    first.start()
+    assert started.wait(timeout=5)
+    # Second caller arrives mid-fetch: no second download.
+    assert updater.download_in_background() is None
+    release.set()
+    first.join(timeout=5)
+    assert manager.download_updates.call_count == 1
+
+
+def test_auto_update_announces_each_version_once(
+        monkeypatch, _clean_updater_state):
+    manager = Mock()
+    update = Mock(target_full_release=Mock(version="0.5.0"))
+    manager.check_for_updates.return_value = update
+    monkeypatch.setattr(updater, "_manager", lambda: manager)
+
+    told, ready = [], []
+    updater.start_auto_update(notify=told.append, on_ready=ready.append,
+                              first_delay=0.0, interval=3600.0)
+    import time
+    deadline = time.monotonic() + 5.0
+    while not ready and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert ready == ["0.5.0"]
+    assert any("0.5.0" in m for m in told)
+    # Second loop start is a no-op: still one thread's worth of work.
+    updater.start_auto_update(notify=told.append, first_delay=0.0)
+    assert updater._auto_started is True
+
+
+def test_auto_update_is_a_no_op_where_unavailable(monkeypatch):
+    monkeypatch.setattr(updater, "available", lambda: False)
+    updater.start_auto_update(notify=Mock())
+    assert updater._auto_started is False
+    assert updater.download_in_background(notify=Mock()) is None

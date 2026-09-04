@@ -6,6 +6,7 @@ asked, and never asks twice about the same thing.
 
 import subprocess
 import sys
+import threading
 import time
 from unittest.mock import Mock, patch
 
@@ -481,3 +482,86 @@ def test_a_headless_machine_builds_nothing_in_advance(daemon, monkeypatch):
     with patch.object(daemon, "_start_tool_window") as start:
         daemon.prewarm_settings()
     start.assert_not_called()
+
+
+# ------------------------------------------------------- update menu + apply
+def test_update_row_offers_a_check_when_idle(daemon, monkeypatch):
+    """No download waiting: the row reads as a check, not a promise."""
+    import whisper_flow.updater as updater_module
+
+    monkeypatch.setattr(updater_module, "pending_version", lambda: None)
+    monkeypatch.setattr(updater_module, "is_downloading", lambda: False)
+    assert daemon._update_label() == "Check for updates"
+
+
+def test_update_row_names_the_waiting_build(daemon, monkeypatch):
+    import whisper_flow.updater as updater_module
+
+    monkeypatch.setattr(updater_module, "pending_version", lambda: "0.5.0")
+    assert daemon._update_label() == "Update to 0.5.0 (restart)"
+
+
+def test_update_row_shows_an_in_flight_download(daemon, monkeypatch):
+    import whisper_flow.updater as updater_module
+
+    monkeypatch.setattr(updater_module, "pending_version", lambda: None)
+    monkeypatch.setattr(updater_module, "is_downloading", lambda: True)
+    assert daemon._update_label() == "Downloading update…"
+
+
+def test_update_click_while_recording_defers_the_restart(daemon, monkeypatch):
+    """Restarting into an update must never kill a dictation in flight."""
+    import whisper_flow.updater as updater_module
+
+    monkeypatch.setattr(updater_module, "pending_version", lambda: "0.5.0")
+    monkeypatch.setattr(daemon, "_is_processing", lambda: True)
+    applied = []
+    monkeypatch.setattr(updater_module, "apply_pending",
+                        lambda notify=None: applied.append(1) or True)
+    with patch.object(daemon, "notify"):
+        daemon._update_clicked()
+    assert daemon._update_apply_deferred is True
+    assert applied == []
+
+
+def test_deferred_update_installs_once_idle_with_an_empty_queue(daemon, monkeypatch):
+    """The flag from a mid-dictation click fires at the next idle finish."""
+    import queue as queue_module
+
+    import whisper_flow.updater as updater_module
+
+    daemon._update_apply_deferred = True
+    daemon.is_processing = True
+    daemon.request_queue = queue_module.Queue()
+    applied = []
+    monkeypatch.setattr(updater_module, "apply_pending",
+                        lambda notify=None: applied.append(1) or True)
+    started = []
+    monkeypatch.setattr(
+        threading.Thread, "start", lambda self: started.append(self.name))
+
+    daemon._finish_processing("transcribe")
+
+    assert daemon._update_apply_deferred is False
+    assert started == ["whisper-flow-update-deferred"]
+    assert daemon.is_processing is False
+
+
+def test_deferred_update_waits_for_queued_dictations_first(daemon, monkeypatch):
+    """A restart must not strand requests that arrived after the click."""
+    import queue as queue_module
+
+    import whisper_flow.updater as updater_module
+
+    daemon._update_apply_deferred = True
+    daemon.is_processing = True
+    daemon.config.queue_request_timeout = 30.0
+    daemon.request_queue = queue_module.Queue()
+    daemon.request_queue.put(("auto_transcribe", time.time()))
+    monkeypatch.setattr(updater_module, "apply_pending",
+                        lambda notify=None: (_ for _ in ()).throw(
+                            AssertionError("must not apply yet")))
+    with patch.object(daemon, "_process_mode") as process_mode:
+        daemon._finish_processing("transcribe")
+    assert daemon._update_apply_deferred is True   # still armed
+    process_mode.assert_called_once_with("auto_transcribe")

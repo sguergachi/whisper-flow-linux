@@ -1021,3 +1021,38 @@ def test_reinstall_forces_a_fresh_download_even_when_bundled_exists(
     assert local_backend._reinstall_cpu_engine() is True
     assert (runtime / local_backend._exe_name).read_text() == "fresh cpu engine"
     assert local_backend.server_exe == runtime / local_backend._exe_name
+
+
+def test_drivers_between_527_and_549_get_the_cuda_11_build(monkeypatch):
+    """The 12.4 cuBLAS runtime needs R550+; R527-R549 dies on it instantly."""
+    monkeypatch.setattr(backend_module.shutil, "which", lambda _: "/usr/bin/nvidia-smi")
+    monkeypatch.setattr(
+        backend_module.subprocess, "run",
+        lambda *a, **k: types.SimpleNamespace(returncode=0, stdout="537.58\n"),
+    )
+    backend_module._accelerator = None
+    backend_module._driver_version = ""
+    try:
+        assert backend_module.detect_accelerator() == "cuda11"
+        assert backend_module._driver_version == "537.58"
+    finally:
+        backend_module._accelerator = None
+        backend_module._driver_version = ""
+
+
+def test_quarantine_moves_only_the_failed_binary(
+        local_backend, config, monkeypatch):
+    """A GPU crash must not wipe the good CPU engine (or vice versa)."""
+    monkeypatch.setattr(sys, "platform", "win32")
+    runtime = Path(config.config_dir) / "runtime"
+    cuda = runtime / "cuda"
+    cuda.mkdir(parents=True)
+    (runtime / local_backend._exe_name).write_text("cpu engine")
+    (cuda / local_backend._exe_name).write_text("cuda engine")
+    local_backend._record_engine("cuda12")
+
+    local_backend._quarantine_faulty_engine(cuda / local_backend._exe_name)
+    assert not (cuda / local_backend._exe_name).exists()
+    assert (cuda / (local_backend._exe_name + ".failed")).exists()
+    # The innocent CPU binary is untouched.
+    assert (runtime / local_backend._exe_name).exists()

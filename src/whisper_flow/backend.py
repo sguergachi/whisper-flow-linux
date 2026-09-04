@@ -136,6 +136,10 @@ def _cuda_lib_dirs(nvcc: str) -> list[Path]:
 # built, which is most of the wait before it appeared.
 ACCELERATOR_ENV = "WHISPER_FLOW_ACCELERATOR"
 _accelerator: str | None = None
+# Full driver version from the probe above (e.g. "537.58"), for diagnostics.
+# Empty when there is no NVIDIA card. Read by machine_facts(); never probed
+# twice — the subprocess already ran here.
+_driver_version: str = ""
 
 
 def detect_accelerator() -> str:
@@ -257,7 +261,7 @@ def _is_engine_healthy(engine_path: Path) -> bool:
     try:
         import subprocess as _sp
         # Use --help which doesn't load a model, just checks DLLs and CPU features
-        result = _sp.run([str(engine_path), "--help"], capture_output=True, text=True, timeout=5, creationflags=no_console_flags())
+        result = _sp.run([str(engine_path), "--help"], capture_output=True, text=True, timeout=15, creationflags=no_console_flags())
         # 0 or 1 is ok (help may exit 0 or 1), but 0xC0000005 (-1073741819) is crash
         if result.returncode in (-1073741819, 3221225477, 0xC0000005):
             log(f"[BACKEND] engine {engine_path} --help crashed with {result.returncode} 0x{result.returncode & 0xFFFFFFFF:08X}")
@@ -317,9 +321,17 @@ def _probe_accelerator() -> str:
         )
         if out.returncode != 0 or not out.stdout.strip():
             return "cpu"
-        major = int(out.stdout.strip().split(".")[0])
-        # CUDA 12 needs a 525+ driver on Windows; below that use the 11.8 build.
-        return "cuda12" if major >= 527 else "cuda11"
+        global _driver_version
+        _driver_version = out.stdout.strip().splitlines()[0].strip()
+        try:
+            major = int(_driver_version.split(".")[0])
+        except (ValueError, IndexError):
+            return "cpu"
+        # The 12.4 cuBLAS runtime needs an R550+ driver; an R527-R549 card
+        # reports cuda-capable but dies instantly starting the 12.4 binary
+        # (empty output, 0xC0000005). Those drivers get the 11.8 build,
+        # which only needs R520+.
+        return "cuda12" if major >= 550 else "cuda11"
     except Exception:
         return "cpu"
 
@@ -425,6 +437,7 @@ def machine_facts() -> str:
     """
     import platform as _plat
     cpu = (_plat.processor() or _plat.machine() or "?").strip() or "?"
+    drv = _driver_version or "none"
     ram = avail = 0.0
     try:
         ram = total_ram_gb()
@@ -451,7 +464,8 @@ def machine_facts() -> str:
                 avail = st.ullAvailPhys / (1024 ** 3)
     except Exception:
         pass
-    return f"cpu={cpu} ram_total={ram:.1f}GB ram_avail={avail:.1f}GB"
+    return (f"cpu={cpu} ram_total={ram:.1f}GB ram_avail={avail:.1f}GB "
+            f"nvidia_drv={drv}")
 
 
 def recommended_model(accelerator: str) -> str:
@@ -1429,9 +1443,13 @@ class LocalBackend:
                     try:
                         free_gb = shutil.disk_usage(runtime).free / (1024 ** 3)
                         log(f"[BACKEND] free disk at {runtime}: {free_gb:.1f}GB")
-                        if free_gb < 3.0:
+                        # CPU zip is ~20MB / ~71MB unpacked; the CUDA zip is
+                        # ~677MB and needs room to download AND unpack.
+                        need_gb = 3.0 if kind == "GPU" else 0.5
+                        if free_gb < need_gb:
                             raise RuntimeError(
-                                f"only {free_gb:.1f}GB free — the GPU engine needs ~3GB to download and unpack")
+                                f"only {free_gb:.1f}GB free — the {kind} engine "
+                                f"needs ~{need_gb:g}GB to download and unpack")
                     except RuntimeError:
                         raise
                     except Exception as e:
@@ -1611,40 +1629,41 @@ class LocalBackend:
             return self.bundled_model()
         return "ggml-base.en-q8_0"
 
-    def _quarantine_faulty_engine(self) -> None:
-        """Move a crashing GPU binary aside so the bundled CPU engine can run.
+    def _quarantine_file(self, path) -> None:
+        """Move one suspect binary aside, keeping it for diagnosis."""
+        try:
+            path = Path(path)
+            if not path.exists():
+                return
+            backup = path.with_suffix(path.suffix + ".failed")
+            # Don't overwrite a previous backup silently
+            if backup.exists():
+                try:
+                    backup.unlink()
+                except OSError:
+                    pass
+            path.rename(backup)
+            log(f"[BACKEND] quarantined faulty engine to {backup}")
+        except Exception as e:
+            log(f"[BACKEND] could not quarantine {path}: {e}")
 
-        On Windows the GPU and CPU engines share the same path
-        (runtime/whisper-server.exe) — the GPU download overwrites the CPU
-        one. Deleting/moving it exposes the bundled CPU engine that shipped
-        with the installer, which is the fastest way to get the app working
-        again without a download. The faulty file is kept as .cuda-failed
-        for diagnosis.
+    def _quarantine_faulty_engine(self, exe_path=None) -> None:
+        """Move the crashing binary aside — and only that one.
+
+        This used to rename BOTH the CPU and the CUDA binaries, which
+        destroyed a freshly downloaded 677MB GPU engine the moment its
+        first start failed, and likewise wiped a good CPU engine when the
+        GPU one died. Only the file that just crashed is moved (kept as
+        .failed for diagnosis); the marker is dropped so installed_engine()
+        recomputes from what is actually on disk.
         """
         try:
-            exe = _runtime_dir(self.config.config_dir) / self._exe_name
-            if exe.exists():
-                backup = exe.with_suffix(exe.suffix + ".cuda-failed")
-                # Don't overwrite a previous backup silently
-                if backup.exists():
-                    try:
-                        backup.unlink()
-                    except OSError:
-                        pass
-                exe.rename(backup)
-                log(f"[BACKEND] quarantined faulty engine to {backup}")
-            cuda_exe = _cuda_dir(self.config.config_dir) / self._exe_name
-            if cuda_exe.exists():
-                backup = cuda_exe.with_suffix(cuda_exe.suffix + ".cuda-failed")
-                if backup.exists():
-                    try:
-                        backup.unlink()
-                    except OSError:
-                        pass
-                cuda_exe.rename(backup)
-                log(f"[BACKEND] quarantined faulty CUDA engine to {backup}")
-            # Mark as CPU so installed_engine() stops preferring the now-missing GPU path
-            self._record_engine("cpu")
+            target = Path(exe_path) if exe_path else Path(self.server_exe)
+            self._quarantine_file(target)
+            try:
+                self._engine_marker.unlink(missing_ok=True)
+            except OSError:
+                pass
         except Exception as e:
             log(f"[BACKEND] could not quarantine faulty engine: {e}")
 
@@ -1880,8 +1899,8 @@ class LocalBackend:
                     log(f"[BACKEND] engine {eng} failed health check, will re-download CPU engine")
                     # Try to re-download CPU engine
                     try:
-                        # Quarantine the bad engine
-                        self._quarantine_faulty_engine()
+                        # Quarantine the bad engine (only this file)
+                        self._quarantine_faulty_engine(eng)
                     except Exception:
                         pass
                     if not self.ensure_cpu_engine():

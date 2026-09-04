@@ -2318,19 +2318,37 @@ class LocalBackend:
         return f"http://127.0.0.1:{self.config.local_server_port}"
 
     def _wait_until_ready(self, timeout: float = 120.0) -> bool:
-        """Loading a multi-gigabyte model into VRAM is not instant."""
-        import socket
+        """Loading a multi-gigabyte model into VRAM is not instant.
+
+        Probed with a complete HTTP request, never a bare TCP open-close:
+        a connect that sends nothing and disconnects is an abnormal edge
+        for an HTTP server (and a suspect for the post-ready native
+        crashes), while a full request/response round-trip is the path
+        every inference takes. Any HTTP status — even 404 — means alive.
+        """
+        import http.client
 
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if self._process and self._process.poll() is not None:
                 return False        # it exited
+            conn = None
             try:
-                with socket.create_connection(
-                        ("127.0.0.1", self.config.local_server_port), timeout=2):
+                conn = http.client.HTTPConnection(
+                    "127.0.0.1", self.config.local_server_port, timeout=2)
+                conn.request("GET", "/")
+                status = conn.getresponse().status
+                if isinstance(status, int):
                     return True
-            except OSError:
-                time.sleep(0.5)
+            except Exception:
+                pass
+            finally:
+                try:
+                    if conn is not None:
+                        conn.close()
+                except Exception:
+                    pass
+            time.sleep(0.5)
         return False
 
     def stop(self) -> None:

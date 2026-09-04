@@ -1119,3 +1119,51 @@ def test_hotkey_path_never_downloads(local_backend, config, monkeypatch):
     assert local_backend.start("ggml-base.en-q8_0", allow_download=False) is None
     assert local_backend.start_with_fallback(
         "ggml-base.en-q8_0", allow_download=False) is None
+
+
+def test_readiness_probe_speaks_http_not_raw_tcp(
+        local_backend, config, monkeypatch):
+    """A bare open-close is an abnormal edge for an HTTP server; the probe
+    must complete a request/response round-trip instead."""
+    import http.server
+    import threading
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(404)
+            self.end_headers()
+            try:
+                self.wfile.write(b"{}")
+            except BrokenPipeError:
+                pass
+
+        def log_message(self, *a):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    port = server.server_address[1]
+    config.local_server_port = port
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        local_backend._process = None   # never "exited": only probe matters
+        assert local_backend._wait_until_ready(timeout=5.0) is True
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+
+def test_readiness_gives_up_when_nothing_listens(
+        local_backend, config, monkeypatch):
+    """No listener: False after the timeout, without hanging the caller."""
+    import socket
+
+    sock = socket.socket()
+    try:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    finally:
+        sock.close()
+    config.local_server_port = port
+    local_backend._process = None
+    assert local_backend._wait_until_ready(timeout=1.0) is False

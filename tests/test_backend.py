@@ -1056,3 +1056,51 @@ def test_quarantine_moves_only_the_failed_binary(
     assert (cuda / (local_backend._exe_name + ".failed")).exists()
     # The innocent CPU binary is untouched.
     assert (runtime / local_backend._exe_name).exists()
+
+
+def test_persistent_crashes_escalate_to_the_plain_engine(
+        local_backend, config, monkeypatch):
+    """A fresh BLAS binary that still faults implicates BLAS, not the bytes."""
+    _install_engine(local_backend, config)
+    monkeypatch.setattr(backend_module, "detect_accelerator", lambda: "cpu")
+    monkeypatch.setattr(
+        LocalBackend, "_reinstall_cpu_engine", lambda self: True)
+    monkeypatch.setattr(
+        LocalBackend, "_download_plain_engine", lambda self: True)
+    assert local_backend.note_crash(3221225477) is False
+    assert local_backend.note_crash(3221225477) is False
+    assert local_backend.note_crash(3221225477) is True  # fresh BLAS reinstall
+    # Next crash round: the reinstall already happened, so escalate.
+    local_backend._last_reinstall_identity = local_backend._engine_identity(
+        local_backend.server_exe)
+    local_backend._crash_count = 0
+    local_backend._crash_engine = None
+    for _ in range(2):
+        assert local_backend.note_crash(3221225477) is False
+    assert local_backend.note_crash(3221225477) is True
+    assert local_backend._plain_fallback_done is True
+
+
+def test_plain_engine_download_goes_to_its_own_directory(
+        local_backend, config, monkeypatch):
+    """The plain set must not land beside the BLAS binary either."""
+    monkeypatch.setattr(sys, "platform", "win32")
+
+    def fake_download(url, dest, progress=None, cancel_event=None, **_kw):
+        assert "whisper-bin-x64.zip" in url
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text("")
+
+    def fake_extract(archive, into):
+        into.mkdir(parents=True, exist_ok=True)
+        (into / local_backend._exe_name).write_text("plain engine")
+
+    monkeypatch.setattr(backend_module, "_download", fake_download)
+    monkeypatch.setattr(backend_module, "_extract", fake_extract)
+
+    assert local_backend._download_plain_engine() is True
+    plain = Path(config.config_dir) / "runtime" / "plain"
+    assert (plain / local_backend._exe_name).exists()
+    assert local_backend.installed_engine() == "cpu-plain"
+    assert local_backend.server_exe == plain / local_backend._exe_name
+    assert "compatibility" in local_backend.engine_summary()

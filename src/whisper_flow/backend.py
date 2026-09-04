@@ -522,20 +522,35 @@ def wanted_engine(accelerator: str) -> str:
     return accelerator
 
 
-def _server_archive(accelerator: str) -> str:
+def _server_archive(accelerator: str, variant: str = "blas") -> str:
     """The whisper.cpp release asset to fetch for this machine.
 
     The Linux build is CPU-only because that is all upstream publishes for
     it; it does ship per-microarchitecture ggml backends and loads the best
     one for the host at runtime, so a laptop still gets AVX2 rather than a
     lowest-common-denominator binary.
+
+    variant="plain" fetches the no-BLAS Windows build: slower (no OpenBLAS
+    acceleration) but a different compute path, and the last resort when
+    the BLAS binary faults natively on a machine.
     """
     if sys.platform != "win32":
         return "whisper-bin-ubuntu-x64.tar.gz"
+    if variant == "plain":
+        return "whisper-bin-x64.zip"
     return {
         "cuda12": "whisper-cublas-12.4.0-bin-x64.zip",
         "cuda11": "whisper-cublas-11.8.0-bin-x64.zip",
     }.get(accelerator, "whisper-blas-bin-x64.zip")
+
+
+def _plain_dir(config_dir: Path) -> Path:
+    """Where the no-BLAS fallback engine lives (runtime/plain/).
+
+    Same separation rule as CUDA: its DLL set must never sit beside the
+    BLAS binary's, or the loader mixes them.
+    """
+    return _runtime_dir(config_dir) / "plain"
 
 
 def _extract(archive: Path, into: Path) -> None:
@@ -878,6 +893,7 @@ def stop_managed_strays(config_dir, keep_pid: int | None = None) -> int:
     candidates = [
         runtime / name,
         runtime / "cuda" / name,
+        runtime / "plain" / name,
     ]
     stopped = 0
     seen: set[str] = set()
@@ -1054,6 +1070,11 @@ class LocalBackend:
         self._crash_count = 0
         self._crash_engine: str | None = None
         self._last_healthy_at = 0.0
+        # Identity of the engine file installed by the last reinstall, and
+        # whether the plain-build fallback already ran. Crashes that survive
+        # a fresh download implicate the BLAS path itself, not the bytes.
+        self._last_reinstall_identity: str | None = None
+        self._plain_fallback_done = False
         # Held for the life of this process; closing it kills the server.
         self._job = _kill_on_exit_job()
 
@@ -1072,7 +1093,10 @@ class LocalBackend:
         missing model is not the binary's fault. After _CRASH_REINSTALL_AFTER
         consecutive crashes of the same file, the bytes on disk are the prime
         suspect (stale bundled build, truncated download, AVX mismatch), so
-        the engine is re-downloaded fresh rather than restarted again.
+        the engine is re-downloaded fresh rather than restarted again. If a
+        freshly downloaded BLAS engine keeps crashing too, escalate once to
+        the no-BLAS plain build — slower, but a different compute path that
+        dodges OpenBLAS/CPU-dispatch faults.
         """
         try:
             crashed = code if isinstance(code, int) else -1
@@ -1089,12 +1113,33 @@ class LocalBackend:
             log(f"[BACKEND] native crash #{self._crash_count} of {self.server_exe}")
             if self._crash_count < self._CRASH_REINSTALL_AFTER:
                 return False
+            # Second time here with an engine we already refreshed? The BLAS
+            # path itself is at fault on this machine — try the plain build.
+            if (self._plain_fallback_done
+                    or (self._last_reinstall_identity is not None
+                        and identity == self._last_reinstall_identity)):
+                log(f"[BACKEND] {self._crash_count} consecutive native crashes "
+                    f"even after a fresh download — switching to the no-BLAS "
+                    f"plain engine")
+                self._notify("BLAS engine keeps crashing — trying the compatibility engine...")
+                if self._download_plain_engine():
+                    self._crash_count = 0
+                    self._crash_engine = None
+                    self._plain_fallback_done = True
+                    return True
+                log("[BACKEND] plain engine download failed; will keep retrying")
+                return False
             log(f"[BACKEND] {self._crash_count} consecutive native crashes — "
                 f"re-downloading a fresh CPU engine instead of trusting these bytes")
             self._notify("Speech engine keeps crashing — downloading a fresh copy...")
             if self._reinstall_cpu_engine():
                 self._crash_count = 0
                 self._crash_engine = None
+                try:
+                    self._last_reinstall_identity = self._engine_identity(
+                        self.server_exe)
+                except Exception:
+                    self._last_reinstall_identity = None
                 return True
             log("[BACKEND] fresh engine download failed; will keep retrying the old one")
             return False
@@ -1183,6 +1228,10 @@ class LocalBackend:
             cuda = _cuda_dir(self.config.config_dir) / self._exe_name
             if cuda.exists():
                 return cuda
+        if self.installed_engine() == "cpu-plain":
+            plain = _plain_dir(self.config.config_dir) / self._exe_name
+            if plain.exists():
+                return plain
         downloaded = _runtime_dir(self.config.config_dir) / self._exe_name
         if downloaded.exists():
             return downloaded
@@ -1194,13 +1243,15 @@ class LocalBackend:
     def _engine_exe(self, kind: str) -> Path:
         """Where a given engine kind's binary lives.
 
-        Each kind owns its directory: CUDA in runtime/cuda/, CPU flat in
-        runtime/. Sharing one directory mixed cuBLAS DLLs beside the CPU
-        binary, which Windows then preferred over the right libraries and
-        crashed with 0xC0000005 for every model.
+        Each kind owns its directory: CUDA in runtime/cuda/, plain in
+        runtime/plain/, CPU flat in runtime/. Sharing one directory mixed
+        foreign DLLs beside the running binary, which Windows then preferred
+        over the right libraries and crashed with 0xC0000005 for every model.
         """
         if kind.startswith("cuda"):
             return _cuda_dir(self.config.config_dir) / self._exe_name
+        if kind == "cpu-plain":
+            return _plain_dir(self.config.config_dir) / self._exe_name
         return _runtime_dir(self.config.config_dir) / self._exe_name
 
     @property
@@ -1224,13 +1275,14 @@ class LocalBackend:
         """
         flat = _runtime_dir(self.config.config_dir) / self._exe_name
         cuda = _cuda_dir(self.config.config_dir) / self._exe_name
-        if not flat.exists() and not cuda.exists():
+        plain = _plain_dir(self.config.config_dir) / self._exe_name
+        if not flat.exists() and not cuda.exists() and not plain.exists():
             return "cpu"        # bundled, or nothing: the shipped build is CPU
         try:
             recorded = self._engine_marker.read_text(encoding="utf-8").strip()
         except OSError:
             recorded = ""
-        if recorded in ("cpu", "cuda11", "cuda12"):
+        if recorded in ("cpu", "cuda11", "cuda12", "cpu-plain"):
             if self._engine_exe(recorded).exists():
                 return recorded
         # A binary in the CUDA directory means CUDA on any platform (it is
@@ -1715,6 +1767,41 @@ class LocalBackend:
             log(f"[BACKEND] could not download fresh CPU engine: {e}")
             return False
 
+    def _download_plain_engine(self) -> bool:
+        """Download the no-BLAS Windows build into runtime/plain/.
+
+        Last resort when even a pristine BLAS binary faults natively: the
+        plain build has no OpenBLAS dependency, so it dodges BLAS/CPU-dispatch
+        faults entirely. Slower per pass, but a slow transcript beats none.
+        Only meaningful on Windows (upstream publishes no plain Linux asset
+        beyond the default tarball, which is already BLAS-free).
+        """
+        if sys.platform != "win32":
+            log("[BACKEND] no plain engine asset for this platform")
+            return False
+        try:
+            archive = _server_archive(detect_accelerator(), variant="plain")
+            self._notify("Downloading compatibility engine...")
+            runtime = _runtime_dir(self.config.config_dir)
+            archive_path = runtime / archive
+            url = f"{RELEASE_URL}/{archive}"
+            log(f"[BACKEND] downloading plain engine {url}")
+            _download(url, archive_path)
+            try:
+                log(f"[BACKEND] engine archive downloaded: "
+                    f"{archive_path.stat().st_size // 1_000_000}MB")
+            except OSError:
+                pass
+            _unpack_engine(archive_path, _plain_dir(self.config.config_dir),
+                           self._exe_name, "plain")
+            self._record_engine("cpu-plain")
+            log("[BACKEND] plain compatibility engine installed")
+            self._notify("Compatibility engine ready — slower, but stable on this PC")
+            return True
+        except Exception as e:
+            log(f"[BACKEND] could not download plain engine: {e}")
+            return False
+
     def start_with_fallback(self, model: str | None = None) -> str | None:
         """Start GPU model if possible, otherwise fall back to a CPU model.
 
@@ -2097,6 +2184,9 @@ class LocalBackend:
         engine = self.installed_engine()
         if engine.startswith("cuda"):
             return f"NVIDIA GPU ({engine})"
+        if engine == "cpu-plain":
+            return (f"CPU compatibility build, {usable_cores()} threads - "
+                    f"slower, stable on this PC")
         if detect_accelerator().startswith("cuda"):
             # A card is fitted but the engine is not. Worth saying - but only
             # where it can be changed: without the toolkit there is nothing

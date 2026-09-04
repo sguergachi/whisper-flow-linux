@@ -2120,6 +2120,21 @@ class LocalBackend:
                     str(_runtime_dir(self.config.config_dir))) else "bundled")
                 log(f"[BACKEND] engine {exe} ({origin}, {st.st_size // 1024}KB) "
                     f"model {model} | {machine_facts()}")
+                # What sits beside the binary decides which DLLs it loads
+                # (exe dir wins the search order), and where this process
+                # runs decides the fallback. Both have caused 0xC0000005s.
+                try:
+                    siblings = sorted(
+                        f"{p.name}:{p.stat().st_size // 1024}KB"
+                        for p in exe.parent.iterdir() if p.is_file())
+                    log(f"[BACKEND] engine dir ({len(siblings)} files): "
+                        f"{', '.join(siblings)[:1500]}")
+                except OSError as e:
+                    log(f"[BACKEND] engine dir unreadable: {e}")
+                try:
+                    log(f"[BACKEND] daemon cwd: {os.getcwd()}")
+                except Exception:
+                    pass
             except Exception as e:
                 log(f"[BACKEND] engine facts failed: {e}")
             cmd = [

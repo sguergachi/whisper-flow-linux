@@ -24,6 +24,7 @@ from .config import Config
 from .hotkey_manager import HotkeyManager, HotkeyMode
 from .hud import HUD, STOP_SUFFIX
 from .logging import log, recent_log, set_logging_enabled, write_crash_report
+from .logging import reset_stage_log, trace_stage
 from .paths import lock_file as _lock_file
 from .paths import pid_file as _pid_file
 from .version import build_version
@@ -2312,6 +2313,10 @@ Use 'whisper-flow stop' to exit daemon
     def _run_worker(self, foreground: bool = False):
         """Run the worker process with health monitoring."""
         log(f"[DAEMON] Starting worker process (foreground={foreground})")
+        # A startup transcript, so "it doesn't launch" always leaves a
+        # last-known stage behind in the same folder as the crash log.
+        reset_stage_log()
+        trace_stage("worker starting")
         # No fault dialogs, ever: a crashing whisper-server must exit with
         # its status code, not park a modal "Application Error" on the
         # user's screen holding the dead process until clicked. Inherited
@@ -2322,12 +2327,14 @@ Use 'whisper-flow stop' to exit daemon
             pass
         if not self._acquire_single_instance():
             log("[DAEMON] Another instance is already running; exiting")
+            trace_stage("exit: another instance is already running")
             self.notify("whisper-flow is already running")
             return
 
         unsupported = self._check_platform_support()
         if unsupported:
             log(f"[DAEMON] Unsupported platform: {unsupported}")
+            trace_stage(f"exit: unsupported platform ({unsupported})")
             self.notify(f"whisper-flow needs Windows 11 22H2 or later: {unsupported}")
             return
         crash_count = 0
@@ -2340,15 +2347,19 @@ Use 'whisper-flow stop' to exit daemon
                 pid_file = _pid_file()
                 pid_file.parent.mkdir(parents=True, exist_ok=True)
                 pid_file.write_text(str(os.getpid()))
+                trace_stage("pid written")
 
                 # Start watchdog for health monitoring
                 self._start_watchdog()
+                trace_stage("watchdog started")
 
                 # Set up hotkeys
                 self.setup_hotkeys()
+                trace_stage("hotkeys set up")
 
                 # And a transcription backend, if one is installed
                 self._start_managed_backend()
+                trace_stage("backend started")
 
                 # New releases download themselves in the background; the
                 # tray row flips to "Update to X" when one lands. No-op
@@ -2359,6 +2370,7 @@ Use 'whisper-flow stop' to exit daemon
                         on_ready=self._on_update_ready)
                 except Exception as e:
                     log(f"[DAEMON] background updater failed to start: {e}")
+                trace_stage("updater started")
 
                 if foreground:
                     # Foreground mode: try tray, then keep hotkeys alive without a
@@ -2366,6 +2378,7 @@ Use 'whisper-flow stop' to exit daemon
                     # systemd: input() hits EOF immediately and used to stop the
                     # whole daemon - which is exactly "hotkeys do nothing".
                     log("[DAEMON] Running in foreground mode")
+                    trace_stage("tray starting")
                     try:
                         self.tray_icon = _pystray().Icon(
                             "whisper-flow",
@@ -2374,17 +2387,21 @@ Use 'whisper-flow stop' to exit daemon
                             self.setup_tray_menu(),
                         )
                         log("[DAEMON] Tray icon created successfully")
+                        trace_stage("tray running")
                         self.tray_icon.run()
                     except Exception as e:
                         log(f"[DAEMON] Tray setup failed: {e}")
+                        trace_stage(f"tray failed: {e}")
                         if sys.stdin.isatty():
                             self.run_notification_mode()
                         else:
                             log("[DAEMON] no TTY; staying up headless with hotkeys")
+                            trace_stage("headless mode")
                             self.run_headless_mode()
                 else:
                     # Background mode: try tray, fallback to headless
                     log("[DAEMON] Running in background mode")
+                    trace_stage("tray starting (background)")
                     try:
                         self.tray_icon = _pystray().Icon(
                             "whisper-flow",
@@ -2393,9 +2410,11 @@ Use 'whisper-flow stop' to exit daemon
                             self.setup_tray_menu(),
                         )
                         log("[DAEMON] Background tray icon created successfully")
+                        trace_stage("tray running")
                         self.tray_icon.run()
                     except Exception as e:
                         log(f"[DAEMON] Tray setup failed in background mode: {e}")
+                        trace_stage(f"tray failed: {e}")
                         self.run_headless_mode()
 
             except Exception as e:

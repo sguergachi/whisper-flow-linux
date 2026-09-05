@@ -1240,10 +1240,34 @@ def test_auto_heal_give_up_leaves_a_crash_file(temp_config_dir):
         patch.object(daemon, "notify", return_value=None),
         patch("time.sleep", return_value=None),
         patch("whisper_flow.daemon.write_crash_report") as mock_crash,
+        patch("whisper_flow.daemon.reset_stage_log") as mock_reset,
+        patch("whisper_flow.daemon.trace_stage") as mock_stage,
     ):
         daemon.run(foreground=True)
     mock_crash.assert_called_once()
     assert "gave up" in mock_crash.call_args[0][0]
+    # The transcript stops where startup died: hotkeys raised, so the
+    # stages end after the watchdog with no tray line ever recorded.
+    mock_reset.assert_called_once()
+    stages = [call[0][0] for call in mock_stage.call_args_list]
+    assert stages[:3] == ["worker starting", "pid written",
+                          "watchdog started"]
+    assert not any("tray" in stage for stage in stages)
+
+
+def test_stage_transcript_survives_to_a_file(tmp_path, monkeypatch):
+    """The transcript is a plain file next to the crash log."""
+    from whisper_flow.logging import reset_stage_log, trace_stage
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    reset_stage_log()
+    trace_stage("worker starting")
+    trace_stage("tray failed: boom")
+    text = (tmp_path / ".config" / "whisper-flow"
+            / "startup-stages.log").read_text(encoding="utf-8")
+    assert "worker starting" in text
+    assert "tray failed: boom" in text
 
 
 def test_windows_entry_writes_a_crash_file_on_startup_failure(

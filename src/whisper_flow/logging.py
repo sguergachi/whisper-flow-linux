@@ -79,12 +79,44 @@ def write_crash_report(body: str) -> str | None:
     try:
         from pathlib import Path
 
-        path = (Path.home() / ".config" / "whisper-flow"
-                / "startup-crash.log")
+        path = Path.home() / ".config" / "whisper-flow" / "startup-crash.log"
         path.parent.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        path.write_text(f"whisper-flow startup crash, {stamp}\n\n{body}\n",
-                        encoding="utf-8")
+        path.write_text(
+            f"whisper-flow startup crash, {stamp}\n\n{body}\n", encoding="utf-8"
+        )
         return str(path)
     except Exception:
         return None
+
+
+def _stage_path():
+    from pathlib import Path
+
+    return Path.home() / ".config" / "whisper-flow" / "startup-stages.log"
+
+
+def reset_stage_log() -> None:
+    """Start a fresh startup transcript. Never raises."""
+    try:
+        path = _stage_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("", encoding="utf-8")
+    except Exception:
+        pass
+
+
+def trace_stage(name: str) -> None:
+    """Append one timestamped line to the startup transcript.
+
+    The transcript is the instrument for "it doesn't launch": each stage
+    of daemon startup records itself as it happens, so a hang, a silent
+    early exit, or a tray failure shows up as the last line in the file.
+    Never raises.
+    """
+    try:
+        log(f"[DAEMON] stage: {name}")
+        with open(_stage_path(), "a", encoding="utf-8") as fh:
+            fh.write(f"{datetime.now():%H:%M:%S} {name}\n")
+    except Exception:
+        pass

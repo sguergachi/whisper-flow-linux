@@ -323,6 +323,16 @@ class WhisperFlowDaemon:
                                 pass
                     except Exception:
                         pass
+                    # Compositor-side stuck modifiers: while idle, release
+                    # anything the desktop may hold that we do not. Bounded
+                    # inside the listener (once a minute, only shortly after
+                    # hotkey activity), harmless when healthy, and it heals
+                    # the "every key opens a shortcut" state without input.
+                    if not self.is_processing:
+                        try:
+                            self.hotkey_manager.sweep_input()
+                        except Exception as e:
+                            log(f"[DAEMON] input sweep failed: {e}")
 
                 # Log status only when it changes; at a 2s interval a constant
                 # heartbeat buries every real message in the journal.
@@ -528,6 +538,13 @@ class WhisperFlowDaemon:
 
             # Set up escape key handling for canceling recordings
             self.hotkey_manager._handle_escape_key = self.cancel_recording
+
+            # Emergency input resets must surface: a freed keyboard with no
+            # explanation reads as the app flaking, and a repeatedly
+            # failing listener needs a human to restart the app.
+            self.hotkey_manager.set_emergency_callback(
+                lambda reason: self.notify(
+                    f"⌨️ Keyboard input was emergency-reset ({reason})"))
 
             # Start the hotkey manager
             self.hotkey_manager.start()
@@ -1829,6 +1846,23 @@ class WhisperFlowDaemon:
             report.append(f"  engine            : {self.backend.describe()}")
         except Exception as e:
             report.append(f"  engine            : unavailable ({e})")
+        try:
+            status = self.hotkey_manager.input_status()
+            report.append(
+                "  input             : backend={backend} alive={alive} "
+                "grabbed={grabbed} pump_age_s={pump} muted={muted} "
+                "held={held} disabled={disabled} recoveries={recoveries}".format(
+                    backend=status.get("backend"),
+                    alive=status.get("alive"),
+                    grabbed=status.get("grabbed"),
+                    pump=status.get("pump_age_s"),
+                    muted=status.get("muted"),
+                    held=status.get("held"),
+                    disabled=status.get("disabled"),
+                    recoveries=status.get("recoveries_60s"),
+                ))
+        except Exception as e:
+            report.append(f"  input             : unavailable ({e})")
 
         try:
             overlay = self.hud.crash_log()

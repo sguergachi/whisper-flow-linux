@@ -1117,3 +1117,109 @@ class TestTrayMenu:
         assert settings[0][1].get("default") is True
         defaults = [item for item in items if item[1].get("default")]
         assert defaults == settings
+
+
+# ------------------------------------------------- wedged-input safety net
+def _idle_daemon(temp_config_dir):
+    """A daemon with config/apps/hotkeys mocked out, doing nothing."""
+    from whisper_flow.daemon import WhisperFlowDaemon
+
+    with (
+        patch("whisper_flow.daemon.Config") as mock_config_class,
+        patch("whisper_flow.daemon.WhisperFlow") as mock_app_class,
+        patch("whisper_flow.daemon.HotkeyManager") as mock_hotkey_manager_class,
+    ):
+        mock_config = Mock()
+        mock_config.hotkey_transcribe = "ctrl+cmd"
+        mock_config.hotkey_auto_transcribe = "ctrl+cmd+space"
+        mock_config.hotkey_command = "ctrl+cmd+alt"
+        mock_config.max_recording_duration = 300.0
+        mock_config.watchdog_interval = 0.05
+        mock_config.processing_lock_timeout = 300.0
+        mock_config_class.return_value = mock_config
+        mock_app_class.return_value = Mock()
+        mock_hotkey_manager = Mock()
+        mock_hotkey_manager_class.return_value = mock_hotkey_manager
+        daemon = WhisperFlowDaemon(temp_config_dir)
+    daemon.is_running = True
+    daemon.is_recording = False
+    daemon.is_processing = False
+    return daemon, mock_hotkey_manager
+
+
+def test_setup_hotkeys_wires_the_emergency_channel(temp_config_dir):
+    """A freed keyboard with no explanation reads as the app flaking."""
+    from whisper_flow.daemon import WhisperFlowDaemon
+
+    with (
+        patch("whisper_flow.daemon.Config") as mock_config_class,
+        patch("whisper_flow.daemon.WhisperFlow") as mock_app_class,
+        patch("whisper_flow.daemon.HotkeyManager") as mock_hotkey_manager_class,
+        patch.object(WhisperFlowDaemon, "_start_tool_window",
+                     return_value=False),
+        patch("whisper_flow.daemon.subprocess.Popen"),
+    ):
+        mock_config = Mock()
+        mock_config.hotkey_transcribe = "ctrl+cmd"
+        mock_config.hotkey_auto_transcribe = "ctrl+cmd+space"
+        mock_config.hotkey_command = "ctrl+cmd+alt"
+        mock_config_class.return_value = mock_config
+        mock_app_class.return_value = Mock()
+        mock_hotkey_manager = Mock()
+        mock_hotkey_manager_class.return_value = mock_hotkey_manager
+
+        daemon = WhisperFlowDaemon(temp_config_dir)
+        daemon.setup_hotkeys()
+
+        mock_hotkey_manager.set_emergency_callback.assert_called_once()
+        emergency = mock_hotkey_manager.set_emergency_callback.call_args[0][0]
+        with patch.object(WhisperFlowDaemon, "notify") as mock_notify:
+            emergency("pump stalled 5.0s")
+        note = mock_notify.call_args[0][0]
+        assert "emergency-reset" in note
+        assert "pump stalled" in note
+
+
+def test_watchdog_sweeps_idle_input(temp_config_dir):
+    """The compositor-side stuck-modifier state heals itself while idle."""
+    daemon, mock_hotkey_manager = _idle_daemon(temp_config_dir)
+    daemon._start_watchdog()
+    try:
+        time.sleep(0.3)
+    finally:
+        daemon.is_running = False
+        daemon.watchdog_thread.join(timeout=2)
+    assert mock_hotkey_manager.sweep_input.called
+
+
+def test_watchdog_leaves_input_alone_while_busy(temp_config_dir):
+    """Mid-dictation the keyboard belongs to the user, not the janitor."""
+    daemon, mock_hotkey_manager = _idle_daemon(temp_config_dir)
+    daemon.is_processing = True
+    daemon._start_watchdog()
+    try:
+        time.sleep(0.2)
+    finally:
+        daemon.is_running = False
+        daemon.watchdog_thread.join(timeout=2)
+    assert not mock_hotkey_manager.sweep_input.called
+
+
+def test_diagnostics_reports_input_health(temp_config_dir):
+    """A wedged keyboard should be visible in the pasted report."""
+    daemon, mock_hotkey_manager = _idle_daemon(temp_config_dir)
+    mock_hotkey_manager.input_status.return_value = {
+        "backend": "evdev", "alive": True, "grabbed": 3,
+        "pump_age_s": 0.4, "muted": 2, "held": 2,
+        "disabled": False, "recoveries_60s": 1,
+    }
+    text = daemon._diagnostics("wedged keyboard report")
+    assert "input             : backend=evdev alive=True grabbed=3" in text
+    assert "recoveries=1" in text
+
+
+def test_diagnostics_survives_a_dead_hotkey_manager(temp_config_dir):
+    daemon, mock_hotkey_manager = _idle_daemon(temp_config_dir)
+    mock_hotkey_manager.input_status.side_effect = OSError("gone")
+    text = daemon._diagnostics("no input")
+    assert "input             : unavailable" in text

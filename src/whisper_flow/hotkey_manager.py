@@ -84,6 +84,7 @@ class HotkeyManager:
         self.is_running = False
         self.keyboard_listener = None
         self._evdev_listener = None
+        self._emergency_callback: Callable[[str], None] | None = None
 
         # Simple state
         self.last_key_times: dict[str, float] = {}  # Track per-key debouncing
@@ -130,6 +131,49 @@ class HotkeyManager:
         """
         self.processing_callback = callback
         log("[HOTKEY] Processing callback registered")
+
+    def set_emergency_callback(self, callback: Callable[[str], None]) -> None:
+        """Called as callback(reason) when input had to be forcibly reset.
+
+        A wedged reader or dead proxy means the user's keyboard was just
+        freed from an exclusive grab; that must surface as a notification,
+        not silence. Stored for the current listener and any future one
+        (restarts create a new listener object).
+        """
+        self._emergency_callback = callback
+        listener = self._evdev_listener
+        if listener is not None and hasattr(listener, "on_emergency"):
+            listener.on_emergency = callback
+
+    def sweep_input(self) -> int:
+        """Release modifiers the compositor may hold that we do not.
+
+        Only meaningful while idle; the daemon calls it from the watchdog
+        when neither recording nor processing. Bounded inside the listener
+        (rate + recency policy). Returns releases sent.
+        """
+        listener = self._evdev_listener
+        sweep = getattr(listener, "maybe_sweep_unheld_modifiers", None)
+        if sweep is None:
+            sweep = getattr(listener, "sweep_unheld_modifiers", None)
+        if sweep is None:
+            return 0
+        try:
+            return sweep()
+        except Exception as e:
+            log(f"[HOTKEY] input sweep failed: {e}")
+            return 0
+
+    def input_status(self) -> dict:
+        """Listener health snapshot for logs and diagnostics. Counts only."""
+        listener = self._evdev_listener
+        snapshot = getattr(listener, "status_snapshot", None)
+        if snapshot is not None:
+            try:
+                return snapshot()
+            except Exception as e:
+                log(f"[HOTKEY] input status failed: {e}")
+        return {"backend": "none", "alive": self._listener_alive()}
 
     def register_hotkey(
         self,
@@ -226,12 +270,27 @@ class HotkeyManager:
             return self.keyboard_listener.is_alive()
         return False
 
+    def _listener_pump_age(self) -> float | None:
+        """Seconds since the backend last pumped events, if it reports one."""
+        listener = self._evdev_listener
+        pump_age = getattr(listener, "pump_age_seconds", None)
+        if pump_age is None:
+            return None
+        try:
+            return pump_age()
+        except Exception as e:
+            log(f"[HOTKEY] pump age check failed: {e}")
+            return None
+
     def _start_windows(self):
         """Start the Windows low-level keyboard hook."""
         from .hotkey_win import WinHotkeyListener
 
         self._evdev_listener = WinHotkeyListener()
         self._evdev_listener.escape_callback = self._handle_escape_key
+        if self._emergency_callback is not None and hasattr(
+                self._evdev_listener, "on_emergency"):
+            self._evdev_listener.on_emergency = self._emergency_callback
         for name, binding in self.active_bindings.items():
             key_str = "+".join(sorted(binding.keys))
             release_cb = (binding.callback_release
@@ -248,6 +307,8 @@ class HotkeyManager:
 
         self._evdev_listener = EvdevHotkeyListener()
         self._evdev_listener.escape_callback = self._handle_escape_key
+        if self._emergency_callback is not None:
+            self._evdev_listener.on_emergency = self._emergency_callback
 
         for name, binding in self.active_bindings.items():
             # Build key string from the parsed set (which is normalized)
@@ -649,64 +710,75 @@ class HotkeyManager:
         """Heartbeat loop to monitor hotkey manager health."""
         while self.is_running:
             try:
-                current_time = time.time()
-
-                # Update heartbeat timestamp
-                self.last_heartbeat = current_time
-
-                # Only when it changes, exactly as the daemon's watchdog does.
-                #
-                # An idle heartbeat every ten seconds against a 300-line ring
-                # buffer meant the log held the last fifty minutes of "nothing
-                # happened" and nothing else. A log sent in to explain a
-                # problem arrived as 300 identical lines with every event that
-                # mattered already pushed out of the far end - which is not a
-                # diagnostic, it is proof the app was running.
-                state = (self.is_running, self._listener_alive(),
-                         len(self.pressed_keys), self.active_combination,
-                         self.current_push_to_talk)
-                if state != self._last_heartbeat_state:
-                    self._last_heartbeat_state = state
-                    log(
-                        f"[HOTKEY] Heartbeat - running: {self.is_running}, listener_alive: {self._listener_alive()}, pressed_keys: {len(self.pressed_keys)}, active_combination: {self.active_combination}, push_to_talk: {self.current_push_to_talk}",
-                    )
-
-                # Safety check: if we have an active combination but no pressed keys, clear it
-                if self.active_combination and not self.pressed_keys:
-                    log(
-                        f"[HOTKEY] Safety check: clearing active combination {self.active_combination} - no keys pressed",
-                    )
-                    self.active_combination = None
-                    self.current_push_to_talk = None
-
-                # Stuck key detection: remove keys held longer than the timeout
-                self._evict_stuck_keys(current_time)
-
-                # Check for inconsistent state: active_combination set but not all combo keys are pressed
-                if self.active_combination and self.pressed_keys:
-                    binding = self.active_bindings.get(self.active_combination)
-                    if binding and not binding.keys.issubset(self.pressed_keys):
-                        log(
-                            f"[HOTKEY] Inconsistent state: active combination {self.active_combination} keys {binding.keys} not all in pressed_keys {self.pressed_keys}",
-                        )
-                        # Only reset if the missing keys aren't coming back (they were released)
-                        # If released keys are missing, this means we missed release events
-                        log(
-                            "[HOTKEY] Resetting active state due to inconsistent key state",
-                        )
-                        self.active_combination = None
-                        self.current_push_to_talk = None
-
-                # Check if the keyboard listener is still alive
-                if not self._listener_alive():
-                    log("[HOTKEY] Warning: Keyboard listener died, attempting restart")
-                    self._restart_listener()
-
-                time.sleep(self.heartbeat_interval)
-
+                self._heartbeat_check()
             except Exception as e:
                 log(f"[HOTKEY] Heartbeat error: {e}")
-                time.sleep(self.heartbeat_interval)
+
+            time.sleep(self.heartbeat_interval)
+
+    def _heartbeat_check(self) -> None:
+        """One heartbeat pass: timestamps, stuck keys, listener liveness."""
+        current_time = time.time()
+
+        # Update heartbeat timestamp
+        self.last_heartbeat = current_time
+
+        # Only when it changes, exactly as the daemon's watchdog does.
+        #
+        # An idle heartbeat every ten seconds against a 300-line ring
+        # buffer meant the log held the last fifty minutes of "nothing
+        # happened" and nothing else. A log sent in to explain a
+        # problem arrived as 300 identical lines with every event that
+        # mattered already pushed out of the far end - which is not a
+        # diagnostic, it is proof the app was running.
+        state = (self.is_running, self._listener_alive(),
+                 len(self.pressed_keys), self.active_combination,
+                 self.current_push_to_talk)
+        if state != self._last_heartbeat_state:
+            self._last_heartbeat_state = state
+            log(
+                f"[HOTKEY] Heartbeat - running: {self.is_running}, listener_alive: {self._listener_alive()}, pressed_keys: {len(self.pressed_keys)}, active_combination: {self.active_combination}, push_to_talk: {self.current_push_to_talk}",
+            )
+
+        # Safety check: if we have an active combination but no pressed keys, clear it
+        if self.active_combination and not self.pressed_keys:
+            log(
+                f"[HOTKEY] Safety check: clearing active combination {self.active_combination} - no keys pressed",
+            )
+            self.active_combination = None
+            self.current_push_to_talk = None
+
+        # Stuck key detection: remove keys held longer than the timeout
+        self._evict_stuck_keys(current_time)
+
+        # Check for inconsistent state: active_combination set but not all combo keys are pressed
+        if self.active_combination and self.pressed_keys:
+            binding = self.active_bindings.get(self.active_combination)
+            if binding and not binding.keys.issubset(self.pressed_keys):
+                log(
+                    f"[HOTKEY] Inconsistent state: active combination {self.active_combination} keys {binding.keys} not all in pressed_keys {self.pressed_keys}",
+                )
+                # Only reset if the missing keys aren't coming back (they were released)
+                # If released keys are missing, this means we missed release events
+                log(
+                    "[HOTKEY] Resetting active state due to inconsistent key state",
+                )
+                self.active_combination = None
+                self.current_push_to_talk = None
+
+        # Check if the keyboard listener is still alive
+        if not self._listener_alive():
+            log("[HOTKEY] Warning: Keyboard listener died, attempting restart")
+            self._restart_listener()
+        else:
+            # A wedged reader thread is still "alive" - the pump
+            # stamp is what proves it is turning. The listener's own
+            # supervisor is the fast path (1s); this is the backup.
+            age = self._listener_pump_age()
+            if age is not None and age > 30.0:
+                log(f"[HOTKEY] Warning: listener pump stale "
+                    f"({age:.0f}s), attempting restart")
+                self._restart_listener()
 
     def _evict_stuck_keys(self, current_time: float) -> None:
         """Drop keys that have looked held for longer than the stuck timeout.

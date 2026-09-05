@@ -531,3 +531,94 @@ class TestHotkeyManager:
 
         assert manager.pressed_keys == set()
         assert manager.active_combination is None
+
+    def test_set_emergency_callback_reaches_current_and_future_listeners(self):
+        """A wedged-input rescue must surface instead of staying silent."""
+        manager = HotkeyManager()
+        notified = []
+        cb = notified.append
+        manager.set_emergency_callback(cb)
+        assert manager._emergency_callback is cb
+
+        listener = Mock()
+        manager._evdev_listener = listener
+        manager.set_emergency_callback(cb)
+        assert listener.on_emergency is cb
+
+    def test_set_emergency_callback_tolerates_backends_without_it(self):
+        """Windows hook and pynput listeners have no emergency channel."""
+        manager = HotkeyManager()
+        manager._evdev_listener = Mock(spec=[])
+        manager.set_emergency_callback(lambda reason: None)
+
+    def test_sweep_input_delegates_and_survives(self):
+        manager = HotkeyManager()
+        assert manager.sweep_input() == 0  # no listener at all
+
+        listener = Mock()
+        listener.maybe_sweep_unheld_modifiers.return_value = 5
+        manager._evdev_listener = listener
+        assert manager.sweep_input() == 5
+
+        listener.maybe_sweep_unheld_modifiers.side_effect = OSError("gone")
+        assert manager.sweep_input() == 0
+
+    def test_sweep_input_falls_back_to_raw_sweep(self):
+        """Older listener objects only know the unguarded sweep."""
+        manager = HotkeyManager()
+        listener = Mock(spec=["sweep_unheld_modifiers"])
+        listener.sweep_unheld_modifiers.return_value = 8
+        manager._evdev_listener = listener
+        # spec has no maybe_ variant: getattr returns None, raw sweep runs.
+        assert manager.sweep_input() == 8
+
+    def test_input_status_snapshot_and_fallback(self):
+        manager = HotkeyManager()
+        status = manager.input_status()
+        assert status["backend"] == "none"
+
+        listener = Mock()
+        listener.status_snapshot.return_value = {"backend": "evdev", "alive": True}
+        manager._evdev_listener = listener
+        assert manager.input_status() == {"backend": "evdev", "alive": True}
+
+        listener.status_snapshot.side_effect = OSError("gone")
+        assert manager.input_status()["backend"] == "none"
+
+    def test_heartbeat_restarts_a_pump_stale_listener(self):
+        """Alive thread, dead pump: the old check saw nothing wrong."""
+        manager = HotkeyManager()
+        manager.is_running = True
+        listener = Mock()
+        listener.is_alive.return_value = True
+        listener.pump_age_seconds.return_value = 45.0
+        manager._evdev_listener = listener
+        with patch.object(manager, "_restart_listener") as restart:
+            manager._heartbeat_check()
+        restart.assert_called_once()
+
+    def test_heartbeat_leaves_a_pumping_listener_alone(self):
+        manager = HotkeyManager()
+        manager.is_running = True
+        listener = Mock()
+        listener.is_alive.return_value = True
+        listener.pump_age_seconds.return_value = 0.4
+        manager._evdev_listener = listener
+        with patch.object(manager, "_restart_listener") as restart:
+            manager._heartbeat_check()
+        restart.assert_not_called()
+
+    def test_heartbeat_restarts_a_dead_listener(self):
+        """Pre-existing behavior, pinned down while refactoring the loop."""
+        manager = HotkeyManager()
+        manager.is_running = True
+        listener = Mock()
+        listener.is_alive.return_value = False
+        manager._evdev_listener = listener
+        with patch.object(manager, "_restart_listener") as restart:
+            manager._heartbeat_check()
+        restart.assert_called_once()
+
+    def test_pump_age_unknown_without_backend(self):
+        manager = HotkeyManager()
+        assert manager._listener_pump_age() is None

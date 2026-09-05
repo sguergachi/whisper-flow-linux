@@ -475,3 +475,312 @@ def test_near_miss_logs_when_one_key_short(listener, monkeypatch):
     # Space never pressed: one short of the chord.
     assert any("almost auto_transcribe" in line and "missing" in line
                for line in logs), logs
+
+
+# ------------------------------------------------- input safety net
+class _RaisingUInput:
+    def write_event(self, event):
+        raise OSError("proxy gone")
+
+    def write(self, *a):
+        raise OSError("proxy gone")
+
+    def syn(self):
+        raise OSError("proxy gone")
+
+    def close(self):
+        pass
+
+
+def _alive_thread():
+    """A stand-in reader thread so recovery never spawns a real one."""
+    thread = Mock()
+    thread.is_alive.return_value = True
+    return thread
+
+
+def _grabbed(listener, monkeypatch):
+    """One fake grabbed keyboard on the listener."""
+    dev = _FakeDevice("/dev/input/event9", 99)
+    dev.grab()
+    listener._kbd_devices = [dev]
+    listener._running = True
+    return dev
+
+
+def test_stalled_pump_frees_the_keyboard(listener):
+    """Grabs held + no pump = wedged reader: ungrab first, ask later."""
+    import time
+
+    dev = _grabbed(listener, None)
+    listener._thread = _alive_thread()
+    listener._last_pump_at = time.monotonic() - 5.0
+    notified = []
+    listener.on_emergency = notified.append
+
+    listener._supervise_once()
+
+    assert dev.grabbed is False
+    assert listener._kbd_devices == []
+    assert listener._key_state == set()
+    assert len(notified) == 1 and "stalled" in notified[0]
+
+
+def test_healthy_pump_stays_quiet(listener):
+    """A turning loop with grabs held is normal operation, not an emergency."""
+    import time
+
+    dev = _grabbed(listener, None)
+    listener._thread = _alive_thread()
+    listener._last_pump_at = time.monotonic()
+    notified = []
+    listener.on_emergency = notified.append
+
+    listener._supervise_once()
+
+    assert dev.grabbed is True
+    assert notified == []
+
+
+def test_supervisor_ignores_an_unheld_keyboard():
+    """Nothing grabbed means nothing to save, however quiet the loop."""
+    import time
+
+    from whisper_flow.hotkey_evdev import EvdevHotkeyListener
+
+    lis = EvdevHotkeyListener()
+    lis._running = True
+    lis._thread = _alive_thread()
+    lis._last_pump_at = time.monotonic() - 60.0
+    notified = []
+    lis.on_emergency = notified.append
+
+    lis._supervise_once()
+
+    assert notified == []
+
+
+def test_repeated_recoveries_stand_down_but_leave_keys_free(listener):
+    """Desktop usable always beats working hotkeys."""
+    _grabbed(listener, None)
+    listener._thread = _alive_thread()
+    listener._running = True
+    notified = []
+    listener.on_emergency = notified.append
+
+    for _ in range(4):
+        listener._emergency_recover("x")
+    assert listener._listener_disabled is True
+    assert len(notified) == 4
+    assert any("disabled" in m for m in notified)
+
+    # Stood down: even a stale pump fires nothing more.
+    import time
+    listener._last_pump_at = time.monotonic() - 60.0
+    listener._supervise_once()
+    assert len(notified) == 4
+
+
+def test_persistent_forward_failures_trigger_recovery(listener):
+    """Dozens of lost writes with events flowing means the proxy is dead."""
+    dev = _grabbed(listener, None)
+    listener._thread = _alive_thread()
+    listener._uinput = _RaisingUInput()
+    notified = []
+    listener.on_emergency = notified.append
+
+    for _ in range(29):
+        listener._forward(FakeEvent(ecodes.KEY_A, 1))
+    assert notified == []
+    listener._forward(FakeEvent(ecodes.KEY_A, 1))
+
+    assert dev.grabbed is False
+    assert len(notified) == 1 and "uinput" in notified[0]
+
+
+def test_single_forward_glitch_does_not_reset_input(listener):
+    """One lost write is noise; the counter resets on the next success."""
+    _grabbed(listener, None)
+    listener._thread = _alive_thread()
+    notified = []
+    listener.on_emergency = notified.append
+
+    calls = {"n": 0}
+
+    class Flaky:
+        def write_event(self, event):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise OSError("blip")
+
+        def syn(self):
+            pass
+
+        def close(self):
+            pass
+
+    listener._uinput = Flaky()
+    listener._forward(FakeEvent(ecodes.KEY_A, 1))
+    listener._forward(FakeEvent(ecodes.KEY_A, 1))
+    assert notified == []
+    assert listener._forward_failures == 0
+
+
+def test_triple_esc_resets_all_input(listener):
+    """Three quick Escapes free a confused desktop even mid-chord."""
+    dev = _grabbed(listener, None)
+    listener._thread = _alive_thread()
+    cancelled = []
+    listener.escape_callback = lambda: cancelled.append(True)
+    notified = []
+    listener.on_emergency = notified.append
+    listener._key_state.add(ecodes.KEY_LEFTMETA)
+    listener._muted.add(ecodes.KEY_LEFTMETA)
+
+    for _ in range(3):
+        listener._handle_key(FakeEvent(ecodes.KEY_ESC, 1))
+    while not listener._callbacks.empty():
+        _n, _k, cb = listener._callbacks.get()
+        cb()
+
+    # Every Escape still cancels as usual...
+    assert len(cancelled) == 3
+    # ...and the third additionally frees everything unconditionally.
+    assert len(notified) == 1 and "triple-Esc" in notified[0]
+    assert dev.grabbed is False
+    assert listener._key_state == set()
+    assert listener._muted == set()
+    synthetics = [f for f in listener.forwarded if len(f) == 3]
+    released = {(c, v) for _, c, v in synthetics}
+    for code in (ecodes.KEY_LEFTMETA, ecodes.KEY_RIGHTMETA,
+                 ecodes.KEY_LEFTCTRL, ecodes.KEY_RIGHTCTRL,
+                 ecodes.KEY_LEFTALT, ecodes.KEY_RIGHTALT,
+                 ecodes.KEY_LEFTSHIFT, ecodes.KEY_RIGHTSHIFT):
+        assert (code, 0) in released
+
+
+def test_single_esc_only_cancels(listener):
+    """Ordinary cancel must not trip the emergency path."""
+    dev = _grabbed(listener, None)
+    listener._thread = _alive_thread()
+    cancelled = []
+    listener.escape_callback = lambda: cancelled.append(True)
+    notified = []
+    listener.on_emergency = notified.append
+
+    listener._handle_key(FakeEvent(ecodes.KEY_ESC, 1))
+    while not listener._callbacks.empty():
+        _n, _k, cb = listener._callbacks.get()
+        cb()
+
+    assert cancelled == [True]
+    assert notified == []
+    assert dev.grabbed is True
+
+
+def test_esc_counter_cleared_by_other_keys(listener):
+    """Esc Esc A Esc Esc is typing, not a reset request."""
+    listener._thread = _alive_thread()
+    listener.escape_callback = lambda: None
+    notified = []
+    listener.on_emergency = notified.append
+
+    listener._handle_key(FakeEvent(ecodes.KEY_ESC, 1))
+    listener._handle_key(FakeEvent(ecodes.KEY_ESC, 1))
+    listener._handle_key(FakeEvent(ecodes.KEY_A, 1))
+    listener._handle_key(FakeEvent(ecodes.KEY_ESC, 1))
+    listener._handle_key(FakeEvent(ecodes.KEY_ESC, 1))
+
+    assert notified == []
+
+
+def test_sweep_releases_only_what_we_do_not_hold(listener):
+    """A shortcut the user is holding must never be broken by hygiene."""
+    listener._running = True
+    listener.forwarded.clear()
+    listener._key_state.add(ecodes.KEY_LEFTMETA)
+    listener._muted.add(ecodes.KEY_LEFTALT)
+
+    assert listener.sweep_unheld_modifiers() == 6
+    synthetics = {(c, v) for _, c, v in listener.forwarded}
+    assert (ecodes.KEY_LEFTMETA, 0) not in synthetics
+    assert (ecodes.KEY_RIGHTMETA, 0) not in synthetics
+    assert (ecodes.KEY_LEFTALT, 0) in synthetics
+    assert (ecodes.KEY_LEFTCTRL, 0) in synthetics
+    assert (ecodes.KEY_RIGHTSHIFT, 0) in synthetics
+
+
+def test_sweep_is_a_noop_without_proxy_or_when_stopped(listener):
+    listener._uinput = None
+    assert listener.sweep_unheld_modifiers() == 0
+    listener._running = False
+    assert listener.sweep_unheld_modifiers() == 0
+
+
+def test_maybe_sweep_policy_bounds_idle_hygiene(listener):
+    """At most one pass a minute, only shortly after hotkey activity."""
+    import time
+
+    listener._running = True
+    # Never touched hotkeys: silent, no writes.
+    assert listener.maybe_sweep_unheld_modifiers() == 0
+    assert listener.forwarded == []
+
+    # Recent activity: one bounded pass...
+    listener._last_input_risk_at = time.monotonic()
+    assert listener.maybe_sweep_unheld_modifiers() == 8
+    # ...and the next minute stays quiet.
+    assert listener.maybe_sweep_unheld_modifiers() == 0
+
+    # Stale risk, never swept: quiet again.
+    listener._last_sweep_at = 0.0
+    listener._last_input_risk_at = time.monotonic() - 700.0
+    listener.forwarded.clear()
+    assert listener.maybe_sweep_unheld_modifiers() == 0
+    assert listener.forwarded == []
+
+
+def test_status_snapshot_counts_never_names(listener):
+    """Diagnostics must not become a keylog: counts only."""
+    import time
+
+    listener._kbd_devices = [Mock(path="/dev/input/event1")]
+    listener._thread = _alive_thread()
+    listener._running = True
+    listener._last_pump_at = time.monotonic() - 0.5
+    listener._key_state.add(42)
+    listener._muted.add(43)
+
+    snap = listener.status_snapshot()
+    assert snap["backend"] == "evdev"
+    assert snap["alive"] is True
+    assert snap["grabbed"] == 1
+    assert snap["held"] == 1
+    assert snap["muted"] == 1
+    assert snap["disabled"] is False
+    assert snap["recoveries_60s"] == 0
+    assert 0.0 <= snap["pump_age_s"] < 5.0
+    assert "42" not in str(snap.values())
+
+
+def test_pump_age_none_before_first_pump():
+    from whisper_flow.hotkey_evdev import EvdevHotkeyListener
+
+    assert EvdevHotkeyListener().pump_age_seconds() is None
+
+
+def test_rebuild_marks_input_risk(listener, monkeypatch):
+    """A device-set rebuild with keys held arms the idle sweeper."""
+    listener, _ = _listener_with(monkeypatch, ["/dev/input/event1"])
+    listener._open_devices()
+    released = []
+    listener.register_hotkey("transcribe", "super+alt",
+                             lambda: None, lambda: released.append(True))
+    listener._press_triggered.add("transcribe")
+
+    listener._abandon_devices()
+
+    assert listener._last_input_risk_at > 0.0
+    name, kind, cb = listener._callbacks.get_nowait()
+    cb()
+    assert released == [True]

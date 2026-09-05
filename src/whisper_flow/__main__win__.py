@@ -351,8 +351,20 @@ def main() -> int:
         _stop_running_app()
         return 0
 
-    from whisper_flow.daemon import WhisperFlowDaemon
-    WhisperFlowDaemon().run(foreground=True)
+    try:
+        from whisper_flow.daemon import WhisperFlowDaemon
+        WhisperFlowDaemon().run(foreground=True)
+    except Exception:
+        # The windowed build has no console and the tray never started, so
+        # without this a startup failure is just "it doesn't launch".
+        import traceback
+
+        try:
+            from whisper_flow.logging import write_crash_report
+            write_crash_report(traceback.format_exc())
+        except Exception:
+            pass
+        raise
     return 0
 
 

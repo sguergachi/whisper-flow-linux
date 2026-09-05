@@ -740,6 +740,16 @@ def test_maybe_sweep_policy_bounds_idle_hygiene(listener):
     assert listener.forwarded == []
 
 
+def test_fresh_boot_stays_silent(listener, monkeypatch):
+    """monotonic() is uptime: minutes after boot, "never" is still never."""
+    import time
+
+    monkeypatch.setattr(time, "monotonic", lambda: 120.0)
+    listener._running = True
+    assert listener.maybe_sweep_unheld_modifiers() == 0
+    assert listener.forwarded == []
+
+
 def test_status_snapshot_counts_never_names(listener):
     """Diagnostics must not become a keylog: counts only."""
     import time

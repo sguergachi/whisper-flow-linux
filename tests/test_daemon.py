@@ -1223,3 +1223,45 @@ def test_diagnostics_survives_a_dead_hotkey_manager(temp_config_dir):
     mock_hotkey_manager.input_status.side_effect = OSError("gone")
     text = daemon._diagnostics("no input")
     assert "input             : unavailable" in text
+
+
+# ------------------------------------------------- silent startup deaths
+def test_auto_heal_give_up_leaves_a_crash_file(temp_config_dir):
+    """No console, no tray this early: without a file there is nothing
+    to diagnose a machine where the app simply never appears."""
+    daemon, _ = _idle_daemon(temp_config_dir)
+    with (
+        patch.object(daemon, "_acquire_single_instance", return_value=True),
+        patch.object(daemon, "_check_platform_support", return_value=None),
+        patch.object(daemon, "_start_watchdog", return_value=None),
+        patch.object(daemon, "setup_hotkeys",
+                     side_effect=RuntimeError("boom")),
+        patch.object(daemon, "_cleanup", return_value=None),
+        patch.object(daemon, "notify", return_value=None),
+        patch("time.sleep", return_value=None),
+        patch("whisper_flow.daemon.write_crash_report") as mock_crash,
+    ):
+        daemon.run(foreground=True)
+    mock_crash.assert_called_once()
+    assert "gave up" in mock_crash.call_args[0][0]
+
+
+def test_windows_entry_writes_a_crash_file_on_startup_failure(
+        tmp_path, monkeypatch):
+    """The windowed build has no console: a failed import or constructor
+    must still leave a traceback behind."""
+    import sys
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(sys, "argv", ["whisper-flow.exe"])
+    from whisper_flow import __main__win__ as win_main
+
+    with patch("whisper_flow.daemon.WhisperFlowDaemon",
+               side_effect=RuntimeError("boom")):
+        with pytest.raises(RuntimeError):
+            win_main.main()
+    crash = (tmp_path / ".config" / "whisper-flow" / "startup-crash.log")
+    assert crash.exists()
+    text = crash.read_text(encoding="utf-8")
+    assert text.startswith("whisper-flow startup crash")
+    assert "boom" in text

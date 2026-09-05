@@ -142,7 +142,10 @@ class EvdevHotkeyListener:
         self._supervisor_thread = None
         self._started_at = 0.0
         self._last_sweep_at = 0.0
-        self._last_input_risk_at = 0.0
+        # Never, not zero: monotonic() is uptime, so 0.0 reads as "just
+        # now" on a machine booted minutes ago (fresh CI runners included)
+        # and the idle sweeper would fire having seen no hotkey at all.
+        self._last_input_risk_at = float("-inf")
         self._recovery_times: list = []
         # Stood down after repeated failed recoveries: grabs released, reader
         # stopped, keyboard left entirely alone until the app restarts.

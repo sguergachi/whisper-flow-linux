@@ -66,3 +66,25 @@ def clear_log() -> None:
     """Drop what has been recorded. Only tests should need this."""
     with _ring_lock:
         _ring.clear()
+
+
+def write_crash_report(body: str) -> str | None:
+    """Persist a startup crash where the next launch can find it.
+
+    The frozen Windows build has no console, and the tray never starts when
+    startup itself fails, so an in-memory ring buffer dies with the process
+    and the user sees only "it doesn't launch". A file survives. Returns
+    the path written, or None when even that failed. Never raises.
+    """
+    try:
+        from pathlib import Path
+
+        path = (Path.home() / ".config" / "whisper-flow"
+                / "startup-crash.log")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        path.write_text(f"whisper-flow startup crash, {stamp}\n\n{body}\n",
+                        encoding="utf-8")
+        return str(path)
+    except Exception:
+        return None

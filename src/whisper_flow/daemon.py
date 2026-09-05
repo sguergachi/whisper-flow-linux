@@ -23,7 +23,7 @@ from .backend import LocalBackend
 from .config import Config
 from .hotkey_manager import HotkeyManager, HotkeyMode
 from .hud import HUD, STOP_SUFFIX
-from .logging import log, recent_log, set_logging_enabled
+from .logging import log, recent_log, set_logging_enabled, write_crash_report
 from .paths import lock_file as _lock_file
 from .paths import pid_file as _pid_file
 from .version import build_version
@@ -2411,6 +2411,12 @@ Use 'whisper-flow stop' to exit daemon
                     pass
                 if crash_count > 5:
                     log("[DAEMON] too many crashes, giving up auto-heal")
+                    # No console on Windows and no tray this early: without
+                    # a file this reads as "it doesn't launch" with nothing
+                    # to diagnose from.
+                    write_crash_report(
+                        "auto-heal gave up after 5 restarts\n\n"
+                        + recent_log(200))
                     break
                 backoff = min(2 ** crash_count, 30)
                 log(f"[DAEMON] auto-heal restarting in {backoff}s")

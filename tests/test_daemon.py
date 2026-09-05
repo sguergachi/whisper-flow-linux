@@ -1252,7 +1252,9 @@ def test_windows_entry_writes_a_crash_file_on_startup_failure(
     must still leave a traceback behind."""
     import sys
 
+    # Path.home() honours HOME on posix but USERPROFILE on Windows.
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     monkeypatch.setattr(sys, "argv", ["whisper-flow.exe"])
     from whisper_flow import __main__win__ as win_main
 

@@ -1291,3 +1291,69 @@ def test_windows_entry_writes_a_crash_file_on_startup_failure(
     text = crash.read_text(encoding="utf-8")
     assert text.startswith("whisper-flow startup crash")
     assert "boom" in text
+
+
+# ------------------------------------------------- tray retry
+def _tray_daemon(temp_config_dir):
+    """A daemon whose icon/menu builds are cheap fakes."""
+    daemon, _ = _idle_daemon(temp_config_dir)
+    daemon.create_tray_icon = Mock(return_value=Mock())
+    daemon.setup_tray_menu = Mock(return_value=Mock())
+    return daemon
+
+
+def test_tray_retry_rides_out_a_slow_desktop(temp_config_dir):
+    """Two failures then a tray: the app is up, not headless."""
+    daemon = _tray_daemon(temp_config_dir)
+    icon = Mock()
+    fake_pystray = Mock()
+    fake_pystray.Icon.side_effect = [RuntimeError("no tray yet"),
+                                     RuntimeError("no tray yet"), icon]
+    with (
+        patch("whisper_flow.daemon._pystray", return_value=fake_pystray),
+        patch("whisper_flow.daemon.trace_stage"),
+        patch("time.sleep") as mock_sleep,
+    ):
+        assert daemon._start_tray() is True
+    assert fake_pystray.Icon.call_count == 3
+    assert mock_sleep.call_count == 2
+    icon.run.assert_called_once()
+
+
+def test_tray_gives_up_after_three_attempts(temp_config_dir):
+    daemon = _tray_daemon(temp_config_dir)
+    fake_pystray = Mock()
+    fake_pystray.Icon.side_effect = RuntimeError("no tray")
+    with (
+        patch("whisper_flow.daemon._pystray", return_value=fake_pystray),
+        patch("whisper_flow.daemon.trace_stage"),
+        patch("time.sleep") as mock_sleep,
+    ):
+        assert daemon._start_tray() is False
+    assert fake_pystray.Icon.call_count == 3
+    assert mock_sleep.call_count == 2
+
+
+def test_tray_failure_is_loud_not_silent(temp_config_dir):
+    """No tray must toast and go headless, never just vanish."""
+    daemon = _tray_daemon(temp_config_dir)
+    fake_pystray = Mock()
+    fake_pystray.Icon.side_effect = RuntimeError("no tray")
+    with (
+        patch.object(daemon, "_acquire_single_instance", return_value=True),
+        patch.object(daemon, "_check_platform_support", return_value=None),
+        patch.object(daemon, "_start_watchdog", return_value=None),
+        patch.object(daemon, "_start_managed_backend", return_value=None),
+        patch.object(daemon, "_cleanup", return_value=None),
+        patch.object(daemon, "notify") as mock_notify,
+        patch.object(daemon, "run_headless_mode") as mock_headless,
+        patch("whisper_flow.daemon._pystray", return_value=fake_pystray),
+        patch("whisper_flow.daemon.reset_stage_log"),
+        patch("whisper_flow.daemon.trace_stage"),
+        patch("time.sleep", return_value=None),
+    ):
+        daemon.run(foreground=True)
+    assert fake_pystray.Icon.call_count == 3
+    mock_notify.assert_called_once()
+    assert "tray" in mock_notify.call_args[0][0].lower()
+    mock_headless.assert_called_once()

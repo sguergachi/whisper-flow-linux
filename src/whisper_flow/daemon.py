@@ -2378,20 +2378,8 @@ Use 'whisper-flow stop' to exit daemon
                     # systemd: input() hits EOF immediately and used to stop the
                     # whole daemon - which is exactly "hotkeys do nothing".
                     log("[DAEMON] Running in foreground mode")
-                    trace_stage("tray starting")
-                    try:
-                        self.tray_icon = _pystray().Icon(
-                            "whisper-flow",
-                            self.create_tray_icon(),
-                            "WhisperFlow Daemon",
-                            self.setup_tray_menu(),
-                        )
-                        log("[DAEMON] Tray icon created successfully")
-                        trace_stage("tray running")
-                        self.tray_icon.run()
-                    except Exception as e:
-                        log(f"[DAEMON] Tray setup failed: {e}")
-                        trace_stage(f"tray failed: {e}")
+                    if not self._start_tray():
+                        self.notify("System tray unavailable - hotkeys still work")
                         if sys.stdin.isatty():
                             self.run_notification_mode()
                         else:
@@ -2401,20 +2389,8 @@ Use 'whisper-flow stop' to exit daemon
                 else:
                     # Background mode: try tray, fallback to headless
                     log("[DAEMON] Running in background mode")
-                    trace_stage("tray starting (background)")
-                    try:
-                        self.tray_icon = _pystray().Icon(
-                            "whisper-flow",
-                            self.create_tray_icon(),
-                            "WhisperFlow Daemon",
-                            self.setup_tray_menu(),
-                        )
-                        log("[DAEMON] Background tray icon created successfully")
-                        trace_stage("tray running")
-                        self.tray_icon.run()
-                    except Exception as e:
-                        log(f"[DAEMON] Tray setup failed in background mode: {e}")
-                        trace_stage(f"tray failed: {e}")
+                    if not self._start_tray(background=True):
+                        trace_stage("headless mode")
                         self.run_headless_mode()
 
             except Exception as e:
@@ -2504,6 +2480,37 @@ Use 'whisper-flow stop' to exit daemon
 
         self.is_running = False
         log("[DAEMON] Cleanup complete")
+
+    def _start_tray(self, background: bool = False) -> bool:
+        """Create the tray icon and run it, retrying a slow desktop.
+
+        At login this process can start before Explorer's notification area
+        is ready, and pystray then fails once and never tries again - which
+        used to strand the app headless forever, with no tray, no Settings
+        and no explanation. Three attempts a few seconds apart cover a slow
+        desktop; a machine with truly no tray still ends up headless, loudly.
+        True while the icon ran (returns when it stops).
+        """
+        attempts = 3
+        for attempt in range(1, attempts + 1):
+            trace_stage(f"tray starting (attempt {attempt})")
+            try:
+                self.tray_icon = _pystray().Icon(
+                    "whisper-flow",
+                    self.create_tray_icon(),
+                    "WhisperFlow Daemon",
+                    self.setup_tray_menu(),
+                )
+                log("[DAEMON] Tray icon created successfully")
+                trace_stage("tray running")
+                self.tray_icon.run()
+                return True
+            except Exception as e:
+                log(f"[DAEMON] Tray setup failed (attempt {attempt}): {e}")
+                trace_stage(f"tray failed: {e}")
+                if attempt < attempts:
+                    time.sleep(5)
+        return False
 
     def run_headless_mode(self):
         """Run in headless mode when tray is not available in background."""

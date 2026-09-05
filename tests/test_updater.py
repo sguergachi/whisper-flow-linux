@@ -129,6 +129,8 @@ def _clean_updater_state(monkeypatch):
     updater._downloading = False
     updater._notified_version = None
     updater._auto_started = False
+    updater._last_check_ok = None
+    updater._consecutive_failures = 0
     yield
     updater._checked_version = None
     updater._pending_update = None
@@ -136,6 +138,8 @@ def _clean_updater_state(monkeypatch):
     updater._downloading = False
     updater._notified_version = None
     updater._auto_started = False
+    updater._last_check_ok = None
+    updater._consecutive_failures = 0
 
 
 def test_background_download_stores_pending_and_fires_ready(
@@ -287,3 +291,52 @@ def test_auto_update_is_a_no_op_where_unavailable(monkeypatch):
     updater.start_auto_update(notify=Mock())
     assert updater._auto_started is False
     assert updater.download_in_background(notify=Mock()) is None
+
+
+def test_three_failed_rounds_earn_one_offline_toast(
+        monkeypatch, _clean_updater_state):
+    manager = Mock()
+    manager.check_for_updates.side_effect = OSError("dns down")
+    monkeypatch.setattr(updater, "_manager", lambda: manager)
+
+    told = []
+    updater._auto_update_round(notify=told.append)
+    updater._auto_update_round(notify=told.append)
+    assert told == []
+    updater._auto_update_round(notify=told.append)
+    assert len(told) == 1 and "update server" in told[0]
+    # Re-armed: the next streak earns its own single toast.
+    updater._auto_update_round(notify=told.append)
+    updater._auto_update_round(notify=told.append)
+    assert len(told) == 1
+    updater._auto_update_round(notify=told.append)
+    assert len(told) == 2
+
+
+def test_a_good_round_clears_the_failure_streak(
+        monkeypatch, _clean_updater_state):
+    manager = Mock()
+    manager.check_for_updates.side_effect = OSError("dns down")
+    monkeypatch.setattr(updater, "_manager", lambda: manager)
+
+    told = []
+    updater._auto_update_round(notify=told.append)
+    updater._auto_update_round(notify=told.append)
+    manager.check_for_updates.side_effect = None
+    manager.check_for_updates.return_value = None   # up to date: fine
+    updater._auto_update_round(notify=told.append)
+    assert told == []
+    assert updater._consecutive_failures == 0
+
+
+def test_round_outcome_is_visible_for_diagnosis(
+        monkeypatch, _clean_updater_state):
+    manager = Mock()
+    manager.check_for_updates.return_value = None
+    monkeypatch.setattr(updater, "_manager", lambda: manager)
+    updater._auto_update_round()
+    assert updater._last_check_ok is True
+
+    manager.check_for_updates.side_effect = OSError("offline")
+    updater._auto_update_round()
+    assert updater._last_check_ok is False

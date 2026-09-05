@@ -138,6 +138,11 @@ _pending_version: str | None = None   # its version
 _downloading = False                  # a fetch is in flight right now
 _notified_version: str | None = None  # last version the user was told about
 _auto_started = False
+# Outcome of the most recent background round: True = current or fetched,
+# False = the check or the download failed, None = no round ran yet. Lets
+# the loop tell "offline" apart from "up to date" without extra checks.
+_last_check_ok: bool | None = None
+_consecutive_failures = 0
 
 # Download attempts per version before giving up until the next check.
 _DOWNLOAD_RETRIES = 3
@@ -173,7 +178,7 @@ def download_in_background(notify=None, on_ready=None) -> str | None:
     flaky download instead of failing loudly; quiet when already current.
     Never raises.
     """
-    global _downloading, _pending_update, _pending_version
+    global _downloading, _pending_update, _pending_version, _last_check_ok
     if not available():
         return pending_version()
     with _lock:
@@ -183,12 +188,18 @@ def download_in_background(notify=None, on_ready=None) -> str | None:
         update = _manager().check_for_updates()
     except Exception as e:
         log(f"[UPDATE] check failed: {e}")
+        with _lock:
+            _last_check_ok = False
         return pending_version()
     if not update:
         log("[UPDATE] already current")
+        with _lock:
+            _last_check_ok = True
         return pending_version()
     version = _version_of(update)
     if not _remember_checked(version):
+        with _lock:
+            _last_check_ok = True
         return pending_version()        # seen before; nothing new to fetch
     with _lock:
         if _pending_version == version:
@@ -199,6 +210,7 @@ def download_in_background(notify=None, on_ready=None) -> str | None:
             with _lock:
                 _pending_update = update
                 _pending_version = version
+                _last_check_ok = True
             log(f"[UPDATE] {version} downloaded in the background")
             if on_ready:
                 try:
@@ -206,6 +218,8 @@ def download_in_background(notify=None, on_ready=None) -> str | None:
                 except Exception as e:
                     log(f"[UPDATE] ready callback failed: {e}")
             return version
+        with _lock:
+            _last_check_ok = False
         return pending_version()
     finally:
         with _lock:
@@ -301,6 +315,7 @@ def start_auto_update(notify=None, on_ready=None,
     """
     global _auto_started
     if not available():
+        log("[UPDATE] background updater off: not an installed Windows build")
         return
     with _lock:
         if _auto_started:
@@ -326,10 +341,10 @@ def start_auto_update(notify=None, on_ready=None,
             time.sleep(first_delay)
             while True:
                 try:
-                    download_in_background(
-                        notify=None,
-                        on_ready=lambda v: (announce(v),
-                                            on_ready(v) if on_ready else None),
+                    _auto_update_round(
+                        notify,
+                        lambda v: (announce(v),
+                                   on_ready(v) if on_ready else None),
                     )
                 except Exception as e:
                     log(f"[UPDATE] background round failed: {e}")
@@ -339,3 +354,36 @@ def start_auto_update(notify=None, on_ready=None,
 
     threading.Thread(target=loop, daemon=True,
                      name="whisper-flow-update-loop").start()
+
+
+def _auto_update_round(notify=None, on_ready=None) -> None:
+    """One background check-download cycle, with an offline tripwire.
+
+    Three failed rounds in a row earn exactly one toast ("couldn't reach
+    the update server"), then the counter re-arms. Silent failures look
+    identical to a dead updater from the tray, so without this there is no
+    telling broken-network apart from broken-code. Never raises.
+    """
+    global _consecutive_failures
+    try:
+        download_in_background(notify=None, on_ready=on_ready)
+    except Exception as e:
+        log(f"[UPDATE] background round failed: {e}")
+        with _lock:
+            global _last_check_ok
+            _last_check_ok = False
+    with _lock:
+        failed = _last_check_ok is False
+        if failed:
+            _consecutive_failures += 1
+        else:
+            _consecutive_failures = 0
+        streak = _consecutive_failures
+        if streak >= 3:
+            _consecutive_failures = 0   # re-arm for the next streak
+    if streak >= 3 and notify:
+        try:
+            notify("Couldn't reach the update server — will keep trying "
+                   "in the background")
+        except Exception as e:
+            log(f"[UPDATE] notify failed: {e}")

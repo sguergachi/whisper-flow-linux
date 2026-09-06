@@ -1357,3 +1357,90 @@ def test_tray_failure_is_loud_not_silent(temp_config_dir):
     mock_notify.assert_called_once()
     assert "tray" in mock_notify.call_args[0][0].lower()
     mock_headless.assert_called_once()
+
+
+# ------------------------------------------------- startup never downloads
+def _model_daemon(temp_config_dir, backend):
+    """A daemon pointed at a local server with the given backend."""
+    daemon, _ = _idle_daemon(temp_config_dir)
+    daemon.config.manage_local_server = True
+    daemon.config.local_whisper_url = ""
+    daemon.backend = backend
+    daemon.notify = Mock()
+    return daemon
+
+
+def test_startup_does_not_download_missing_models(temp_config_dir):
+    """A fresh install used to reach the tray only after a half-hour
+    download finished on the startup thread."""
+    daemon = _model_daemon(temp_config_dir, Mock())
+    daemon.backend.working_model.return_value = "ggml-base.en-q8_0"
+    daemon.backend.is_installed.return_value = False
+    daemon._backend_start = Mock(return_value=None)
+    with patch("threading.Thread") as mock_thread:
+        daemon._start_managed_backend()
+    daemon._backend_start.assert_called_once_with(
+        "ggml-base.en-q8_0", allow_download=False)
+    daemon.backend.install.assert_not_called()
+    notes = [call[0][0] for call in daemon.notify.call_args_list]
+    assert any("background" in note for note in notes)
+    mock_thread.assert_called_once()
+    target = mock_thread.call_args[1]["target"]
+    assert target == daemon._fetch_model_in_background
+    assert mock_thread.call_args[1]["daemon"] is True
+    mock_thread.return_value.start.assert_called_once()
+
+
+def test_background_fetch_adopts_a_landed_model(temp_config_dir):
+    daemon = _model_daemon(temp_config_dir, Mock())
+    daemon.backend.install.return_value = True
+    daemon.backend.installed_engine.return_value = "cpu"
+    daemon._backend_start = Mock(return_value="http://127.0.0.1:8765")
+    daemon._use_backend_url = Mock()
+
+    daemon._fetch_model_in_background("ggml-base.en-q8_0")
+
+    daemon.backend.install.assert_called_once_with("ggml-base.en-q8_0")
+    daemon._use_backend_url.assert_called_once_with("http://127.0.0.1:8765")
+    assert daemon._backend_model == "ggml-base.en-q8_0"
+    notes = [call[0][0] for call in daemon.notify.call_args_list]
+    assert any("ready" in note for note in notes)
+
+
+def test_background_fetch_reports_a_failed_download(temp_config_dir):
+    daemon = _model_daemon(temp_config_dir, Mock())
+    daemon.backend.install.return_value = False
+    daemon._backend_start = Mock()
+
+    daemon._fetch_model_in_background("ggml-base.en-q8_0")
+
+    daemon._backend_start.assert_not_called()
+    notes = [call[0][0] for call in daemon.notify.call_args_list]
+    assert any("retry" in note for note in notes)
+
+
+def test_present_but_broken_server_keeps_its_warning(temp_config_dir):
+    """Files on disk, server dead: same message as before, no fetch."""
+    daemon = _model_daemon(temp_config_dir, Mock())
+    daemon.backend.working_model.return_value = "ggml-base.en-q8_0"
+    daemon.backend.is_installed.return_value = True
+    daemon._backend_start = Mock(return_value=None)
+    with patch("threading.Thread") as mock_thread:
+        daemon._start_managed_backend()
+    notes = [call[0][0] for call in daemon.notify.call_args_list]
+    assert any("failed to start" in note for note in notes)
+    mock_thread.assert_not_called()
+
+
+def test_working_server_starts_synchronously(temp_config_dir):
+    """The normal case is untouched: installed and healthy, straight up."""
+    daemon = _model_daemon(temp_config_dir, Mock())
+    daemon.backend.working_model.return_value = "ggml-base.en-q8_0"
+    daemon.backend.setup_reason.return_value = ""
+    daemon._backend_start = Mock(return_value="http://127.0.0.1:8765")
+    daemon._use_backend_url = Mock()
+    with patch("threading.Thread") as mock_thread:
+        daemon._start_managed_backend()
+    assert daemon._backend_model == "ggml-base.en-q8_0"
+    mock_thread.assert_not_called()
+    assert daemon.notify.call_count == 0

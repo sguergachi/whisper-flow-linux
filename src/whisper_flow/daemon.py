@@ -1683,9 +1683,25 @@ class WhisperFlowDaemon:
                 self.notify("No speech model yet - open Settings in the tray")
             return
 
-        url = self._backend_start(model)
+        url = self._backend_start(model, allow_download=False)
         actual_model = self.backend.working_model() if url else None
         if not url:
+            # Missing files are not a startup errand: install() pulls
+            # hundreds of megabytes on the calling thread, which once kept
+            # a fresh install tray-less for half an hour. Fetch in the
+            # background; the tray (and Settings through it) comes first.
+            try:
+                missing = not self.backend.is_installed(model)
+            except Exception:
+                missing = False
+            if missing:
+                log(f"[BACKEND] {model} not on disk; fetching in the background")
+                self.notify(f"Downloading {model} in the background - "
+                            f"the tray is up, transcription starts when it lands")
+                threading.Thread(target=self._fetch_model_in_background,
+                                 args=(model,), daemon=True,
+                                 name="whisper-flow-model-fetch").start()
+                return
             # Startup is the only place a silent failure becomes "No whisper
             # server configured" on the first real dictation, which reads as
             # typing being broken rather than transcription. Surface it now
@@ -1783,6 +1799,40 @@ class WhisperFlowDaemon:
                             self.backend.mark_setup_seen()
             except Exception as e:
                 log(f"[DAEMON] auto GPU install check failed: {e}")
+
+    def _fetch_model_in_background(self, model: str) -> None:
+        """Download a model missing at startup, without holding up the tray.
+
+        Runs on its own thread: install() pulls hundreds of megabytes, which
+        is what kept a fresh install tray-less for half an hour. Announces
+        itself when transcription is actually possible. Never raises.
+        """
+        try:
+            log(f"[BACKEND] background fetch of {model} started")
+            try:
+                landed = bool(self.backend.install(model))
+            except Exception as e:
+                log(f"[BACKEND] background fetch of {model} failed: {e}")
+                landed = False
+            if not landed:
+                self.notify(f"Could not download {model} - open Settings to retry")
+                return
+            url = self._backend_start(model, allow_download=False)
+            if not url:
+                log(f"[BACKEND] {model} downloaded but the server would not start")
+                self.notify("Speech engine failed to start - open Settings")
+                return
+            try:
+                self._backend_model = model
+                self._backend_engine = self.backend.installed_engine()
+                self._use_backend_url(url)
+            except Exception as e:
+                log(f"[BACKEND] could not adopt background-fetched {model}: {e}")
+                return
+            log(f"[BACKEND] {model} ready after background fetch")
+            self.notify(f"{model} downloaded - transcription ready")
+        except Exception as e:
+            log(f"[BACKEND] background fetch failed: {e}")
 
     def copy_log(self, icon=None, item=None):
         """Put the recent log on the clipboard, whether or not anything failed.

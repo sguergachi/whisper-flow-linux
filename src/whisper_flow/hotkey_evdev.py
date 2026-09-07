@@ -92,9 +92,12 @@ def _grab_error(failures: list[tuple[str, BaseException]]) -> str:
         return "Cannot grab any keyboard devices"
     busy = any(getattr(e, "errno", None) == errno.EBUSY for _, e in failures)
     if busy:
+        paths = ", ".join(path for path, _ in failures[:4])
         return (
             "Cannot grab the keyboard: another program already has it "
-            "(another whisper-flow, keyd, or kanata)"
+            "(another whisper-flow, keyd, or kanata). "
+            f"Busy: {paths}. The holder shows in: "
+            f"sudo lsof {failures[0][0]}"
         )
     detail = "; ".join(f"{path}: {err}" for path, err in failures[:3])
     return f"Cannot grab any keyboard devices ({detail})"

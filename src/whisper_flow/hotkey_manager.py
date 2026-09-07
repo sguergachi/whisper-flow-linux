@@ -270,6 +270,20 @@ class HotkeyManager:
             return self.keyboard_listener.is_alive()
         return False
 
+    def is_alive(self) -> bool:
+        """Whether the backend listener is up and pumping.
+
+        The daemon watchdog polls this to revive a dead listener. It used
+        to probe hasattr() for a method that did not exist, so the whole
+        auto-heal block never ran and a listener that failed at startup -
+        grabbed keyboards elsewhere, no permission - stayed dead, tray-only,
+        until someone restarted the app by hand.
+        """
+        try:
+            return self._listener_alive()
+        except Exception:
+            return False
+
     def _listener_pump_age(self) -> float | None:
         """Seconds since the backend last pumped events, if it reports one."""
         listener = self._evdev_listener

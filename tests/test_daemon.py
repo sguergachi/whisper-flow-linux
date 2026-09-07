@@ -1444,3 +1444,36 @@ def test_working_server_starts_synchronously(temp_config_dir):
     assert daemon._backend_model == "ggml-base.en-q8_0"
     mock_thread.assert_not_called()
     assert daemon.notify.call_count == 0
+
+
+# ------------------------------------------------- hotkey auto-heal
+def test_dead_listener_is_revived_once_then_throttled(temp_config_dir):
+    """A start-failed listener revives on the next watchdog pass, then
+    waits 15s between retries instead of rebuilding every 2s forever."""
+    daemon, mock_manager = _idle_daemon(temp_config_dir)
+    daemon.hotkey_manager = Mock()
+    daemon.hotkey_manager.is_alive.return_value = False
+    assert daemon._maybe_heal_hotkeys() is True
+    daemon.hotkey_manager.start.assert_called_once()
+    # Immediate second pass: throttled, no new attempt.
+    assert daemon._maybe_heal_hotkeys() is False
+    assert daemon.hotkey_manager.start.call_count == 1
+
+
+def test_live_listener_is_left_alone(temp_config_dir):
+    daemon, _ = _idle_daemon(temp_config_dir)
+    daemon.hotkey_manager = Mock()
+    daemon.hotkey_manager.is_alive.return_value = True
+    assert daemon._maybe_heal_hotkeys() is False
+    daemon.hotkey_manager.start.assert_not_called()
+
+
+def test_failed_revive_reports_and_retries_later(temp_config_dir):
+    daemon, _ = _idle_daemon(temp_config_dir)
+    daemon.hotkey_manager = Mock()
+    daemon.hotkey_manager.is_alive.return_value = False
+    daemon.hotkey_manager.start.side_effect = RuntimeError("still busy")
+    assert daemon._maybe_heal_hotkeys() is False
+    # Throttled even on failure: one attempt per window.
+    assert daemon._maybe_heal_hotkeys() is False
+    assert daemon.hotkey_manager.start.call_count == 1

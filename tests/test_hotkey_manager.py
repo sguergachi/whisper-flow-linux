@@ -622,3 +622,21 @@ class TestHotkeyManager:
     def test_pump_age_unknown_without_backend(self):
         manager = HotkeyManager()
         assert manager._listener_pump_age() is None
+
+    def test_is_alive_false_with_no_listener(self):
+        """No backend yet: dead, not an exception."""
+        assert HotkeyManager().is_alive() is False
+
+    def test_is_alive_follows_the_backend(self):
+        manager = HotkeyManager()
+        manager._evdev_listener = Mock()
+        manager._evdev_listener.is_alive.return_value = True
+        assert manager.is_alive() is True
+        manager._evdev_listener.is_alive.return_value = False
+        assert manager.is_alive() is False
+
+    def test_is_alive_survives_a_broken_backend(self):
+        manager = HotkeyManager()
+        manager._evdev_listener = Mock()
+        manager._evdev_listener.is_alive.side_effect = OSError("gone")
+        assert manager.is_alive() is False

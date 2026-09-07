@@ -794,3 +794,15 @@ def test_rebuild_marks_input_risk(listener, monkeypatch):
     name, kind, cb = listener._callbacks.get_nowait()
     cb()
     assert released == [True]
+
+
+def test_busy_grab_error_names_devices_and_holder():
+    """EBUSY must say which keyboards and how to find the holder."""
+    import errno
+
+    from whisper_flow.hotkey_evdev import _grab_error
+
+    err = OSError(errno.EBUSY, "Device or resource busy")
+    msg = _grab_error([("/dev/input/event3", err)])
+    assert "/dev/input/event3" in msg
+    assert "lsof" in msg

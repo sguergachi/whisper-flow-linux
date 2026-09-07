@@ -310,20 +310,7 @@ class WhisperFlowDaemon:
 
                 # Hotkey/hud auto-heal: if listener died, restart it without crashing daemon
                 if not self.is_recording:
-                    try:
-                        hm = getattr(self, "hotkey_manager", None)
-                        if hm and hasattr(hm, "is_alive"):
-                            try:
-                                if not hm.is_alive():
-                                    log("[DAEMON] hotkey manager dead, auto-healing")
-                                    try:
-                                        hm.start()
-                                    except Exception as he:
-                                        log(f"[DAEMON] hotkey auto-heal failed: {he}")
-                            except Exception:
-                                pass
-                    except Exception:
-                        pass
+                    self._maybe_heal_hotkeys()
                     # Compositor-side stuck modifiers: while idle, release
                     # anything the desktop may hold that we do not. Bounded
                     # inside the listener (once a minute, only shortly after
@@ -2561,6 +2548,41 @@ Use 'whisper-flow stop' to exit daemon
                 if attempt < attempts:
                     time.sleep(5)
         return False
+
+    def _maybe_heal_hotkeys(self) -> bool:
+        """Revive a dead hotkey listener, throttled. True when revived.
+
+        A listener that failed at startup (keyboards grabbed elsewhere,
+        no permission) used to stay dead, tray-only, until a manual
+        restart: the watchdog probed hasattr(hm, "is_alive") for a method
+        that did not exist, so the whole block never ran. Now it retries,
+        at most every 15s so a permanently-grabbed keyboard does not get
+        a fresh uinput proxy and two log lines every 2s forever. Never
+        raises.
+        """
+        try:
+            hm = getattr(self, "hotkey_manager", None)
+            if not hm or not hasattr(hm, "is_alive"):
+                return False
+            try:
+                if hm.is_alive():
+                    return False
+            except Exception:
+                return False
+            now = time.time()
+            if now - getattr(self, "_last_hotkey_heal", 0.0) < 15.0:
+                return False
+            self._last_hotkey_heal = now
+            log("[DAEMON] hotkey manager dead, auto-healing")
+            try:
+                hm.start()
+                log("[DAEMON] hotkey manager revived")
+                return True
+            except Exception as he:
+                log(f"[DAEMON] hotkey auto-heal failed: {he}")
+                return False
+        except Exception:
+            return False
 
     def run_headless_mode(self):
         """Run in headless mode when tray is not available in background."""

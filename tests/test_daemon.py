@@ -1477,3 +1477,47 @@ def test_failed_revive_reports_and_retries_later(temp_config_dir):
     # Throttled even on failure: one attempt per window.
     assert daemon._maybe_heal_hotkeys() is False
     assert daemon.hotkey_manager.start.call_count == 1
+
+
+# ------------------------------------------------- never block the hotkey
+def test_recording_starts_without_waiting_for_the_server(temp_config_dir):
+    """A cold GPU server takes ~20s; push-to-talk started only after the
+    user released the keys, then instantly stopped with 0 frames."""
+    daemon = _model_daemon(temp_config_dir, Mock())
+    daemon.config.local_whisper_url = ""
+    daemon.backend._process = None
+    daemon.backend.working_model.return_value = "ggml-base.en-q8_0"
+    daemon._ensure_backend_running = Mock(return_value=True)
+    with patch("threading.Thread") as mock_thread:
+        daemon._warm_backend_for_recording()
+    # Nothing synchronous: the ensure runs on a thread.
+    daemon._ensure_backend_running.assert_not_called()
+    mock_thread.assert_called_once()
+    assert mock_thread.call_args[1]["daemon"] is True
+    # And the thread target actually performs the ensure.
+    mock_thread.call_args[1]["target"]()
+    daemon._ensure_backend_running.assert_called_once_with(
+        allow_download=False)
+
+
+def test_warm_path_is_quiet_when_server_is_up(temp_config_dir):
+    daemon = _model_daemon(temp_config_dir, Mock())
+    daemon.config.local_whisper_url = "http://127.0.0.1:8082"
+    daemon.backend._process = Mock()
+    daemon.backend._process.poll.return_value = None
+    with patch("threading.Thread") as mock_thread:
+        daemon._warm_backend_for_recording()
+    mock_thread.assert_not_called()
+    daemon.backend.working_model.assert_not_called()
+
+
+def test_warm_path_warns_when_no_model_exists(temp_config_dir):
+    daemon = _model_daemon(temp_config_dir, Mock())
+    daemon.config.local_whisper_url = ""
+    daemon.backend._process = None
+    daemon.backend.working_model.return_value = None
+    with patch("threading.Thread") as mock_thread:
+        daemon._warm_backend_for_recording()
+    mock_thread.assert_not_called()
+    notes = [call[0][0] for call in daemon.notify.call_args_list]
+    assert any("No speech model" in note for note in notes)

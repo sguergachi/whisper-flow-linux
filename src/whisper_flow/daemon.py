@@ -708,29 +708,12 @@ class WhisperFlowDaemon:
             log(f"[DAEMON] Already recording, ignoring start request for mode: {mode}")
             return False
 
-        # If the server died (GPU 0xC0000005 in the user's log), revive it
-        # *before* opening the mic — otherwise 5s of speech is recorded and
-        # then dropped with "No whisper server configured".
-        try:
-            backend_ok = self._ensure_backend_running(allow_download=False)
-        except Exception as e:
-            log(f"[DAEMON] backend check before recording failed: {e}")
-            backend_ok = False
-        if not backend_ok:
-            # No model at all — can't transcribe even on CPU; still allow
-            # recording so the audio-debug captures evidence, but warn now
-            # rather than after 5s of silence.
-            try:
-                has_model = bool(self.backend.working_model())
-            except Exception:
-                has_model = False
-            if not has_model:
-                log("[DAEMON] no working model — recording will have nowhere to transcribe")
-                self.notify("No speech model installed — open Settings to download one")
-            else:
-                log("[DAEMON] backend not running before recording — will record anyway and retry after")
-                # Don't block the hotkey on a download; the recording thread's
-                # closing pass will retry via TranscriptionService fallback
+        # A cold server takes ~20s to load a GPU model; blocking the hotkey
+        # on it meant push-to-talk started only after the user released the
+        # keys, then instantly stopped with 0 frames ("Recording failed").
+        # The mic opens immediately now and the server warms underneath; the
+        # closing pass retries the backend before transcribing.
+        self._warm_backend_for_recording()
 
         log(f"[DAEMON] Starting recording for mode: {mode}")
         # Clear the previous cycle's thread handle first. The watchdog treats
@@ -1786,6 +1769,50 @@ class WhisperFlowDaemon:
                             self.backend.mark_setup_seen()
             except Exception as e:
                 log(f"[DAEMON] auto GPU install check failed: {e}")
+
+    def _backend_alive_now(self) -> bool:
+        """Instant check: URL set and server process alive. No I/O, no locks."""
+        try:
+            return bool(self.config.local_whisper_url
+                        and self.backend._process
+                        and self.backend._process.poll() is None)
+        except Exception:
+            return False
+
+    def _warm_backend_for_recording(self) -> None:
+        """Make sure a server is coming up, without blocking the hotkey.
+
+        Never raises. When nothing can transcribe (no model at all) it says
+        so now rather than after seconds of silence.
+        """
+        try:
+            if self._backend_alive_now():
+                return
+        except Exception:
+            pass
+        try:
+            has_model = bool(self.backend.working_model())
+        except Exception:
+            has_model = False
+        if not has_model:
+            log("[DAEMON] no working model — recording will have nowhere to transcribe")
+            try:
+                self.notify("No speech model installed — open Settings to download one")
+            except Exception:
+                pass
+            return
+        log("[DAEMON] backend not running before recording — warming in the background")
+        threading.Thread(target=self._ensure_backend_in_background,
+                         daemon=True,
+                         name="whisper-flow-backend-warm").start()
+
+    def _ensure_backend_in_background(self) -> None:
+        """Revive the server off the hotkey path. Never raises."""
+        try:
+            if self._ensure_backend_running(allow_download=False):
+                log("[BACKEND] warmed up in the background, ready to transcribe")
+        except Exception as e:
+            log(f"[DAEMON] background backend warm failed: {e}")
 
     def _fetch_model_in_background(self, model: str) -> None:
         """Download a model missing at startup, without holding up the tray.

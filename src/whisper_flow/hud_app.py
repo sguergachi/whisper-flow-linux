@@ -466,6 +466,11 @@ class HudWindow(Gtk.Window):
         # cannot tell from a failure.
         self.processing = False
         self._processing_t0 = 0.0
+        # A short text label (mic switched, etc.): the capsule shows words
+        # instead of the waveform until it expires. Cleared by begin_show,
+        # so a recording always takes the pill back.
+        self.toast_text: str | None = None
+        self._toast_token = 0
         # Which mode this overlay is showing for. A resident overlay learns
         # it per recording, from the show command; one spawned per recording
         # gets it here, from the environment the daemon built for it.
@@ -1152,12 +1157,55 @@ class HudWindow(Gtk.Window):
         print(f"[HUD] processing {time.time():.6f}", flush=True)
         return False
 
+    # How long a text label stays up, in seconds.
+    TOAST_SECONDS = 3
+
+    def begin_toast(self, text: str):
+        """Show a short text label in the capsule, then take it down.
+
+        For moments with no recording to show - a microphone switch, not a
+        dictation. A recording starting meanwhile takes the pill back via
+        begin_show, which invalidates the pending hide.
+        """
+        text = (text or "").strip()
+        if not text or self._quitting:
+            return False
+        self._toast_token += 1
+        token = self._toast_token
+        self.toast_text = text
+        self.processing = False
+        self.stop_button = False
+        self.start = time.monotonic()
+        self.alpha = 0.0
+        self._fade_in_t0 = time.monotonic()
+        self._fade_out_t0 = None
+        self._quitting = False
+        self._window_resize()
+        self._apply_position()
+        self._placed = (not IS_WINDOWS or self.get_mapped()
+                        or self._pin_proc is not None)
+        self.present()
+        print(f"[HUD] toast {time.time():.6f} {text!r}", flush=True)
+        GLib.timeout_add_seconds(self.TOAST_SECONDS, self._end_toast, token)
+        return False
+
+    def _end_toast(self, token: int):
+        """Take a label down, unless a recording owns the pill by now."""
+        if token != self._toast_token or self.toast_text is None:
+            return False
+        self.toast_text = None
+        self.begin_hide()
+        return False
+
     def begin_show(self, level_file: str, point: str = "",
                    stop_button: bool = False):
         """Show for a new recording. No process start, no window creation."""
         self._move_to_monitor(point)
         self.level_file = level_file
         self.processing = False
+        # A recording owns the pill: whatever label was showing is done.
+        self.toast_text = None
+        self._toast_token += 1
         self.stop_button = stop_button
         self.stop_hover = 0.0
         self.stop_hover_target = 0.0
@@ -1582,6 +1630,13 @@ class HudWindow(Gtk.Window):
         else:
             self._paint_chrome(cr, w, h, a)
 
+        # A text label owns the whole capsule while it is up: words
+        # instead of the waveform, in the same glass.
+        if self.toast_text is not None:
+            self._draw_toast_text(cr, w, mid, a)
+            cr.restore()
+            return
+
         # Live recording: wave + dot tint by noise / transcription risk
         # (white → yellow → red). Processing keeps the blue spinner path.
         if self.processing:
@@ -1659,6 +1714,32 @@ class HudWindow(Gtk.Window):
 
         cr.restore()
 
+    def _draw_toast_text(self, cr, w, mid, a):
+        """One centred label in the capsule: words instead of the waveform."""
+        text = self._fit_toast_text(cr, self.toast_text or "", w)
+        if not text:
+            return
+        cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL,
+                            cairo.FONT_WEIGHT_NORMAL)
+        cr.set_font_size(13.0)
+        _, _, text_w, text_h, _, _ = cr.text_extents(text)
+        cr.set_source_rgba(1, 1, 1, 0.92 * a)
+        cr.move_to((w - text_w) / 2, mid + text_h / 2)
+        cr.show_text(text)
+
+    @staticmethod
+    def _fit_toast_text(cr, text: str, w: float) -> str:
+        """Trim a label with an ellipsis until it fits the capsule."""
+        cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL,
+                            cairo.FONT_WEIGHT_NORMAL)
+        cr.set_font_size(13.0)
+        room = w - 2 * RADIUS
+        if cr.text_extents(text)[2] <= room:
+            return text
+        while len(text) > 1 and cr.text_extents(text + "…")[2] > room:
+            text = text[:-1]
+        return (text + "…").strip()
+
     def _draw_stop_button(self, cr, a):
         """The round-rect tab tucked under the pill's bottom centre.
 
@@ -1727,6 +1808,8 @@ def _command_loop(win: "HudWindow"):
                               stop == "1")
             elif command == "processing":
                 GLib.idle_add(win.begin_processing)
+            elif command.startswith("toast "):
+                GLib.idle_add(win.begin_toast, command[6:].strip())
             elif command == "hide":
                 GLib.idle_add(win.begin_hide)
             elif command == "quit":
@@ -1771,7 +1854,14 @@ def main() -> int:
         threading.Thread(target=_command_loop, args=(win,), daemon=True,
                          name="whisper-flow-hud-commands").start()
     else:
-        win.present()
+        # A standalone label (WHISPER_FLOW_HUD_TEXT): the capsule shows
+        # words for a few seconds and then the process leaves, no
+        # recording involved.
+        toast = os.environ.get("WHISPER_FLOW_HUD_TEXT", "").strip()
+        if toast:
+            win.begin_toast(toast)
+        else:
+            win.present()
     _mark("present() returned")
     loop.run()
     return 0

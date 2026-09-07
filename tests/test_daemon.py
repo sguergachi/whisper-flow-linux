@@ -1521,3 +1521,80 @@ def test_warm_path_warns_when_no_model_exists(temp_config_dir):
     mock_thread.assert_not_called()
     notes = [call[0][0] for call in daemon.notify.call_args_list]
     assert any("No speech model" in note for note in notes)
+
+
+# ------------------------------------------------- microphone following
+def _mic_daemon(temp_config_dir, signature):
+    """A daemon whose recorders all report the given input signature."""
+    daemon, _ = _idle_daemon(temp_config_dir)
+    daemon.hud = Mock()
+    for app in (daemon.transcribe_app, daemon.auto_transcribe_app,
+                daemon.command_app):
+        app.audio_recorder.input_signature.return_value = signature
+    return daemon
+
+
+def test_first_mic_pass_records_silently(temp_config_dir):
+    daemon = _mic_daemon(temp_config_dir, (None, "Mic A", frozenset({"Mic A"})))
+    assert daemon._maybe_switch_microphone() is False
+    daemon.hud.toast.assert_not_called()
+
+
+def test_new_default_mic_switches_and_toasts(temp_config_dir):
+    daemon = _mic_daemon(temp_config_dir, (None, "Mic A", frozenset({"Mic A"})))
+    assert daemon._maybe_switch_microphone() is False  # baseline
+    daemon.transcribe_app.audio_recorder.input_signature.return_value = (
+        None, "Headset", frozenset({"Mic A", "Headset"}))
+    assert daemon._maybe_switch_microphone() is True
+    # One drop per app (the fixture shares a single app Mock, so one
+    # recorder sees all three drops).
+    assert daemon.transcribe_app.audio_recorder.drop_warm_stream.call_count == 3
+    daemon.hud.toast.assert_called_once_with("Microphone: Headset")
+    # Settled: the next pass is quiet.
+    assert daemon._maybe_switch_microphone() is False
+    assert daemon.hud.toast.call_count == 1
+
+
+def test_unchanged_mic_stays_quiet(temp_config_dir):
+    daemon = _mic_daemon(temp_config_dir, (None, "Mic A", frozenset({"Mic A"})))
+    daemon._maybe_switch_microphone()
+    daemon.hud.reset_mock()
+    assert daemon._maybe_switch_microphone() is False
+    daemon.hud.toast.assert_not_called()
+
+
+def test_dead_audio_never_switches(temp_config_dir):
+    daemon = _mic_daemon(temp_config_dir, None)
+    assert daemon._maybe_switch_microphone() is False
+    daemon.hud.toast.assert_not_called()
+
+
+def test_short_mic_name_drops_bus_tags():
+    from whisper_flow.daemon import WhisperFlowDaemon
+
+    assert (WhisperFlowDaemon._short_mic_name("USB Audio (hw:4,0)")
+            == "USB Audio")
+    assert (WhisperFlowDaemon._short_mic_name("Logitech BRIO: USB Audio")
+            == "Logitech BRIO: USB Audio")
+
+
+def test_toast_spawns_a_self_quitting_overlay_where_uncommandable(
+        temp_config_dir, monkeypatch):
+    """Linux overlays have no pipe: the toast is a dedicated process
+    carrying its text in the environment, quitting on its own."""
+    import subprocess
+
+    from whisper_flow import hud as hud_module
+
+    monkeypatch.setattr(hud_module, "RESIDENT", False)
+    overlay = hud_module.HUD()
+    spawned = []
+    monkeypatch.setattr(overlay, "_overlay_command",
+                        lambda: ["whisper-flow-hud"])
+    monkeypatch.setattr(subprocess, "Popen",
+                        lambda *a, **k: spawned.append((a, k)) or Mock())
+    overlay.toast("Microphone: Headset")
+    assert len(spawned) == 1
+    _, kwargs = spawned[0]
+    assert kwargs["env"]["WHISPER_FLOW_HUD_TEXT"] == "Microphone: Headset"
+    assert kwargs["stdout"] is subprocess.DEVNULL

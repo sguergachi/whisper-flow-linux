@@ -404,6 +404,35 @@ class HUD:
         except OSError:
             pass
 
+    def toast(self, text: str) -> None:
+        """Show a short text label in the capsule for a few seconds.
+
+        For moments with no recording to show - a microphone switch, not a
+        dictation. A resident overlay takes the order down its pipe; one
+        spawned per recording cannot be commanded, so a dedicated overlay
+        is spawned that quits itself. Never raises.
+        """
+        text = (text or "").strip()
+        if not text:
+            return
+        try:
+            with self._lock:
+                if RESIDENT:
+                    if not self._command(f"toast {text}"):
+                        log("[HUD] no resident overlay for the toast")
+                    return
+                env = self._overlay_env("")
+                env["WHISPER_FLOW_HUD_TEXT"] = text
+                subprocess.Popen(
+                    self._overlay_command(),
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    env=env,
+                    **({} if IS_WINDOWS else {"preexec_fn": os.setsid}),
+                )
+        except Exception as e:
+            log(f"[HUD] could not show the toast: {e}")
+
     def hide(self):
         """Hide the recording HUD overlay."""
         with self._lock:

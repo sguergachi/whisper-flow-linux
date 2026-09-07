@@ -160,3 +160,50 @@ def test_whisper_with_a_small_mean_is_not_wrongly_skipped():
     # Room tone at mean ~8 is below the 30 threshold: nothing should be cut,
     # because the clip never had a warm-up to drop.
     assert len(skipped) == len(frames)
+
+
+# ------------------------------------------------- input switching
+def _pa_with(inputs, default):
+    """A fake PortAudio: inputs is [(name, is_input)], default the name."""
+    pa = Mock()
+    infos = {}
+    for index, (name, is_input) in enumerate(inputs):
+        infos[index] = {"index": index, "name": name,
+                        "maxInputChannels": 1 if is_input else 0,
+                        "defaultSampleRate": 44100.0, "hostApi": 0}
+    pa.get_device_count.return_value = len(infos)
+    pa.get_device_info_by_index.side_effect = lambda i: infos[i]
+    pa.get_default_input_device_info.return_value = {
+        "index": next(i for i, (n, _) in enumerate(inputs) if n == default),
+        "name": default, "defaultSampleRate": 44100.0}
+    return pa
+
+
+def test_input_signature_names_choice_default_and_offered():
+    recorder = _recorder()
+    recorder.pa = _pa_with([("Speakers", False), ("Mic A", True),
+                            ("Mic B", True)], "Mic A")
+    recorder.config.mic_device_index = None
+    assert recorder.input_signature() == (
+        None, "Mic A", frozenset({"Mic A", "Mic B"}))
+
+
+def test_input_signature_none_without_audio():
+    recorder = _recorder()
+    assert recorder.pa is None
+    assert recorder.input_signature() is None
+
+
+def test_drop_warm_stream_releases_the_old_device():
+    recorder = _recorder()
+    stream = Mock()
+    recorder._warm_stream = stream
+    recorder.drop_warm_stream()
+    assert recorder._warm_stream is None
+    stream.close.assert_called_once()
+
+
+def test_drop_warm_stream_is_a_noop_when_idle():
+    recorder = _recorder()
+    recorder.drop_warm_stream()  # must not raise with nothing held
+    assert recorder._warm_stream is None

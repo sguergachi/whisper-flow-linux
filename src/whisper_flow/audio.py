@@ -496,6 +496,47 @@ class AudioRecorder:
         converted = np.interp(positions, np.arange(smoothed.size), smoothed)
         return np.clip(converted, -32768, 32767).astype(np.int16).tobytes()
 
+    def input_signature(self):
+        """Identity of the capture device we would open right now.
+
+        A (chosen, default, offered) triple: the resolved device index (or
+        None for the platform default), the OS default input's name, and
+        the names of every input on offer. The daemon fingerprints this to
+        notice a plugged-in microphone that became the default. Cheap
+        PortAudio queries, no stream opened. None when audio is down.
+        """
+        if self.pa is None:
+            return None
+        try:
+            default = self.pa.get_default_input_device_info()
+            offered = set()
+            for index in range(self.pa.get_device_count()):
+                info = self.pa.get_device_info_by_index(index)
+                if info.get("maxInputChannels"):
+                    offered.add(str(info.get("name")))
+            try:
+                chosen = self._input_device_index()
+            except Exception:
+                chosen = None
+            return (chosen, str(default.get("name")),
+                    frozenset(offered))
+        except Exception:
+            return None
+
+    def drop_warm_stream(self) -> None:
+        """Forget a kept-warm capture stream, releasing the microphone.
+
+        The warm stream is bound to the device it was opened on; after an
+        input switch it would keep recording from the old microphone. Only
+        called while idle, never mid-recording.
+        """
+        with self._stream_lock:
+            stream, self._warm_stream = self._warm_stream, None
+            self._warm_timer = None
+        if stream is not None:
+            log("[AUDIO] dropping the warm stream after an input switch")
+            self._close_stream(stream)
+
     def log_input_devices(self) -> None:
         """List the capture devices once, with the one we would choose marked.
 

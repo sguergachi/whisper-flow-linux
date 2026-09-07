@@ -707,3 +707,23 @@ def test_the_hold_cannot_strand_the_pill_off_screen():
         assert way_out in show, (
             f"{way_out} no longer clears the hold, so a pill shown that way "
             f"waits for a correction that is never coming")
+
+
+# ------------------------------------------------------------- text toasts
+def test_toast_commands_the_resident_overlay(hud, monkeypatch):
+    """A mic switch is words down the same pipe, not a new process."""
+    process = _running(hud, monkeypatch)
+    hud.toast("Microphone: Headset")
+    assert process.written == ["toast Microphone: Headset\n"]
+
+
+def test_empty_toast_sends_nothing(hud, monkeypatch):
+    process = _running(hud, monkeypatch)
+    hud.toast("   ")
+    assert process.written == []
+
+
+def test_toast_without_overlay_stays_silent(hud, monkeypatch):
+    """No resident running (prewarm pending): log, never raise."""
+    monkeypatch.setattr(hud, "_resident_process", lambda: None)
+    hud.toast("Microphone: Headset")  # must not raise

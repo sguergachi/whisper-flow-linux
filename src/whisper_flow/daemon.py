@@ -3,6 +3,7 @@
 import os
 import platform
 import queue
+import re
 import subprocess
 import sys
 import tempfile
@@ -321,6 +322,10 @@ class WhisperFlowDaemon:
                             self.hotkey_manager.sweep_input()
                         except Exception as e:
                             log(f"[DAEMON] input sweep failed: {e}")
+                        # A plugged-in microphone that became the OS default
+                        # is picked up here, while idle so no recording is
+                        # ever yanked off its device mid-utterance.
+                        self._maybe_switch_microphone()
 
                 # Log status only when it changes; at a 2s interval a constant
                 # heartbeat buries every real message in the journal.
@@ -2575,6 +2580,56 @@ Use 'whisper-flow stop' to exit daemon
                 if attempt < attempts:
                     time.sleep(5)
         return False
+
+    @staticmethod
+    def _short_mic_name(name: str) -> str:
+        """A device name trimmed for a pill label: no trailing bus tags."""
+        short = re.sub(r"\s*\(hw:\d+,\d+\)\s*$", "", name or "").strip()
+        return short or name
+
+    def _maybe_switch_microphone(self) -> bool:
+        """Follow the OS default input when it changes. True on a switch.
+
+        Plugging in a headset that becomes the default used to change
+        nothing until a restart: the next recording opened the old device
+        (or a warm stream bound to it) and came back silent. The first
+        pass after startup only records the fingerprint, never toasts.
+        A device pinned in Settings wins by construction: the fingerprint
+        is the resolved choice, so an explicit pin that still resolves
+        never changes. Never raises.
+        """
+        try:
+            recorder = self.transcribe_app.audio_recorder
+        except Exception:
+            return False
+        try:
+            signature = recorder.input_signature()
+        except Exception:
+            return False
+        if signature is None:
+            return False
+        last = getattr(self, "_last_mic_signature", None)
+        if last is None:
+            self._last_mic_signature = signature
+            return False
+        if signature == last:
+            return False
+        self._last_mic_signature = signature
+        _, old_default, _ = last
+        _, new_default, _ = signature
+        for app in (self.transcribe_app, self.auto_transcribe_app,
+                    self.command_app):
+            try:
+                app.audio_recorder.drop_warm_stream()
+            except Exception:
+                pass
+        log(f"[AUDIO] input switched (default {old_default!r} -> "
+            f"{new_default!r}); next recording uses the new microphone")
+        try:
+            self.hud.toast(f"Microphone: {self._short_mic_name(new_default)}")
+        except Exception as e:
+            log(f"[DAEMON] mic toast failed: {e}")
+        return True
 
     def _maybe_heal_hotkeys(self) -> bool:
         """Revive a dead hotkey listener, throttled. True when revived.

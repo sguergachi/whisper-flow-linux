@@ -23,6 +23,9 @@ def recorder():
     rec._warm_chunk = None
     rec._devices_logged = True          # not under test here
     rec._warm_timer = None
+    rec._warm_device = None
+    rec._last_open_device = None
+    rec._avoid_device = None
     import threading
     rec._stream_lock = threading.Lock()
     return rec

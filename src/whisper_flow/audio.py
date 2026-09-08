@@ -229,6 +229,14 @@ class AudioRecorder:
         # microphone. _check_pyaudio reports it per recording instead.
         self.pa = None
         self._warm_stream = None
+        self._warm_device = None
+        self._last_open_device = None
+        # A device that proved itself dead: opened fine but delivered exact
+        # digital zeros for a whole utterance. Avoided for the rest of the
+        # session in favour of the platform default; the pin in Settings is
+        # left alone (a muted mic unmutes, a wrong device does not fix
+        # itself, and only the user can tell which it was).
+        self._avoid_device: int | None = None
         self._devices_logged = False
         self._warm_chunk = None
         # What the device is actually running at. Equal to the configured
@@ -289,6 +297,12 @@ class AudioRecorder:
             remapped = self._remap_configured_device(
                 self.config.mic_device_index)
             if remapped is not None:
+                avoided = getattr(self, "_avoid_device", None)
+                if avoided is not None and remapped == avoided:
+                    log(f"[AUDIO] configured device {remapped} gave only "
+                        f"digital silence last time; using the default "
+                        f"instead for now")
+                    return None
                 return remapped
             # Gone, or unsupported with no twin. On Windows fall through
             # to the WASAPI pick; elsewhere the platform default.
@@ -496,6 +510,46 @@ class AudioRecorder:
         converted = np.interp(positions, np.arange(smoothed.size), smoothed)
         return np.clip(converted, -32768, 32767).astype(np.int16).tobytes()
 
+    def _note_capture_result(self, frames: list, duration_s: float) -> None:
+        """Learn from a finished capture.
+
+        A device delivering bit-exact zeros for a whole utterance is
+        avoided for the rest of the session in favour of the platform
+        default. Gated on exact silence (peak == 0), never mere quiet: a
+        live mic in a silent room still reads noise floor above zero,
+        while a muted mic or a device node handing nothing back reads
+        exactly 0. Short captures (<1s) never count - cold opens start
+        with transients. Any sign of life forgives: a nonzero capture
+        clears the avoidance, so an unmuted mic restores its own pin.
+        """
+        try:
+            if not frames:
+                return
+            peak, _ = self._loudness(frames)
+            if peak != 0:
+                if getattr(self, "_avoid_device", None) is not None:
+                    self._avoid_device = None
+                    log("[AUDIO] capture device is delivering audio again; "
+                        "configured device restored")
+                return
+            if duration_s < 1.0:
+                return
+            device, name = getattr(
+                self, "_last_open_device", None) or (None, "default")
+            if device is None:
+                log("[AUDIO] the default input delivered only digital "
+                    "silence — check the OS default microphone and mute "
+                    "switches")
+                return
+            if getattr(self, "_avoid_device", None) == device:
+                return
+            self._avoid_device = device
+            log(f"[AUDIO] {name} (index {device}) delivered "
+                f"{duration_s:.1f}s of digital silence — avoiding it for "
+                f"now, next recording uses the default input")
+        except Exception as e:
+            log(f"[AUDIO] silence check failed: {e}")
+
     def input_signature(self):
         """Identity of the capture device we would open right now.
 
@@ -533,9 +587,22 @@ class AudioRecorder:
         with self._stream_lock:
             stream, self._warm_stream = self._warm_stream, None
             self._warm_timer = None
+            self._warm_device = None
         if stream is not None:
             log("[AUDIO] dropping the warm stream after an input switch")
             self._close_stream(stream)
+
+    def _device_name(self, device: int | None) -> str:
+        """Human name for a device index, for log lines. Never raises."""
+        if device is None:
+            return "default"
+        try:
+            if self.pa is None:
+                return f"device {device}"
+            return str(self.pa.get_device_info_by_index(device).get(
+                "name", f"device {device}"))
+        except Exception:
+            return f"device {device}"
 
     def log_input_devices(self) -> None:
         """List the capture devices once, with the one we would choose marked.
@@ -573,6 +640,10 @@ class AudioRecorder:
         MIC_KEEP_WARM_SECONDS so the microphone-in-use indicator does not
         stay lit, and so nothing else is kept out of the device.
         """
+        # Fresh per attempt: a failed open must not leave the previous
+        # recording's device behind to take the blame for this one's
+        # silence. The warm-reuse path below restores its own.
+        self._last_open_device = None
         with self._stream_lock:
             warm = self._warm_stream
             if warm is not None and self._warm_chunk == chunk:
@@ -580,7 +651,9 @@ class AudioRecorder:
                 try:
                     if not warm.is_active():
                         warm.start_stream()
-                    log("[AUDIO] reused a warm capture stream")
+                    self._last_open_device = self._warm_device
+                    log(f"[AUDIO] reused a warm capture stream "
+                        f"({self._device_name(self._warm_device)})")
                     return warm
                 except Exception as e:
                     log(f"[AUDIO] warm stream unusable: {e}")
@@ -589,6 +662,10 @@ class AudioRecorder:
         self.log_input_devices()
         device = self._input_device_index()
         capture_rate = self._native_rate(device)
+        name = self._device_name(device)
+        log(f"[AUDIO] opening input {name} "
+            f"{'' if device is None else f'(index {device}) '}"
+            f"@ {capture_rate}Hz")
         try:
             with suppress_alsa_warnings():
                 stream = self.pa.open(
@@ -603,6 +680,7 @@ class AudioRecorder:
             if capture_rate != self.config.sample_rate:
                 log(f"[AUDIO] capturing at {capture_rate}Hz, converting to "
                     f"{self.config.sample_rate}Hz")
+            self._last_open_device = (device, name)
             return stream
         except Exception as e:
             if device is None:
@@ -614,6 +692,7 @@ class AudioRecorder:
             log(f"[AUDIO] input device {device} would not open ({e}); "
                 f"falling back to the default device")
             self._capture_rate = self.config.sample_rate
+            self._last_open_device = (None, self._device_name(None))
             with suppress_alsa_warnings():
                 return self.pa.open(
                     format=pyaudio.paInt16,
@@ -637,6 +716,10 @@ class AudioRecorder:
         with self._stream_lock:
             previous, self._warm_stream = self._warm_stream, stream
             self._warm_chunk = chunk
+            # Bound to the device it was opened on: reusing it later must
+            # record from the same microphone, and a device switch must
+            # know what to throw away.
+            self._warm_device = getattr(self, "_last_open_device", None)
             if self._warm_timer is not None:
                 self._warm_timer.cancel()
             # The timer carries the stream it was scheduled for. Cancelling a
@@ -656,6 +739,7 @@ class AudioRecorder:
                 return  # a newer recording has already taken the warm slot
             stream, self._warm_stream = self._warm_stream, None
             self._warm_timer = None
+            self._warm_device = None
         if stream is not None:
             log("[AUDIO] releasing the microphone after idle")
             self._close_stream(stream)
@@ -845,6 +929,7 @@ class AudioRecorder:
             if frames:
                 self._save_wav_file(output_path, frames)
                 peak, mean = self._loudness(frames)
+                self._note_capture_result(frames, duration)
                 # A whisper peaks around 100, and calling that a dead device
                 # was wrong: the microphone was working, the voice was small.
                 # Only a genuine noise floor gets the warning now.
@@ -854,8 +939,10 @@ class AudioRecorder:
                     quiet = " - very quiet, will retry amplified if it comes back empty"
                 else:
                     quiet = ""
+                device_label = (getattr(
+                    self, "_last_open_device", None) or (None, "default"))[1]
                 log(f"[AUDIO] recording stopped after {duration:.2f}s, "
-                    f"peak {peak} mean {mean}{quiet}")
+                    f"peak {peak} mean {mean} on {device_label}{quiet}")
                 return output_path
             # Zero frames from a stream that opened is the signature of a
             # microphone the OS is refusing to hand over. On Windows 11 that
@@ -998,7 +1085,9 @@ class AudioRecorder:
             # Save the recorded audio
             if frames and recording_started:
                 self._save_wav_file(output_path, frames)
+                self._note_capture_result(frames, time.time() - started_at)
                 return output_path
+            self._note_capture_result(frames, time.time() - started_at)
             os.unlink(output_path)
             return None
 

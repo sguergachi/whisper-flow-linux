@@ -4,6 +4,8 @@ import sys
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+import numpy as np
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from whisper_flow.audio import AudioRecorder
@@ -70,8 +72,7 @@ def test_stale_warm_timer_cannot_close_the_current_stream():
 # ------------------------------------------------- the HUD's level file
 def _frame_at(rms: int) -> bytes:
     """A 30ms frame whose RMS is exactly `rms`."""
-    import numpy as np
-
+    
     return np.full(480, rms, dtype=np.int16).tobytes()
 
 
@@ -119,8 +120,7 @@ def test_cold_open_silence_is_skipped():
     That silence made the floor read as a dead-silent room and the VAD's pad
     kept it in the trimmed file, where it poisoned the first transcription.
     """
-    import numpy as np
-
+    
     recorder = _recorder()
     rate = 16000
     frame = 480
@@ -141,8 +141,7 @@ def test_cold_open_silence_is_skipped():
 
 def test_whisper_with_a_small_mean_is_not_wrongly_skipped():
     """A genuine quiet whisper (frame mean ~50) must not look like warm-up."""
-    import numpy as np
-
+    
     recorder = _recorder()
     rate = 16000
     frame = 480
@@ -207,3 +206,121 @@ def test_drop_warm_stream_is_a_noop_when_idle():
     recorder = _recorder()
     recorder.drop_warm_stream()  # must not raise with nothing held
     assert recorder._warm_stream is None
+
+
+# ------------------------------------------------- dead-device fallback
+def _live_recorder(pinned=7, rate=48000):
+    """A recorder whose only mic is pinned, running hot like the BRIO."""
+    from unittest.mock import Mock, patch
+
+    config = Mock()
+    config.vad_mode = 2
+    config.frame_ms = 30
+    config.sample_rate = 16000
+    config.mic_device_index = pinned
+    config.speedup_audio = 1.0
+    with patch("whisper_flow.audio.pyaudio", Mock()):
+        recorder = AudioRecorder(config, Mock())
+    # The container has no audio stack; keep the (mocked) module present
+    # so the per-recording check passes.
+    recorder._check_pyaudio = lambda: True
+    infos = {7: {"index": 7, "name": "Test Mic",
+                 "maxInputChannels": 1, "defaultSampleRate": float(rate),
+                 "hostApi": 0}}
+    pa = Mock()
+    pa.get_device_count.return_value = max(infos) + 1
+    pa.get_device_info_by_index.side_effect = lambda i: infos[i]
+    pa.get_default_input_device_info.return_value = {
+        "index": 30, "name": "default", "defaultSampleRate": 44100.0}
+    recorder.pa = pa
+    return recorder
+
+
+def _zero_stream(frames_before_stop, stop_event, samples_per_read=1440):
+    """A stream that opens fine and delivers exact digital zeros."""
+    from unittest.mock import Mock
+
+    stream = Mock()
+    stream.is_active.return_value = True
+    calls = {"n": 0}
+
+    def read(n, *a, **k):
+        calls["n"] += 1
+        if calls["n"] >= frames_before_stop:
+            stop_event.set()
+        return b"\x00" * (samples_per_read * 2)
+
+    stream.read.side_effect = read
+    return stream
+
+
+def test_all_zero_capture_avoids_the_device():
+    import threading
+
+    recorder = _live_recorder()
+    stop = threading.Event()
+    recorder.pa.open.return_value = _zero_stream(40, stop)
+    path = recorder.record_push_to_talk("super+alt", stop_event=stop)
+    assert path is not None
+    assert recorder._avoid_device == 7
+    # Next press resolves to the platform default instead.
+    assert recorder._input_device_index() is None
+
+
+def test_live_capture_keeps_the_pin():
+    import threading
+
+    recorder = _live_recorder()
+    stop = threading.Event()
+    stream = _zero_stream(40, stop)
+    loud = (np.zeros(1440, dtype=np.int16) + 2000).tobytes()
+    stream.read.side_effect = lambda n, *a, **k: loud
+    recorder.pa.open.return_value = stream
+    stop_trigger = threading.Timer(0.5, stop.set)
+    stop_trigger.start()
+    try:
+        path = recorder.record_push_to_talk("super+alt", stop_event=stop)
+    finally:
+        stop_trigger.cancel()
+    assert path is not None
+    assert recorder._avoid_device is None
+    assert recorder._input_device_index() == 7
+
+
+def test_silence_on_the_default_has_nowhere_to_fall_back():
+    recorder = _live_recorder(pinned=None)
+    recorder.config.mic_device_index = None
+    recorder._last_open_device = (None, "default")
+    frames = [b"\x00" * 960 for _ in range(40)]
+    recorder._note_capture_result(frames, 2.0)
+    assert recorder._avoid_device is None
+
+
+def test_short_silence_does_not_count():
+    recorder = _live_recorder()
+    recorder._last_open_device = (7, "Test Mic")
+    frames = [b"\x00" * 960 for _ in range(10)]
+    recorder._note_capture_result(frames, 0.3)
+    assert recorder._avoid_device is None
+
+
+def test_a_live_mic_forgives_a_muted_one():
+    recorder = _live_recorder()
+    recorder._avoid_device = 7
+    frames = [(np.zeros(480, dtype=np.int16) + 500).tobytes()
+              for _ in range(40)]
+    recorder._note_capture_result(frames, 2.0)
+    assert recorder._avoid_device is None
+    assert recorder._input_device_index() == 7
+
+
+def test_opens_name_the_device_and_rate():
+    recorder = _live_recorder()
+    recorder.pa.open.return_value = Mock()
+    logged = []
+    import whisper_flow.audio as audio_module
+    from unittest.mock import patch
+    with patch.object(audio_module, "log", logged.append):
+        recorder._open_input_stream(480)
+    line = " ".join(str(x) for x in logged)
+    assert "Test Mic" in line and "48000Hz" in line

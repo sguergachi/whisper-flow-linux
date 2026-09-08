@@ -2612,7 +2612,11 @@ Use 'whisper-flow stop' to exit daemon
         if last is None:
             self._last_mic_signature = signature
             return False
-        if signature == last:
+        # Only the recording device matters: the offered set churns on
+        # every plug/unplug, but a new arrival nobody records from is not
+        # a switch.
+        if signature[:2] == last[:2]:
+            self._last_mic_signature = signature
             return False
         self._last_mic_signature = signature
         _, old_default, _ = last

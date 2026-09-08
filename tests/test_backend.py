@@ -1422,3 +1422,133 @@ def test_mark_of_the_web_is_none_off_windows(monkeypatch):
 
     monkeypatch.setattr(sys, "platform", "linux")
     assert LocalBackend.has_mark_of_the_web("/tmp/x") is None
+
+
+# ------------------------------------------------- port fallback
+def test_pick_port_prefers_the_configured_one(local_backend):
+    assert local_backend._pick_port() == 18080
+
+
+def test_pick_port_steps_over_a_held_port(local_backend, monkeypatch):
+    import socket
+
+    held = {18080}
+
+    class FakeSocket:
+        def __init__(self, *a, **k):
+            pass
+
+        def bind(self, addr):
+            if addr[1] in held:
+                raise OSError("held")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(socket, "socket", FakeSocket)
+    assert local_backend._pick_port() == 18081
+
+
+def test_pick_port_gives_up_gracefully(local_backend, monkeypatch):
+    import socket
+
+    class BusySocket:
+        def __init__(self, *a, **k):
+            pass
+
+        def bind(self, addr):
+            raise OSError("held")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(socket, "socket", BusySocket)
+    assert local_backend._pick_port() == 18080
+
+
+def test_url_follows_the_active_port(local_backend):
+    assert "18080" in local_backend.url
+    local_backend._active_port = 18083
+    assert "18083" in local_backend.url
+
+
+# ------------------------------------------------- plain-engine-once guard
+def test_plain_engine_is_not_fetched_twice_in_one_session(
+        local_backend, config, monkeypatch):
+    """Bundled crash → plain download → plain crash → terminal, not loop."""
+    from unittest.mock import Mock
+
+    _install_engine(local_backend, config)
+    monkeypatch.setattr(backend_module, "detect_accelerator", lambda: "cpu")
+    local_backend._plain_fallback_done = True
+    local_backend._plain_engine_failed = True
+    notified = []
+    local_backend._notify = notified.append
+    fetch = Mock(return_value=True)
+    monkeypatch.setattr(local_backend, "_download_plain_engine", fetch)
+    for _ in range(3):
+        local_backend.note_crash(0xC0000005)
+    fetch.assert_not_called()
+    assert any("both" in note.lower() and "compatibility" in note.lower()
+               for note in notified)
+
+
+# ------------------------------------------------- CLI fallback
+def _cli_backend(local_backend, config, tmp_path):
+    """A backend whose engine dir holds a whisper-cli 'binary'."""
+    from pathlib import Path
+
+    exe = Path(config.config_dir) / "runtime" / local_backend._exe_name
+    exe.parent.mkdir(parents=True, exist_ok=True)
+    exe.write_text("engine")
+    cli = exe.parent / ("whisper-cli.exe"
+                        if sys.platform == "win32" else "whisper-cli")
+    cli.write_text("cli")
+    model = Path(config.config_dir) / "models" / "ggml-base.en-q8_0.bin"
+    model.parent.mkdir(parents=True, exist_ok=True)
+    model.write_text("model")
+    local_backend.config.model_name = "ggml-base.en-q8_0"
+    return cli
+
+
+def test_cli_fallback_needs_a_cli_binary(local_backend, config):
+    _install_engine(local_backend, config)
+    assert local_backend.cli_path() is None
+    assert local_backend.transcribe_file_cli("/tmp/x.wav") is None
+
+
+def test_cli_fallback_refuses_unknown_flags(local_backend, config,
+                                            monkeypatch):
+    import subprocess
+
+    _cli_backend(local_backend, config, None)
+
+    def fake_run(cmd, **k):
+        assert "--help" in cmd
+        return types.SimpleNamespace(returncode=0, stdout="usage: stuff",
+                                     stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert local_backend.transcribe_file_cli("/tmp/x.wav") is None
+
+
+def test_cli_fallback_returns_file_text(local_backend, config, monkeypatch,
+                                        tmp_path):
+    import subprocess
+
+    _cli_backend(local_backend, config, tmp_path)
+    wav = tmp_path / "clip.wav"
+    wav.write_bytes(b"\x00" * 32000)
+
+    def fake_run(cmd, **k):
+        if "--help" in cmd:
+            return types.SimpleNamespace(
+                returncode=0,
+                stdout="--output-txt --output-file -m -f", stderr="")
+        for i, part in enumerate(cmd):
+            if part == "--output-file":
+                Path(cmd[i + 1] + ".txt").write_text("hello cli\n")
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert local_backend.transcribe_file_cli(str(wav)) == "hello cli"

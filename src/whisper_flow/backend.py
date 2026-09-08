@@ -1317,6 +1317,14 @@ class LocalBackend:
         # a fresh download implicate the BLAS path itself, not the bytes.
         self._last_reinstall_identity: str | None = None
         self._plain_fallback_done = False
+        # The plain engine itself already died this session: downloading it
+        # again would loop forever (bundled crash → plain download → plain
+        # crash → bundled → …), so the next round ends in a terminal
+        # message instead of another 7MB fetch.
+        self._plain_engine_failed = False
+        # The port the current spawn attempt uses. The configured one by
+        # default; a fallback when something else holds it (below).
+        self._active_port: int | None = None
         # Held for the life of this process; closing it kills the server.
         self._job = _kill_on_exit_job()
 
@@ -1367,6 +1375,16 @@ class LocalBackend:
             if (self._plain_fallback_done
                     or (self._last_reinstall_identity is not None
                         and identity == self._last_reinstall_identity)):
+                if getattr(self, "_plain_engine_failed", False):
+                    # The plain build died too, this session: both engines
+                    # crash on this PC, so another download changes nothing.
+                    # Say so once per process instead of fetching 7MB again.
+                    log("[BACKEND] plain engine already failed this session — "
+                        "both engines crash here; not downloading again")
+                    self._notify("Speech engine crashes on this PC in both "
+                                 "normal and compatibility mode — transcription "
+                                 "unavailable until this is resolved (see the log)")
+                    return False
                 log(f"[BACKEND] {self._crash_count} consecutive native crashes "
                     f"even after a fresh download — switching to the no-BLAS "
                     f"plain engine")
@@ -2281,6 +2299,39 @@ class LocalBackend:
         self._last_started_model = fallback_model
         return self.start(fallback_model, allow_download=allow_download)
 
+    def _pick_port(self) -> int:
+        """A localhost port for this spawn: configured, else nearby spares.
+
+        Corporate agents love squatting on localhost ports, and a server
+        that cannot bind is a server that never listens. Binding is the
+        test: the first port nobody holds wins. Never raises.
+        """
+        try:
+            base = int(getattr(self.config, "local_server_port", 8082) or 8082)
+        except Exception:
+            base = 8082
+        for port in dict.fromkeys((base, base + 1, base + 2)):
+            try:
+                import socket as _socket
+
+                sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+                try:
+                    sock.bind(("127.0.0.1", port))
+                finally:
+                    sock.close()
+                if port != base:
+                    log(f"[BACKEND] port {base} is held by another process; "
+                        f"serving on {port} instead")
+                return port
+            except OSError:
+                log(f"[BACKEND] port {port} is held by another process; "
+                    f"trying the next")
+                continue
+            except Exception:
+                return base
+        log(f"[BACKEND] ports {base}-{base + 2} all held; trying {base} anyway")
+        return base
+
     # --------------------------------------------------------------- serve
     def start(self, model: str | None = None,
               allow_download: bool = True) -> str | None:
@@ -2348,8 +2399,12 @@ class LocalBackend:
                 "-m", str(self.model_path(model)),
                 "-l", "en",
                 "--host", "127.0.0.1",
-                "--port", str(self.config.local_server_port),
+                "--port", str(self._pick_port()),
             ]
+            try:
+                self._active_port = int(cmd[-1])
+            except Exception:
+                self._active_port = None
             env = None
             if detect_accelerator() == "cpu":
                 # Left to itself whisper.cpp takes four threads whatever the
@@ -2504,6 +2559,7 @@ class LocalBackend:
                     log("[BACKEND] server exited after start; port is held by "
                         "something else - not claiming it as ours")
                     self._process = None
+                    self._active_port = None
                     return None
                 log(f"[BACKEND] server ready on {self.url}")
                 # Keep stderr file for watchdog to diagnose later crashes (don't delete)
@@ -2529,8 +2585,33 @@ class LocalBackend:
                         if engine.startswith("cuda"):
                             log("[BACKEND] hint: cuda engine needs MSVC redist and NVIDIA driver; try CPU engine if VRAM is <4GB or driver is old")
                         else:
-                            log("[BACKEND] hint: CPU engine crashed \u2014 likely stale/corrupt binary or missing VCRedist; "
+                            log("[BACKEND] hint: CPU engine crashed — likely stale/corrupt binary or missing VCRedist; "
                                 "a fresh engine will be downloaded automatically after repeated crashes")
+                        # The plain build dying too means both engines crash
+                        # here: remember it so the crash tracker stops
+                        # re-downloading what already failed this session.
+                        try:
+                            plain_exe = str(_plain_dir(
+                                self.config.config_dir) / self._exe_name)
+                            if cmd and str(cmd[0]) == plain_exe:
+                                self._plain_engine_failed = True
+                        except Exception:
+                            pass
+                        # Name the faulting DLL, or establish there is none:
+                        # a real crash logs an Application Error 1000 naming
+                        # the module, while a process killed from outside
+                        # (EDR) leaves no such event.
+                        try:
+                            mod = faulting_module("whisper-server.exe")
+                            if mod:
+                                log(f"[BACKEND] faulting module: {mod}")
+                            else:
+                                log("[BACKEND] no Application Error event for "
+                                    "whisper-server.exe — killed externally "
+                                    "(EDR?) rather than crashing itself, or "
+                                    "Windows Error Reporting is disabled")
+                        except Exception as e:
+                            log(f"[BACKEND] faulting-module lookup failed: {e}")
                         self.note_crash(code)
                 except Exception as e:
                     log(f"[BACKEND] server did not become ready (exit={code}) cmd={' '.join(cmd)} stderr unreadable: {e}")
@@ -2541,11 +2622,13 @@ class LocalBackend:
                 self._stderr_path = _stderr_path
             except Exception:
                 pass
+            self._active_port = None
             return None
 
     @property
     def url(self) -> str:
-        return f"http://127.0.0.1:{self.config.local_server_port}"
+        port = getattr(self, "_active_port", None) or self.config.local_server_port
+        return f"http://127.0.0.1:{port}"
 
     def _wait_until_ready(self, timeout: float = 120.0,
                           quiet_period: float = 0.5) -> bool:
@@ -2576,7 +2659,9 @@ class LocalBackend:
             conn = None
             try:
                 conn = http.client.HTTPConnection(
-                    "127.0.0.1", self.config.local_server_port, timeout=2)
+                    "127.0.0.1",
+                    getattr(self, "_active_port", None) or self.config.local_server_port,
+                    timeout=2)
                 conn.request("GET", "/")
                 status = conn.getresponse().status
                 if isinstance(status, int):
@@ -2605,6 +2690,115 @@ class LocalBackend:
                 except Exception:
                     pass
             self._process = None
+            self._active_port = None
+
+    def cli_path(self) -> Path | None:
+        """whisper-cli beside the serving engine, if one shipped.
+
+        The bundle carries it next to whisper-server; a directory that
+        lost its server to quarantine may still have it (or lose it the
+        same way — the caller treats absence as no fallback).
+        """
+        try:
+            name = ("whisper-cli.exe" if sys.platform == "win32"
+                    else "whisper-cli")
+            cli = Path(self.server_exe).parent / name
+            return cli if cli.exists() else None
+        except Exception:
+            return None
+
+    def transcribe_file_cli(self, wav_path, model=None, language: str = "en",
+                            timeout: float = 180.0) -> str | None:
+        """Transcribe one file with whisper-cli: no server, no port.
+
+        Last resort for a machine where the server process cannot stay up
+        (EDR killing listeners, a port that can never bind): the CLI loads
+        the model, decodes, and exits, touching no socket at all. Returns
+        the transcript text, or None when that did not work either. Never
+        raises — failure here must read exactly like the server failing.
+        """
+        tmpdir = None
+        try:
+            import subprocess as _sp
+            import tempfile as _tf
+
+            cli = self.cli_path()
+            if cli is None:
+                return None
+            model = model or self.working_model()
+            if not model:
+                log("[BACKEND] CLI fallback has no model to decode with")
+                return None
+            mpath = self.model_path(model)
+            if not mpath.exists():
+                log(f"[BACKEND] CLI fallback model missing: {mpath}")
+                return None
+            try:
+                wav = Path(wav_path)
+                if not wav.exists() or wav.stat().st_size == 0:
+                    return None
+            except OSError:
+                return None
+            # Flag support varies across whisper.cpp vintages; ask the
+            # binary once per process rather than guessing wrong forever.
+            if getattr(self, "_cli_txt_flag", None) is None:
+                try:
+                    probe = _sp.run(
+                        [str(cli), "--help"], capture_output=True, text=True,
+                        timeout=15,
+                        creationflags=(no_console_flags()
+                                       if sys.platform == "win32" else 0),
+                    )
+                    self._cli_txt_flag = ("output-txt" in (probe.stdout or "")
+                                          and "output-file" in (probe.stdout or ""))
+                except Exception as e:
+                    log(f"[BACKEND] CLI flag probe failed: {e}")
+                    return None
+                if not self._cli_txt_flag:
+                    log("[BACKEND] CLI fallback unavailable: this whisper-cli "
+                        "has no --output-txt/--output-file flags")
+                    return None
+            tmpdir = Path(_tf.mkdtemp(prefix="whisper-flow-cli-"))
+            base = tmpdir / "out"
+            cmd = [str(cli), "-m", str(mpath), "-f", str(wav),
+                   "-l", language or "en",
+                   "--output-txt", "--output-file", str(base)]
+            log(f"[BACKEND] CLI fallback transcribing "
+                f"{wav.stat().st_size // 1024}KB with {model}")
+            try:
+                proc = _sp.run(
+                    cmd, capture_output=True, text=True, timeout=timeout,
+                    creationflags=(no_console_flags()
+                                   if sys.platform == "win32" else 0),
+                    cwd=str(cli.parent),
+                )
+            except _sp.TimeoutExpired:
+                log("[BACKEND] CLI fallback timed out")
+                return None
+            text_file = Path(str(base) + ".txt")
+            try:
+                text = (text_file.read_text(encoding="utf-8",
+                                            errors="replace").strip()
+                        if text_file.exists() else "")
+            except OSError:
+                text = ""
+            if proc.returncode != 0 and not text:
+                tail = (proc.stderr or "")[-500:]
+                log(f"[BACKEND] CLI fallback failed (rc={proc.returncode}): "
+                    f"{tail}")
+                return None
+            return text or None
+        except Exception as e:
+            log(f"[BACKEND] CLI fallback failed: {e}")
+            return None
+        finally:
+            try:
+                import shutil as _shutil
+
+                if tmpdir is not None:
+                    _shutil.rmtree(tmpdir, ignore_errors=True)
+            except Exception:
+                pass
 
     @property
     def _setup_marker(self) -> Path:

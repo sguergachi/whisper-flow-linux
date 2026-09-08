@@ -1752,3 +1752,50 @@ def test_startup_without_removal_says_downloading(temp_config_dir):
     notes = [call[0][0] for call in daemon.notify.call_args_list]
     assert any("background" in note.lower() for note in notes)
     assert not any("quarantine" in note.lower() for note in notes)
+
+
+# ------------------------------------------------- CLI fallback in healing
+def _healing_setup(temp_config_dir, cli_text):
+    """A daemon whose server heal fails and whose CLI says cli_text."""
+    from unittest.mock import Mock
+
+    daemon, _ = _idle_daemon(temp_config_dir)
+    daemon.notify = Mock()
+    daemon._ensure_backend_running = Mock(return_value=False)
+    daemon.backend.transcribe_file_cli = Mock(return_value=cli_text)
+    daemon.backend.working_model = Mock(return_value="ggml-base.en-q8_0")
+    app = Mock()
+
+    def boom(*a, **k):
+        raise RuntimeError("No whisper server configured")
+
+    app.transcription_service.transcribe_audio.side_effect = boom
+    app.transcription_service.local_url = None
+    return daemon, app
+
+
+def test_cli_fallback_saves_a_final_pass(temp_config_dir):
+    daemon, app = _healing_setup(temp_config_dir, "hello cli")
+    healing = daemon._healing_transcribe(app)
+    assert healing("/tmp/clip.wav") == "hello cli"
+    daemon.backend.transcribe_file_cli.assert_called_once()
+
+
+def test_cli_fallback_skips_live_ticks(temp_config_dir):
+    """A model load per second of speech would bury the live words."""
+    import pytest
+
+    daemon, app = _healing_setup(temp_config_dir, "hello cli")
+    healing = daemon._healing_transcribe(app)
+    with pytest.raises(RuntimeError, match="No whisper server"):
+        healing("/tmp/clip.wav", max_retries=1, timeout=1.0)
+    daemon.backend.transcribe_file_cli.assert_not_called()
+
+
+def test_cli_blank_still_raises(temp_config_dir):
+    import pytest
+
+    daemon, app = _healing_setup(temp_config_dir, None)
+    healing = daemon._healing_transcribe(app)
+    with pytest.raises(RuntimeError, match="No whisper server"):
+        healing("/tmp/clip.wav")

@@ -952,6 +952,31 @@ class WhisperFlowDaemon:
                 healed = self._ensure_backend_running(allow_download=False)
                 if not healed:
                     log("[DAEMON] auto-heal could not revive backend")
+                    # Last resort that needs no port: whisper-cli beside the
+                    # engine loads the model, decodes, and exits. Live ticks
+                    # (max_retries=1) are excluded — a model load per second
+                    # of speech would bury the words waiting behind it.
+                    try:
+                        if kwargs.get("max_retries", 3) != 1:
+                            audio_path = (args[0] if args
+                                          else kwargs.get("audio_path"))
+                            text = None
+                            if isinstance(audio_path, (str, os.PathLike)):
+                                text = self.backend.transcribe_file_cli(
+                                    audio_path,
+                                    model=self.backend.working_model())
+                            if text:
+                                from .transcription import (
+                                    _normalize, collapse_repetition,
+                                    is_hallucination)
+                                text = collapse_repetition(_normalize(text))
+                                if (text and text != "[BLANK_AUDIO]"
+                                        and not is_hallucination(text)):
+                                    log("[DAEMON] CLI fallback transcribed "
+                                        "the utterance without any server")
+                                    return text
+                    except Exception as ce:
+                        log(f"[DAEMON] CLI fallback failed: {ce}")
                     raise
                 return orig(*args, **kwargs)
 

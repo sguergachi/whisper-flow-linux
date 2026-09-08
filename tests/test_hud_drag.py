@@ -63,3 +63,79 @@ def test_docking_resets_the_anchor_state(monkeypatch):
     win._apply_position()
     assert win._layer_top_left is True
     assert calls["anchor"].count(("L", True)) == 2
+
+
+# ------------------------------------------------- coalesced drag applies
+def _dragging_window(monkeypatch, pos=(100, 200)):
+    """A window mid-drag, with position writes recorded, never executed."""
+    fake, calls = _fake_layer_shell()
+    monkeypatch.setattr(hud_app_module, "LayerShell", fake)
+    monkeypatch.setattr(hud_app_module.GLib, "idle_add",
+                        lambda *a, **k: calls.setdefault("idle", []).append(a) or 1)
+    monkeypatch.setattr(hud_app_module, "_save_position",
+                        lambda *a: calls.setdefault("saved", []).append(a))
+    win = _drag_window(pos)
+    win._connector = "test"
+    win._dragging = False
+    win._pos_flush_queued = False
+    win._drag_origin = None
+    return win, calls
+
+
+def test_updates_retarget_without_applying(monkeypatch):
+    """Ten motion events: one queued flush, zero compositor commits."""
+    win, calls = _dragging_window(monkeypatch)
+    win._on_drag_begin(None, 10, 10)
+    for dx in range(1, 11):
+        win._on_drag_update(None, dx * 5, 0)
+    assert win._pos == (100 + 50, 200)
+    assert len(calls.get("idle", [])) == 1
+    assert calls["margin"] == []
+    # The flush lands the latest target, anchors still set only once.
+    win._flush_pos()
+    left = [m for m in calls["margin"] if m[0] == "L"]
+    assert left == [("L", 150)]
+    assert calls["anchor"].count(("L", True)) == 1
+
+
+def test_stale_flush_after_show_never_moves(monkeypatch):
+    """A drag ended by a new recording must not move the fresh pill."""
+    win, calls = _dragging_window(monkeypatch)
+    win._on_drag_begin(None, 10, 10)
+    win._on_drag_update(None, 50, 0)
+    # begin_show's part: the recording owns the pill now.
+    win._dragging = False
+    win._drag_origin = None
+    assert win._flush_pos() is False
+    assert calls["margin"] == []
+
+
+def test_drag_end_lands_the_final_target(monkeypatch):
+    win, calls = _dragging_window(monkeypatch)
+    win._on_drag_begin(None, 10, 10)
+    win._on_drag_update(None, 50, 30)
+    win._on_drag_end(None, 50, 30)
+    assert win._dragging is False
+    left = [m for m in calls["margin"] if m[0] == "L"]
+    top = [m for m in calls["margin"] if m[0] == "T"]
+    assert left == [("L", 150)]
+    assert top == [("T", 230)]
+    assert ("test", 150, 230) in calls["saved"]
+
+
+def test_dragged_branch_clears_the_bottom_margin(monkeypatch):
+    fake, calls = _fake_layer_shell()
+    monkeypatch.setattr(hud_app_module, "LayerShell", fake)
+    win = _drag_window((100, 200))
+    win._apply_position()
+    bottoms = [m for m in calls["margin"] if m[0] == "B"]
+    assert bottoms == [("B", 0)]
+
+
+def test_win32_pin_recorded_before_any_window(monkeypatch):
+    """A target recorded with no HWND yet still governs the next move."""
+    win = hud_app_module.HudWindow.__new__(hud_app_module.HudWindow)
+    win._hwnd = None
+    win._pin = None
+    win._apply_position_win32(300, 400)
+    assert win._pin == (300, 400)

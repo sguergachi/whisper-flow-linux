@@ -530,6 +530,11 @@ class HudWindow(Gtk.Window):
         saved = _load_positions().get(self._connector)
         self._pos = tuple(saved[:2]) if isinstance(saved, list) and len(saved) >= 2 else None
         self._drag_origin = None
+        # A drag in progress. While set, motion events only retarget _pos
+        # (applied once per loop turn); anything else that would move the
+        # pill stands down so the two never fight over it.
+        self._dragging = False
+        self._pos_flush_queued = False
         self._apply_position()
         print(f"[HUD] output={self._connector} position="
               f"{self._pos if self._pos else 'bottom-centre (default)'}", flush=True)
@@ -944,9 +949,14 @@ class HudWindow(Gtk.Window):
         return 1.0
 
     def _apply_position_win32(self, x: int, y: int):
+        # The pin first: it is the hook's whole world, and a target recorded
+        # here survives even when there is not yet a window to move. The old
+        # order returned early without recording it, so a move attempted
+        # before realize left a stale pin that snapped the window back on
+        # the next unrelated move.
+        self._pin = (int(x), int(y))
         if not self._hwnd:
             return
-        self._pin = (int(x), int(y))
         SWP_NOACTIVATE = 0x10
         SWP_NOZORDER = 0x4
         ctypes.windll.user32.SetWindowPos(
@@ -1207,9 +1217,13 @@ class HudWindow(Gtk.Window):
         self._move_to_monitor(point)
         self.level_file = level_file
         self.processing = False
-        # A recording owns the pill: whatever label was showing is done.
+        # A recording owns the pill: whatever label was showing is done, and
+        # a drag from the previous one ends here rather than fighting the
+        # fresh position with a stale origin.
         self.toast_text = None
         self._toast_token += 1
+        self._dragging = False
+        self._drag_origin = None
         self.stop_button = stop_button
         self.stop_hover = 0.0
         self.stop_hover_target = 0.0
@@ -1295,6 +1309,10 @@ class HudWindow(Gtk.Window):
             self._layer_top_left = True
         LayerShell.set_margin(self, LayerShell.Edge.LEFT, int(x))
         LayerShell.set_margin(self, LayerShell.Edge.TOP, int(y))
+        # Margins on unanchored edges are ignored per spec, but say so
+        # explicitly: a compositor that honours a stale BOTTOM margin
+        # anyway would fight every drag.
+        LayerShell.set_margin(self, LayerShell.Edge.BOTTOM, 0)
 
     def _clamp(self, x, y):
         if self._monitor is None:
@@ -1306,19 +1324,50 @@ class HudWindow(Gtk.Window):
     def _on_drag_begin(self, gesture, sx, sy):
         self._drag_origin = self._pos if self._pos is not None else self._default_pos()
         self._drag_start_xy = (sx, sy)
+        self._dragging = True
+        if os.environ.get("WHISPER_FLOW_HUD_DEBUG_DRAG"):
+            print(f"[HUD] drag begin origin={self._drag_origin} "
+                  f"press=({sx:.0f},{sy:.0f})", flush=True)
+
+    def _request_pos_flush(self):
+        """Apply the latest drag target, at most once per main-loop turn.
+
+        A drag delivers many motion events per frame; each one used to
+        commit a position straight to the compositor (or SetWindowPos),
+        queuing a configure round-trip per event that the pill then chased
+        for the rest of the gesture. Coalescing to one apply per turn keeps
+        the target always fresh without the queue.
+        """
+        if getattr(self, "_pos_flush_queued", False):
+            return
+        self._pos_flush_queued = True
+        GLib.idle_add(self._flush_pos)
+
+    def _flush_pos(self):
+        self._pos_flush_queued = False
+        # A new recording owns the pill; a queued target from a drag it
+        # ended must never move the fresh position.
+        if not getattr(self, "_dragging", False):
+            return False
+        try:
+            self._apply_position()
+        except Exception:
+            pass
+        return False
 
     def _on_drag_update(self, gesture, dx, dy):
         if self._drag_origin is None:
             return
         ox, oy = self._drag_origin
         self._pos = self._clamp(ox + dx, oy + dy)
-        self._apply_position()
+        self._request_pos_flush()
 
     def _on_drag_end(self, gesture, dx, dy):
         if self._drag_origin is None:
             return
         moved = abs(dx) + abs(dy)
         self._drag_origin = None
+        self._dragging = False
         if moved < DRAG_SLOP:
             # A tap. Only the two affordances do anything: the stop button,
             # which ends the recording, and the close X, which dismisses the
@@ -1336,6 +1385,17 @@ class HudWindow(Gtk.Window):
                     self._request_stop()
                 self.quit()
             return
+        # The last motion's apply may still be queued behind this event;
+        # land the final target now rather than leaving a frame of movement
+        # behind (or dropping it entirely if the pill hides first).
+        self._pos_flush_queued = False
+        try:
+            self._apply_position()
+        except Exception:
+            pass
+        if os.environ.get("WHISPER_FLOW_HUD_DEBUG_DRAG"):
+            print(f"[HUD] drag end pos={self._pos} moved={moved:.0f}",
+                  flush=True)
         _save_position(self._connector, *self._pos)
         print(f"[HUD] position saved for {self._connector}: {self._pos}", flush=True)
 

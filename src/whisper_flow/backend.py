@@ -1957,6 +1957,50 @@ class LocalBackend:
         except OSError as e:
             log(f"[BACKEND] could not record the engine kind: {e}")
 
+    def engine_removed_externally(self) -> str | None:
+        """The kind of engine that was here and now is not, or None.
+
+        The marker is written only after a verified unpack and is deleted
+        by our own removal paths (_reinstall wipes it before re-fetching,
+        quarantine drops it with the binary). Marker present + binary
+        absent therefore means something outside this app removed it —
+        on a corporate machine, almost always antivirus/EDR quarantine —
+        and re-downloading into the same quarantine is the loop to name,
+        not to repeat blindly.
+        """
+        try:
+            recorded = self._engine_marker.read_text(
+                encoding="utf-8").strip()
+        except OSError:
+            return None
+        if recorded not in ("cpu", "cuda11", "cuda12", "cpu-plain"):
+            return None
+        try:
+            if self._engine_exe(recorded).exists():
+                return None
+        except Exception:
+            return None
+        return recorded
+
+    @staticmethod
+    def has_mark_of_the_web(path) -> bool | None:
+        """Whether the file carries a Zone.Identifier stream (Windows).
+
+        Browsers stamp downloads with one; urllib-created files normally
+        have none. Some enterprise setups treat marked files as untrusted
+        regardless of signature. Informational only — never stripped.
+        None off Windows or when the check itself fails.
+        """
+        if sys.platform != "win32":
+            return None
+        try:
+            with open(f"{path}:Zone.Identifier", "rb"):
+                return True
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return None
+
     def _cpu_fallback_model(self, failed_model: str | None = None) -> str | None:
         """A CPU-friendly model that is actually on disk, or None.
 
@@ -2275,6 +2319,13 @@ class LocalBackend:
                     origin = "bundled"
                 log(f"[BACKEND] engine {exe} ({origin}, {st.st_size // 1024}KB) "
                     f"model {model} | {machine_facts()}")
+                if sys.platform == "win32":
+                    try:
+                        motw = self.has_mark_of_the_web(exe)
+                        if motw is not None:
+                            log(f"[BACKEND] engine Mark-of-the-Web: {motw}")
+                    except Exception:
+                        pass
                 # What sits beside the binary decides which DLLs it loads
                 # (exe dir wins the search order), and where this process
                 # runs decides the fallback. Both have caused 0xC0000005s.

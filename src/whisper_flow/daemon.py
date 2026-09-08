@@ -1686,9 +1686,25 @@ class WhisperFlowDaemon:
             except Exception:
                 missing = False
             if missing:
-                log(f"[BACKEND] {model} not on disk; fetching in the background")
-                self.notify(f"Downloading {model} in the background - "
-                            f"the tray is up, transcription starts when it lands")
+                try:
+                    removed = self.backend.engine_removed_externally()
+                except Exception:
+                    removed = None
+                if removed:
+                    # The engine was verified on disk and is now gone without
+                    # our code removing it: on a corporate machine that is
+                    # antivirus/EDR quarantine. Say so plainly — the next
+                    # download lands in the same quarantine unless excluded.
+                    log(f"[BACKEND] {removed} engine was installed but its "
+                        f"binary is gone — removed externally, most likely "
+                        f"antivirus quarantine; re-fetching once")
+                    self.notify("Speech engine was removed (likely antivirus "
+                                "quarantine) — re-downloading it now; if this "
+                                "repeats, exclude the app folder in your antivirus")
+                else:
+                    log(f"[BACKEND] {model} not on disk; fetching in the background")
+                    self.notify(f"Downloading {model} in the background - "
+                                f"the tray is up, transcription starts when it lands")
                 threading.Thread(target=self._fetch_model_in_background,
                                  args=(model,), daemon=True,
                                  name="whisper-flow-model-fetch").start()

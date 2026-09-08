@@ -1387,3 +1387,38 @@ def test_absent_shared_store_changes_nothing(local_backend, config,
     assert local_backend.server_exe == (
         Path(config.config_dir) / "runtime" / local_backend._exe_name)
     assert local_backend.is_installed() is False
+
+
+# ------------------------------------------------- externally removed engine
+def test_removed_engine_is_named_not_replaced_silently(
+        local_backend, config):
+    """Marker + missing binary = something outside the app removed it."""
+    from pathlib import Path
+
+    runtime = Path(config.config_dir) / "runtime"
+    runtime.mkdir(parents=True, exist_ok=True)
+    local_backend._record_engine("cpu")
+    assert local_backend.engine_removed_externally() == "cpu"
+
+
+def test_present_engine_is_not_flagged(local_backend, config):
+    from pathlib import Path
+
+    runtime = Path(config.config_dir) / "runtime"
+    runtime.mkdir(parents=True, exist_ok=True)
+    (runtime / local_backend._exe_name).write_text("engine")
+    local_backend._record_engine("cpu")
+    assert local_backend.engine_removed_externally() is None
+
+
+def test_no_marker_means_no_accusation(local_backend, config):
+    assert local_backend.engine_removed_externally() is None
+
+
+def test_mark_of_the_web_is_none_off_windows(monkeypatch):
+    import sys
+
+    from whisper_flow.backend import LocalBackend
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    assert LocalBackend.has_mark_of_the_web("/tmp/x") is None

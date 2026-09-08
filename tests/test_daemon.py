@@ -1376,6 +1376,7 @@ def test_startup_does_not_download_missing_models(temp_config_dir):
     daemon = _model_daemon(temp_config_dir, Mock())
     daemon.backend.working_model.return_value = "ggml-base.en-q8_0"
     daemon.backend.is_installed.return_value = False
+    daemon.backend.engine_removed_externally.return_value = None
     daemon._backend_start = Mock(return_value=None)
     with patch("threading.Thread") as mock_thread:
         daemon._start_managed_backend()
@@ -1720,3 +1721,30 @@ def test_recording_proceeds_with_no_download_at_all(temp_config_dir):
         patch("threading.Thread"),
     ):
         assert daemon.start_recording("transcribe") is True
+
+
+def test_startup_names_external_engine_removal(temp_config_dir):
+    """Marker + missing binary: say quarantine, not just 'downloading'."""
+    daemon = _model_daemon(temp_config_dir, Mock())
+    daemon.backend.working_model.return_value = "ggml-base.en-q8_0"
+    daemon.backend.is_installed.return_value = False
+    daemon.backend.engine_removed_externally.return_value = "cpu"
+    daemon._backend_start = Mock(return_value=None)
+    with patch("threading.Thread") as mock_thread:
+        daemon._start_managed_backend()
+    notes = [call[0][0] for call in daemon.notify.call_args_list]
+    assert any("quarantine" in note.lower() for note in notes)
+    mock_thread.assert_called_once()
+
+
+def test_startup_without_removal_says_downloading(temp_config_dir):
+    daemon = _model_daemon(temp_config_dir, Mock())
+    daemon.backend.working_model.return_value = "ggml-base.en-q8_0"
+    daemon.backend.is_installed.return_value = False
+    daemon.backend.engine_removed_externally.return_value = None
+    daemon._backend_start = Mock(return_value=None)
+    with patch("threading.Thread"):
+        daemon._start_managed_backend()
+    notes = [call[0][0] for call in daemon.notify.call_args_list]
+    assert any("background" in note.lower() for note in notes)
+    assert not any("quarantine" in note.lower() for note in notes)

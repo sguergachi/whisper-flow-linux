@@ -11,7 +11,12 @@ import sys
 from pathlib import Path
 from unittest.mock import Mock
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+cairo = pytest.importorskip("cairo")
+gi = pytest.importorskip("gi")
 
 import whisper_flow.hud_app as hud_app_module
 

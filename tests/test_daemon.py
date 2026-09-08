@@ -1647,9 +1647,13 @@ def test_rescan_is_throttled_between_passes(temp_config_dir):
     rec.refresh_devices.assert_not_called()
 
 
-def test_snd_tripwire_forces_an_immediate_rescan(temp_config_dir):
+def test_snd_tripwire_forces_an_immediate_rescan(temp_config_dir, monkeypatch):
+    import sys
     import time
 
+    # The tripwire reads /dev/snd: a Linux-only path, so say so even on
+    # the Windows runner (where the method is a deliberate no-op).
+    monkeypatch.setattr(sys, "platform", "linux")
     daemon = _mic_daemon(temp_config_dir, (None, "Mic A", frozenset({"Mic A"})))
     rec = daemon.transcribe_app.audio_recorder
     rec.refresh_devices.return_value = False

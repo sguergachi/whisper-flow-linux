@@ -2662,8 +2662,15 @@ Use 'whisper-flow stop' to exit daemon
             return False
         if signature is None:
             return False
+        # A Mock recorder (tests) answers anything with another Mock;
+        # only a real triple fingerprints hardware.
+        if not isinstance(signature, tuple) or len(signature) != 3:
+            return False
         last = getattr(self, "_last_mic_signature", None)
         if last is None:
+            self._last_mic_signature = signature
+            return False
+        if not isinstance(last, tuple) or len(last) != 3:
             self._last_mic_signature = signature
             return False
         # Only the recording device matters: the offered set churns on

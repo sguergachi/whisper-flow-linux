@@ -1314,3 +1314,76 @@ def test_engine_binary_ok_needs_a_real_binary(tmp_path):
     assert _engine_binary_ok(tmp_path, "whisper-server") is False
     small.write_bytes(b"x" * 200_000)
     assert _engine_binary_ok(tmp_path, "whisper-server") is True
+
+
+# ------------------------------------------------- shared machine store
+@pytest.fixture
+def shared_store(tmp_path, monkeypatch):
+    """A fake %PROGRAMDATA%/whisper-flow, via the documented override."""
+    store = tmp_path / "ProgramData" / "whisper-flow"
+    monkeypatch.setenv("WHISPER_FLOW_SHARED_DIR", str(store))
+    return store
+
+
+def _seed_shared(store, backend, model="ggml-small.en-q8_0", cuda=False):
+    exe_dir = store / "runtime" / ("cuda" if cuda else "")
+    exe_dir.mkdir(parents=True, exist_ok=True)
+    (exe_dir / backend._exe_name).write_text("shared engine")
+    models = store / "models"
+    models.mkdir(parents=True, exist_ok=True)
+    (models / f"{model}.bin").write_text("shared model")
+    return store
+
+
+def test_shared_store_serves_a_locked_down_machine(
+        local_backend, config, shared_store):
+    """No user downloads, no bundle: engine + model from the shared store."""
+    _seed_shared(shared_store, local_backend)
+    assert local_backend.server_exe == (
+        shared_store / "runtime" / local_backend._exe_name)
+    assert local_backend.model_path() == (
+        shared_store / "models" / f"{config.model_name}.bin")
+    assert local_backend.is_installed() is True
+    assert "shared store" in local_backend.describe()
+
+
+def test_user_downloads_win_over_shared(local_backend, config, shared_store):
+    _seed_shared(shared_store, local_backend)
+    exe = Path(config.config_dir) / "runtime" / local_backend._exe_name
+    exe.parent.mkdir(parents=True, exist_ok=True)
+    exe.write_text("user engine")
+    assert local_backend.server_exe == exe
+
+
+def test_shared_cuda_reads_as_cuda(local_backend, config, shared_store):
+    _seed_shared(shared_store, local_backend, cuda=True)
+    assert local_backend.installed_engine() == "cuda12"
+    assert local_backend.server_exe == (
+        shared_store / "runtime" / "cuda" / local_backend._exe_name)
+
+
+def test_quarantine_leaves_the_shared_store_alone(
+        local_backend, config, shared_store):
+    """Renaming a machine-wide binary would break every user (and fail
+    without admin rights anyway): report, do not touch."""
+    # The shared store lives outside any home directory in production
+    # (%PROGRAMDATA% vs %USERPROFILE%); reproduce that layout here.
+    local_backend.config.config_dir = shared_store.parent / "home"
+    _seed_shared(shared_store, local_backend)
+    exe = shared_store / "runtime" / local_backend._exe_name
+    local_backend._quarantine_faulty_engine(exe)
+    assert exe.exists()
+    assert not list(shared_store.rglob("*.failed"))
+
+
+def test_working_model_sees_shared_models(local_backend, config, shared_store):
+    _seed_shared(shared_store, local_backend, model="ggml-base.en-q8_0")
+    local_backend.config.model_name = "ggml-base.en-q8_0"
+    assert local_backend.working_model() == "ggml-base.en-q8_0"
+
+
+def test_absent_shared_store_changes_nothing(local_backend, config,
+                                             shared_store):
+    assert local_backend.server_exe == (
+        Path(config.config_dir) / "runtime" / local_backend._exe_name)
+    assert local_backend.is_installed() is False

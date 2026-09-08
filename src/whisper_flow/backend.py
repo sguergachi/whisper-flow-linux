@@ -92,6 +92,34 @@ def _model_dir(config_dir: Path) -> Path:
     return Path(config_dir) / "models"
 
 
+def shared_data_dir() -> Path:
+    """Machine-wide read-only store for engine + models.
+
+    %PROGRAMDATA%\\whisper-flow on Windows, /usr/share/whisper-flow on
+    Linux; WHISPER_FLOW_SHARED_DIR overrides both. Seeded once by an
+    administrator (or IT software distribution) with a runtime/ engine
+    tree and a models/ directory in exactly the per-user layout below.
+    Locked-down machines that may neither download nor execute binaries
+    from a user profile then run with no downloads at all. Never written
+    to by this process: everything here is read + execute.
+    """
+    override = os.environ.get("WHISPER_FLOW_SHARED_DIR", "").strip()
+    if override:
+        return Path(override)
+    if sys.platform == "win32":
+        base = os.environ.get("PROGRAMDATA", r"C:\ProgramData")
+        return Path(base) / "whisper-flow"
+    return Path("/usr/share/whisper-flow")
+
+
+def _shared_runtime() -> Path:
+    return shared_data_dir() / "runtime"
+
+
+def _shared_models() -> Path:
+    return shared_data_dir() / "models"
+
+
 def _cuda_dir(config_dir: Path) -> Path:
     """Where the CUDA engine lives (runtime/cuda/).
 
@@ -1444,18 +1472,30 @@ class LocalBackend:
         only exists because this machine has a GPU and the better engine
         was fetched for it. On Linux the source-built CUDA engine lives in
         its own directory (runtime/cuda), so it is the one that wins there.
+        A machine-wide shared store (%PROGRAMDATA%\\whisper-flow) sits
+        between the user downloads and the bundle: read-only at runtime,
+        so locked-down machines run from it with no downloads at all.
         """
         if self.installed_engine().startswith("cuda"):
             cuda = _cuda_dir(self.config.config_dir) / self._exe_name
             if cuda.exists():
                 return cuda
+            shared_cuda = _shared_runtime() / "cuda" / self._exe_name
+            if shared_cuda.exists():
+                return shared_cuda
         if self.installed_engine() == "cpu-plain":
             plain = _plain_dir(self.config.config_dir) / self._exe_name
             if plain.exists():
                 return plain
+            shared_plain = _shared_runtime() / "plain" / self._exe_name
+            if shared_plain.exists():
+                return shared_plain
         downloaded = _runtime_dir(self.config.config_dir) / self._exe_name
         if downloaded.exists():
             return downloaded
+        shared = _shared_runtime() / self._exe_name
+        if shared.exists():
+            return shared
         bundled = bundled_dir()
         if bundled:
             return bundled / "engine" / self._exe_name
@@ -1497,7 +1537,12 @@ class LocalBackend:
         flat = _runtime_dir(self.config.config_dir) / self._exe_name
         cuda = _cuda_dir(self.config.config_dir) / self._exe_name
         plain = _plain_dir(self.config.config_dir) / self._exe_name
-        if not flat.exists() and not cuda.exists() and not plain.exists():
+        shared_flat = _shared_runtime() / self._exe_name
+        shared_cuda = _shared_runtime() / "cuda" / self._exe_name
+        shared_plain = _shared_runtime() / "plain" / self._exe_name
+        if (not flat.exists() and not cuda.exists() and not plain.exists()
+                and not shared_flat.exists() and not shared_cuda.exists()
+                and not shared_plain.exists()):
             return "cpu"        # bundled, or nothing: the shipped build is CPU
         try:
             recorded = self._engine_marker.read_text(encoding="utf-8").strip()
@@ -1508,19 +1553,23 @@ class LocalBackend:
                 return recorded
         # A binary in the CUDA directory means CUDA on any platform (it is
         # the only thing ever unpacked there since engines were separated).
-        if cuda.exists():
+        if cuda.exists() or shared_cuda.exists():
             return "cuda12"
         # Legacy installs (before the split) shared one directory on Windows.
         # cuBLAS ships its own libraries beside the binary and the CPU build
         # has none, so the directory says what it is without needing to
-        # have been told.
-        names = {path.name.lower() for path in flat.parent.glob("*")}
-        if any(name.startswith("cublas64_12") for name in names):
-            return "cuda12"
-        if any(name.startswith("cublas64_11") for name in names):
-            return "cuda11"
-        if any(name.startswith(("ggml-cuda", "cudart64_")) for name in names):
-            return "cuda12"     # a CUDA build of unknown vintage; not the CPU one
+        # have been told. The shared store gets the same sniffing.
+        for parent in (flat.parent, _shared_runtime()):
+            try:
+                names = {path.name.lower() for path in parent.glob("*")}
+            except OSError:
+                continue
+            if any(name.startswith("cublas64_12") for name in names):
+                return "cuda12"
+            if any(name.startswith("cublas64_11") for name in names):
+                return "cuda11"
+            if any(name.startswith(("ggml-cuda", "cudart64_")) for name in names):
+                return "cuda12"     # a CUDA build of unknown vintage; not the CPU one
         return "cpu"
 
     def engine_is_gpu(self) -> bool:
@@ -1531,6 +1580,9 @@ class LocalBackend:
         downloaded = _model_dir(self.config.config_dir) / f"{name}.bin"
         if downloaded.exists():
             return downloaded
+        shared = _shared_models() / f"{name}.bin"
+        if shared.exists():
+            return shared
         bundled = bundled_dir()
         if bundled and (bundled / "models" / f"{name}.bin").exists():
             return bundled / "models" / f"{name}.bin"
@@ -1636,11 +1688,15 @@ class LocalBackend:
 
         downloaded = sorted(
             p.stem for p in _model_dir(self.config.config_dir).glob("*.bin"))
-        if downloaded:
-            if self.config.model_name in downloaded:
+        shared = sorted(
+            p.stem for p in _shared_models().glob("*.bin")
+            if p.stem not in downloaded)
+        fetched = downloaded + shared
+        if fetched:
+            if self.config.model_name in fetched:
                 return self.config.model_name
             # Otherwise the largest one that was fetched.
-            return max(downloaded, key=lambda name: MODELS.get(name, (0, ""))[0])
+            return max(fetched, key=lambda name: MODELS.get(name, (0, ""))[0])
         if self.model_path(self.config.model_name).exists():
             return self.config.model_name
         return self.bundled_model()
@@ -1962,9 +2018,20 @@ class LocalBackend:
         GPU one died. Only the file that just crashed is moved (kept as
         .failed for diagnosis); the marker is dropped so installed_engine()
         recomputes from what is actually on disk.
+
+        Never touches the shared store or the bundle: those are read-only
+        by design (and machine-wide — quarantining them would break every
+        user, and fail without admin rights anyway). A crashing shared
+        engine is reported, not moved.
         """
         try:
             target = Path(exe_path) if exe_path else Path(self.server_exe)
+            try:
+                target.relative_to(Path(self.config.config_dir))
+            except ValueError:
+                log(f"[BACKEND] shared/bundled engine failed ({target}) — "
+                    f"leaving the read-only copy alone; ask IT for a fresh one")
+                return
             self._quarantine_file(target)
             try:
                 self._engine_marker.unlink(missing_ok=True)
@@ -1976,7 +2043,8 @@ class LocalBackend:
     def ensure_cpu_engine(self) -> bool:
         """Make sure a CPU engine is available, downloading if needed.
 
-        Returns True if a CPU engine is now present (bundled or downloaded).
+        Returns True if a CPU engine is now present (downloaded, shared,
+        or bundled).
         """
         # Already have a working CPU engine
         if self.server_exe.exists() and not self.engine_is_gpu():
@@ -2198,8 +2266,13 @@ class LocalBackend:
             try:
                 exe = Path(self.server_exe)
                 st = exe.stat()
-                origin = ("downloaded" if str(exe).startswith(
-                    str(_runtime_dir(self.config.config_dir))) else "bundled")
+                user_root = str(_runtime_dir(self.config.config_dir))
+                if str(exe).startswith(user_root):
+                    origin = "downloaded"
+                elif str(exe).startswith(str(shared_data_dir())):
+                    origin = "shared"
+                else:
+                    origin = "bundled"
                 log(f"[BACKEND] engine {exe} ({origin}, {st.st_size // 1024}KB) "
                     f"model {model} | {machine_facts()}")
                 # What sits beside the binary decides which DLLs it loads
@@ -2566,7 +2639,13 @@ class LocalBackend:
     def describe(self) -> str:
         """One line for the diagnostics report."""
         accelerator = detect_accelerator()
+        try:
+            exe = Path(self.server_exe)
+            shared = str(exe).startswith(str(shared_data_dir()))
+        except Exception:
+            shared = False
         return (f"{platform.system()} / {accelerator} / "
-                f"engine {self.installed_engine()} / "
+                f"engine {self.installed_engine()}"
+                f"{' (shared store)' if shared else ''} / "
                 f"server {'present' if self.server_exe.exists() else 'missing'} / "
                 f"model {'present' if self.model_path().exists() else 'missing'}")

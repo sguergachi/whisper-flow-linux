@@ -2602,6 +2602,28 @@ Use 'whisper-flow stop' to exit daemon
             recorder = self.transcribe_app.audio_recorder
         except Exception:
             return False
+        # New hardware is invisible until PortAudio re-enumerates: the
+        # count and names above come from a scan at init. Re-scan while
+        # idle, throttled (a scan costs a throwaway audio init), and at
+        # once when the kernel's sound-device set changes under us.
+        try:
+            now = time.time()
+            if self._snd_controls_changed():
+                self._last_mic_rescan = 0.0
+            if now - getattr(self, "_last_mic_rescan", 0.0) >= 10.0:
+                self._last_mic_rescan = now
+                try:
+                    if recorder.refresh_devices():
+                        for app in (self.auto_transcribe_app,
+                                    self.command_app):
+                            try:
+                                app.audio_recorder.refresh_devices(force=True)
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+        except Exception:
+            pass
         try:
             signature = recorder.input_signature()
         except Exception:
@@ -2634,6 +2656,25 @@ Use 'whisper-flow stop' to exit daemon
         except Exception as e:
             log(f"[DAEMON] mic toast failed: {e}")
         return True
+
+    def _snd_controls_changed(self) -> bool:
+        """Whether the kernel's sound-device set changed since last look.
+
+        A fast tripwire so a plug/unplug re-scans on the next watchdog
+        pass instead of waiting out the throttle. Linux only (Windows has
+        no equivalent one-liner, so it stays on the timed re-scan); None
+        where there is no /dev/snd to look at. Never raises.
+        """
+        if sys.platform == "win32":
+            return False
+        try:
+            import glob
+            current = frozenset(glob.glob("/dev/snd/controlC*"))
+        except Exception:
+            return False
+        last = getattr(self, "_last_snd_controls", None)
+        self._last_snd_controls = current
+        return last is not None and current != last
 
     def _maybe_heal_hotkeys(self) -> bool:
         """Revive a dead hotkey listener, throttled. True when revived.

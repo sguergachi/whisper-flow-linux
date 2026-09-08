@@ -324,3 +324,88 @@ def test_opens_name_the_device_and_rate():
         recorder._open_input_stream(480)
     line = " ".join(str(x) for x in logged)
     assert "Test Mic" in line and "48000Hz" in line
+
+
+# ------------------------------------------------- hardware rescans
+def _fake_pa(names, default):
+    """A PortAudio snapshot: names is [str], default one of them."""
+    from unittest.mock import Mock
+
+    pa = Mock()
+    infos = {i: {"index": i, "name": n, "maxInputChannels": 1,
+                 "defaultSampleRate": 44100.0, "hostApi": 0}
+             for i, n in enumerate(names)}
+    pa.get_device_count.return_value = len(infos)
+    pa.get_device_info_by_index.side_effect = lambda i: infos[i]
+    pa.get_default_input_device_info.return_value = {
+        "index": names.index(default), "name": default,
+        "defaultSampleRate": 44100.0}
+    return pa
+
+
+def _rescan_recorder(pa, probes):
+    """A recorder on pa; patch pyaudio so PyAudio() yields probes in turn."""
+    from unittest.mock import Mock, patch
+
+    import whisper_flow.audio as audio_module
+
+    recorder = _recorder()
+    recorder.pa = pa
+    fake_pyaudio = Mock()
+    fake_pyaudio.PyAudio.side_effect = list(probes)
+    return recorder, patch.object(audio_module, "pyaudio", fake_pyaudio)
+
+
+def test_refresh_keeps_instance_when_unchanged():
+    recorder, ctx = _rescan_recorder(
+        _fake_pa(["Mic A"], "Mic A"), [_fake_pa(["Mic A"], "Mic A")])
+    with ctx:
+        assert recorder.refresh_devices() is False
+    # Same world: old instance kept, probe discarded.
+    assert recorder.pa.get_default_input_device_info()["name"] == "Mic A"
+
+
+def test_refresh_swaps_instance_on_new_hardware():
+    from unittest.mock import Mock
+
+    recorder, ctx = _rescan_recorder(
+        _fake_pa(["Mic A"], "Mic A"), [_fake_pa(["Mic A", "Headset"], "Headset")])
+    old = recorder.pa
+    stream = Mock()
+    recorder._warm_stream = stream
+    with ctx:
+        assert recorder.refresh_devices() is True
+    assert recorder._warm_stream is None
+    stream.close.assert_called_once()
+    old.terminate.assert_called_once()
+    assert recorder.input_signature()[1] == "Headset"
+
+
+def test_refresh_survives_failed_probe():
+    from unittest.mock import Mock, patch
+
+    import whisper_flow.audio as audio_module
+
+    recorder = _recorder()
+    pa = _fake_pa(["Mic A"], "Mic A")
+    recorder.pa = pa
+    fake_pyaudio = Mock()
+    fake_pyaudio.PyAudio.side_effect = OSError("no audio")
+    with patch.object(audio_module, "pyaudio", fake_pyaudio):
+        assert recorder.refresh_devices() is False
+    assert recorder.pa is pa
+
+
+def test_refresh_recovers_when_audio_was_down():
+    from unittest.mock import Mock, patch
+
+    import whisper_flow.audio as audio_module
+
+    recorder = _recorder()
+    assert recorder.pa is None
+    probe = _fake_pa(["Mic A"], "Mic A")
+    fake_pyaudio = Mock()
+    fake_pyaudio.PyAudio.return_value = probe
+    with patch.object(audio_module, "pyaudio", fake_pyaudio):
+        assert recorder.refresh_devices() is True
+    assert recorder.pa is probe

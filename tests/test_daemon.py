@@ -1598,3 +1598,73 @@ def test_toast_spawns_a_self_quitting_overlay_where_uncommandable(
     _, kwargs = spawned[0]
     assert kwargs["env"]["WHISPER_FLOW_HUD_TEXT"] == "Microphone: Headset"
     assert kwargs["stdout"] is subprocess.DEVNULL
+
+
+# ------------------------------------------------- live hardware detection
+def test_plug_in_rescans_and_toasts_the_new_default(temp_config_dir):
+    """A headset plugged in mid-session must appear without a restart."""
+    daemon = _mic_daemon(temp_config_dir, (None, "Mic A", frozenset({"Mic A"})))
+    rec = daemon.transcribe_app.audio_recorder
+    rec.refresh_devices.return_value = False
+    assert daemon._maybe_switch_microphone() is False  # baseline
+    daemon.hud.toast.reset_mock()
+    # Hardware arrives: rescan finds it, fingerprint moves to it.
+    rec.refresh_devices.return_value = True
+    rec.input_signature.return_value = (
+        None, "Headset", frozenset({"Mic A", "Headset"}))
+    daemon._last_mic_rescan = 0.0
+    assert daemon._maybe_switch_microphone() is True
+    daemon.hud.toast.assert_called_once_with("Microphone: Headset")
+
+
+def test_unplug_falls_back_to_what_remains(temp_config_dir):
+    daemon = _mic_daemon(temp_config_dir, (None, "Headset",
+                                           frozenset({"Mic A", "Headset"})))
+    rec = daemon.transcribe_app.audio_recorder
+    rec.refresh_devices.return_value = False
+    assert daemon._maybe_switch_microphone() is False  # baseline
+    daemon.hud.toast.reset_mock()
+    rec.refresh_devices.return_value = True
+    rec.input_signature.return_value = (None, "Mic A", frozenset({"Mic A"}))
+    daemon._last_mic_rescan = 0.0
+    assert daemon._maybe_switch_microphone() is True
+    daemon.hud.toast.assert_called_once_with("Microphone: Mic A")
+
+
+def test_rescan_is_throttled_between_passes(temp_config_dir):
+    import time
+
+    daemon = _mic_daemon(temp_config_dir, (None, "Mic A", frozenset({"Mic A"})))
+    rec = daemon.transcribe_app.audio_recorder
+    rec.refresh_devices.return_value = False
+    rec.refresh_devices.reset_mock()
+    daemon._last_mic_rescan = time.time()
+    daemon._last_snd_controls = frozenset({"/dev/snd/controlC0"})
+    with __import__("unittest.mock", fromlist=["patch"]).patch(
+            "glob.glob", return_value=["/dev/snd/controlC0"]):
+        daemon._maybe_switch_microphone()
+    rec.refresh_devices.assert_not_called()
+
+
+def test_snd_tripwire_forces_an_immediate_rescan(temp_config_dir):
+    import time
+
+    daemon = _mic_daemon(temp_config_dir, (None, "Mic A", frozenset({"Mic A"})))
+    rec = daemon.transcribe_app.audio_recorder
+    rec.refresh_devices.return_value = False
+    rec.refresh_devices.reset_mock()
+    daemon._last_mic_rescan = time.time()
+    daemon._last_snd_controls = frozenset({"/dev/snd/controlC0"})
+    with __import__("unittest.mock", fromlist=["patch"]).patch(
+            "glob.glob",
+            return_value=["/dev/snd/controlC0", "/dev/snd/controlC1"]):
+        daemon._maybe_switch_microphone()
+    rec.refresh_devices.assert_called_once()
+
+
+def test_snd_tripwire_never_raises(temp_config_dir, monkeypatch):
+    daemon, _ = _idle_daemon(temp_config_dir)
+    monkeypatch.setattr("glob.glob", Mock(side_effect=OSError("no dev")))
+    assert daemon._snd_controls_changed() is False
+    monkeypatch.setattr("sys.platform", "win32")
+    assert daemon._snd_controls_changed() is False

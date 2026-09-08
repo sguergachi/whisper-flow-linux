@@ -471,6 +471,10 @@ class HudWindow(Gtk.Window):
         # so a recording always takes the pill back.
         self.toast_text: str | None = None
         self._toast_token = 0
+        # Which layer-shell anchoring is currently applied. Dragging only
+        # moves margins; re-asserting anchors per motion event is what
+        # made the pill trail the cursor.
+        self._layer_top_left = False
         # Which mode this overlay is showing for. A resident overlay learns
         # it per recording, from the show command; one spawned per recording
         # gets it here, from the environment the daemon built for it.
@@ -1278,11 +1282,17 @@ class HudWindow(Gtk.Window):
             LayerShell.set_anchor(self, LayerShell.Edge.TOP, False)
             LayerShell.set_anchor(self, LayerShell.Edge.BOTTOM, True)
             LayerShell.set_margin(self, LayerShell.Edge.BOTTOM, BOTTOM_MARGIN)
+            self._layer_top_left = False
             return
         x, y = self._pos
-        LayerShell.set_anchor(self, LayerShell.Edge.BOTTOM, False)
-        LayerShell.set_anchor(self, LayerShell.Edge.LEFT, True)
-        LayerShell.set_anchor(self, LayerShell.Edge.TOP, True)
+        # Anchors only on transition: re-asserting them on every motion
+        # event costs a configure round-trip each, which is what made the
+        # pill trail the cursor while dragging. A move is just margins.
+        if not getattr(self, "_layer_top_left", False):
+            LayerShell.set_anchor(self, LayerShell.Edge.BOTTOM, False)
+            LayerShell.set_anchor(self, LayerShell.Edge.LEFT, True)
+            LayerShell.set_anchor(self, LayerShell.Edge.TOP, True)
+            self._layer_top_left = True
         LayerShell.set_margin(self, LayerShell.Edge.LEFT, int(x))
         LayerShell.set_margin(self, LayerShell.Edge.TOP, int(y))
 

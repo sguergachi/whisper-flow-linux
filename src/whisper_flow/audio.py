@@ -550,6 +550,19 @@ class AudioRecorder:
         except Exception as e:
             log(f"[AUDIO] silence check failed: {e}")
 
+    def _hardware_snapshot(self, pa) -> tuple | None:
+        """(default input name, offered input names) from one instance."""
+        try:
+            default = pa.get_default_input_device_info()
+            offered = set()
+            for index in range(pa.get_device_count()):
+                info = pa.get_device_info_by_index(index)
+                if info.get("maxInputChannels"):
+                    offered.add(str(info.get("name")))
+            return (str(default.get("name")), frozenset(offered))
+        except Exception:
+            return None
+
     def input_signature(self):
         """Identity of the capture device we would open right now.
 
@@ -562,20 +575,69 @@ class AudioRecorder:
         if self.pa is None:
             return None
         try:
-            default = self.pa.get_default_input_device_info()
-            offered = set()
-            for index in range(self.pa.get_device_count()):
-                info = self.pa.get_device_info_by_index(index)
-                if info.get("maxInputChannels"):
-                    offered.add(str(info.get("name")))
+            snapshot = self._hardware_snapshot(self.pa)
+            if snapshot is None:
+                return None
+            default_name, offered = snapshot
             try:
                 chosen = self._input_device_index()
             except Exception:
                 chosen = None
-            return (chosen, str(default.get("name")),
-                    frozenset(offered))
+            return (chosen, default_name, offered)
         except Exception:
             return None
+
+    def refresh_devices(self, force: bool = False) -> bool:
+        """Re-enumerate capture hardware. True when the world changed.
+
+        PortAudio scans devices once, at init: a plugged-in microphone
+        does not exist for get_device_count until a fresh instance looks
+        again, which is why plug/unplug went unnoticed. The replacement
+        is built and compared first, so a failed scan never costs the
+        working instance, and an unchanged world keeps it (plus the warm
+        stream bound to it). Swapping terminates the old instance, so
+        idle-only - never mid-recording. Never raises.
+        """
+        try:
+            if pyaudio is None:
+                return False
+            if self.pa is None:
+                try:
+                    with suppress_alsa_warnings():
+                        self.pa = pyaudio.PyAudio()
+                except Exception as e:
+                    log(f"[AUDIO] audio rescan failed: {e}")
+                    return False
+                log("[AUDIO] audio system appeared after all")
+                return True
+            try:
+                with suppress_alsa_warnings():
+                    probe = pyaudio.PyAudio()
+            except Exception as e:
+                log(f"[AUDIO] audio rescan failed: {e}")
+                return False
+            try:
+                before = self._hardware_snapshot(self.pa)
+                after = self._hardware_snapshot(probe)
+            except Exception:
+                before, after = None, None
+            if not force and before is not None and after == before:
+                try:
+                    probe.terminate()
+                except Exception:
+                    pass
+                return False
+            self.drop_warm_stream()
+            old, self.pa = self.pa, probe
+            try:
+                old.terminate()
+            except Exception:
+                pass
+            log("[AUDIO] capture hardware changed; re-enumerated")
+            return True
+        except Exception as e:
+            log(f"[AUDIO] audio rescan failed: {e}")
+            return False
 
     def drop_warm_stream(self) -> None:
         """Forget a kept-warm capture stream, releasing the microphone.

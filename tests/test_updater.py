@@ -340,3 +340,21 @@ def test_round_outcome_is_visible_for_diagnosis(
     manager.check_for_updates.side_effect = OSError("offline")
     updater._auto_update_round()
     assert updater._last_check_ok is False
+
+
+def test_unavailable_updater_names_the_reason_once(monkeypatch):
+    """A frozen build with no velopack says why, exactly once."""
+    import sys
+
+    import whisper_flow.updater as updater_module
+    from whisper_flow.logging import recent_log
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setitem(sys.modules, "velopack", None)
+    monkeypatch.setattr(updater_module, "_availability_logged", False)
+    assert updater_module.available() is False
+    assert "velopack not importable" in recent_log(50)
+    before = len(recent_log(200))
+    assert updater_module.available() is False
+    assert len(recent_log(200)) == before

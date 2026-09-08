@@ -384,7 +384,7 @@ def test_linux_cuda_install_without_a_toolkit_installs_the_cpu_engine(
 
     def fake_extract(archive, into):
         into.mkdir(parents=True, exist_ok=True)
-        (into / local_backend._exe_name).write_text("")
+        (into / local_backend._exe_name).write_bytes(b"x" * 200_000)
 
     monkeypatch.setattr(backend_module, "_download", fake_download)
     monkeypatch.setattr(backend_module, "_extract", fake_extract)
@@ -594,7 +594,7 @@ def test_a_gpu_machine_fetches_the_cuda_engine_over_the_bundled_cpu_one(
     def fake_extract(archive, into):
         """Unpack what the real cuBLAS zip holds: the binary and cuBLAS."""
         into.mkdir(parents=True, exist_ok=True)
-        (into / local_backend._exe_name).write_text("cuda engine")
+        (into / local_backend._exe_name).write_bytes(b"x" * 200_000)
         (into / "cublas64_12.dll").write_text("")
 
     monkeypatch.setattr(backend_module, "_download", fake_download)
@@ -927,7 +927,7 @@ def test_cuda_and_cpu_engines_unpack_into_separate_directories(
         # Real archives keep the binary and its DLLs side by side, one
         # directory deep.
         into.mkdir(parents=True, exist_ok=True)
-        (into / local_backend._exe_name).write_text("cuda engine")
+        (into / local_backend._exe_name).write_bytes(b"x" * 200_000)
         (into / "cublas64_12.dll").write_text("")
 
     monkeypatch.setattr(backend_module, "_download", fake_download)
@@ -959,7 +959,7 @@ def test_cpu_unpack_evicts_stale_cuda_dlls(
 
     def fake_extract(archive, into):
         into.mkdir(parents=True, exist_ok=True)
-        (into / local_backend._exe_name).write_text("cpu engine")
+        (into / local_backend._exe_name).write_bytes(b"x" * 200_000)
 
     monkeypatch.setattr(backend_module, "_download", fake_download)
     monkeypatch.setattr(backend_module, "_extract", fake_extract)
@@ -986,7 +986,7 @@ def test_second_install_over_an_existing_engine_does_not_fail(
     def fake_extract(archive, into):
         into.mkdir(parents=True, exist_ok=True)
         (into / "bench.exe").write_text("new")
-        (into / local_backend._exe_name).write_text("cpu engine")
+        (into / local_backend._exe_name).write_bytes(b"x" * 200_000)
 
     monkeypatch.setattr(backend_module, "_download", fake_download)
     monkeypatch.setattr(backend_module, "_extract", fake_extract)
@@ -1008,7 +1008,7 @@ def test_reinstall_forces_a_fresh_download_even_when_bundled_exists(
 
     def fake_extract(archive, into):
         into.mkdir(parents=True, exist_ok=True)
-        (into / local_backend._exe_name).write_text("fresh cpu engine")
+        (into / local_backend._exe_name).write_bytes(b"x" * 200_000)
 
     monkeypatch.setattr(backend_module, "_download", fake_download)
     monkeypatch.setattr(backend_module, "_extract", fake_extract)
@@ -1019,7 +1019,7 @@ def test_reinstall_forces_a_fresh_download_even_when_bundled_exists(
     assert not (runtime / local_backend._exe_name).exists()
     # ...but reinstall (post-crash) fetches pristine bytes that win.
     assert local_backend._reinstall_cpu_engine() is True
-    assert (runtime / local_backend._exe_name).read_text() == "fresh cpu engine"
+    assert (runtime / local_backend._exe_name).read_bytes() == b"x" * 200_000
     assert local_backend.server_exe == runtime / local_backend._exe_name
 
 
@@ -1093,7 +1093,7 @@ def test_plain_engine_download_goes_to_its_own_directory(
 
     def fake_extract(archive, into):
         into.mkdir(parents=True, exist_ok=True)
-        (into / local_backend._exe_name).write_text("plain engine")
+        (into / local_backend._exe_name).write_bytes(b"x" * 200_000)
 
     monkeypatch.setattr(backend_module, "_download", fake_download)
     monkeypatch.setattr(backend_module, "_extract", fake_extract)
@@ -1198,7 +1198,7 @@ def test_concurrent_installs_share_one_download(tmp_path, monkeypatch):
 
     def fake_extract(archive, into):
         into.mkdir(parents=True, exist_ok=True)
-        (into / backend._exe_name).write_text("cpu engine")
+        (into / backend._exe_name).write_bytes(b"x" * 200_000)
 
     monkeypatch.setattr(backend_module, "_download", fake_download)
     monkeypatch.setattr(backend_module, "_extract", fake_extract)
@@ -1244,3 +1244,73 @@ def test_lock_waiter_gives_up_instead_of_corrupting(tmp_path):
     finally:
         # No waiting around: deadline math must hold even on coarse clocks.
         assert time.monotonic() - old < 30
+
+
+# ------------------------------------------------- install-lock sanity
+def _lock_in(config_dir, age_seconds):
+    """An install.lock with a given mtime age."""
+    import os
+    import time
+    from pathlib import Path
+
+    from whisper_flow.backend import _install_lock_path
+
+    path = _install_lock_path(Path(config_dir))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("1234")
+    old = time.time() - age_seconds
+    os.utime(path, (old, old))
+    return path
+
+
+def test_stale_lock_is_stolen_immediately(tmp_path):
+    """A dead download's lock must not block the next install for 30min.
+
+    The steal check compared monotonic() (uptime) against st_mtime
+    (epoch), so every age read as minus fifty years and stale locks
+    were never stolen: one crashed download broke installs forever.
+    """
+    import time
+
+    from whisper_flow.backend import _acquire_install_lock
+
+    _lock_in(tmp_path, age_seconds=200)
+    started = time.monotonic()
+    held = _acquire_install_lock(tmp_path, timeout=5)
+    assert time.monotonic() - started < 5
+    assert held is not None
+    from whisper_flow.backend import _release_install_lock
+
+    _release_install_lock(held)
+
+
+def test_fresh_lock_blocks_but_eventually_gives_up(tmp_path):
+    from whisper_flow.backend import InstallBusyError, _acquire_install_lock
+
+    _lock_in(tmp_path, age_seconds=5)
+    try:
+        _acquire_install_lock(tmp_path, timeout=1)
+    except InstallBusyError:
+        return
+    raise AssertionError("a live lock should raise InstallBusyError")
+
+
+def test_install_in_progress_tracks_lock_freshness(tmp_path):
+    from whisper_flow.backend import install_in_progress
+
+    assert install_in_progress(tmp_path) is False
+    _lock_in(tmp_path, age_seconds=5)
+    assert install_in_progress(tmp_path) is True
+    _lock_in(tmp_path, age_seconds=500)
+    assert install_in_progress(tmp_path) is False
+
+
+def test_engine_binary_ok_needs_a_real_binary(tmp_path):
+    from whisper_flow.backend import _engine_binary_ok
+
+    assert _engine_binary_ok(tmp_path, "whisper-server") is False
+    small = tmp_path / "whisper-server"
+    small.write_bytes(b"x" * 1000)
+    assert _engine_binary_ok(tmp_path, "whisper-server") is False
+    small.write_bytes(b"x" * 200_000)
+    assert _engine_binary_ok(tmp_path, "whisper-server") is True

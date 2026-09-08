@@ -713,6 +713,22 @@ class WhisperFlowDaemon:
             log(f"[DAEMON] Already recording, ignoring start request for mode: {mode}")
             return False
 
+        # No server and bytes still landing: recording now would capture
+        # speech that can never transcribe and end in "Recording failed".
+        # Say so instead, and leave the download to finish.
+        try:
+            import whisper_flow.backend as _be
+
+            if (not self._backend_alive_now()
+                    and _be.install_in_progress(self.config.config_dir)):
+                log("[DAEMON] engine still downloading — refusing a "
+                    "recording that could never transcribe")
+                self.notify("Still downloading the speech engine — "
+                            "try again in a minute")
+                return False
+        except Exception as e:
+            log(f"[DAEMON] download check failed: {e}")
+
         # A cold server takes ~20s to load a GPU model; blocking the hotkey
         # on it meant push-to-talk started only after the user released the
         # keys, then instantly stopped with 0 frames ("Recording failed").

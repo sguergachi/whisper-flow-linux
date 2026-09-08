@@ -31,7 +31,14 @@ def available() -> bool:
         return False
     try:
         import velopack           # noqa: F401
-    except ImportError:
+    except ImportError as e:
+        # Once, not per call: on a frozen build this means the module did
+        # not make it into the bundle, and every update feature is quietly
+        # dead until it does.
+        global _availability_logged
+        if not _availability_logged:
+            _availability_logged = True
+            log(f"[UPDATE] updater unavailable: velopack not importable ({e})")
         return False
     return True
 
@@ -132,6 +139,7 @@ def check_in_background(notify=None) -> None:
 # no-op where updates are unavailable (Linux, source checkouts).
 
 _lock = threading.Lock()
+_availability_logged = False
 _checked_version: str | None = None   # newest version seen (downloaded or not)
 _pending_update = None                # velopack update object, downloaded
 _pending_version: str | None = None   # its version

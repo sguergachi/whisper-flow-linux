@@ -1668,3 +1668,55 @@ def test_snd_tripwire_never_raises(temp_config_dir, monkeypatch):
     assert daemon._snd_controls_changed() is False
     monkeypatch.setattr("sys.platform", "win32")
     assert daemon._snd_controls_changed() is False
+
+
+# ------------------------------------------------- doomed recordings refused
+def _download_daemon(temp_config_dir, fresh_lock):
+    """A daemon with no server and a controlled install.lock age."""
+    import os
+    import time
+
+    daemon, _ = _idle_daemon(temp_config_dir)
+    daemon.notify = Mock()
+    daemon.config.config_dir = str(temp_config_dir)
+    daemon.config.local_whisper_url = ""
+    daemon.backend._process = None
+    if fresh_lock is not None:
+        lock = temp_config_dir / "install.lock"
+        lock.write_text("1234")
+        old = time.time() - (5 if fresh_lock else 500)
+        os.utime(lock, (old, old))
+    return daemon
+
+
+def test_recording_refused_while_engine_downloads(temp_config_dir):
+    """No server + bytes landing: say so instead of a doomed recording."""
+    daemon = _download_daemon(temp_config_dir, fresh_lock=True)
+    assert daemon.start_recording("transcribe") is False
+    assert daemon.is_recording is False
+    notes = [call[0][0] for call in daemon.notify.call_args_list]
+    assert any("downloading" in note.lower() for note in notes)
+
+
+def test_recording_proceeds_once_download_lands(temp_config_dir):
+    """Stale lock (dead download) must never block the hotkey forever."""
+    daemon = _download_daemon(temp_config_dir, fresh_lock=False)
+    with (
+        patch.object(daemon, "_warm_backend_for_recording",
+                     return_value=None),
+        patch.object(daemon, "_get_app_for_mode", return_value=Mock()),
+        patch("threading.Thread"),
+    ):
+        assert daemon.start_recording("transcribe") is True
+    assert daemon.is_recording is True
+
+
+def test_recording_proceeds_with_no_download_at_all(temp_config_dir):
+    daemon = _download_daemon(temp_config_dir, fresh_lock=None)
+    with (
+        patch.object(daemon, "_warm_backend_for_recording",
+                     return_value=None),
+        patch.object(daemon, "_get_app_for_mode", return_value=Mock()),
+        patch("threading.Thread"),
+    ):
+        assert daemon.start_recording("transcribe") is True

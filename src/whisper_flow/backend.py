@@ -770,6 +770,43 @@ def _install_lock_path(config_dir: Path) -> Path:
     return Path(config_dir) / "install.lock"
 
 
+# A lock touched this recently means bytes are actively arriving (holders
+# touch it per chunk); older than this and the holder is dead. Same
+# threshold the lock itself steals at, so every reader agrees.
+INSTALL_LOCK_FRESH_SECONDS = 120.0
+
+
+def install_in_progress(config_dir) -> bool:
+    """Whether an engine/model download is running right now.
+
+    Lets the hotkey path refuse a recording that could never transcribe
+    (no server + download still landing) with a clear "still downloading"
+    instead of recording into a "Recording failed". A stale lock from a
+    dead download reads as idle, so this never blocks past the threshold.
+    Never raises.
+    """
+    try:
+        stamp = _install_lock_path(Path(config_dir)).stat().st_mtime
+        return time.time() - stamp < INSTALL_LOCK_FRESH_SECONDS
+    except OSError:
+        return False
+    except Exception:
+        return False
+
+
+def _engine_binary_ok(target: Path, exe_name: str) -> bool:
+    """A real engine binary survived at target: present and non-trivial.
+
+    whisper-server is megabytes; anything under 100KB is a stub, a
+    half-write, or an antivirus victim mid-quarantine. Never raises.
+    """
+    try:
+        exe = Path(target) / exe_name
+        return exe.exists() and exe.stat().st_size >= 100_000
+    except OSError:
+        return False
+
+
 def _acquire_install_lock(config_dir, cancel_event=None,
                           timeout: float = 1800.0):
     """Hold the download mutex across processes AND threads.
@@ -808,7 +845,13 @@ def _acquire_install_lock(config_dir, cancel_event=None,
         except OSError:
             return None
         try:
-            age = _time.monotonic() - path.stat().st_mtime
+            # Wall clock against wall clock: st_mtime is epoch seconds,
+            # and monotonic() is seconds since boot — mixing them put
+            # every lock's age at about minus fifty years, so stale locks
+            # from dead downloads were never stolen and every later
+            # install waited out the full 30-minute timeout before
+            # failing. One crashed download broke the engine forever.
+            age = time.time() - path.stat().st_mtime
             if age > 120:
                 try:
                     path.unlink()
@@ -1722,6 +1765,17 @@ class LocalBackend:
                               if wanted.startswith("cuda") else runtime)
                     _unpack_engine(archive_path, target, self._exe_name,
                                    "cuda" if wanted.startswith("cuda") else "cpu")
+                    # Prove the binary survived the unpack: antivirus on
+                    # Windows loves whisper-server.exe, and without this the
+                    # install "succeeds", the server never starts, and every
+                    # launch re-downloads into the same quarantine.
+                    if not _engine_binary_ok(target, self._exe_name):
+                        log(f"[BACKEND] engine binary missing right after "
+                            f"unpack at {target / self._exe_name} — check "
+                            f"antivirus quarantine, then open Settings to retry")
+                        self._notify("Speech engine vanished after downloading "
+                                     "— check antivirus quarantine, then retry in Settings")
+                        return False
                     if sys.platform != "win32":
                         # A tarball's mode bits do not survive every extraction path.
                         try:

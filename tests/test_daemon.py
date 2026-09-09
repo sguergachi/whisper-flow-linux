@@ -1810,3 +1810,27 @@ def test_backend_start_logs_swallowed_exceptions(temp_config_dir):
     daemon.backend.start_with_fallback.side_effect = RuntimeError("boom-port")
     assert daemon._backend_start("ggml-base.en-q8_0") is None
     assert "boom-port" in recent_log(50)
+
+
+def test_live_recovery_never_waits_for_model_start(temp_config_dir):
+    daemon, app = _healing_setup(temp_config_dir, 'unused')
+    daemon._warm_backend_for_recording = Mock()
+    with pytest.raises(RuntimeError, match='No whisper server'):
+        daemon._healing_transcribe(app)('clip.wav', max_retries=1)
+    daemon._ensure_backend_running.assert_not_called()
+    daemon._warm_backend_for_recording.assert_called_once()
+
+
+def test_repeated_warm_requests_share_one_worker(temp_config_dir):
+    daemon = _model_daemon(temp_config_dir, Mock())
+    daemon.config.local_whisper_url = ''
+    daemon.backend._process = None
+    daemon.backend.working_model.return_value = 'ggml-base.en-q8_0'
+    daemon._ensure_backend_running = Mock(return_value=True)
+    with patch('threading.Thread') as thread:
+        for _ in range(10):
+            daemon._warm_backend_for_recording()
+        thread.assert_called_once()
+        thread.call_args.kwargs['target']()
+        daemon._warm_backend_for_recording()
+        assert thread.call_count == 2

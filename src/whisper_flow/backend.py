@@ -1321,8 +1321,9 @@ class LocalBackend:
         self._notify = notify or (lambda msg: None)
         self._process = None
         self._stderr_path = None
+        self._ready = False
         self._last_started_model = None
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         # Consecutive 0xC0000005 deaths of the same engine file, and when the
         # server last stayed up. Reset by any start that survives past a
         # minute; the reinstall below resets the count.
@@ -1353,7 +1354,7 @@ class LocalBackend:
         except OSError:
             return str(path)
 
-    def note_crash(self, code) -> bool:
+    def note_crash(self, code, allow_download: bool = True) -> bool:
         """Record a server death. Returns True when the engine was refreshed.
 
         Only native crashes (0xC0000005) count: a refused connection or a
@@ -1386,6 +1387,9 @@ class LocalBackend:
             self._crash_count += 1
             log(f"[BACKEND] native crash #{self._crash_count} of {self.server_exe}")
             if self._crash_count < self._CRASH_REINSTALL_AFTER:
+                return False
+            if not allow_download:
+                log("[BACKEND] engine repair deferred until idle — downloads disabled")
                 return False
             # Second time here with an engine we already refreshed? The BLAS
             # path itself is at fault on this machine — try the plain build.
@@ -2119,7 +2123,7 @@ class LocalBackend:
         except Exception as e:
             log(f"[BACKEND] could not quarantine faulty engine: {e}")
 
-    def ensure_cpu_engine(self) -> bool:
+    def ensure_cpu_engine(self, allow_download: bool = True) -> bool:
         """Make sure a CPU engine is available, downloading if needed.
 
         Returns True if a CPU engine is now present (downloaded, shared,
@@ -2131,6 +2135,8 @@ class LocalBackend:
         # Bundled CPU engine counts — quarantine will already have exposed it
         if bundled_dir() and (bundled_dir() / "engine" / self._exe_name).exists():
             return True
+        if not allow_download:
+            return False
         return self._download_fresh_cpu_engine()
 
     def _download_fresh_cpu_engine(self) -> bool:
@@ -2230,6 +2236,10 @@ class LocalBackend:
         already on disk and returns None otherwise — never a minutes-long
         fetch between keypress and microphone.
         """
+        with self._lock:
+            return self._start_with_fallback_locked(model, allow_download)
+
+    def _start_with_fallback_locked(self, model, allow_download):
         url = self.start(model, allow_download=allow_download)
         if url:
             return url
@@ -2287,7 +2297,7 @@ class LocalBackend:
             pass
         log(f"[BACKEND] GPU start failed for {model}, trying CPU fallback with {fallback_model}")
         self._quarantine_faulty_engine()
-        if not self.ensure_cpu_engine():
+        if not self.ensure_cpu_engine(allow_download=allow_download):
             return None
         # If fallback model not installed, download it (e.g. base when only medium was present)
         if not self.is_installed(fallback_model):
@@ -2361,6 +2371,7 @@ class LocalBackend:
             if self._process and self._process.poll() is None:
                 return self.url
 
+            self._ready = False
             if not self.is_installed(model):
                 return None
 
@@ -2411,41 +2422,6 @@ class LocalBackend:
                     pass
             except Exception as e:
                 log(f"[BACKEND] engine facts failed: {e}")
-            cmd = [
-                str(self.server_exe),
-                "-m", str(self.model_path(model)),
-                "-l", "en",
-                "--host", "127.0.0.1",
-                "--port", str(self._pick_port()),
-            ]
-            try:
-                self._active_port = int(cmd[-1])
-            except Exception:
-                self._active_port = None
-            env = None
-            if detect_accelerator() == "cpu":
-                # Left to itself whisper.cpp takes four threads whatever the
-                # machine has, which is short of the optimum on a desktop and
-                # past it on a two-core laptop. See usable_cores().
-                cmd += ["-t", str(usable_cores())]
-            elif self.installed_engine().startswith("cuda") \
-                    and sys.platform != "win32":
-                # The source-built engine links the ggml libraries it ships
-                # with (in runtime/cuda) and the CUDA runtime out of the
-                # toolkit. LD_LIBRARY_PATH outranks the binary's build-dir
-                # RUNPATH, so listing the engine's own directory first is
-                # what keeps it working after the build tree is gone; the
-                # toolkit dirs are there because /opt/cuda is installed on
-                # many distros and never added to ldconfig.
-                lib_dirs = [str(_cuda_dir(self.config.config_dir))]
-                nvcc = _cuda_toolkit()
-                if nvcc:
-                    lib_dirs += [str(p) for p in _cuda_lib_dirs(nvcc)]
-                if lib_dirs:
-                    env = dict(os.environ)
-                    existing = env.get("LD_LIBRARY_PATH", "")
-                    env["LD_LIBRARY_PATH"] = ":".join(
-                        lib_dirs + ([existing] if existing else []))
             if sys.platform == "win32" and not _is_vcredist_available():
                 log("[BACKEND] VCRedist missing — whisper-server.exe will crash 0xC0000005")
                 log("[BACKEND] hint: install Microsoft Visual C++ Redistributable from https://aka.ms/vs/17/release/vc_redist.x64.exe")
@@ -2503,6 +2479,41 @@ class LocalBackend:
                         return None
             except Exception as e:
                 log(f"[BACKEND] engine health pre-flight failed: {e}")
+            cmd = [
+                str(self.server_exe),
+                "-m", str(self.model_path(model)),
+                "-l", "en",
+                "--host", "127.0.0.1",
+                "--port", str(self._pick_port()),
+            ]
+            try:
+                self._active_port = int(cmd[-1])
+            except Exception:
+                self._active_port = None
+            env = None
+            if not self.engine_is_gpu():
+                # Left to itself whisper.cpp takes four threads whatever the
+                # machine has, which is short of the optimum on a desktop and
+                # past it on a two-core laptop. See usable_cores().
+                cmd += ["-t", str(usable_cores())]
+            elif self.installed_engine().startswith("cuda") \
+                    and sys.platform != "win32":
+                # The source-built engine links the ggml libraries it ships
+                # with (in runtime/cuda) and the CUDA runtime out of the
+                # toolkit. LD_LIBRARY_PATH outranks the binary's build-dir
+                # RUNPATH, so listing the engine's own directory first is
+                # what keeps it working after the build tree is gone; the
+                # toolkit dirs are there because /opt/cuda is installed on
+                # many distros and never added to ldconfig.
+                lib_dirs = [str(_cuda_dir(self.config.config_dir))]
+                nvcc = _cuda_toolkit()
+                if nvcc:
+                    lib_dirs += [str(p) for p in _cuda_lib_dirs(nvcc)]
+                if lib_dirs:
+                    env = dict(os.environ)
+                    existing = env.get("LD_LIBRARY_PATH", "")
+                    env["LD_LIBRARY_PATH"] = ":".join(
+                        lib_dirs + ([existing] if existing else []))
             # No console window for a background helper. Keep stdout AND
             # stderr in a temp file so a native crash (0xC0000005) leaves
             # evidence. stdout matters: the server's "listening" line and
@@ -2578,6 +2589,7 @@ class LocalBackend:
                     self._process = None
                     self._active_port = None
                     return None
+                self._ready = True
                 log(f"[BACKEND] server ready on {self.url}")
                 # Keep stderr file for watchdog to diagnose later crashes (don't delete)
                 try:
@@ -2635,7 +2647,7 @@ class LocalBackend:
                                         "Windows Error Reporting is disabled")
                         except Exception as e:
                             log(f"[BACKEND] faulting-module lookup failed: {e}")
-                        self.note_crash(code)
+                        self.note_crash(code, allow_download=allow_download)
                 except Exception as e:
                     log(f"[BACKEND] server did not become ready (exit={code}) cmd={' '.join(cmd)} stderr unreadable: {e}")
                 # Keep the file for the diagnostics report; it will be cleaned on next start/stop
@@ -2645,8 +2657,15 @@ class LocalBackend:
                 self._stderr_path = _stderr_path
             except Exception:
                 pass
-            self._active_port = None
+            # A timed-out child is not a ready server. Reap it before a
+            # retry can reuse it or forget the port it actually bound.
+            self._stop_locked()
             return None
+
+    @property
+    def is_ready(self) -> bool:
+        return bool(self._ready and self._process is not None
+                    and self._process.poll() is None)
 
     @property
     def url(self) -> str:
@@ -2661,7 +2680,8 @@ class LocalBackend:
         a connect that sends nothing and disconnects is an abnormal edge
         for an HTTP server (and a suspect for the post-ready native
         crashes), while a full request/response round-trip is the path
-        every inference takes. Any HTTP status — even 404 — means alive.
+        every inference takes. /health reports model readiness; 404 supports
+        older engines without that endpoint. Server errors are not ready.
 
         Nothing touches the port for the first `quiet_period` seconds: a
         request landing mid-load is the worst moment to make contact, so
@@ -2685,9 +2705,9 @@ class LocalBackend:
                     "127.0.0.1",
                     getattr(self, "_active_port", None) or self.config.local_server_port,
                     timeout=2)
-                conn.request("GET", "/")
+                conn.request("GET", "/health")
                 status = conn.getresponse().status
-                if isinstance(status, int):
+                if status in (200, 404):
                     return True
             except Exception:
                 pass
@@ -2702,18 +2722,24 @@ class LocalBackend:
 
     def stop(self) -> None:
         with self._lock:
-            if not self._process:
-                return
+            self._stop_locked()
+
+    def _stop_locked(self) -> None:
+        """Reap the child while the caller owns the lifecycle lock."""
+        self._ready = False
+        process = self._process
+        if process is not None:
             try:
-                self._process.terminate()
-                self._process.wait(timeout=5)
+                process.terminate()
+                process.wait(timeout=5)
             except Exception:
                 try:
-                    self._process.kill()
-                except Exception:
-                    pass
-            self._process = None
-            self._active_port = None
+                    process.kill()
+                    process.wait(timeout=5)
+                except Exception as e:
+                    log(f"[BACKEND] could not reap server: {e}")
+        self._process = None
+        self._active_port = None
 
     def cli_path(self) -> Path | None:
         """whisper-cli beside the serving engine, if one shipped.

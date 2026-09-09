@@ -363,18 +363,12 @@ elif scenario == "prewarm_rereads":
     # case for one built at login: the daemon downloads a model or writes a
     # setting hours before anyone opens this.
     #
-    # Where the .env lives is not WHISPER_FLOW_CONFIG_DIR's business - that
-    # names the config_dir field, while the file is found under the real
-    # LOCALAPPDATA or ~/.config - so the lookup is pointed at the temporary
-    # one here. What is under test is that showing the window re-reads
-    # whatever that lookup answers, not the answer it gave at import.
-    from whisper_flow import config as config_module
+    # Use the configured directory through the real lookup, just as Save does.
     assert w._rows["local_server_port"].get_value() == 8082
     with open(config_dir + "/.env", "w") as fh:
         # Escaped: this source is a string in the test that runs it, so a bare
         # newline here ends that string rather than reaching the child.
         fh.write("WHISPER_FLOW_LOCAL_SERVER_PORT=8099\\n")
-    config_module._resolve_env_file = lambda: config_dir + "/.env"
     w.show_for_click()
     assert pump(lambda: w._rows["local_server_port"].get_value() == 8099), (
         f"the window showed the config as it was when it was built "

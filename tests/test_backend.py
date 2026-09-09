@@ -1590,3 +1590,125 @@ def test_event_log_reader_off_windows(monkeypatch):
 
     monkeypatch.setattr(sys, "platform", "linux")
     assert backend_module.event_log_reader() == "not Windows"
+
+
+@pytest.fixture
+def spawn_backend(local_backend, config, monkeypatch):
+    """Exercise lifecycle with real paths and a controlled child process."""
+    from unittest.mock import Mock
+
+    _install_engine(local_backend, config)
+    monkeypatch.setattr(backend_module, 'stop_managed_strays', lambda *a: None)
+    monkeypatch.setattr(backend_module, 'stop_port_whisper_servers', lambda *a: None)
+    monkeypatch.setattr(backend_module, '_verify_model_file', lambda *a: True)
+    monkeypatch.setattr(backend_module, '_is_engine_healthy', lambda *a: True)
+    monkeypatch.setattr(backend_module, '_is_vcredist_available', lambda: True)
+    monkeypatch.setattr(backend_module, 'detect_accelerator', lambda: 'cpu')
+    monkeypatch.setattr(backend_module, '_adopt_into_job', lambda *a: None)
+    process = Mock()
+    process.poll.return_value = None
+    popen = Mock(return_value=process)
+    monkeypatch.setattr(backend_module.subprocess, 'Popen', popen)
+    monkeypatch.setattr(local_backend, '_pick_port', lambda: 18081)
+    return local_backend, process, popen
+
+
+def test_start_timeout_reaps_child_before_retry(spawn_backend, monkeypatch):
+    backend, process, popen = spawn_backend
+    monkeypatch.setattr(backend, '_wait_until_ready', lambda **kw: False)
+    assert backend.start() is None
+    process.terminate.assert_called_once()
+    process.wait.assert_called_once_with(timeout=5)
+    assert backend._process is None
+    assert backend._active_port is None
+    monkeypatch.setattr(backend, '_wait_until_ready', lambda **kw: True)
+    assert backend.start() == 'http://127.0.0.1:18081'
+    assert popen.call_count == 2
+
+
+def test_stop_waits_after_forced_kill(spawn_backend):
+    backend, process, _ = spawn_backend
+    backend._process = process
+    process.wait.side_effect = [TimeoutError(), 0]
+    backend.stop()
+    process.kill.assert_called_once()
+    assert process.wait.call_count == 2
+    assert backend._process is None
+
+
+def test_spawn_uses_repaired_engine_not_quarantined_path(
+        spawn_backend, config, monkeypatch):
+    backend, _, popen = spawn_backend
+    original = backend.server_exe
+    repaired = original.parent / 'cpu' / backend._exe_name
+    repaired.parent.mkdir()
+    repaired.write_text('repaired')
+    monkeypatch.setattr(backend_module, '_is_engine_healthy',
+                        lambda path: path == repaired)
+    monkeypatch.setattr(backend, '_quarantine_faulty_engine', lambda *a: None)
+
+    def repair():
+        monkeypatch.setattr(LocalBackend, 'server_exe', property(lambda self: repaired))
+        return True
+
+    monkeypatch.setattr(backend, 'ensure_cpu_engine', repair)
+    monkeypatch.setattr(backend, '_wait_until_ready', lambda **kw: True)
+    assert backend.start() is not None
+    assert popen.call_args.args[0][0] == str(repaired)
+    assert popen.call_args.kwargs['cwd'] == str(repaired.parent)
+
+
+def test_gpu_fallback_respects_download_prohibition(local_backend, monkeypatch):
+    from unittest.mock import Mock
+
+    monkeypatch.setattr(local_backend, 'start', lambda *a, **kw: None)
+    monkeypatch.setattr(local_backend, 'engine_is_gpu', lambda: True)
+    monkeypatch.setattr(local_backend, '_cpu_fallback_model', lambda *a: 'ggml-base.en-q8_0')
+    monkeypatch.setattr(local_backend, 'is_installed', lambda *a: True)
+    monkeypatch.setattr(local_backend, '_quarantine_faulty_engine', lambda: None)
+    ensure = Mock(return_value=False)
+    monkeypatch.setattr(local_backend, 'ensure_cpu_engine', ensure)
+    assert local_backend.start_with_fallback('ggml-large-v3-turbo', allow_download=False) is None
+    ensure.assert_called_once_with(allow_download=False)
+
+
+def test_crash_repair_does_not_download_during_dictation(local_backend, monkeypatch):
+    from unittest.mock import Mock
+
+    repair = Mock()
+    monkeypatch.setattr(local_backend, '_reinstall_cpu_engine', repair)
+    for _ in range(3):
+        assert local_backend.note_crash(0xC0000005, allow_download=False) is False
+    repair.assert_not_called()
+    assert local_backend.note_crash(0xC0000005) is True
+    repair.assert_called_once()
+
+
+@pytest.mark.parametrize('status', [500, 503])
+def test_readiness_retries_server_errors(local_backend, monkeypatch, status):
+    from unittest.mock import Mock
+    import http.client
+
+    connection = Mock()
+    connection.getresponse.side_effect = [types.SimpleNamespace(status=status),
+                                           types.SimpleNamespace(status=200)]
+    monkeypatch.setattr(http.client, 'HTTPConnection', Mock(return_value=connection))
+    monkeypatch.setattr(backend_module.time, 'sleep', lambda _: None)
+    assert local_backend._wait_until_ready(timeout=1, quiet_period=0)
+    assert connection.request.call_count == 2
+    connection.request.assert_called_with('GET', '/health')
+
+
+def test_live_child_is_not_ready_until_probe_completes(spawn_backend, monkeypatch):
+    backend, _, _ = spawn_backend
+
+    def probe(**kwargs):
+        assert backend._process.poll() is None
+        assert backend.is_ready is False
+        return True
+
+    monkeypatch.setattr(backend, '_wait_until_ready', probe)
+    assert backend.start() is not None
+    assert backend.is_ready is True
+    backend.stop()
+    assert backend.is_ready is False

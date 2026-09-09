@@ -160,6 +160,7 @@ class WhisperFlowDaemon:
 
         # Managed speech engine, so a fresh install has something to talk to
         self.backend = LocalBackend(self.config, notify=self.notify)
+        self._backend_warm_lock = threading.Lock()
         self._backend_model = None
         self._backend_engine = None
         self._pressed_at = None
@@ -948,6 +949,11 @@ class WhisperFlowDaemon:
                 is_conn = "Cannot reach" in msg or "Connection" in msg or "Failed to connect" in msg
                 if not (is_no_server or is_conn):
                     raise
+                if kwargs.get("max_retries", 3) == 1:
+                    # Live passes are disposable. Waiting for model startup
+                    # here stalls the streaming worker and its closing pass.
+                    self._warm_backend_for_recording()
+                    raise
                 log(f"[DAEMON] transcribe failed with '{e}' — auto-healing backend and retrying once")
                 healed = self._ensure_backend_running(allow_download=False)
                 if not healed:
@@ -1637,7 +1643,7 @@ class WhisperFlowDaemon:
         """
         try:
             # Already have a URL and the process is alive
-            if self.config.local_whisper_url and self.backend._process and self.backend._process.poll() is None:
+            if self._backend_alive_now():
                 return True
         except Exception:
             pass
@@ -1682,6 +1688,7 @@ class WhisperFlowDaemon:
             self._use_backend_url(url)
             log(f"[BACKEND] (re)started {actual} on {self.backend.engine_summary()} before recording")
             return True
+        self._use_backend_url("")
         return False
 
     def _start_managed_backend(self) -> None:
@@ -1841,6 +1848,7 @@ class WhisperFlowDaemon:
         """Instant check: URL set and server process alive. No I/O, no locks."""
         try:
             return bool(self.config.local_whisper_url
+                        and self.backend.is_ready
                         and self.backend._process
                         and self.backend._process.poll() is None)
         except Exception:
@@ -1868,10 +1876,16 @@ class WhisperFlowDaemon:
             except Exception:
                 pass
             return
+        if not self._backend_warm_lock.acquire(blocking=False):
+            return
         log("[DAEMON] backend not running before recording — warming in the background")
-        threading.Thread(target=self._ensure_backend_in_background,
-                         daemon=True,
-                         name="whisper-flow-backend-warm").start()
+        try:
+            threading.Thread(target=self._ensure_backend_in_background,
+                             daemon=True,
+                             name="whisper-flow-backend-warm").start()
+        except Exception as e:
+            self._backend_warm_lock.release()
+            log(f"[DAEMON] could not schedule backend warm: {e}")
 
     def _ensure_backend_in_background(self) -> None:
         """Revive the server off the hotkey path. Never raises."""
@@ -1880,6 +1894,8 @@ class WhisperFlowDaemon:
                 log("[BACKEND] warmed up in the background, ready to transcribe")
         except Exception as e:
             log(f"[DAEMON] background backend warm failed: {e}")
+        finally:
+            self._backend_warm_lock.release()
 
     def _fetch_model_in_background(self, model: str) -> None:
         """Download a model missing at startup, without holding up the tray.

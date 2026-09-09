@@ -43,12 +43,15 @@ from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-def _resolve_env_file() -> str | os.PathLike[str]:
+def _resolve_env_file(config_dir=None) -> str | os.PathLike[str]:
     """Resolve a stable .env location.
 
-    Prefer ~/.config/whisper-flow/.env, fall back to project root,
-    then CWD-relative ".env".
+    An explicit config directory owns its .env, even before the first save.
+    Otherwise prefer the platform default, then project/CWD fallbacks.
     """
+    explicit = config_dir if config_dir is not None else os.environ.get("WHISPER_FLOW_CONFIG_DIR")
+    if explicit is not None:
+        return Path(explicit).expanduser() / ".env"
     config_env = default_config_dir() / ".env"
     if config_env.exists():
         return config_env
@@ -77,6 +80,14 @@ class Config(BaseSettings):
         case_sensitive=False,
         extra="ignore",
     )
+
+    def __init__(self, **values):
+        # Resolve at construction, including an explicit config directory.
+        # Otherwise settings can write one .env while startup reads another,
+        # or a resident window keeps the pre-first-save path forever.
+        if "_env_file" not in values:
+            values["_env_file"] = _resolve_env_file(values.get("config_dir"))
+        super().__init__(**values)
 
     # File paths
     config_dir: Path = Field(
@@ -376,15 +387,6 @@ class Config(BaseSettings):
         """
 
 
-def reload_config() -> Config:
-    """A Config that re-resolves the .env file first.
-
-    `env_file` above is evaluated once, when this module is imported, and
-    _resolve_env_file() answers by looking for a file that exists. A process
-    that starts before the .env does - the settings window, built at login on
-    a machine that has not saved any settings yet - therefore holds a path
-    from a moment when there was nothing there, and would go on reading
-    defaults however many times it re-read the config. Anything re-reading
-    after startup wants this rather than Config().
-    """
-    return Config(_env_file=_resolve_env_file())
+def reload_config(config_dir: Path | None = None) -> Config:
+    """Read the current environment and settings file again."""
+    return Config(config_dir=config_dir) if config_dir is not None else Config()

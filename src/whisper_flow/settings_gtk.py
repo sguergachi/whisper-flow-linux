@@ -1149,7 +1149,7 @@ class SettingsWindow(Adw.ApplicationWindow):
     def _reload_from_disk(self) -> None:
         """Catch up with everything that changed since this window was built."""
         try:
-            self.config = reload_config()
+            self.config = reload_config(self.config.config_dir)
             self.backend = LocalBackend(self.config)
             self._current_model = self.backend.working_model()
         except Exception as e:

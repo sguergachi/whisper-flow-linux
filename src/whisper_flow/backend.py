@@ -327,6 +327,23 @@ def suppress_crash_dialogs() -> None:
 _faulting_module_cache: dict = {}
 
 
+def event_log_reader() -> str | None:
+    """Why the Application log cannot be read, or None if it can.
+
+    "No crash event found" is only evidence of an external kill when the
+    log was actually readable. A frozen build missing win32evtlog fails
+    the import below, which used to be indistinguishable from a clean
+    log — and read as proof of EDR that was never established.
+    """
+    if sys.platform != "win32" or platform.system() != "Windows":
+        return "not Windows"
+    try:
+        import win32evtlog  # noqa: F401
+    except ImportError as e:
+        return f"win32evtlog not available in this build ({e})"
+    return None
+
+
 def faulting_module(exe_name: str) -> str | None:
     """Faulting DLL of the newest Application-Error 1000 for ``exe_name``.
 
@@ -2606,10 +2623,16 @@ class LocalBackend:
                             if mod:
                                 log(f"[BACKEND] faulting module: {mod}")
                             else:
-                                log("[BACKEND] no Application Error event for "
-                                    "whisper-server.exe — killed externally "
-                                    "(EDR?) rather than crashing itself, or "
-                                    "Windows Error Reporting is disabled")
+                                unreadable = event_log_reader()
+                                if unreadable:
+                                    log("[BACKEND] could not read the Application "
+                                        f"log ({unreadable}) — the crash may "
+                                        f"still be genuine; this proves nothing")
+                                else:
+                                    log("[BACKEND] no Application Error event for "
+                                        "whisper-server.exe — killed externally "
+                                        "(EDR?) rather than crashing itself, or "
+                                        "Windows Error Reporting is disabled")
                         except Exception as e:
                             log(f"[BACKEND] faulting-module lookup failed: {e}")
                         self.note_crash(code)

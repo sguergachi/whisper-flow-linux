@@ -1552,3 +1552,41 @@ def test_cli_fallback_returns_file_text(local_backend, config, monkeypatch,
 
     monkeypatch.setattr(subprocess, "run", fake_run)
     assert local_backend.transcribe_file_cli(str(wav)) == "hello cli"
+
+
+# ------------------------------------------------- forensics honesty
+def test_event_log_reader_names_a_missing_reader(monkeypatch):
+    import sys
+
+    from whisper_flow import backend as backend_module
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(backend_module.platform, "system",
+                        lambda: "Windows")
+    monkeypatch.setitem(sys.modules, "win32evtlog", None)
+    # A None entry makes `import win32evtlog` raise ImportError.
+    reason = backend_module.event_log_reader()
+    assert reason is not None and "win32evtlog" in reason
+
+
+def test_event_log_reader_ok_when_importable(monkeypatch):
+    import sys
+    import types
+
+    from whisper_flow import backend as backend_module
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(backend_module.platform, "system",
+                        lambda: "Windows")
+    monkeypatch.setitem(sys.modules, "win32evtlog",
+                        types.ModuleType("win32evtlog"))
+    assert backend_module.event_log_reader() is None
+
+
+def test_event_log_reader_off_windows(monkeypatch):
+    import sys
+
+    from whisper_flow import backend as backend_module
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    assert backend_module.event_log_reader() == "not Windows"

@@ -1603,8 +1603,12 @@ class WhisperFlowDaemon:
                     if isinstance(plain, str) and plain.startswith("http"):
                         return plain
                     return url
-            except Exception:
-                pass
+            except Exception as e:
+                # A raise anywhere in the fallback path (stray cleanup,
+                # port probing, model validation) used to vanish here,
+                # and the log showed a start that never spawned with no
+                # reason at all.
+                log(f"[DAEMON] backend fallback start raised: {e}")
         try:
             try:
                 url = self.backend.start(model, allow_download=allow_download)
@@ -1613,7 +1617,8 @@ class WhisperFlowDaemon:
             if isinstance(url, str) and url.startswith("http"):
                 return url
             return None if not isinstance(url, str) else url
-        except Exception:
+        except Exception as e:
+            log(f"[DAEMON] backend start raised: {e}")
             return None
 
     def _ensure_backend_running(self, allow_download: bool = True) -> bool:

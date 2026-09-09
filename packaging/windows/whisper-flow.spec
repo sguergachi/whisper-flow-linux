@@ -231,6 +231,11 @@ hidden = collect_submodules("pydantic") + [
     # import first runs, in front of the user.
     "pystray",
     "velopack",
+    # Read lazily inside faulting_module(); without these the frozen build
+    # cannot read the Application log and every native crash misreports as
+    # "killed externally" that was never established.
+    "win32evtlog",
+    "win32evtlogutil",
     # blur_win reaches for these, and ctypes.wintypes is a submodule that
     # importing ctypes does not bring along.
     "ctypes.wintypes",

@@ -229,6 +229,17 @@ def _selftest() -> int:
         gi.require_foreign("cairo")
         report.append("cairo foreign struct converter present")
 
+        # Crash forensics depends on reading the Application log, and the
+        # reader is imported lazily - so a missing bundle entry would only
+        # surface as a misdiagnosed crash on a user's machine. Fail here.
+        try:
+            import win32evtlog  # noqa: F401
+            import win32evtlogutil  # noqa: F401
+            report.append("win32evtlog present for crash forensics")
+        except ImportError as e:
+            raise RuntimeError(
+                f"win32evtlog not bundled ({e}) - add it to hiddenimports")
+
         # A generic Adw.Window realized fine while both real windows were
         # broken, which is how this check stayed green through the whole
         # thing. Build the windows the app actually shows, the way it shows

@@ -1799,3 +1799,14 @@ def test_cli_blank_still_raises(temp_config_dir):
     healing = daemon._healing_transcribe(app)
     with pytest.raises(RuntimeError, match="No whisper server"):
         healing("/tmp/clip.wav")
+
+
+def test_backend_start_logs_swallowed_exceptions(temp_config_dir):
+    """A raise in the fallback path must name itself, not vanish."""
+    from whisper_flow.logging import recent_log
+
+    daemon, _ = _idle_daemon(temp_config_dir)
+    daemon.backend = Mock()
+    daemon.backend.start_with_fallback.side_effect = RuntimeError("boom-port")
+    assert daemon._backend_start("ggml-base.en-q8_0") is None
+    assert "boom-port" in recent_log(50)

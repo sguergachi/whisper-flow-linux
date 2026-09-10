@@ -8,7 +8,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from whisper_flow.audio import AudioRecorder
+from whisper_flow.audio import AudioRecorder, capture_name_listed
 
 
 def _recorder() -> AudioRecorder:
@@ -312,6 +312,26 @@ def test_a_live_mic_forgives_a_muted_one():
     recorder._note_capture_result(frames, 2.0)
     assert recorder._avoid_device is None
     assert recorder._input_device_index() == 7
+
+
+def test_alsa_plugin_pcms_are_not_listed_as_microphones():
+    """PortAudio enumerates lavrate/pulse/default as capture devices.
+
+    They are not microphones. Selecting one is why the Linux settings
+    Test sat at zero while the desktop default source was a real USB
+    mic PipeWire already held.
+    """
+    for name in ("default", "sysdefault", "pulse", "pipewire", "lavrate",
+                 "samplerate", "speexrate", "speex", "upmix", "vdownmix"):
+        assert capture_name_listed(name, "ALSA") is False, name
+        assert capture_name_listed(name, "") is False, name
+    assert capture_name_listed("surround51", "ALSA") is False
+    assert capture_name_listed(
+        "HDA Intel PCH: ALC1220 Analog (hw:0,0)", "ALSA") is True
+    assert capture_name_listed("Logitech BRIO: USB Audio (hw:2,0)", "ALSA")
+    # Windows names must not be filtered by the ALSA plugin list.
+    assert capture_name_listed("default", "WASAPI") is True
+    assert capture_name_listed("Headset", "MME") is True
 
 
 def test_opens_name_the_device_and_rate():

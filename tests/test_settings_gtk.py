@@ -648,6 +648,14 @@ elif scenario == "mic_meter":
         assert w._mic_want_device == settings_gtk._MIC_METER_OFF, (
             "opening settings listened without pressing Test")
 
+    # A real PortAudio open on Linux (no session source, or ALSA EBUSY)
+    # fails immediately and _tick_mic_meter treats that as Test failed.
+    # This scenario injects levels itself.
+    def _idle_meter(self):
+        while not self._mic_meter_stop.wait(0.2):
+            pass
+    settings_gtk.SettingsWindow._mic_meter_loop = _idle_meter
+
     w._start_mic_test()
     assert w._mic_test_button.get_label() == "Stop"
     assert w._mic_meter_tick_id != 0
@@ -685,6 +693,90 @@ elif scenario == "mic_meter":
     with w._mic_meter_lock:
         assert w._mic_want_device == settings_gtk._MIC_METER_OFF, (
             "hiding the window left the capture stream requested")
+elif scenario == "meter_read":
+    # ALSA reports 0 available until a blocking read waits for a period.
+    # Skipping those reads is what left the Linux Test bar at zero.
+    class _Stream:
+        def __init__(self, available):
+            self.available = available
+            self.reads = []
+        def get_read_available(self):
+            if isinstance(self.available, Exception):
+                raise self.available
+            return self.available
+        def read(self, n, exception_on_overflow=False):
+            self.reads.append(n)
+            return b"\\x00\\x01" * n
+
+    chunk = 882
+    zero = _Stream(0)
+    data = settings_gtk._meter_read_frames(zero, chunk)
+    assert zero.reads == [chunk], zero.reads
+    assert len(data) == chunk * 2
+
+    small = _Stream(16)
+    settings_gtk._meter_read_frames(small, chunk)
+    assert small.reads == [16], small.reads
+
+    large = _Stream(4000)
+    settings_gtk._meter_read_frames(large, chunk)
+    assert large.reads == [chunk], large.reads
+
+    missing = _Stream(Exception("no count"))
+    settings_gtk._meter_read_frames(missing, chunk)
+    assert missing.reads == [chunk], missing.reads
+
+    errcode = _Stream(-10)   # PortAudio error codes are negative
+    settings_gtk._meter_read_frames(errcode, chunk)
+    assert errcode.reads == [chunk], errcode.reads
+
+    # Default on Linux opens the Pulse/PipeWire PCM, not a hw: node.
+    class _PA:
+        devices = [
+            {"name": "HDA Analog (hw:0,0)", "maxInputChannels": 2},
+            {"name": "pulse", "maxInputChannels": 32},
+            {"name": "pipewire", "maxInputChannels": 128},
+            {"name": "default", "maxInputChannels": 32},
+        ]
+        def get_device_count(self):
+            return len(self.devices)
+        def get_device_info_by_index(self, i):
+            return self.devices[i]
+    assert settings_gtk._linux_shared_input_index(_PA()) == 1
+    assert settings_gtk._resolve_meter_device(_PA(), None) == 1
+    assert settings_gtk._resolve_meter_device(_PA(), 0) == 0
+elif scenario == "mic_linux_devices":
+    import types
+    fake = types.ModuleType("pyaudio")
+    class _PA:
+        devices = [
+            {"name": "HDA Intel PCH: ALC1220 Analog (hw:0,0)",
+             "maxInputChannels": 2, "hostApi": 0},
+            {"name": "Logitech BRIO: USB Audio (hw:2,0)",
+             "maxInputChannels": 2, "hostApi": 0},
+            {"name": "lavrate", "maxInputChannels": 128, "hostApi": 0},
+            {"name": "pulse", "maxInputChannels": 32, "hostApi": 0},
+            {"name": "pipewire", "maxInputChannels": 128, "hostApi": 0},
+            {"name": "default", "maxInputChannels": 32, "hostApi": 0},
+            {"name": "speex", "maxInputChannels": 1, "hostApi": 0},
+        ]
+        def get_device_count(self):
+            return len(self.devices)
+        def get_device_info_by_index(self, i):
+            return self.devices[i]
+        def get_host_api_info_by_index(self, i):
+            return {"name": "ALSA"}
+        def terminate(self):
+            pass
+    fake.PyAudio = _PA
+    sys.modules["pyaudio"] = fake
+    listed = _real_list_input_devices()
+    names = [name for _, name in listed]
+    assert any("ALC1220" in n for n in names), names
+    assert any("BRIO" in n for n in names), names
+    for banned in ("lavrate", "pulse", "pipewire", "default", "speex"):
+        assert all(banned not in n.split(" (")[0].lower() for n in names), (
+            f"{banned} still listed: {names}")
 print("OK")
 """
 
@@ -846,6 +938,24 @@ def test_the_device_row_has_a_live_mic_meter(tmp_path):
     settings process otherwise holds the input open for the whole session.
     """
     result = _run(tmp_path, "mic_meter")
+    assert "OK" in result.stdout, result.stderr
+
+
+def test_the_meter_reads_when_alsa_reports_nothing_available(tmp_path):
+    """Linux Test sat at zero because get_read_available() returns 0.
+
+    ALSA/PipeWire do not fill a user-space buffer until a blocking read
+    waits for the next period. Skipping those reads toasted 'sent no
+    audio' after a few seconds. Default must also open Pulse/PipeWire,
+    not a hw: node the session already holds.
+    """
+    result = _run(tmp_path, "meter_read")
+    assert "OK" in result.stdout, result.stderr
+
+
+def test_linux_alsa_plugins_are_not_offered_as_mics(tmp_path):
+    """lavrate/pulse/default are PCMs, not microphones."""
+    result = _run(tmp_path, "mic_linux_devices")
     assert "OK" in result.stdout, result.stderr
 
 
@@ -1013,3 +1123,23 @@ def test_windows_frost_clears_the_slab_that_hides_acrylic():
     assert 'self.connect("map", self._on_map_win32)' in source
     assert 'applied != "accent-acrylic"' in source
     assert 'setdefault("GSK_RENDERER", "cairo")' in source
+
+
+def test_the_meter_does_not_skip_alsa_zero_available():
+    """Regression: available < 32 continued without reading.
+
+    That path is what made Test on Linux never paint. Reads go through
+    _meter_read_frames, which blocking-reads a short chunk when ALSA
+    reports nothing waiting.
+    """
+    source = (Path(__file__).resolve().parents[1]
+              / "src/whisper_flow/settings_gtk.py").read_text(encoding="utf-8")
+    assert "def _meter_read_frames(" in source
+    loop = source.split("def _mic_meter_loop(", 1)[1].split(
+        "\n    def ", 1)[0]
+    assert "_meter_read_frames(" in loop
+    assert "available < 32" not in loop
+    helper = source.split("def _meter_read_frames(", 1)[1].split(
+        "\ndef ", 1)[0]
+    assert "get_read_available" in helper
+    assert "available > 0" in helper

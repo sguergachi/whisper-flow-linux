@@ -506,6 +506,7 @@ def _list_input_devices() -> list[tuple[int, str]]:
     """
     try:
         import pyaudio
+        from .audio import capture_name_listed
         try:
             pa = pyaudio.PyAudio()
         except Exception as e:
@@ -526,6 +527,8 @@ def _list_input_devices() -> list[tuple[int, str]]:
                     if not _host_api_supported(api):
                         continue
                     name = str(info.get("name", f"device {i}"))
+                    if not capture_name_listed(name, api):
+                        continue
                     devices.append((i, f"{name} ({api})" if api else name))
                 except Exception:
                     continue
@@ -621,6 +624,78 @@ def _meter_native_rate(pa, device) -> int:
     return 16000
 
 
+def _linux_shared_input_index(pa) -> int | None:
+    """ALSA PCM that shares with PipeWire/Pulse, or None.
+
+    Hardware nodes PipeWire already holds are missing or EBUSY. The
+    pulse/pipewire/default PCMs are how a second process (settings Test)
+    hears the same microphone the desktop is using. Prefer pulse, then
+    pipewire, then default — PortAudio's own default is often `default`,
+    but pulse is the one that actually follows the session source.
+    """
+    if sys.platform == "win32":
+        return None
+    prefer = ("pulse", "pipewire", "default")
+    found: dict[str, int] = {}
+    try:
+        for i in range(pa.get_device_count()):
+            try:
+                info = pa.get_device_info_by_index(i)
+            except Exception:
+                continue
+            if int(info.get("maxInputChannels") or 0) <= 0:
+                continue
+            name = str(info.get("name", "")).strip().lower()
+            if name in prefer and name not in found:
+                found[name] = i
+    except Exception:
+        return None
+    for name in prefer:
+        if name in found:
+            return found[name]
+    return None
+
+
+def _resolve_meter_device(pa, device):
+    """Device index to open for Test. None stays None on Windows.
+
+    On Linux, Default (None) is rewritten to the shared Pulse/PipeWire
+    PCM so Test does not try a hw: node the session already owns.
+    """
+    if device is not None:
+        return device
+    shared = _linux_shared_input_index(pa)
+    return shared if shared is not None else device
+
+
+def _meter_read_frames(stream, chunk: int) -> bytes:
+    """Read one meter chunk, including when ALSA reports 0 available.
+
+    PortAudio's ALSA/PipeWire backend often reports 0 frames available
+    until a blocking read waits for the next period. Skipping those
+    reads (``get_read_available() < 32``) left the Linux Test bar at
+    zero and then toasted "sent no audio". WASAPI typically has a
+    buffer waiting, so the available>0 branch still avoids a wait
+    there.
+
+    ``stream.read`` of ~20 ms runs on the meter worker thread. PyAudio
+    0.2.14 releases the GIL around ``Pa_ReadStream``, so GTK stays
+    responsive.
+    """
+    available = None
+    try:
+        available = int(stream.get_read_available())
+    except Exception:
+        available = None
+    # PortAudio error codes are negative; treat them as "unknown".
+    if available is not None and available < 0:
+        available = None
+    n = chunk if chunk else 512
+    if available is not None and available > 0:
+        n = min(available, n)
+    return stream.read(n, exception_on_overflow=False)
+
+
 def _open_meter_stream(pa, device):
     """Open a capture stream for the Device-row level meter.
 
@@ -629,6 +704,7 @@ def _open_meter_stream(pa, device):
     """
     import pyaudio
 
+    device = _resolve_meter_device(pa, device)
     rate = _meter_native_rate(pa, device)
     # ~20 ms of audio per read when data is available.
     chunk = max(256, rate // 50)
@@ -1984,10 +2060,10 @@ class SettingsWindow(Adw.ApplicationWindow):
     def _mic_meter_loop(self) -> None:
         """Open the chosen input and publish levels until asked to stop.
 
-        Reads only what PortAudio already has buffered (or one short chunk)
-        so a stalled device cannot hold the GIL for seconds and freeze GTK.
-        Callback streams were tried first; on several ALSA/PipeWire setups
-        they delivered no frames and the bar sat at zero.
+        ALSA/PipeWire often report 0 frames available until a short
+        blocking read waits for the next period; `_meter_read_frames`
+        does that. Callback streams were tried first and delivered no
+        frames on those backends, so the bar sat at zero.
         """
         try:
             import pyaudio
@@ -2004,7 +2080,6 @@ class SettingsWindow(Adw.ApplicationWindow):
         open_device = _MIC_METER_OFF
         peak = _MIC_METER_PEAK_FLOOR
         open_failures = 0
-        empty_reads = 0
 
         try:
             try:
@@ -2031,7 +2106,6 @@ class SettingsWindow(Adw.ApplicationWindow):
                         self._mic_drawn_level = 0.0
                     peak = _MIC_METER_PEAK_FLOOR
                     open_failures = 0
-                    empty_reads = 0
                     self._mic_meter_stop.wait(0.1)
                     continue
 
@@ -2042,7 +2116,6 @@ class SettingsWindow(Adw.ApplicationWindow):
                     stream, chunk = _open_meter_stream(pa, want)
                     open_device = want if stream is not None else _MIC_METER_OFF
                     peak = _MIC_METER_PEAK_FLOOR
-                    empty_reads = 0
                     if stream is None:
                         open_failures += 1
                         with self._mic_meter_lock:
@@ -2056,31 +2129,8 @@ class SettingsWindow(Adw.ApplicationWindow):
                     open_failures = 0
                     log(f"[SETTINGS] mic meter listening on device {want}")
 
-                # Never stall the GIL on a device that will not deliver
-                # frames: PortAudio's stream.read holds the interpreter
-                # lock, so a multi-second block freezes GTK even though
-                # this loop is on a worker thread. Prefer only what is
-                # already buffered; when the available-count API is missing
-                # take one short chunk and rely on the empty-read timeout.
                 try:
-                    available = None
-                    try:
-                        available = int(stream.get_read_available())
-                    except Exception:
-                        available = None
-                    if available is not None and available < 32:
-                        empty_reads += 1
-                        if empty_reads > 150:
-                            with self._mic_meter_lock:
-                                self._mic_meter_error = (
-                                    "Microphone opened but sent no audio.")
-                        # Sleep releases the GIL so GTK stays responsive.
-                        self._mic_meter_stop.wait(0.02)
-                        continue
-                    n = chunk if chunk else 512
-                    if available is not None:
-                        n = min(available, n)
-                    data = stream.read(n, exception_on_overflow=False)
+                    data = _meter_read_frames(stream, chunk)
                 except Exception as e:
                     log(f"[SETTINGS] mic meter read failed: {e}")
                     _close_meter_stream(stream)
@@ -2096,7 +2146,6 @@ class SettingsWindow(Adw.ApplicationWindow):
                     if samples.size < 1:
                         self._mic_meter_stop.wait(0.02)
                         continue
-                    empty_reads = 0
                     loud = float(np.max(np.abs(samples.astype(np.float32))))
                     rms = float(np.sqrt(
                         np.mean(samples.astype(np.float32) ** 2)))

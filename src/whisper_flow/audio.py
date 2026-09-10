@@ -110,6 +110,17 @@ UNSUPPORTED_HOST_APIS = frozenset({
     "wdmks",
 })
 
+# ALSA lists every PCM plugin as a capture device. Rate converters and
+# remixers open but never hear a microphone; pulse/pipewire/default
+# duplicate the settings "Default" row. Picking one is why Linux Test
+# sat at zero with a working mic on the desktop default source.
+VIRTUAL_ALSA_PCMS = frozenset({
+    "default", "sysdefault", "pulse", "pipewire", "jack", "oss",
+    "lavrate", "samplerate", "speexrate", "speex",
+    "upmix", "vdownmix", "dmix", "dsnoop",
+    "hdmi", "iec958", "spdif", "a52", "usbstream",
+})
+
 
 def host_api_supported(api: str) -> bool:
     """Whether this PortAudio host API is safe to open for capture.
@@ -124,6 +135,26 @@ def host_api_supported(api: str) -> bool:
         return False
     if "directsound" in key or "wdm-ks" in key or "wdmks" in key:
         return False
+    return True
+
+
+def capture_name_listed(name: str, api: str = "") -> bool:
+    """Whether this PortAudio row should appear as a microphone.
+
+    Hardware devices stay. ALSA plugin PCMs do not: they are not
+    interchangeable with the physical mic, and the settings Test on
+    Linux did not move when one of them was selected.
+    """
+    if not name:
+        return False
+    key = name.strip().lower()
+    api_key = (api or "").lower().replace("windows ", "").strip()
+    # No host API name is normal on some ALSA builds; still drop plugins.
+    if api_key in ("", "alsa") or "alsa" in api_key:
+        if key in VIRTUAL_ALSA_PCMS:
+            return False
+        if key.startswith("surround"):
+            return False
     return True
 
 

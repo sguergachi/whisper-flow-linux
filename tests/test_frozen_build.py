@@ -134,6 +134,7 @@ def test_the_linux_entry_also_assigns_the_typelib_path():
     assert '"GI_TYPELIB_PATH"' in entry
     assert 'setdefault("GI_TYPELIB_PATH"' not in entry
     assert 'os.environ["GI_TYPELIB_PATH"] =' not in entry
+    assert "cleanup_replaced_appimage" in entry
 
 
 def test_the_linux_spec_declares_lazy_pystray():

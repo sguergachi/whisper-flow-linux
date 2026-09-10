@@ -18,10 +18,20 @@ def test_a_source_checkout_cannot_update_itself(monkeypatch):
     assert updater.available() is False
 
 
-def test_linux_cannot_update_itself(monkeypatch):
+def test_linux_onedir_without_appimage_cannot_update_itself(monkeypatch):
     monkeypatch.setattr(sys, "platform", "linux")
     monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.delenv("APPIMAGE", raising=False)
     assert updater.available() is False
+
+
+def test_linux_appimage_can_update_itself(monkeypatch, tmp_path):
+    img = tmp_path / "WhisperFlow-0.4.336-x86_64.AppImage"
+    img.write_bytes(b"\x7fELF" + b"\0" * 60)
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setenv("APPIMAGE", str(img))
+    assert updater.available() is True
 
 
 def test_nothing_is_attempted_when_unavailable(monkeypatch):
@@ -340,6 +350,229 @@ def test_round_outcome_is_visible_for_diagnosis(
     manager.check_for_updates.side_effect = OSError("offline")
     updater._auto_update_round()
     assert updater._last_check_ok is False
+
+
+def test_a_failed_round_is_visible_as_last_check_failed(
+        monkeypatch, _clean_updater_state):
+    manager = Mock()
+    manager.check_for_updates.side_effect = OSError("offline")
+    monkeypatch.setattr(updater, "_manager", lambda: manager)
+    updater._auto_update_round()
+    assert updater.last_check_failed() is True
+
+
+def test_version_tuple_pads_and_strips_words():
+    assert updater._version_tuple("0.4.336") == (0, 4, 336)
+    assert updater._version_tuple("0.4.0 (source)") == (0, 4, 0)
+    assert updater._version_tuple("0.4") == (0, 4, 0)
+    assert updater._is_newer("0.4.337", "0.4.336") is True
+    assert updater._is_newer("0.4.336", "0.4.336") is False
+    assert updater._is_newer("0.5.0", "0.4.400") is True
+    assert updater._is_newer("0.4.1", "0.4.336") is False
+
+
+def test_the_release_job_publishes_the_linux_update_feed():
+    from pathlib import Path
+
+    workflow = (Path(__file__).resolve().parents[1]
+                / ".github/workflows/build.yml").read_text(encoding="utf-8")
+    assert "releases.linux.json" in workflow
+    assert "Write the Linux update feed" in workflow
+
+
+def test_linux_feed_json_is_parsed():
+    data = {
+        "version": "0.4.400",
+        "file": "WhisperFlow-0.4.400-x86_64.AppImage",
+        "sha256": "abc",
+    }
+    update = updater._linux_update_from_feed(data)
+    assert update.version == "0.4.400"
+    assert update.url.endswith("/WhisperFlow-0.4.400-x86_64.AppImage")
+    assert update.sha256 == "abc"
+
+
+def test_github_api_payload_is_parsed():
+    data = {
+        "assets": [
+            {
+                "name": "WhisperFlow-win-Setup.exe",
+                "browser_download_url": "https://example/setup",
+            },
+            {
+                "name": "WhisperFlow-0.4.401-x86_64.AppImage",
+                "browser_download_url": "https://example/appimage",
+                "digest": "sha256:deadbeef",
+            },
+        ]
+    }
+    update = updater._linux_update_from_github(data)
+    assert update.version == "0.4.401"
+    assert update.url == "https://example/appimage"
+    assert update.sha256 == "deadbeef"
+
+
+def test_linux_check_reports_a_newer_appimage(monkeypatch, tmp_path,
+                                              _clean_updater_state):
+    img = tmp_path / "WhisperFlow-0.4.300-x86_64.AppImage"
+    img.write_bytes(b"\x7fELF" + b"\0" * 60)
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setenv("APPIMAGE", str(img))
+    monkeypatch.setattr(updater, "_current_version", lambda: "0.4.300")
+    monkeypatch.setattr(
+        updater, "_http_get",
+        lambda url, timeout=20.0: (
+            b'{"version":"0.4.400","file":"WhisperFlow-0.4.400-x86_64.AppImage",'
+            b'"sha256":"abc"}'
+            if url.endswith("releases.linux.json") else b"{}"
+        ),
+    )
+    assert updater.check() == "0.4.400"
+
+
+def test_linux_check_is_quiet_when_current(monkeypatch, tmp_path,
+                                           _clean_updater_state):
+    img = tmp_path / "WhisperFlow-0.4.400-x86_64.AppImage"
+    img.write_bytes(b"\x7fELF" + b"\0" * 60)
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setenv("APPIMAGE", str(img))
+    monkeypatch.setattr(updater, "_current_version", lambda: "0.4.400")
+    monkeypatch.setattr(
+        updater, "_http_get",
+        lambda url, timeout=20.0: (
+            b'{"version":"0.4.400","file":"WhisperFlow-0.4.400-x86_64.AppImage",'
+            b'"sha256":"abc"}'
+        ),
+    )
+    assert updater.check() is None
+
+
+def test_linux_falls_back_to_github_api_when_feed_is_missing(
+        monkeypatch, tmp_path, _clean_updater_state):
+    import urllib.error
+
+    img = tmp_path / "WhisperFlow-0.4.300-x86_64.AppImage"
+    img.write_bytes(b"\x7fELF" + b"\0" * 60)
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setenv("APPIMAGE", str(img))
+    monkeypatch.setattr(updater, "_current_version", lambda: "0.4.300")
+
+    def http_get(url, timeout=20.0):
+        if url.endswith("releases.linux.json"):
+            raise urllib.error.URLError("not found")
+        return (
+            b'{"assets":[{"name":"WhisperFlow-0.4.410-x86_64.AppImage",'
+            b'"browser_download_url":"https://example/img",'
+            b'"digest":"sha256:ff"}]}'
+        )
+
+    monkeypatch.setattr(updater, "_http_get", http_get)
+    assert updater.check() == "0.4.410"
+
+
+def test_linux_background_download_stores_pending(
+        monkeypatch, tmp_path, _clean_updater_state):
+    img = tmp_path / "WhisperFlow-0.4.300-x86_64.AppImage"
+    img.write_bytes(b"\x7fELF" + b"\0" * 60)
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setenv("APPIMAGE", str(img))
+    monkeypatch.setattr(updater, "_current_version", lambda: "0.4.300")
+    monkeypatch.setattr(
+        updater, "_http_get",
+        lambda url, timeout=20.0: (
+            b'{"version":"0.4.400","file":"WhisperFlow-0.4.400-x86_64.AppImage",'
+            b'"sha256":"abc"}'
+        ),
+    )
+
+    def fake_download(url, dest, expected_sha=None, timeout=60.0):
+        dest.write_bytes(b"\x7fELF" + b"\0" * 60)
+        dest.chmod(0o755)
+
+    monkeypatch.setattr(updater, "_http_download", fake_download)
+    ready = []
+    assert updater.download_in_background(on_ready=ready.append) == "0.4.400"
+    assert updater.pending_version() == "0.4.400"
+    assert ready == ["0.4.400"]
+    pending = img.with_name(img.name + ".new")
+    assert pending.is_file()
+
+
+def test_linux_apply_swaps_in_place_and_respawns(
+        monkeypatch, tmp_path, _clean_updater_state):
+    img = tmp_path / "WhisperFlow-0.4.300-x86_64.AppImage"
+    img.write_bytes(b"\x7fELFOLD" + b"\0" * 60)
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setenv("APPIMAGE", str(img))
+    monkeypatch.setattr(updater, "_current_version", lambda: "0.4.300")
+    monkeypatch.setattr(
+        updater, "_http_get",
+        lambda url, timeout=20.0: (
+            b'{"version":"0.4.400","file":"WhisperFlow-0.4.400-x86_64.AppImage",'
+            b'"sha256":"abc"}'
+        ),
+    )
+
+    def fake_download(url, dest, expected_sha=None, timeout=60.0):
+        dest.write_bytes(b"\x7fELFNEW" + b"\0" * 60)
+        dest.chmod(0o755)
+
+    monkeypatch.setattr(updater, "_http_download", fake_download)
+    updater.download_in_background()
+
+    respawned, exited = [], []
+    monkeypatch.setattr(updater, "_linux_respawn", respawned.append)
+    monkeypatch.setattr(updater, "_exit_after_apply",
+                        lambda: exited.append(True))
+
+    assert updater.apply_pending() is True
+    assert img.read_bytes().startswith(b"\x7fELFNEW")
+    old = img.with_name(img.name + ".old")
+    assert old.is_file()
+    assert old.read_bytes().startswith(b"\x7fELFOLD")
+    assert respawned == [str(img)]
+    assert exited == [True]
+
+
+def test_cleanup_removes_the_replaced_appimage(monkeypatch, tmp_path):
+    img = tmp_path / "WhisperFlow-0.4.400-x86_64.AppImage"
+    img.write_bytes(b"\x7fELFNEW" + b"\0" * 60)
+    old = img.with_name(img.name + ".old")
+    old.write_bytes(b"\x7fELFOLD" + b"\0" * 60)
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setenv("APPIMAGE", str(img))
+    updater.cleanup_replaced_appimage()
+    assert img.is_file()
+    assert not old.exists()
+
+
+def test_http_download_rejects_a_hash_mismatch(monkeypatch, tmp_path):
+    dest = tmp_path / "out.AppImage"
+
+    class _Resp:
+        def read(self, n=-1):
+            data = b"\x7fELF" + b"\0" * 60
+            self.read = lambda n=-1: b""
+            return data
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr(updater.urllib.request, "urlopen",
+                        lambda *a, **k: _Resp())
+    with pytest.raises(ValueError, match="hash mismatch"):
+        updater._http_download("https://example/img", dest, expected_sha="nope")
+    assert not dest.exists()
+    assert not dest.with_name("out.AppImage.partial").exists()
 
 
 def test_unavailable_updater_names_the_reason_once(monkeypatch):

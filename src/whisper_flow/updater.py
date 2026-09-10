@@ -1,32 +1,56 @@
-"""Checking for and applying updates, through Velopack.
+"""Checking for and applying updates.
 
-Only meaningful in an installed Windows build. A source checkout updates
-with git, and the Linux package is installed by its own script, so both
-report "not applicable" rather than pretending.
+Windows (Velopack) and the Linux AppImage both self-update from the rolling
+``latest`` GitHub release. A source checkout updates with git, so it reports
+unavailable rather than pretending.
 
-Updates are delta by default: most of what ships is a speech model that does
-not change between versions, so a code-only release is a few megabytes
-rather than the ~160MB the full installer weighs.
+On Windows, updates are delta by default: most of what ships is a speech
+model that does not change between versions, so a code-only release is a
+few megabytes rather than the ~160MB the full installer weighs. On Linux
+the AppImage is one file (~120MB) replaced in place, so the desktop entry
+and login autostart keep pointing at the same path.
 
 The flow is check -> download in the background -> apply on click. The
 download never blocks a hotkey and the apply never interrupts a dictation:
 both wait their turn, and every step retries instead of failing loudly.
 """
 
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import shlex
+import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
+from pathlib import Path
 
 from .logging import log
+from .version import build_version
 
 # Where the release files live. The rolling "latest" release keeps a stable
 # download URL, so it works as a static update feed with no server.
 UPDATE_URL = ("https://github.com/sguergachi/whisper-flow-linux/"
               "releases/download/latest")
+GITHUB_API_RELEASE = (
+    "https://api.github.com/repos/sguergachi/whisper-flow-linux/"
+    "releases/tags/latest"
+)
+LINUX_FEED = UPDATE_URL + "/releases.linux.json"
+
+_APPIMAGE_NAME = re.compile(
+    r"WhisperFlow-(\d+(?:\.\d+)+)-x86_64\.AppImage$")
 
 
 def available() -> bool:
     """Whether this build can update itself at all."""
+    if _is_linux_appimage():
+        return True
     if sys.platform != "win32" or not getattr(sys, "frozen", False):
         return False
     try:
@@ -58,7 +82,7 @@ def check(notify=None) -> str | None:
     if not available():
         return None
     try:
-        update = _manager().check_for_updates()
+        update = _discover_update()
     except Exception as e:
         log(f"[UPDATE] check failed: {e}")
         if notify:
@@ -82,8 +106,7 @@ def apply_now(notify=None) -> bool:
     if not available():
         return False
     try:
-        manager = _manager()
-        update = manager.check_for_updates()
+        update = _discover_update()
         if not update:
             if notify:
                 notify("whisper-flow is up to date")
@@ -92,11 +115,17 @@ def apply_now(notify=None) -> bool:
         version = _version_of(update)
         if notify:
             notify(f"Downloading {version}...")
-        manager.download_updates(update)
+        # One attempt: the user clicked, and a 50s retry loop would look
+        # like a hang. Background fetches are the ones that retry.
+        if isinstance(update, _LinuxUpdate):
+            dest = _linux_dest(update)
+            _http_download(update.url, dest, update.sha256)
+            update.path = dest
+        else:
+            _manager().download_updates(update)
         if notify:
             notify(f"Restarting into {version}")
-        manager.apply_updates_and_restart(update)
-        return True
+        return _apply_update(update, notify)
     except Exception as e:
         log(f"[UPDATE] could not apply the update: {e}")
         if notify:
@@ -106,6 +135,8 @@ def apply_now(notify=None) -> bool:
 
 def _version_of(update) -> str:
     """The version out of whatever shape the update object has."""
+    if isinstance(update, _LinuxUpdate):
+        return update.version
     for attribute in ("target_full_release", "TargetFullRelease"):
         release = getattr(update, attribute, None)
         if release is not None:
@@ -136,12 +167,12 @@ def check_in_background(notify=None) -> None:
 # ------------------------------------------------------------------ state
 # Everything below is one shared state machine so the periodic checker, a
 # tray click and the apply step cannot trip over each other. All of it is a
-# no-op where updates are unavailable (Linux, source checkouts).
+# no-op where updates are unavailable (source checkouts, non-AppImage Linux).
 
 _lock = threading.Lock()
 _availability_logged = False
 _checked_version: str | None = None   # newest version seen (downloaded or not)
-_pending_update = None                # velopack update object, downloaded
+_pending_update = None                # velopack object or _LinuxUpdate
 _pending_version: str | None = None   # its version
 _downloading = False                  # a fetch is in flight right now
 _notified_version: str | None = None  # last version the user was told about
@@ -169,6 +200,12 @@ def is_downloading() -> bool:
         return _downloading
 
 
+def last_check_failed() -> bool:
+    """Whether the most recent check or download did not complete."""
+    with _lock:
+        return _last_check_ok is False
+
+
 def _remember_checked(version: str | None) -> bool:
     """Record a sighting. True when this version is new to us."""
     global _checked_version
@@ -193,7 +230,7 @@ def download_in_background(notify=None, on_ready=None) -> str | None:
         if _downloading:
             return _pending_version     # a fetch is already doing the work
     try:
-        update = _manager().check_for_updates()
+        update = _discover_update()
     except Exception as e:
         log(f"[UPDATE] check failed: {e}")
         with _lock:
@@ -236,6 +273,8 @@ def download_in_background(notify=None, on_ready=None) -> str | None:
 
 def _fetch_with_retries(version, update, notify) -> bool:
     """Download, retrying a flaky connection. True when it landed."""
+    if isinstance(update, _LinuxUpdate):
+        return _linux_fetch_with_retries(version, update, notify)
     try:
         manager = _manager()
     except Exception as e:
@@ -285,8 +324,7 @@ def apply_pending(notify=None) -> bool:
                 notify(f"Restarting into whisper-flow {version or ''}".rstrip())
             except Exception:
                 pass
-        _manager().apply_updates_and_restart(update)
-        return True                     # does not return on success
+        return _apply_update(update, notify)
     except Exception as e:
         log(f"[UPDATE] apply of {version} failed: {e}, trying one fresh round")
     # The stored object went stale (or the restart was refused): one fresh
@@ -295,12 +333,12 @@ def apply_pending(notify=None) -> bool:
         _pending_update = None
         _pending_version = None
     try:
-        fresh = _manager().check_for_updates()
+        fresh = _discover_update()
         if not fresh:
             return False
-        _manager().download_updates(fresh)
-        _manager().apply_updates_and_restart(fresh)
-        return True
+        if not _fetch_with_retries(_version_of(fresh), fresh, notify=None):
+            raise RuntimeError("download failed")
+        return _apply_update(fresh, notify)
     except Exception as e:
         log(f"[UPDATE] fresh apply round failed: {e}")
         if notify:
@@ -323,12 +361,14 @@ def start_auto_update(notify=None, on_ready=None,
     """
     global _auto_started
     if not available():
-        log("[UPDATE] background updater off: not an installed Windows build")
+        log("[UPDATE] background updater off: not an installed build")
         return
     with _lock:
         if _auto_started:
             return
         _auto_started = True
+
+    cleanup_replaced_appimage()
 
     def announce(version: str):
         global _notified_version
@@ -395,3 +435,321 @@ def _auto_update_round(notify=None, on_ready=None) -> None:
                    "in the background")
         except Exception as e:
             log(f"[UPDATE] notify failed: {e}")
+
+
+# ------------------------------------------------------------- discovery
+
+def _discover_update():
+    """Newest remote build if it is newer than us, else None.
+
+    Linux reads releases.linux.json (GitHub API as fallback). Windows asks
+    Velopack. Raises on network failure so the caller can log it.
+    """
+    if _is_linux_appimage():
+        return _linux_newer()
+    return _manager().check_for_updates()
+
+
+def _apply_update(update, notify=None) -> bool:
+    """Restart into `update`. Does not return on success for either platform."""
+    if isinstance(update, _LinuxUpdate):
+        return _apply_linux(update, notify)
+    _manager().apply_updates_and_restart(update)
+    return True
+
+
+def _current_version() -> str:
+    return build_version()
+
+
+def _version_tuple(text: str) -> tuple[int, int, int]:
+    """Numeric (major, minor, patch) from a version string.
+
+    ``0.4.336``, ``0.4.0 (source)``, leftover words after the number: all
+    fine. Missing parts pad with zeros so ``0.4`` and ``0.4.0`` compare equal.
+    """
+    core = (text or "").strip().split()[0]
+    nums: list[int] = []
+    for part in core.split("."):
+        if part.isdigit():
+            nums.append(int(part))
+        else:
+            break
+    while len(nums) < 3:
+        nums.append(0)
+    return (nums[0], nums[1], nums[2])
+
+
+def _is_newer(remote: str, local: str) -> bool:
+    return _version_tuple(remote) > _version_tuple(local)
+
+
+# -------------------------------------------------------- Linux AppImage
+
+class _LinuxUpdate:
+    """A remote AppImage waiting to be fetched, or already on disk."""
+
+    __slots__ = ("version", "url", "sha256", "path")
+
+    def __init__(self, version: str, url: str, sha256: str | None = None,
+                 path: Path | None = None):
+        self.version = version
+        self.url = url
+        self.sha256 = sha256
+        self.path = path
+
+
+def _appimage_path() -> str | None:
+    """Path of the running AppImage, or None."""
+    try:
+        from .desktop_install import appimage_path
+        return appimage_path()
+    except Exception:
+        return None
+
+
+def _is_linux_appimage() -> bool:
+    """Frozen Linux running from an AppImage file we can replace."""
+    if sys.platform == "win32" or not getattr(sys, "frozen", False):
+        return False
+    return bool(_appimage_path())
+
+
+def _user_agent() -> str:
+    return (f"whisper-flow/{_current_version()} "
+            "(+https://github.com/sguergachi/whisper-flow-linux)")
+
+
+def _http_get(url: str, timeout: float = 20.0) -> bytes:
+    request = urllib.request.Request(
+        url, headers={"User-Agent": _user_agent()})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return response.read()
+
+
+def _http_download(url: str, dest: Path, expected_sha: str | None = None,
+                   timeout: float = 60.0) -> None:
+    """Stream `url` to `dest`. Raises on HTTP/IO/hash failure."""
+    request = urllib.request.Request(
+        url, headers={"User-Agent": _user_agent()})
+    hasher = hashlib.sha256()
+    partial = dest.with_name(dest.name + ".partial")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            with open(partial, "wb") as handle:
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    handle.write(chunk)
+                    hasher.update(chunk)
+        digest = hasher.hexdigest()
+        if expected_sha and digest.lower() != expected_sha.lower():
+            raise ValueError(
+                f"download hash mismatch (got {digest}, expected {expected_sha})")
+        if partial.stat().st_size < 64:
+            raise ValueError("download too small to be an AppImage")
+        with open(partial, "rb") as handle:
+            magic = handle.read(4)
+        if magic != b"\x7fELF":
+            raise ValueError("download is not an ELF AppImage")
+        os.chmod(partial, 0o755)
+        os.replace(partial, dest)
+    except Exception:
+        try:
+            partial.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _linux_update_from_feed(data: dict) -> _LinuxUpdate | None:
+    version = str(data.get("version") or data.get("Version") or "").strip()
+    filename = str(data.get("file") or data.get("FileName") or "").strip()
+    sha = data.get("sha256") or data.get("SHA256")
+    sha = str(sha).strip() if sha else None
+    if not version or not filename:
+        return None
+    url = filename if filename.startswith("http") else f"{UPDATE_URL}/{filename}"
+    return _LinuxUpdate(version, url, sha)
+
+
+def _version_from_filename(name: str) -> str | None:
+    match = _APPIMAGE_NAME.search(name or "")
+    return match.group(1) if match else None
+
+
+def _linux_update_from_github(data: dict) -> _LinuxUpdate | None:
+    for asset in data.get("assets") or []:
+        name = asset.get("name") or ""
+        if not _APPIMAGE_NAME.search(name):
+            continue
+        version = _version_from_filename(name)
+        if not version:
+            continue
+        url = asset.get("browser_download_url")
+        if not url:
+            continue
+        sha = None
+        digest = asset.get("digest") or ""
+        if isinstance(digest, str) and digest.lower().startswith("sha256:"):
+            sha = digest.split(":", 1)[1]
+        return _LinuxUpdate(version, url, sha)
+    return None
+
+
+def _linux_remote() -> _LinuxUpdate | None:
+    """The newest AppImage on the rolling feed.
+
+    Prefers releases.linux.json (tiny, no API quota). Falls back to the
+    GitHub release API so a missing feed file is not a dead updater.
+    Raises on total network failure.
+    """
+    feed_error: Exception | None = None
+    try:
+        data = json.loads(_http_get(LINUX_FEED))
+        update = _linux_update_from_feed(data)
+        if update:
+            return update
+        feed_error = ValueError("releases.linux.json had no AppImage")
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError,
+            json.JSONDecodeError, ValueError, OSError) as e:
+        feed_error = e
+        log(f"[UPDATE] linux feed missed ({e}); trying GitHub API")
+    data = json.loads(_http_get(GITHUB_API_RELEASE))
+    update = _linux_update_from_github(data)
+    if update:
+        return update
+    if feed_error:
+        raise feed_error
+    return None
+
+
+def _linux_newer() -> _LinuxUpdate | None:
+    """Remote AppImage if it is newer than this build, else None."""
+    remote = _linux_remote()
+    if not remote:
+        return None
+    if not _is_newer(remote.version, _current_version()):
+        return None
+    return remote
+
+
+def _linux_dest(update: _LinuxUpdate) -> Path:
+    current = _appimage_path()
+    if not current:
+        raise RuntimeError("not running from an AppImage")
+    return Path(current).with_name(Path(current).name + ".new")
+
+
+def _linux_fetch_with_retries(version, update: _LinuxUpdate, notify) -> bool:
+    try:
+        dest = _linux_dest(update)
+    except Exception as e:
+        log(f"[UPDATE] cannot choose AppImage destination: {e}")
+        return False
+    if dest.is_file() and _file_sha256(dest) == (update.sha256 or "").lower():
+        update.path = dest
+        return True
+    for attempt in range(_DOWNLOAD_RETRIES):
+        try:
+            if notify and attempt == 0:
+                try:
+                    notify(f"Downloading whisper-flow {version} in the background...")
+                except Exception:
+                    pass
+            _http_download(update.url, dest, update.sha256)
+            update.path = dest
+            return True
+        except Exception as e:
+            log(f"[UPDATE] download attempt {attempt + 1} for {version} failed: {e}")
+            if attempt + 1 < _DOWNLOAD_RETRIES:
+                time.sleep(_DOWNLOAD_BACKOFF[
+                    min(attempt, len(_DOWNLOAD_BACKOFF) - 1)])
+    log(f"[UPDATE] giving up on {version} until the next check")
+    if notify:
+        try:
+            notify(f"Could not download whisper-flow {version} - will retry later")
+        except Exception:
+            pass
+    return False
+
+
+def _file_sha256(path: Path) -> str:
+    hasher = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def _apply_linux(update: _LinuxUpdate, notify=None) -> bool:
+    """Replace the running AppImage and restart into it.
+
+    Rename-aside so the FUSE mount of the running file stays valid until
+    this process exits: current -> current.old, then .new -> current.
+    A one-second delayed exec starts the new file after the instance lock
+    is released by this process dying. On success this does not return.
+    """
+    current = _appimage_path()
+    if not current:
+        raise RuntimeError("not running from an AppImage")
+    new_path = Path(update.path) if update.path else _linux_dest(update)
+    if not new_path.is_file():
+        raise RuntimeError(f"downloaded AppImage missing: {new_path}")
+    current_path = Path(current)
+    old_path = current_path.with_name(current_path.name + ".old")
+    os.replace(current_path, old_path)
+    try:
+        os.replace(new_path, current_path)
+        os.chmod(current_path, 0o755)
+    except Exception:
+        try:
+            if old_path.is_file() and not current_path.exists():
+                os.replace(old_path, current_path)
+        except OSError:
+            pass
+        raise
+    _linux_respawn(str(current_path))
+    _exit_after_apply()
+    return True                     # tests mock _exit_after_apply
+
+
+def _linux_respawn(path: str) -> None:
+    """Start `path` after this process has had a moment to die.
+
+    The daemon holds an flock; a replacement started too soon exits with
+    "already running" and the tray never comes back. sleep-then-exec in a
+    new session is the same shape restart.py uses from the settings window.
+    """
+    subprocess.Popen(
+        ["sh", "-c", f"sleep 1; exec {shlex.quote(path)}"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+def _exit_after_apply() -> None:
+    """Leave so the replacement can take the instance lock. Tests mock this."""
+    os._exit(0)
+
+
+def cleanup_replaced_appimage() -> None:
+    """Delete the previous AppImage left beside us after a successful swap.
+
+    Safe on the next start: the old process (and its FUSE mount) is gone,
+    so the leftover ``*.AppImage.old`` is just a file. Never raises.
+    """
+    current = _appimage_path()
+    if not current:
+        return
+    old = Path(current).with_name(Path(current).name + ".old")
+    try:
+        if old.is_file():
+            old.unlink()
+            log("[UPDATE] removed the replaced AppImage")
+    except OSError as e:
+        log(f"[UPDATE] could not remove the replaced AppImage: {e}")

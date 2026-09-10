@@ -96,6 +96,11 @@ like a normally installed program from then on.
 
 Hold `Super+Alt` to dictate. Look for the microphone in the notification area.
 
+Later builds replace this file from the tray: **Check for updates**. The
+download happens in the background; clicking **Update** restarts into it
+and swaps the AppImage in place, so the app-menu and login entries keep
+working. The first build that can do this has to be downloaded by hand.
+
 If the file manager will not run it the first time: right-click → Properties →
 **Allow executing file as program**, then double-click again (browsers strip
 that flag on download).

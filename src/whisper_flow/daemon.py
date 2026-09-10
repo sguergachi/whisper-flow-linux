@@ -2078,6 +2078,8 @@ class WhisperFlowDaemon:
                 notify=self.notify, on_ready=self._on_update_ready)
             if version and updater.pending_version():
                 self._refresh_tray_menu()
+            elif updater.last_check_failed():
+                self.notify("Could not check for updates")
             elif not updater.pending_version():
                 self.notify("whisper-flow is up to date")
         except Exception as e:
@@ -2510,7 +2512,7 @@ Use 'whisper-flow stop' to exit daemon
 
                 # New releases download themselves in the background; the
                 # tray row flips to "Update to X" when one lands. No-op
-                # where updates are unavailable (Linux, source checkouts).
+                # where updates are unavailable (source checkouts).
                 try:
                     updater.start_auto_update(
                         notify=self.notify,

@@ -509,6 +509,22 @@ def test_update_row_shows_an_in_flight_download(daemon, monkeypatch):
     assert daemon._update_label() == "Downloading update…"
 
 
+def test_update_click_does_not_claim_current_when_the_check_failed(
+        daemon, monkeypatch):
+    """A failed check is not the same as being up to date."""
+    import whisper_flow.updater as updater_module
+
+    monkeypatch.setattr(updater_module, "pending_version", lambda: None)
+    monkeypatch.setattr(updater_module, "is_downloading", lambda: False)
+    monkeypatch.setattr(updater_module, "download_in_background",
+                        lambda notify=None, on_ready=None: None)
+    monkeypatch.setattr(updater_module, "last_check_failed", lambda: True)
+    told = []
+    monkeypatch.setattr(daemon, "notify", told.append)
+    daemon._update_clicked()
+    assert told == ["Could not check for updates"]
+
+
 def test_update_click_while_recording_defers_the_restart(daemon, monkeypatch):
     """Restarting into an update must never kill a dictation in flight."""
     import whisper_flow.updater as updater_module

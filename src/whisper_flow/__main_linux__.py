@@ -195,6 +195,12 @@ def main() -> int:
         ensure_desktop_integration()
     except Exception:
         pass
+    try:
+        from whisper_flow.updater import cleanup_replaced_appimage
+
+        cleanup_replaced_appimage()
+    except Exception:
+        pass
 
     from whisper_flow.daemon import WhisperFlowDaemon
 

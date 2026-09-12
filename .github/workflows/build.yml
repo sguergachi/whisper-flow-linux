@@ -309,11 +309,33 @@ jobs:
           echo "APPIMAGE=${APPIMAGE}" >> "$GITHUB_ENV"
           ls -lah "$APPIMAGE"
 
+      - name: Write the Linux update feed
+        # Tiny JSON the AppImage updater fetches from the rolling release.
+        # The filename in the AppImage changes with the run number; this
+        # file does not, so a running build can learn the next name and
+        # hash without scraping GitHub HTML or burning API quota.
+        run: |
+          test -n "$PACK_VERSION"
+          test -s "$APPIMAGE"
+          SHA=$(sha256sum "$APPIMAGE" | awk '{print $1}')
+          python3 -c "
+          import json
+          print(json.dumps({
+              'version': '$PACK_VERSION',
+              'file': '$APPIMAGE',
+              'sha256': '$SHA',
+          }, indent=2))
+          " > releases.linux.json
+          cat releases.linux.json
+          grep -Fq "$PACK_VERSION" releases.linux.json
+          grep -Fq "$SHA" releases.linux.json
+
       - uses: actions/upload-artifact@v4
         with:
           name: linux-installer
           path: |
             WhisperFlow-*-x86_64.AppImage
+            releases.linux.json
           retention-days: >-
             ${{ (github.ref == 'refs/heads/master' ||
                  startsWith(github.ref, 'refs/tags/v')) && 30 || 5 }}
@@ -666,6 +688,7 @@ jobs:
             --target "$GITHUB_SHA" \
             ${{ steps.plan.outputs.prerelease == 'true' && '--prerelease' || '' }} \
             artifacts/linux-installer/WhisperFlow-*-x86_64.AppImage \
+            artifacts/linux-installer/releases.linux.json \
             release-files/*
 
   prune:

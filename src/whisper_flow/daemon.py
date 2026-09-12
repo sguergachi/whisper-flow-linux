@@ -49,6 +49,55 @@ PUSH_TO_TALK_MODES = ("transcribe",)
 # the window raises itself.
 SETTINGS_CLICK_DEBOUNCE_S = 1.5
 
+# What a window needs from the session to find the desktop it belongs on.
+_DISPLAY_ENV = ("WAYLAND_DISPLAY", "DISPLAY", "XAUTHORITY")
+
+
+def _has_display() -> bool:
+    """Whether a window started from here can reach a desktop.
+
+    At login the app can be started - by XDG autostart, through systemd -
+    before the desktop has put WAYLAND_DISPLAY and DISPLAY into the user
+    manager's environment. Such a process holds a working tray (that is
+    D-Bus) and no display for the rest of its life, so every Settings click
+    fell back to a notification naming the config directory, with nothing
+    in the log to say why. The desktop has published them by the time
+    anyone clicks, so ask again before concluding there is no desktop.
+    """
+    if sys.platform == "win32":
+        return True
+    if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+        return True
+    _adopt_session_display_env()
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+
+def _adopt_session_display_env() -> None:
+    """Take the display variables the session has published since we started."""
+    try:
+        out = subprocess.run(
+            ["systemctl", "--user", "show-environment"],
+            capture_output=True, text=True, timeout=2).stdout
+    except Exception:
+        out = ""
+    adopted = []
+    for line in out.splitlines():
+        name, sep, value = line.partition("=")
+        if sep and name in _DISPLAY_ENV and value and not os.environ.get(name):
+            os.environ[name] = value
+            adopted.append(f"{name}={value}")
+    if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        # No systemd user manager to ask: a Wayland session's socket is
+        # still there to be found.
+        runtime = os.environ.get("XDG_RUNTIME_DIR")
+        if (runtime and os.environ.get("XDG_SESSION_TYPE") == "wayland"
+                and os.path.exists(os.path.join(runtime, "wayland-0"))):
+            os.environ["WAYLAND_DISPLAY"] = "wayland-0"
+            adopted.append("WAYLAND_DISPLAY=wayland-0")
+    if adopted:
+        log(f"[DAEMON] started without a display; adopted {', '.join(adopted)}")
+
+
 def _pystray():
     """Import pystray at the point of use.
 
@@ -153,6 +202,10 @@ class WhisperFlowDaemon:
         # Initialize the new HotkeyManager
         log("[DAEMON] Creating HotkeyManager...")
         self.hotkey_manager = HotkeyManager()
+        # The watchdog starts before setup_hotkeys runs. Until setup has
+        # made its own start, a listener that is not alive yet is not dead -
+        # it has not been started - and healing it then raced setup's start.
+        self._hotkeys_set_up = False
 
         # Initialize HUD overlay for recording indicator
         log("[DAEMON] Creating HUD overlay...")
@@ -541,25 +594,34 @@ class WhisperFlowDaemon:
                     f"⌨️ Keyboard input was emergency-reset ({reason})"))
 
             # Start the hotkey manager
-            self.hotkey_manager.start()
+            try:
+                self.hotkey_manager.start()
+            finally:
+                # Failed or not, from here a listener that is not alive is
+                # the watchdog's to revive.
+                self._hotkeys_set_up = True
             log("[DAEMON] Hotkeys setup complete")
-
-            # Have the overlay up and waiting before the first press, rather
-            # than starting it on the first recording - which would leave the
-            # first dictation of every session as slow as it always was.
-            self.hud.prewarm()
-            # The same for the settings window, which costs far more to open
-            # than the overlay does and is opened from a menu nobody expects
-            # to wait three seconds for.
-            self.prewarm_settings()
-            # And draw the tray icons now, so the first recording does not
-            # spend ~615ms on a picture before opening the microphone.
-            threading.Thread(target=prerender_icons, daemon=True,
-                             name="whisper-flow-icons").start()
 
         except Exception as e:
             log(f"[DAEMON] Error setting up hotkeys: {e}")
             self.notify(f"Error setting up hotkeys: {e}")
+
+        # Not skipped when the keyboard could not be grabbed: the overlay and
+        # the settings window have nothing to do with the hotkeys, and
+        # Settings is where someone whose hotkeys failed goes next.
+        #
+        # Have the overlay up and waiting before the first press, rather
+        # than starting it on the first recording - which would leave the
+        # first dictation of every session as slow as it always was.
+        self.hud.prewarm()
+        # The same for the settings window, which costs far more to open
+        # than the overlay does and is opened from a menu nobody expects
+        # to wait three seconds for.
+        self.prewarm_settings()
+        # And draw the tray icons now, so the first recording does not
+        # spend ~615ms on a picture before opening the microphone.
+        threading.Thread(target=prerender_icons, daemon=True,
+                         name="whisper-flow-icons").start()
 
     def _is_processing(self) -> bool:
         """Check if system is currently processing a request."""
@@ -1198,8 +1260,7 @@ class WhisperFlowDaemon:
         On a thread, like the overlay's: this starts a process that loads GTK,
         and the tray icon must not wait for it.
         """
-        if sys.platform != "win32" and not (
-                os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        if not _has_display():
             return                      # headless: there is no window to warm
 
         def work():
@@ -1224,8 +1285,8 @@ class WhisperFlowDaemon:
         GTK demands the main thread of wherever it runs. Returns False where
         there is no window to show, so the caller can fall back.
         """
-        if sys.platform != "win32" and not (
-                os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        if not _has_display():
+            log("[DAEMON] no display to open a window on")
             return False                # headless: fall back to downloading
         with self._setup_lock:
             process = self._setup_process
@@ -2777,6 +2838,8 @@ Use 'whisper-flow stop' to exit daemon
         try:
             hm = getattr(self, "hotkey_manager", None)
             if not hm or not hasattr(hm, "is_alive"):
+                return False
+            if not getattr(self, "_hotkeys_set_up", False):
                 return False
             try:
                 if hm.is_alive():

@@ -85,6 +85,15 @@ class HotkeyManager:
         self.keyboard_listener = None
         self._evdev_listener = None
         self._emergency_callback: Callable[[str], None] | None = None
+        # start, stop and restart each replace the backend listener, and
+        # they are called from three threads: the daemon's setup, its
+        # watchdog and the heartbeat. Two starts racing at login each built
+        # a listener; one grabbed the keyboards, the other failed with EBUSY
+        # and took its place, so the working one was orphaned - still
+        # holding every keyboard, never stopped - and each restart after
+        # that failed against it, every ten seconds for the rest of the
+        # session.
+        self._lifecycle_lock = threading.RLock()
 
         # Simple state
         self.last_key_times: dict[str, float] = {}  # Track per-key debouncing
@@ -228,6 +237,10 @@ class HotkeyManager:
 
     def start(self) -> None:
         """Start the hotkey listener."""
+        with self._lifecycle_lock:
+            self._start_locked()
+
+    def _start_locked(self) -> None:
         if self.is_running:
             log("[HOTKEY] HotkeyManager is already running")
             return
@@ -300,29 +313,48 @@ class HotkeyManager:
         """Start the Windows low-level keyboard hook."""
         from .hotkey_win import WinHotkeyListener
 
-        self._evdev_listener = WinHotkeyListener()
-        self._evdev_listener.escape_callback = self._handle_escape_key
+        listener = WinHotkeyListener()
+        listener.escape_callback = self._handle_escape_key
         if self._emergency_callback is not None and hasattr(
-                self._evdev_listener, "on_emergency"):
-            self._evdev_listener.on_emergency = self._emergency_callback
+                listener, "on_emergency"):
+            listener.on_emergency = self._emergency_callback
         for name, binding in self.active_bindings.items():
             key_str = "+".join(sorted(binding.keys))
             release_cb = (binding.callback_release
                           if binding.mode == HotkeyMode.PUSH_TO_TALK else None)
-            self._evdev_listener.register_hotkey(
+            listener.register_hotkey(
                 name, key_str, binding.callback_press, release_cb,
             )
-        self._evdev_listener.start()
+        self._install_listener(listener)
         log("[HOTKEY] Windows hotkey listener started")
+
+    def _install_listener(self, listener) -> None:
+        """Start a new backend listener, and only then make it the current one.
+
+        A listener that fails to start is never installed, so it cannot
+        displace one that works; and whatever was current before is stopped
+        first, so no listener is ever left running with nothing pointing at
+        it - an orphan still holding the keyboard grab is exactly what
+        nothing else could ever release.
+        """
+        previous = self._evdev_listener
+        if previous is not None and previous is not listener:
+            self._evdev_listener = None
+            try:
+                previous.stop()
+            except Exception as e:
+                log(f"[HOTKEY] Error stopping previous listener: {e}")
+        listener.start()
+        self._evdev_listener = listener
 
     def _start_evdev(self):
         """Start the evdev-based keyboard listener for Wayland."""
         from .hotkey_evdev import EvdevHotkeyListener
 
-        self._evdev_listener = EvdevHotkeyListener()
-        self._evdev_listener.escape_callback = self._handle_escape_key
+        listener = EvdevHotkeyListener()
+        listener.escape_callback = self._handle_escape_key
         if self._emergency_callback is not None:
-            self._evdev_listener.on_emergency = self._emergency_callback
+            listener.on_emergency = self._emergency_callback
 
         for name, binding in self.active_bindings.items():
             # Build key string from the parsed set (which is normalized)
@@ -335,16 +367,20 @@ class HotkeyManager:
             # Space held as far as the desktop was concerned, so the press
             # typed a space (or fired a desktop shortcut) and looked like
             # auto-transcribe "did nothing".
-            self._evdev_listener.register_hotkey(
+            listener.register_hotkey(
                 name, key_str, press_cb, release_cb,
                 release_modifiers=True,
             )
 
-        self._evdev_listener.start()
+        self._install_listener(listener)
         log("[HOTKEY] Evdev hotkey listener started")
 
     def stop(self) -> None:
         """Stop the hotkey listener."""
+        with self._lifecycle_lock:
+            self._stop_locked()
+
+    def _stop_locked(self) -> None:
         if not self.is_running:
             return
 
@@ -834,6 +870,12 @@ class HotkeyManager:
 
     def _restart_listener(self):
         """Restart the keyboard listener if it died, using the same backend."""
+        with self._lifecycle_lock:
+            if not self.is_running:
+                return              # stopped meanwhile: nothing to restart
+            self._restart_listener_locked()
+
+    def _restart_listener_locked(self):
         try:
             log("[HOTKEY] Restarting keyboard listener...")
             # Stop existing listener

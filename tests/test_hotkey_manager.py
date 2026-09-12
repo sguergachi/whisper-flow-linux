@@ -1,5 +1,6 @@
 """Unit tests for the HotkeyManager class."""
 
+import time
 from unittest.mock import Mock, patch
 
 import pytest
@@ -618,6 +619,57 @@ class TestHotkeyManager:
         with patch.object(manager, "_restart_listener") as restart:
             manager._heartbeat_check()
         restart.assert_called_once()
+
+    def test_a_listener_that_fails_to_start_never_replaces_a_working_one(self):
+        """The EBUSY loser used to be installed over the listener holding
+        the grab, orphaning it: nothing could stop it, and it kept the
+        keyboard from every restart after."""
+        manager = HotkeyManager()
+        working = Mock()
+        manager._evdev_listener = working
+        loser = Mock()
+        loser.start.side_effect = RuntimeError("Cannot grab the keyboard")
+        with pytest.raises(RuntimeError):
+            manager._install_listener(loser)
+        # The old one was stopped before the new one tried, so no grab is
+        # left behind with nothing pointing at it.
+        working.stop.assert_called_once()
+        assert manager._evdev_listener is None
+
+    def test_concurrent_starts_build_one_listener(self):
+        """Setup and the watchdog both starting at login built two."""
+        import threading
+
+        manager = HotkeyManager()
+        built = []
+
+        class SlowListener:
+            def __init__(self):
+                built.append(self)
+
+            def register_hotkey(self, *a, **k):
+                pass
+
+            def start(self):
+                time.sleep(0.2)
+
+            def is_alive(self):
+                return True
+
+            def stop(self):
+                pass
+
+        with patch("whisper_flow.hotkey_manager._is_windows", return_value=False), \
+                patch("whisper_flow.hotkey_manager._is_wayland", return_value=True), \
+                patch("whisper_flow.hotkey_evdev.EvdevHotkeyListener", SlowListener), \
+                patch.object(manager, "_start_heartbeat"):
+            threads = [threading.Thread(target=manager.start) for _ in range(2)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        assert len(built) == 1
+        assert manager._evdev_listener is built[0]
 
     def test_pump_age_unknown_without_backend(self):
         manager = HotkeyManager()

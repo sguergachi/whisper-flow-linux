@@ -4,6 +4,7 @@ The rule these pin down: the app never downloads gigabytes without being
 asked, and never asks twice about the same thing.
 """
 
+import os
 import subprocess
 import sys
 import threading
@@ -41,7 +42,46 @@ def test_no_settings_window_on_a_headless_machine(daemon, monkeypatch):
     monkeypatch.setattr(sys, "platform", "linux")
     monkeypatch.delenv("DISPLAY", raising=False)
     monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+    monkeypatch.setattr("whisper_flow.daemon._adopt_session_display_env",
+                        lambda: None)
     assert daemon._open_settings_window() is False
+
+
+def test_a_daemon_started_before_the_desktop_finds_it_later(daemon, monkeypatch):
+    """Autostart at login can beat the desktop to the user manager's
+    environment. The display it publishes afterwards is picked up at the
+    click, rather than every Settings click falling back for the session."""
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(sys, "frozen", False, raising=False)
+    # Set first, so teardown restores what the code under test adopts.
+    monkeypatch.setenv("DISPLAY", "")
+    monkeypatch.setenv("WAYLAND_DISPLAY", "")
+    monkeypatch.delenv("DISPLAY", raising=False)
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+    published = Mock(stdout="HOME=/home/u\nWAYLAND_DISPLAY=wayland-1\nDISPLAY=:0\n")
+    with patch("whisper_flow.daemon.subprocess.run", return_value=published), \
+            patch("whisper_flow.daemon.subprocess.Popen") as popen:
+        popen.return_value.poll.return_value = None
+        assert daemon._open_settings_window() is True
+    assert os.environ["WAYLAND_DISPLAY"] == "wayland-1"
+    assert os.environ["DISPLAY"] == ":0"
+
+
+def test_a_wayland_socket_is_found_without_systemd(daemon, monkeypatch, tmp_path):
+    from whisper_flow.daemon import _has_display
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    # Set first, so teardown restores what the code under test adopts.
+    monkeypatch.setenv("DISPLAY", "")
+    monkeypatch.setenv("WAYLAND_DISPLAY", "")
+    monkeypatch.delenv("DISPLAY", raising=False)
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+    monkeypatch.setenv("XDG_SESSION_TYPE", "wayland")
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    (tmp_path / "wayland-0").touch()
+    with patch("whisper_flow.daemon.subprocess.run", side_effect=FileNotFoundError):
+        assert _has_display() is True
+    assert os.environ["WAYLAND_DISPLAY"] == "wayland-0"
 
 
 def test_the_window_opens_on_a_linux_desktop(daemon, monkeypatch):
@@ -479,6 +519,8 @@ def test_a_headless_machine_builds_nothing_in_advance(daemon, monkeypatch):
     monkeypatch.setattr(sys, "platform", "linux")
     monkeypatch.delenv("DISPLAY", raising=False)
     monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+    monkeypatch.setattr("whisper_flow.daemon._adopt_session_display_env",
+                        lambda: None)
     with patch.object(daemon, "_start_tool_window") as start:
         daemon.prewarm_settings()
     start.assert_not_called()

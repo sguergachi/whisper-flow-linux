@@ -1454,6 +1454,7 @@ def test_dead_listener_is_revived_once_then_throttled(temp_config_dir):
     daemon, mock_manager = _idle_daemon(temp_config_dir)
     daemon.hotkey_manager = Mock()
     daemon.hotkey_manager.is_alive.return_value = False
+    daemon._hotkeys_set_up = True
     assert daemon._maybe_heal_hotkeys() is True
     daemon.hotkey_manager.start.assert_called_once()
     # Immediate second pass: throttled, no new attempt.
@@ -1469,11 +1470,38 @@ def test_live_listener_is_left_alone(temp_config_dir):
     daemon.hotkey_manager.start.assert_not_called()
 
 
+def test_no_heal_before_setup_has_started_the_listener(temp_config_dir):
+    """The watchdog starts first. Healing a listener setup has not started
+    yet raced setup's own start: two listeners, one orphaned holding the
+    keyboard grab, and every restart for the session failing with EBUSY."""
+    daemon, _ = _idle_daemon(temp_config_dir)
+    daemon.hotkey_manager = Mock()
+    daemon.hotkey_manager.is_alive.return_value = False
+    assert daemon._maybe_heal_hotkeys() is False
+    daemon.hotkey_manager.start.assert_not_called()
+
+
+def test_setup_arms_the_heal_even_when_the_grab_fails(temp_config_dir):
+    daemon, _ = _idle_daemon(temp_config_dir)
+    daemon.hotkey_manager = Mock()
+    daemon.hotkey_manager.start.side_effect = RuntimeError("busy")
+    daemon.hud = Mock()
+    daemon.notify = Mock()
+    with patch.object(daemon, "prewarm_settings") as prewarm, \
+            patch("threading.Thread"):
+        daemon.setup_hotkeys()
+    assert daemon._hotkeys_set_up is True
+    # Settings is where someone whose hotkeys failed goes next.
+    prewarm.assert_called_once()
+    daemon.hud.prewarm.assert_called_once()
+
+
 def test_failed_revive_reports_and_retries_later(temp_config_dir):
     daemon, _ = _idle_daemon(temp_config_dir)
     daemon.hotkey_manager = Mock()
     daemon.hotkey_manager.is_alive.return_value = False
     daemon.hotkey_manager.start.side_effect = RuntimeError("still busy")
+    daemon._hotkeys_set_up = True
     assert daemon._maybe_heal_hotkeys() is False
     # Throttled even on failure: one attempt per window.
     assert daemon._maybe_heal_hotkeys() is False

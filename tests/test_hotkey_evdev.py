@@ -1092,3 +1092,126 @@ def test_starvation_skipped_while_hotkey_armed_or_events_fresh(listener):
     listener._supervise_once()
     assert notified == []
     assert listener._kbd_devices != []
+
+
+# --------------------------- proxy lifecycle and stand-down that stands down
+def test_stand_down_is_silent_and_final(listener):
+    """After stand-down, further emergencies must not recount or re-notify.
+
+    The forward-failure path re-entered recovery on every 30th swallowed
+    keystroke, so one stand-down became a tray notification every second
+    for the rest of the session - while the read loop kept re-grabbing.
+    """
+    _grabbed(listener, None)
+    listener._thread = _alive_thread()
+    listener._running = True
+    notified = []
+    listener.on_emergency = notified.append
+
+    for _ in range(4):
+        listener._emergency_recover("x")
+    assert listener._listener_disabled is True
+    assert len(notified) == 4
+
+    # A fifth emergency frees again but stays otherwise silent.
+    dev = _FakeDevice("/dev/input/event9", 99)
+    dev.grab()
+    listener._kbd_devices = [dev]
+    listener._emergency_recover("x")
+    assert len(notified) == 4
+    assert dev.grabbed is False
+    assert listener._listener_disabled is True
+
+
+def test_forward_threshold_ignored_once_stood_down(listener):
+    """Swallowed strays after stand-down must not revive the emergency loop."""
+    _grabbed(listener, None)
+    listener._thread = _alive_thread()
+    listener._running = True
+    listener._uinput = _RaisingUInput()
+    notified = []
+    listener.on_emergency = notified.append
+    listener._listener_disabled = True
+
+    for _ in range(40):
+        listener._forward(FakeEvent(ecodes.KEY_A, 1))
+    assert notified == []
+
+
+def test_triple_esc_keeps_a_healthy_proxy(listener):
+    """A manual rescue must not close the proxy.
+
+    Closing it left the read loop re-grabbing with nowhere to forward to:
+    every keystroke swallowed until the failure threshold re-fired the
+    emergency in a loop - the rescue became the outage.
+    """
+    dev = _grabbed(listener, None)
+    listener._thread = _alive_thread()
+    proxy = listener._uinput
+    listener.escape_callback = lambda: None
+    notified = []
+    listener.on_emergency = notified.append
+
+    for _ in range(3):
+        listener._handle_key(FakeEvent(ecodes.KEY_ESC, 1))
+
+    assert listener._uinput is proxy
+    assert dev.grabbed is False
+    assert len(notified) == 1 and "triple-Esc" in notified[0]
+
+
+def test_ensure_path_refuses_to_regrab_while_stood_down(listener, monkeypatch):
+    """The read loop must leave a stood-down keyboard free, period."""
+    from whisper_flow import hotkey_evdev
+
+    calls = []
+    monkeypatch.setattr(listener, "_find_keyboard_devices",
+                        lambda: calls.append(1) or [("/dev/input/event1", {})])
+    listener._listener_disabled = True
+
+    assert listener._ensure_forwarding_path() is False
+    assert calls == []
+    assert listener._kbd_devices == []
+
+
+def test_ensure_path_recreates_a_dead_proxy(monkeypatch):
+    """After a full emergency release, the next loop pass is born again."""
+    from whisper_flow import hotkey_evdev
+
+    listener = hotkey_evdev.EvdevHotkeyListener()
+    listener._running = True
+    made = {}
+
+    def fake_find():
+        return [("/dev/input/event1", {})]
+
+    def fake_device(path):
+        made.setdefault(path, _FakeDevice(path, 101))
+        return made[path]
+
+    created = []
+    monkeypatch.setattr(listener, "_find_keyboard_devices", fake_find)
+    monkeypatch.setattr(hotkey_evdev.evdev, "InputDevice", fake_device)
+    monkeypatch.setattr(
+        hotkey_evdev.evdev.UInput, "from_device",
+        lambda *a, **k: created.append(1) or Mock(close=Mock()))
+
+    assert listener._uinput is None
+    assert listener._ensure_forwarding_path() is True
+    assert created == [1]
+    assert listener._uinput is not None
+    assert listener._grabbed_paths() == {"/dev/input/event1"}
+
+
+def test_ensure_path_leaves_keyboard_free_when_proxy_unavailable(listener,
+                                                                 monkeypatch):
+    """No proxy, no grab: typing keeps working without hotkeys."""
+    def boom():
+        raise RuntimeError("Cannot create uinput proxy: no uinput")
+
+    monkeypatch.setattr(listener, "_create_proxy", boom)
+    listener._uinput = None
+    listener._running = True
+
+    assert listener._ensure_forwarding_path() is False
+    assert listener._kbd_devices == []

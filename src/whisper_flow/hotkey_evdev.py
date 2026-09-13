@@ -239,12 +239,20 @@ class EvdevHotkeyListener:
                 continue
         return devices
 
-    def start(self):
+    def _create_proxy(self):
+        """(Re)create the uinput proxy from the first keyboard's capabilities.
+
+        Factored out of start() because recovery needs it too: every
+        emergency frees the keyboard by releasing the grabs and dropping the
+        proxy, and without re-creation here the read loop would re-grab the
+        keyboards with nowhere to forward to - swallowing every keystroke
+        while the threshold re-fired the emergency in a loop. Raises
+        RuntimeError when no proxy can be made; the caller leaves the
+        keyboard free and retries later.
+        """
         kbd_info = self._find_keyboard_devices()
         if not kbd_info:
             raise RuntimeError("No keyboard devices found. Are you in the 'input' group?")
-
-        # Create uinput proxy from the first keyboard's capabilities
         try:
             self._uinput = evdev.UInput.from_device(kbd_info[0][0], name=PROXY_NAME)
         except Exception as e:
@@ -255,7 +263,11 @@ class EvdevHotkeyListener:
                     name=PROXY_NAME,
                 )
             except Exception:
+                self._uinput = None
                 raise RuntimeError(f"Cannot create uinput proxy: {e}") from e
+
+    def start(self):
+        self._create_proxy()
 
         # Grab and open real keyboard devices
         if not self._open_devices():
@@ -312,7 +324,7 @@ class EvdevHotkeyListener:
         """
         try:
             while self._running:
-                if not self._kbd_devices and not self._open_devices():
+                if not self._ensure_forwarding_path():
                     time.sleep(RESCAN_SECONDS)      # nothing to read yet
                     continue
                 self._pump_until_devices_change()
@@ -322,6 +334,31 @@ class EvdevHotkeyListener:
                 self._abandon_devices()
         finally:
             self._release_devices()
+
+    def _ensure_forwarding_path(self) -> bool:
+        """Proxy alive plus keyboards grabbed. False when there is nothing
+        to read and the caller should sleep and retry.
+
+        Two rules keep recovery from becoming a second outage. While stood
+        down after repeated failures the keyboard is left free, period: no
+        re-grab, so the stand-down notification ("keyboard left working")
+        stays true instead of re-grabbing with no proxy and swallowing every
+        keystroke until the next emergency. And the proxy is (re)created
+        before grabbing, never after: grabs without a proxy to forward
+        through are precisely the shape of "the keyboard went dead".
+        """
+        if self._listener_disabled:
+            return False
+        if self._uinput is None:
+            try:
+                self._create_proxy()
+            except Exception as e:
+                app_log(f"[HOTKEY] uinput proxy unavailable ({e}) - "
+                        "leaving keyboard free, will retry")
+                return False
+        if not self._kbd_devices and not self._open_devices():
+            return False
+        return True
 
     def _pump_until_devices_change(self):
         """Read events until a device fails or the keyboard set changes."""
@@ -422,6 +459,12 @@ class EvdevHotkeyListener:
             if self._forward_failures >= FORWARD_FAIL_THRESHOLD:
                 failures = self._forward_failures
                 self._forward_failures = 0
+                if self._listener_disabled:
+                    # Stood down already: the read loop no longer re-grabs,
+                    # so these are strays, not a new outage. Recounting here
+                    # turned one stand-down into a tray notification every
+                    # second for the rest of the session.
+                    return
                 self._emergency_recover(
                     f"uinput proxy failing ({failures} consecutive writes lost)")
             return
@@ -540,14 +583,33 @@ class EvdevHotkeyListener:
         except Exception:
             log.exception("emergency callback failed")
 
-    def _emergency_recover(self, reason: str, *, count_recovery: bool = True) -> None:
+    def _emergency_recover(self, reason: str, *, count_recovery: bool = True,
+                             keep_proxy: bool = False) -> None:
         """Last resort for wedged input: free the keyboard first, ask later.
 
         Order is deliberate. Ungrabbing restores the user's keyboard
         immediately no matter what else is broken; everything after that is
         best-effort recovery. Pending push-to-talk releases are still fired
         so a recording started before the wedge stops instead of running on.
+
+        `keep_proxy` is for user-invoked resets (triple-Esc): the proxy is
+        presumably healthy, so it is kept and only the grabs are released -
+        closing it would leave the read loop re-grabbing with nowhere to
+        forward to, swallowing every keystroke until the failure threshold
+        re-fired this very function in a loop. Genuine proxy deaths pass
+        False: the read loop recreates the proxy before re-grabbing.
         """
+        if self._listener_disabled:
+            # Already stood down: make sure the keyboard is free and return
+            # silently. No recount, no re-notify, no restart - without this,
+            # the forward-failure path re-entered here on every 30th
+            # swallowed keystroke and one stand-down became a tray
+            # notification every second for the rest of the session.
+            try:
+                self._ungrab_devices()
+            except Exception:
+                log.exception("emergency device release failed")
+            return
         app_log(f"[HOTKEY] EMERGENCY input reset: {reason} — releasing all grabs")
         now = time.monotonic()
         if count_recovery:
@@ -556,7 +618,12 @@ class EvdevHotkeyListener:
             self._recovery_times.append(now)
         # 1. Free the keyboard immediately, whatever else is broken.
         try:
-            self._release_devices()
+            if keep_proxy:
+                # Keeps the uinput proxy: _abandon_devices fires the pending
+                # push-to-talk releases itself, so step 2 below is a no-op.
+                self._abandon_devices()
+            else:
+                self._release_devices()
         except Exception:
             log.exception("emergency device release failed")
         # 2. Drop all tracking state, firing pending releases first.
@@ -583,7 +650,8 @@ class EvdevHotkeyListener:
                 "keyboard left working, restart the app")
             return
         # 4. Come back: restart the reader if it died; the read loop
-        # re-grabs devices by itself on its rescan path.
+        # recreates the proxy and re-grabs devices by itself on its rescan
+        # path (and stays stood down without re-grabbing when disabled).
         try:
             thread = self._thread
             if thread is None or not thread.is_alive():
@@ -798,8 +866,10 @@ class EvdevHotkeyListener:
         Releases every modifier on both physical sides without trusting any
         tracked state - the whole point is that the state may be the broken
         part - then runs the same release-and-recover path as a detected
-        stall. Does not count against the failure throttle: a person asking
-        for a reset is not a fault.
+        stall, keeping a presumably healthy proxy: closing it here is what
+        used to turn a manual rescue into a proxy-death spiral, the read
+        loop re-grabbing with nowhere to forward to. Does not count against
+        the failure throttle: a person asking for a reset is not a fault.
         """
         app_log("[HOTKEY] triple-Esc emergency input reset requested")
         if self._uinput is not None:
@@ -813,7 +883,8 @@ class EvdevHotkeyListener:
                 self._uinput.syn()
             except Exception:
                 pass
-        self._emergency_recover("triple-Esc requested", count_recovery=False)
+        self._emergency_recover("triple-Esc requested", count_recovery=False,
+                                keep_proxy=True)
 
     def sweep_unheld_modifiers(self) -> int:
         """Release modifiers we do NOT think are held.

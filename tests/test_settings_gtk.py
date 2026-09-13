@@ -731,6 +731,9 @@ elif scenario == "meter_read":
     assert errcode.reads == [chunk], errcode.reads
 
     # Default on Linux opens the Pulse/PipeWire PCM, not a hw: node.
+    # The shared-PCM lookup is Linux-only by design (it returns None on
+    # win32), so those asserts only run where they can pass; the meter
+    # framing asserts above run everywhere.
     class _PA:
         devices = [
             {"name": "HDA Analog (hw:0,0)", "maxInputChannels": 2},
@@ -742,9 +745,14 @@ elif scenario == "meter_read":
             return len(self.devices)
         def get_device_info_by_index(self, i):
             return self.devices[i]
-    assert settings_gtk._linux_shared_input_index(_PA()) == 1
-    assert settings_gtk._resolve_meter_device(_PA(), None) == 1
-    assert settings_gtk._resolve_meter_device(_PA(), 0) == 0
+    if sys.platform != "win32":
+        assert settings_gtk._linux_shared_input_index(_PA()) == 1
+        assert settings_gtk._resolve_meter_device(_PA(), None) == 1
+        assert settings_gtk._resolve_meter_device(_PA(), 0) == 0
+    else:
+        assert settings_gtk._linux_shared_input_index(_PA()) is None
+        assert settings_gtk._resolve_meter_device(_PA(), None) is None
+        assert settings_gtk._resolve_meter_device(_PA(), 0) == 0
 elif scenario == "mic_linux_devices":
     import types
     fake = types.ModuleType("pyaudio")

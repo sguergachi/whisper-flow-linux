@@ -735,16 +735,39 @@ class EvdevHotkeyListener:
     def _check_bindings(self, rising: bool):
         # Only the most specific satisfied binding wins, so cmd+shift+alt does
         # not also fire the cmd+alt binding nested inside it.
-        satisfied = [
-            (name, keys)
-            for name, (keys, _, _, _) in self._bindings.items()
-            if keys and keys.issubset(self._key_state)
-        ]
-        winner = None
-        if satisfied:
-            winner = max(satisfied, key=lambda item: len(item[1]))[0]
+        #
+        # Any held key outside every binding cancels: the user is pressing
+        # something else - typically a virtual-desktop shortcut sharing our
+        # modifiers (Super+Alt held for dictation, then an arrow to switch
+        # desktops). While such an extra key is held no binding wins, so an
+        # active push-to-talk is released instead of continuing with its
+        # modifiers muted - which forwarded the extra key bare, breaking the
+        # desktop shortcut and repeating the bare key like a held-key lock
+        # ("the shortcut I pressed along with a second key to switch virtual
+        # desktops locked my keyboard and held a single key"). ESC counts as
+        # an extra here too: it still fires its own cancel callback from
+        # _handle_key, and ending the held push-to-talk alongside it leaves
+        # nothing stranded. Keys that belong to some binding - Shift stepping
+        # transcribe up to command - are not extras and keep nested behavior.
+        extras = self._key_state - self._binding_codes
+        if extras:
+            winner = None
+            # Cancelling with keys held is a desync-risk moment by definition:
+            # the extra key was just forwarded bare while the binding's
+            # modifiers stay muted, so arm the idle hygiene sweep.
+            if self._press_triggered:
+                self._mark_input_risk()
+        else:
+            satisfied = [
+                (name, keys)
+                for name, (keys, _, _, _) in self._bindings.items()
+                if keys and keys.issubset(self._key_state)
+            ]
+            winner = None
+            if satisfied:
+                winner = max(satisfied, key=lambda item: len(item[1]))[0]
 
-        if rising and winner is None:
+        if rising and winner is None and not extras:
             self._log_near_miss()
 
         for name, (keys, cb_press, cb_release, release_mods) in self._bindings.items():

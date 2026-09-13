@@ -806,3 +806,93 @@ def test_busy_grab_error_names_devices_and_holder():
     msg = _grab_error([("/dev/input/event3", err)])
     assert "/dev/input/event3" in msg
     assert "lsof" in msg
+
+
+def _drain(listener):
+    fired = []
+    while not listener._callbacks.empty():
+        name, kind, cb = listener._callbacks.get()
+        fired.append((name, kind))
+        cb()
+    return fired
+
+
+def test_extra_key_cancels_push_to_talk(listener):
+    """Holding super+alt then pressing a desktop-switch key must end it.
+
+    Otherwise the binding stays active with its modifiers muted, the extra
+    key is forwarded bare so the desktop shortcut fails, and the bare key
+    repeats like a held-key keyboard lock.
+    """
+    fired = []
+    listener.register_hotkey(
+        "transcribe", "super+alt",
+        lambda: fired.append("press"), lambda: fired.append("release"),
+        release_modifiers=True,
+    )
+    listener._handle_key(FakeEvent(ecodes.KEY_LEFTMETA, 1))
+    listener._handle_key(FakeEvent(ecodes.KEY_LEFTALT, 1))
+    _drain(listener)
+    assert fired == ["press"]
+    assert "transcribe" in listener._press_triggered
+
+    # Second key for the virtual-desktop switch: outside every binding.
+    listener._handle_key(FakeEvent(ecodes.KEY_A, 1))
+    order = _drain(listener)
+    assert fired == ["press", "release"]
+    assert order == [("transcribe", "release")]
+    assert "transcribe" not in listener._press_triggered
+    assert listener._active_hotkey is None
+    # The extra key itself still reaches the compositor.
+    assert (ecodes.KEY_A, 1) in listener.forwarded
+
+
+def test_no_refire_while_extra_key_held(listener):
+    """Re-pressing the hotkey with the extra key still down must not restart."""
+    fired = []
+    listener.register_hotkey(
+        "transcribe", "super+alt",
+        lambda: fired.append("press"), lambda: fired.append("release"),
+        release_modifiers=True,
+    )
+    listener._handle_key(FakeEvent(ecodes.KEY_LEFTMETA, 1))
+    listener._handle_key(FakeEvent(ecodes.KEY_LEFTALT, 1))
+    _drain(listener)
+    listener._handle_key(FakeEvent(ecodes.KEY_A, 1))
+    _drain(listener)
+    assert fired == ["press", "release"]
+
+    listener._handle_key(FakeEvent(ecodes.KEY_LEFTALT, 0))
+    _drain(listener)
+    listener._handle_key(FakeEvent(ecodes.KEY_LEFTALT, 1))
+    assert _drain(listener) == []
+    assert fired == ["press", "release"]
+
+    for code, value in ((ecodes.KEY_A, 0), (ecodes.KEY_LEFTALT, 0),
+                        (ecodes.KEY_LEFTMETA, 0)):
+        listener._handle_key(FakeEvent(code, value))
+    _drain(listener)
+    assert listener._key_state == set()
+    assert listener._press_triggered == set()
+    assert listener._muted == set()
+
+
+def test_binding_key_still_steps_up_to_nested_command(listener):
+    """Shift is part of command, so it is not an extra and must nest."""
+    fired = []
+    listener.register_hotkey(
+        "transcribe", "super+alt",
+        lambda: fired.append("press"), lambda: fired.append("release"),
+        release_modifiers=True,
+    )
+    listener.register_hotkey(
+        "command", "super+alt+shift",
+        lambda: fired.append("cmd-press"), lambda: fired.append("cmd-release"),
+        release_modifiers=True,
+    )
+    listener._handle_key(FakeEvent(ecodes.KEY_LEFTMETA, 1))
+    listener._handle_key(FakeEvent(ecodes.KEY_LEFTALT, 1))
+    _drain(listener)
+    listener._handle_key(FakeEvent(ecodes.KEY_LEFTSHIFT, 1))
+    _drain(listener)
+    assert fired == ["press", "release", "cmd-press"]

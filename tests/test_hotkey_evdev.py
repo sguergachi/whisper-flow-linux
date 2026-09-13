@@ -948,8 +948,6 @@ def test_synthetic_release_drops_tracker_but_mutes(listener):
 
 def test_reconcile_heals_lost_key_up(listener):
     """Forwarded down + kernel up = the compositor is repeating a ghost."""
-    import time
-
     listener._running = True
     listener._kbd_devices = [_Kbd("/dev/input/event9", held=[])]
     listener._forwarded_down.add(ecodes.KEY_A)
@@ -1162,8 +1160,6 @@ def test_triple_esc_keeps_a_healthy_proxy(listener):
 
 def test_ensure_path_refuses_to_regrab_while_stood_down(listener, monkeypatch):
     """The read loop must leave a stood-down keyboard free, period."""
-    from whisper_flow import hotkey_evdev
-
     calls = []
     monkeypatch.setattr(listener, "_find_keyboard_devices",
                         lambda: calls.append(1) or [("/dev/input/event1", {})])

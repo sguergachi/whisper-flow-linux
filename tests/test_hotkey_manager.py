@@ -640,6 +640,11 @@ class TestHotkeyManager:
         """Setup and the watchdog both starting at login built two."""
         import threading
 
+        # evdev exists on Linux only; without it the backend module cannot
+        # even be imported, so there is nothing to patch on Windows.
+        pytest.importorskip("evdev")
+        import whisper_flow.hotkey_evdev  # noqa: F401  (ensures patch target)
+
         manager = HotkeyManager()
         built = []
 

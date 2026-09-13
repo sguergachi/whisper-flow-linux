@@ -797,8 +797,14 @@ pytestmark = pytest.mark.skipif(not _gtk_available(),
 
 
 def _run(tmp_path, scenario: str) -> subprocess.CompletedProcess:
+    # Written to a file rather than passed with -c: the script is ~34KB and
+    # Windows caps a process command line at 32767 characters, so -c failed
+    # there with WinError 206 while Linux never noticed. argv[1:] is
+    # unchanged, so the child cannot tell the difference.
+    child = tmp_path / "gtk_child.py"
+    child.write_text(_CHILD, encoding="utf-8")
     result = subprocess.run(
-        [sys.executable, "-c", _CHILD, str(ROOT), str(tmp_path), scenario],
+        [sys.executable, str(child), str(ROOT), str(tmp_path), scenario],
         capture_output=True, text=True, check=False, timeout=120,
     )
     # Assertion failures in the child only said "OK missing" with an empty

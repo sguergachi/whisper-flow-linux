@@ -896,3 +896,199 @@ def test_binding_key_still_steps_up_to_nested_command(listener):
     listener._handle_key(FakeEvent(ecodes.KEY_LEFTSHIFT, 1))
     _drain(listener)
     assert fired == ["press", "release", "cmd-press"]
+
+
+# --------------------------------------- stuck-key auto-detect and auto-heal
+class _Kbd:
+    """Grabbed keyboard with controllable kernel truth."""
+
+    def __init__(self, path, held=()):
+        self.path = path
+        self.fd = 200 + abs(hash(path)) % 100
+        self._held = set(held)
+        self.grabbed = True
+        self.closed = False
+
+    def active_keys(self):
+        return list(self._held)
+
+    def grab(self):
+        self.grabbed = True
+
+    def ungrab(self):
+        self.grabbed = False
+
+    def close(self):
+        self.closed = True
+
+
+def _synthetic_ups(forwarded):
+    return {(c, v) for f in forwarded if len(f) == 3 for _, c, v in [f]}
+
+
+def test_forwarded_tracker_follows_down_and_up(listener):
+    """The reconciler's input: what the compositor believes is down."""
+    listener._handle_key(FakeEvent(ecodes.KEY_A, 1))
+    assert listener._forwarded_down == {ecodes.KEY_A}
+    listener._handle_key(FakeEvent(ecodes.KEY_A, 0))
+    assert listener._forwarded_down == set()
+
+
+def test_synthetic_release_drops_tracker_but_mutes(listener):
+    """After the hotkey fires the compositor believes the chord is up."""
+    listener.register_hotkey(
+        "transcribe", "super+alt",
+        lambda: None, lambda: None, release_modifiers=True,
+    )
+    listener._handle_key(FakeEvent(ecodes.KEY_LEFTMETA, 1))
+    listener._handle_key(FakeEvent(ecodes.KEY_LEFTALT, 1))
+    assert listener._muted == {ecodes.KEY_LEFTMETA, ecodes.KEY_LEFTALT}
+    assert listener._forwarded_down == set()
+
+
+def test_reconcile_heals_lost_key_up(listener):
+    """Forwarded down + kernel up = the compositor is repeating a ghost."""
+    import time
+
+    listener._running = True
+    listener._kbd_devices = [_Kbd("/dev/input/event9", held=[])]
+    listener._forwarded_down.add(ecodes.KEY_A)
+
+    healed = listener._reconcile_forwarded_with_kernel()
+
+    assert healed == 1
+    assert listener._forwarded_down == set()
+    assert (ecodes.KEY_A, 0) in _synthetic_ups(listener.forwarded)
+
+
+def test_reconcile_keeps_physically_held_key(listener):
+    """Kernel down means the user is really holding it: hands off."""
+    listener._running = True
+    listener._kbd_devices = [_Kbd("/dev/input/event9", held=[ecodes.KEY_A])]
+    listener._forwarded_down.add(ecodes.KEY_A)
+    before = list(listener.forwarded)
+
+    assert listener._reconcile_forwarded_with_kernel() == 0
+    assert listener._forwarded_down == {ecodes.KEY_A}
+    assert list(listener.forwarded) == before
+
+
+def test_reconcile_clears_stale_mute_and_repairs(listener):
+    """A mute that outlived its release stranding Super is dropped + fixed."""
+    listener._running = True
+    listener._kbd_devices = [_Kbd("/dev/input/event9", held=[])]
+    listener._muted.add(ecodes.KEY_LEFTMETA)
+
+    assert listener._reconcile_forwarded_with_kernel() == 1
+    assert listener._muted == set()
+    ups = _synthetic_ups(listener.forwarded)
+    assert (ecodes.KEY_LEFTMETA, 0) in ups
+    assert (ecodes.KEY_RIGHTMETA, 0) in ups
+
+
+def test_reconcile_keeps_mute_while_held(listener):
+    """The intentional mute of a held push-to-talk chord is not a fault."""
+    listener._running = True
+    listener._kbd_devices = [_Kbd("/dev/input/event9",
+                                  held=[ecodes.KEY_LEFTMETA])]
+    listener._muted.add(ecodes.KEY_LEFTMETA)
+    before = list(listener.forwarded)
+
+    assert listener._reconcile_forwarded_with_kernel() == 0
+    assert listener._muted == {ecodes.KEY_LEFTMETA}
+    assert list(listener.forwarded) == before
+
+
+def test_reconcile_noop_without_running_proxy_or_devices(listener):
+    listener._forwarded_down.add(ecodes.KEY_A)
+    assert listener._reconcile_forwarded_with_kernel() == 0
+
+    listener._running = True
+    listener._uinput = None
+    assert listener._reconcile_forwarded_with_kernel() == 0
+
+    from unittest.mock import Mock
+    listener._uinput = Mock()
+    listener._kbd_devices = []
+    assert listener._reconcile_forwarded_with_kernel() == 0
+    assert listener._forwarded_down == {ecodes.KEY_A}
+
+
+def test_reconcile_heals_muted_key_exactly_once(listener):
+    """A key in both the tracker and the mute set heals once, not twice."""
+    listener._running = True
+    listener._kbd_devices = [_Kbd("/dev/input/event9", held=[])]
+    listener._forwarded_down.add(ecodes.KEY_LEFTMETA)
+    listener._muted.add(ecodes.KEY_LEFTMETA)
+
+    assert listener._reconcile_forwarded_with_kernel() == 1
+    assert listener._forwarded_down == set()
+    assert listener._muted == set()
+
+
+def test_supervisor_heals_stuck_key_silently(listener):
+    """A stuck key heals with a log line, not a toast and not a re-grab."""
+    import time
+
+    dev = _Kbd("/dev/input/event9", held=[])
+    listener._running = True
+    listener._started_at = time.monotonic() - 30.0
+    listener._thread = _alive_thread()
+    listener._last_pump_at = time.monotonic()
+    listener._kbd_devices = [dev]
+    listener._forwarded_down.add(ecodes.KEY_A)
+    notified = []
+    listener.on_emergency = notified.append
+
+    listener._supervise_once()
+
+    assert listener._forwarded_down == set()
+    assert notified == []
+    assert dev.grabbed is True
+    assert listener._kbd_devices == [dev]
+
+
+def test_supervisor_recovers_on_event_starvation(listener):
+    """Kernel holds keys but nothing arrives: the reader is missing input."""
+    import time
+
+    dev = _Kbd("/dev/input/event9", held=[ecodes.KEY_A])
+    listener._running = True
+    listener._started_at = time.monotonic() - 30.0
+    listener._thread = _alive_thread()
+    listener._last_pump_at = time.monotonic()
+    listener._last_key_event_at = time.monotonic() - 30.0
+    listener._kbd_devices = [dev]
+    notified = []
+    listener.on_emergency = notified.append
+
+    listener._supervise_once()
+
+    assert dev.grabbed is False
+    assert len(notified) == 1 and "starved" in notified[0]
+
+
+def test_starvation_skipped_while_hotkey_armed_or_events_fresh(listener):
+    """Never cancel a live dictation, or fire on ordinary typing pauses."""
+    import time
+
+    listener._running = True
+    listener._started_at = time.monotonic() - 30.0
+    listener._thread = _alive_thread()
+    listener._last_pump_at = time.monotonic()
+    listener._kbd_devices = [_Kbd("/dev/input/event9", held=[ecodes.KEY_A])]
+    notified = []
+    listener.on_emergency = notified.append
+
+    # Armed hotkey: heal nothing loudly, even in total event silence.
+    listener._press_triggered.add("transcribe")
+    listener._last_key_event_at = time.monotonic() - 30.0
+    listener._supervise_once()
+    assert notified == []
+
+    # Fresh events: an ordinary held key repeating normally.
+    listener._press_triggered.clear()
+    listener._last_key_event_at = time.monotonic()
+    listener._supervise_once()
+    assert notified == []
+    assert listener._kbd_devices != []

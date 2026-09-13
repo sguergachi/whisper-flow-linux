@@ -71,6 +71,17 @@ ESC_RESET_WINDOW = 1.2
 # beats working hotkeys.
 MAX_RECOVERIES_PER_MINUTE = 3
 
+# Kernel reports a key held but no key event of any kind has arrived in this
+# long: the reader is missing input (a device starved behind a stale fd set,
+# a lost key-up) while still holding the grabs. A physically held key always
+# produces auto-repeat events, so sustained silence with something held is
+# never "the user sitting still" - it is the shape of a locked keyboard.
+# Only fires while no hotkey is armed, so an exotic repeat-disabled setup can
+# never cancel a live dictation; and like every other emergency it counts
+# against the stand-down throttle, so a repeat-off machine flaps at most
+# briefly before the keyboard is left free.
+KEY_EVENT_STARVATION_SECONDS = 5.0
+
 # Set WHISPER_FLOW_HOTKEY_DEBUG=1 to log the keys a hotkey is built from, and
 # the state they are matched against, when one is pressed.
 #
@@ -153,6 +164,27 @@ class EvdevHotkeyListener:
         # Stood down after repeated failed recoveries: grabs released, reader
         # stopped, keyboard left entirely alone until the app restarts.
         self._listener_disabled = False
+        # Compositor-view tracking for the reconciler below: logical codes we
+        # forwarded as down and have not yet told the compositor are up
+        # (real key-ups, or synthetic releases for muted binding keys, clear
+        # them). Compared against kernel truth on every supervisor tick; a
+        # key-up the compositor never got leaves it believing the key is held
+        # - auto-repeating a single letter, or holding Super so every key is
+        # a shortcut - which is exactly the reported "locked keyboard".
+        self._forwarded_down: set = set()
+        # Last arrival of any real key event (down, up, or auto-repeat) on
+        # the reader thread. Unlike the pump stamp, which turns on an idle
+        # keyboard too, this only moves when the hardware speaks - so kernel
+        # truth saying "held" while this stands still proves input is being
+        # missed, not that nobody is typing.
+        self._last_key_event_at = float("-inf")
+        # Last kernel-truth snapshot taken by the reconciler, for the
+        # starvation check in the same tick without a second round of ioctls.
+        self._last_kernel_held = None
+        # Silent heals (reconciled stuck keys) inside the last minute, for
+        # logs and diagnostics. Loud emergencies keep their own counter and
+        # their tray notification; a heal that worked needs no toast.
+        self._heal_times: list = []
 
     def register_hotkey(self, name, key_string, callback_press, callback_release=None,
                         release_modifiers=False):
@@ -351,6 +383,8 @@ class EvdevHotkeyListener:
         self._active_hotkey = None
         self._key_state.clear()
         self._muted.clear()
+        self._forwarded_down.clear()
+        self._last_kernel_held = None
         self._near_miss_logged.clear()
 
     def _open_devices(self) -> bool:
@@ -412,9 +446,13 @@ class EvdevHotkeyListener:
             "pump_age_s": round(age, 1) if age is not None else None,
             "muted": len(self._muted),
             "held": len(self._key_state),
+            "forwarded": len(self._forwarded_down),
             "disabled": self._listener_disabled,
             "recoveries_60s": len([
                 t for t in self._recovery_times
+                if time.monotonic() - t < 60.0]),
+            "healed_60s": len([
+                t for t in self._heal_times
                 if time.monotonic() - t < 60.0]),
         }
 
@@ -450,8 +488,48 @@ class EvdevHotkeyListener:
             return
         age = self.pump_age_seconds()
         if age is None or age <= PUMP_STALL_SECONDS:
+            # The loop is turning. Reconcile what the compositor believes
+            # against what the kernel reports, heal any stuck key silently,
+            # and run the bounded unheld-modifier sweep - here, on the
+            # listener's own thread, so it also runs mid-recording, when the
+            # daemon's idle watchdog deliberately stays out of the way and a
+            # lockup would otherwise sit until the dictation ends.
+            try:
+                self._reconcile_forwarded_with_kernel()
+            except Exception:
+                log.exception("input reconciliation failed")
+            try:
+                self.maybe_sweep_unheld_modifiers()
+            except Exception:
+                log.exception("input sweep failed")
+            self._detect_event_starvation(now)
             return
         self._emergency_recover(f"reader stalled ({age:.1f}s without pumping)")
+
+    def _detect_event_starvation(self, now: float) -> None:
+        """Recover when the kernel holds keys but no events arrive.
+
+        A physically held key always produces auto-repeat events, so kernel
+        truth saying "something is down" while no key event of any kind has
+        arrived for seconds proves the reader is missing input behind grabs
+        it still holds - the keyboard looks locked and no hotkey can fire
+        because the release that would end it never arrives either.
+        Skipped while a hotkey is armed (never cancel a live dictation on a
+        repeat-disabled setup's account) and shortly after startup.
+        """
+        if self._press_triggered or self._active_hotkey is not None:
+            return
+        if now - getattr(self, "_started_at", 0.0) < KEY_EVENT_STARVATION_SECONDS:
+            return
+        held = getattr(self, "_last_kernel_held", None)
+        if not held:
+            return
+        silent = now - getattr(self, "_last_key_event_at", float("-inf"))
+        if silent <= KEY_EVENT_STARVATION_SECONDS:
+            return
+        self._emergency_recover(
+            f"keyboard events starved ({len(held)} key(s) held, "
+            f"no events for {silent:.0f}s)")
 
     def _notify_emergency(self, reason: str) -> None:
         cb = self.on_emergency
@@ -490,6 +568,7 @@ class EvdevHotkeyListener:
         self._active_hotkey = None
         self._key_state.clear()
         self._muted.clear()
+        self._forwarded_down.clear()
         self._near_miss_logged.clear()
         self._esc_press_times.clear()
         self._forward_failures = 0
@@ -518,6 +597,29 @@ class EvdevHotkeyListener:
             log.exception("emergency reader restart failed")
         self._notify_emergency(f"keyboard input reset ({reason})")
 
+    def _kernel_held_keys(self) -> set[int] | None:
+        """Kernel truth across every grabbed device, aliased. None if unknown.
+
+        EVIOCGKEY per device, merged - the same source _sync uses. A device
+        without active_keys (test fakes) is skipped rather than trusted; None
+        means "could not ask", never "nothing is held".
+        """
+        if not self._kbd_devices:
+            return None
+        merged: set[int] = set()
+        any_ok = False
+        for dev in self._kbd_devices:
+            active = getattr(dev, "active_keys", None)
+            if active is None:
+                continue
+            try:
+                for code in active():
+                    merged.add(CODE_ALIASES.get(code, code))
+                any_ok = True
+            except Exception:
+                continue
+        return merged if any_ok else None
+
     def _sync_key_state_from_devices(self) -> bool:
         """Rebuild held keys from the kernel across every grabbed device.
 
@@ -531,20 +633,80 @@ class EvdevHotkeyListener:
         Returns True when at least one device answered (state was replaced).
         Tests and the brief window before any grab keep event-tracked state.
         """
-        if not self._kbd_devices:
+        held = self._kernel_held_keys()
+        if held is None:
             return False
-        merged: set[int] = set()
-        any_ok = False
-        for dev in self._kbd_devices:
-            try:
-                for code in dev.active_keys():
-                    merged.add(CODE_ALIASES.get(code, code))
-                any_ok = True
-            except Exception:
+        self._key_state = held
+        return True
+
+    def _emit_key_ups(self, codes) -> None:
+        """Best-effort key-ups via the proxy. A duplicate up is ignored by
+        the compositor; a missing one strands the key - so errors are
+        swallowed and only ups are ever synthesised here, never presses."""
+        if self._uinput is None:
+            return
+        for code in codes:
+            for side in MODIFIER_SIDES.get(code, (code,)):
+                try:
+                    self._uinput.write(ecodes.EV_KEY, side, 0)
+                except Exception:
+                    pass
+        try:
+            self._uinput.syn()
+        except Exception:
+            pass
+
+    def _reconcile_forwarded_with_kernel(self) -> int:
+        """Heal keys the compositor believes held but the kernel reports up.
+
+        Two lockup shapes land here. A forwarded key-down whose key-up never
+        reached the proxy (lost between a device rebuild, a wedged moment, a
+        missed read) leaves the compositor auto-repeating a single letter -
+        the "second key held forever" half of the report. A muted modifier
+        whose synthetic release was lost on a glitching proxy - or whose
+        stale mute outlived its real release - leaves Super held so every
+        keystroke fires a global shortcut - the "desktop looks locked" half.
+        Both heal the same way: the kernel says UP, so send a key-up. The
+        compositor ignores a duplicate; a key still physically held (kernel
+        DOWN) is never touched, so the intentional mute of a held push-to-talk
+        chord survives this untouched. Silent by design: a heal that worked
+        is a line in the log, not a toast.
+        """
+        if self._uinput is None or not self._running:
+            return 0
+        held = self._kernel_held_keys()
+        self._last_kernel_held = held
+        if held is None:
+            return 0
+        # Kernel truth is newer than our edge tracking (events originate in
+        # the kernel, so it always knows first): adopt it, as a key event
+        # would. Otherwise a ghost modifier lingering here keeps the sweep
+        # skipping it and the matcher believing it, until some unrelated key
+        # happens to resync.
+        self._key_state = set(held)
+        healed = 0
+        for code in list(self._forwarded_down):
+            if code in held or code in self._muted:
+                # Still held, or synthetically released already: the muted
+                # loop below owns that case, so it is healed exactly once.
                 continue
-        if any_ok:
-            self._key_state = merged
-        return any_ok
+            self._emit_key_ups((code,))
+            self._forwarded_down.discard(code)
+            healed += 1
+        for code in list(self._muted):
+            if code in held:
+                continue
+            self._muted.discard(code)
+            self._forwarded_down.discard(code)
+            self._emit_key_ups((code,))
+            healed += 1
+        if healed:
+            now = time.monotonic()
+            self._heal_times = [t for t in self._heal_times if now - t < 60.0]
+            self._heal_times.append(now)
+            self._mark_input_risk()
+            app_log(f"[HOTKEY] healed {healed} stuck key(s) against kernel truth")
+        return healed
 
     def _handle_key(self, event):
         """Track state and forward.
@@ -559,6 +721,7 @@ class EvdevHotkeyListener:
         """
         code = CODE_ALIASES.get(event.code, event.code)
         value = event.value
+        self._last_key_event_at = time.monotonic()
 
         if value == 2:
             # Auto-repeat. Never a state change: holding a push-to-talk
@@ -572,6 +735,8 @@ class EvdevHotkeyListener:
 
         if value == 1:
             self._forward(event)
+            # The compositor believes this key down until a matching up.
+            self._forwarded_down.add(code)
             # Kernel state first (multi-device); fall back to edge tracking
             # when nothing is grabbed yet (unit tests).
             if not self._sync_key_state_from_devices():
@@ -598,6 +763,7 @@ class EvdevHotkeyListener:
         if not self._sync_key_state_from_devices():
             self._key_state.discard(code)
         self._muted.discard(code)
+        self._forwarded_down.discard(code)
         self._check_bindings(rising=False)
         # Forwarded even if we already sent a synthetic release: a duplicate
         # key-up is harmless, a missing one is not.
@@ -657,8 +823,9 @@ class EvdevHotkeyListener:
         shortcut and the desktop looks locked". A key-up for an already-up
         key is ignored by the compositor, so a healthy machine cannot tell
         this ran; physically held keys are in _key_state and are skipped, so
-        a shortcut the user is holding is never broken. Only called while
-        the daemon is idle, never mid-recording.
+        a shortcut the user is holding is never broken. Safe any time,
+        including mid-recording: held keys are skipped, and only key-ups -
+        never presses - are synthesised.
         """
         if self._uinput is None or not self._running:
             return 0
@@ -672,6 +839,12 @@ class EvdevHotkeyListener:
                     released += 1
                 except Exception:
                     pass
+            # Whatever we just told the compositor is up is no longer
+            # compositor-held by our account, nor worth muting: a mute for an
+            # unheld key would skip the synthetic release the next hold
+            # needs, stranding that next hold instead.
+            self._forwarded_down.discard(logical)
+            self._muted.discard(logical)
         if released:
             try:
                 self._uinput.syn()
@@ -688,7 +861,14 @@ class EvdevHotkeyListener:
     SWEEP_RISK_WINDOW = 600.0
 
     def maybe_sweep_unheld_modifiers(self) -> int:
-        """Bounded version of the sweep for the idle watchdog path."""
+        """Bounded version of the sweep for the watchdog paths.
+
+        At most one hygiene pass a minute, and only shortly after hotkey
+        activity re-armed it - unbounded sweeping would log forever on an
+        idle desktop. Runs on the listener's supervisor thread as well as
+        the daemon's idle watchdog, so a stuck modifier heals mid-recording
+        too instead of sitting until the dictation ends.
+        """
         now = time.monotonic()
         if now - getattr(self, "_last_sweep_at", 0.0) < self.SWEEP_MIN_INTERVAL:
             return 0
@@ -725,6 +905,8 @@ class EvdevHotkeyListener:
             if logical not in self._key_state or logical in self._muted:
                 continue
             self._muted.add(logical)
+            # The compositor believes this key up now, not down.
+            self._forwarded_down.discard(logical)
             for side in MODIFIER_SIDES.get(logical, (logical,)):
                 try:
                     self._uinput.write(ecodes.EV_KEY, side, 0)
@@ -868,4 +1050,6 @@ class EvdevHotkeyListener:
         self._key_state.clear()
         self._press_triggered.clear()
         self._muted.clear()
+        self._forwarded_down.clear()
+        self._last_kernel_held = None
         self._active_hotkey = None

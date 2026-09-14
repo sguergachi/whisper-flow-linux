@@ -898,6 +898,137 @@ def test_binding_key_still_steps_up_to_nested_command(listener):
     assert fired == ["press", "release", "cmd-press"]
 
 
+def _hold_push_to_talk(listener):
+    listener.register_hotkey(
+        "transcribe", "super+alt", lambda: None, lambda: None,
+        release_modifiers=True,
+    )
+    listener._handle_key(FakeEvent(ecodes.KEY_LEFTMETA, 1))
+    listener._handle_key(FakeEvent(ecodes.KEY_LEFTALT, 1))
+
+
+def _synthetic(forwarded, value):
+    return {f[1] for f in forwarded if len(f) == 3 and f[2] == value}
+
+
+def test_desktop_shortcut_modifiers_return_when_an_extra_key_joins(listener):
+    """Super+Alt held to dictate must not hide Meta+Alt+Arrow.
+
+    The chord is muted at the compositor while the binding is held so
+    dictated text arrives as text. That also hid every desktop shortcut
+    sharing those modifiers: holding super+alt (push-to-talk) and tapping an
+    arrow forwarded the arrow bare, and nothing switched. The extra key is
+    the tell that the user is driving the desktop, so the still-held muted
+    modifiers are pressed back - before the arrow is forwarded, or the
+    compositor matches a bare arrow.
+    """
+    _hold_push_to_talk(listener)
+    assert "transcribe" in listener._press_triggered
+    listener.forwarded.clear()
+
+    listener._handle_key(FakeEvent(ecodes.KEY_LEFT, 1))
+
+    assert _synthetic(listener.forwarded, 1) == {
+        ecodes.KEY_LEFTMETA, ecodes.KEY_RIGHTMETA,
+        ecodes.KEY_LEFTALT, ecodes.KEY_RIGHTALT,
+    }
+    arrow_at = listener.forwarded.index((ecodes.KEY_LEFT, 1))
+    last_press_at = max(i for i, f in enumerate(listener.forwarded)
+                        if len(f) == 3 and f[2] == 1)
+    assert last_press_at < arrow_at
+    assert listener._restored == {ecodes.KEY_LEFTMETA, ecodes.KEY_LEFTALT}
+    assert listener._muted == set()
+
+
+def test_extra_key_release_mutes_the_chord_again(listener):
+    """A transcript typed after the desktop detour must stay text."""
+    _hold_push_to_talk(listener)
+    listener._handle_key(FakeEvent(ecodes.KEY_LEFT, 1))
+    listener._handle_key(FakeEvent(ecodes.KEY_LEFT, 0))
+
+    # The arrow's key-up reaches the compositor with the chord still down...
+    assert listener.forwarded.index((ecodes.KEY_LEFT, 0)) \
+        < max(i for i, f in enumerate(listener.forwarded)
+              if len(f) == 3 and f[2] == 0)
+    # ...and the chord is muted again, so the muted modifiers cannot turn
+    # injected characters into global shortcuts.
+    assert listener._restored == set()
+    assert {ecodes.KEY_LEFTMETA, ecodes.KEY_LEFTALT} <= listener._muted
+
+    # A second arrow asks for the shortcut again.
+    listener.forwarded.clear()
+    listener._handle_key(FakeEvent(ecodes.KEY_RIGHT, 1))
+    assert ecodes.KEY_LEFTMETA in _synthetic(listener.forwarded, 1)
+
+
+def test_releasing_a_restored_modifier_clears_both_its_sides(listener):
+    """The real key-up covers one side; the restore pressed both."""
+    _hold_push_to_talk(listener)
+    listener._handle_key(FakeEvent(ecodes.KEY_LEFT, 1))
+    listener.forwarded.clear()
+
+    listener._handle_key(FakeEvent(ecodes.KEY_LEFTMETA, 0))
+
+    ups = _synthetic(listener.forwarded, 0)
+    assert {ecodes.KEY_LEFTMETA, ecodes.KEY_RIGHTMETA} <= ups
+    assert ecodes.KEY_LEFTMETA not in listener._restored
+    # Alt is still held and still driving the arrow's shortcut.
+    assert ecodes.KEY_LEFTALT in listener._restored
+
+
+def test_a_muted_space_is_never_pressed_back(listener):
+    """Only modifiers are restored; a space would type itself into the app."""
+    listener.register_hotkey(
+        "auto_transcribe", "ctrl+shift+space", lambda: None, None,
+        release_modifiers=True,
+    )
+    for code in (ecodes.KEY_LEFTCTRL, ecodes.KEY_LEFTSHIFT, ecodes.KEY_SPACE):
+        listener._handle_key(FakeEvent(code, 1))
+    listener.forwarded.clear()
+
+    listener._handle_key(FakeEvent(ecodes.KEY_A, 1))
+
+    assert ecodes.KEY_SPACE not in _synthetic(listener.forwarded, 1)
+    assert ecodes.KEY_SPACE in listener._muted
+    assert ecodes.KEY_LEFTCTRL in listener._restored
+    assert ecodes.KEY_LEFTSHIFT in listener._restored
+
+
+def test_a_rebuild_releases_restored_modifiers(listener):
+    """A rebuild leaves no device to prove a restore; it must be let go."""
+    _hold_push_to_talk(listener)
+    listener._handle_key(FakeEvent(ecodes.KEY_LEFT, 1))
+    listener.forwarded.clear()
+
+    listener._abandon_devices()
+
+    assert {ecodes.KEY_LEFTMETA, ecodes.KEY_RIGHTMETA,
+            ecodes.KEY_LEFTALT, ecodes.KEY_RIGHTALT} \
+        <= _synthetic(listener.forwarded, 0)
+    assert listener._restored == set()
+
+
+def test_reconcile_clears_a_restore_whose_release_was_missed(listener):
+    listener._running = True
+    listener._kbd_devices = [_Kbd("/dev/input/event9", held=[])]
+    listener._forwarded_down.add(ecodes.KEY_LEFTMETA)
+    listener._restored.add(ecodes.KEY_LEFTMETA)
+
+    assert listener._reconcile_forwarded_with_kernel() == 1
+    assert listener._restored == set()
+    assert ecodes.KEY_LEFTMETA in _synthetic(listener.forwarded, 0)
+
+
+def test_sweep_clears_a_restore_that_is_no_longer_held(listener):
+    listener._running = True
+    listener._restored.add(ecodes.KEY_LEFTMETA)
+    listener._forwarded_down.add(ecodes.KEY_LEFTMETA)
+
+    assert listener.sweep_unheld_modifiers() > 0
+    assert listener._restored == set()
+    assert listener._forwarded_down == set()
+
+
 # --------------------------------------- stuck-key auto-detect and auto-heal
 class _Kbd:
     """Grabbed keyboard with controllable kernel truth."""

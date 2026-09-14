@@ -135,6 +135,11 @@ class EvdevHotkeyListener:
         self._active_hotkey = None
         self._press_triggered = set()  # hotkeys whose press callback was already fired
         self._muted = set()  # codes whose auto-repeat is suppressed while held
+        # Muted modifiers pressed back for as long as a key outside every
+        # binding is held: the compositor believes them down again so the
+        # desktop shortcut that key forms with them can fire. They are
+        # released and muted again the moment the extra key goes up.
+        self._restored: set = set()
         # (binding_name, frozenset of held codes) already reported as almost
         # matching - cleared when no binding key is held.
         self._near_miss_logged: set = set()
@@ -412,6 +417,12 @@ class EvdevHotkeyListener:
         self._ungrab_devices()          # never the proxy: see _ungrab_devices
         # A rebuild with keys held is a desync-risk moment by definition.
         self._mark_input_risk()
+        # Restored modifiers are compositor-held with no device left to prove
+        # it: release them before the tracking that would have matched them
+        # to a real key-up is gone, or they stay down forever.
+        if self._restored:
+            self._emit_key_ups(tuple(self._restored))
+            self._restored.clear()
         for name in list(self._press_triggered):
             binding = self._bindings.get(name)
             self._press_triggered.discard(name)
@@ -635,6 +646,9 @@ class EvdevHotkeyListener:
         self._active_hotkey = None
         self._key_state.clear()
         self._muted.clear()
+        # _abandon_devices / _release_devices already owed the compositor
+        # those releases; this is only so no stale code survives a rebuild.
+        self._restored.clear()
         self._forwarded_down.clear()
         self._near_miss_logged.clear()
         self._esc_press_times.clear()
@@ -724,6 +738,90 @@ class EvdevHotkeyListener:
         except Exception:
             pass
 
+    def _restore_muted_modifiers(self, code) -> int:
+        """Give a muted push-to-talk chord back to the compositor.
+
+        While a binding with release_modifiers is held, its keys are muted at
+        the compositor so dictated text is text, not shortcuts. That also
+        hides the chord from every desktop shortcut built on the same
+        modifiers: Super+Alt held for dictation means Meta+Alt+Arrow
+        ("Switch Window") never fires, and the desktop looks deaf to Super.
+        A key outside every binding says the user is driving the desktop, not
+        dictating, so the still-held muted modifiers are pressed back - before
+        that key is forwarded, or the compositor matches a bare arrow and
+        nothing happens. Only modifiers are restored, and only ones the kernel
+        reports physically down: the muted Space of a single-press binding is
+        not a key anyone holds through a desktop detour, and pressing it back
+        would type a space.
+        """
+        if not self._muted or code in self._binding_codes:
+            return 0
+        restored = 0
+        for logical in list(self._muted):
+            if logical not in MODIFIER_SIDES or logical not in self._key_state:
+                continue
+            self._muted.discard(logical)
+            self._restored.add(logical)
+            # Tracked as compositor-held so a lost release is reconciled
+            # against kernel truth like any forwarded key.
+            self._forwarded_down.add(logical)
+            for side in MODIFIER_SIDES[logical]:
+                try:
+                    self._uinput.write(ecodes.EV_KEY, side, 1)
+                except Exception:
+                    pass
+            restored += 1
+        if restored:
+            try:
+                self._uinput.syn()
+            except Exception:
+                pass
+            self._mark_input_risk()
+            app_log(f"[HOTKEY] restored {restored} muted modifier(s) for a "
+                    "desktop shortcut while dictation was held")
+        return restored
+
+    def _settle_restored(self, code) -> None:
+        """Undo the temporary restore around a real key-up.
+
+        Two obligations. A restored modifier the user just released must be
+        told up on both sides - the real key-up only covers the physical side,
+        and the other one would otherwise stay held in the compositor, which
+        is exactly the stranded modifier this class exists to avoid. And once
+        the last extra key is up, the restored modifiers go back to being
+        muted: the dictation this detour cancelled may still type its text a
+        moment later, and with the chord back down every character would
+        arrive as a global shortcut instead.
+        """
+        if not self._restored:
+            return
+        logical = CODE_ALIASES.get(code, code)
+        released = []
+        if logical in self._restored:
+            self._restored.discard(logical)
+            self._forwarded_down.discard(logical)
+            released.append(logical)
+        if self._key_state - self._binding_codes:
+            # Another extra key is still held: the chord stays live so its
+            # shortcut works, and this key's release is all that is owed.
+            if released:
+                self._emit_key_ups(released)
+            return
+        for restored_logical in list(self._restored):
+            self._restored.discard(restored_logical)
+            self._forwarded_down.discard(restored_logical)
+            if restored_logical in self._key_state:
+                # Physically held: tell the compositor it is up again, and
+                # mute it so the auto-repeat and the coming transcription
+                # cannot re-assert it. The real release still clears it.
+                self._muted.add(restored_logical)
+            released.append(restored_logical)
+        if released:
+            self._emit_key_ups(released)
+            self._mark_input_risk()
+            log.info("muted %d modifier(s) again after the desktop shortcut",
+                     len(released))
+
     def _reconcile_forwarded_with_kernel(self) -> int:
         """Heal keys the compositor believes held but the kernel reports up.
 
@@ -760,6 +858,9 @@ class EvdevHotkeyListener:
                 continue
             self._emit_key_ups((code,))
             self._forwarded_down.discard(code)
+            # A restore whose real key-up was missed: the compositor is owed
+            # the release, and the logical is not live any more either.
+            self._restored.discard(code)
             healed += 1
         for code in list(self._muted):
             if code in held:
@@ -779,13 +880,16 @@ class EvdevHotkeyListener:
     def _handle_key(self, event):
         """Track state and forward.
 
-        Two rules keep this safe. Every key-down and key-up is forwarded
-        untouched, and no key-down is ever synthesised. An earlier version
-        held combination keys back and replayed them later; one missed release
-        left a synthetic press with no matching release, stranding a modifier
-        down system-wide and making the keyboard unusable. A dropped
-        auto-repeat cannot do that - the key is already down as far as the
-        compositor is concerned, and its real release is still coming.
+        Every real key-down and key-up is forwarded untouched. Synthetic
+        presses exist in exactly one, bounded place: a muted push-to-talk
+        modifier is pressed back for as long as an extra key is held, because
+        the shortcut that key forms with the chord must fire (see
+        _restore_muted_modifiers). Those presses are only ever made for keys
+        the kernel reports physically down, and are released on the extra
+        key's key-up, the physical release, a device rebuild, or an emergency
+        reset - an earlier version replayed held-back keys and one missed
+        release stranded a modifier system-wide, which is the failure class
+        every path here is written against.
         """
         code = CODE_ALIASES.get(event.code, event.code)
         value = event.value
@@ -802,13 +906,17 @@ class EvdevHotkeyListener:
             return
 
         if value == 1:
+            # Kernel state first (multi-device); fall back to edge tracking
+            # when nothing is grabbed yet (unit tests). The extra-key check
+            # below reads it, and must run before anything is forwarded: the
+            # compositor has to see the chord's modifiers down before the key
+            # that forms the shortcut with them.
+            if not self._sync_key_state_from_devices():
+                self._key_state.add(code)
+            self._restore_muted_modifiers(code)
             self._forward(event)
             # The compositor believes this key down until a matching up.
             self._forwarded_down.add(code)
-            # Kernel state first (multi-device); fall back to edge tracking
-            # when nothing is grabbed yet (unit tests).
-            if not self._sync_key_state_from_devices():
-                self._key_state.add(code)
             if code in self._binding_codes:
                 # Hotkey-adjacent activity re-arms the idle hygiene sweep.
                 self._mark_input_risk()
@@ -836,6 +944,9 @@ class EvdevHotkeyListener:
         # Forwarded even if we already sent a synthetic release: a duplicate
         # key-up is harmless, a missing one is not.
         self._forward(event)
+        # After the real key-up, so the compositor sees the key go up with
+        # the chord still down - the mirror of the restore before its press.
+        self._settle_restored(code)
 
     def _track_escape_for_reset(self) -> None:
         """Count quick Escape taps for the emergency input reset.
@@ -916,6 +1027,7 @@ class EvdevHotkeyListener:
             # needs, stranding that next hold instead.
             self._forwarded_down.discard(logical)
             self._muted.discard(logical)
+            self._restored.discard(logical)
         if released:
             try:
                 self._uinput.syn()
@@ -976,8 +1088,10 @@ class EvdevHotkeyListener:
             if logical not in self._key_state or logical in self._muted:
                 continue
             self._muted.add(logical)
-            # The compositor believes this key up now, not down.
+            # The compositor believes this key up now, not down - and a
+            # temporary restore of the same logical is over either way.
             self._forwarded_down.discard(logical)
+            self._restored.discard(logical)
             for side in MODIFIER_SIDES.get(logical, (logical,)):
                 try:
                     self._uinput.write(ecodes.EV_KEY, side, 0)
@@ -1102,6 +1216,9 @@ class EvdevHotkeyListener:
             except Exception:
                 pass
             self._uinput = None
+        # Closing the proxy removes it from the compositor, so any restored
+        # modifier is forgotten there along with every other key it held.
+        self._restored.clear()
 
     def stop(self):
         self._running = False
@@ -1121,6 +1238,7 @@ class EvdevHotkeyListener:
         self._key_state.clear()
         self._press_triggered.clear()
         self._muted.clear()
+        self._restored.clear()
         self._forwarded_down.clear()
         self._last_kernel_held = None
         self._active_hotkey = None

@@ -1355,6 +1355,10 @@ class LocalBackend:
         # crash → bundled → …), so the next round ends in a terminal
         # message instead of another 7MB fetch.
         self._plain_engine_failed = False
+        # The engine doctor: native-crash forensics and self-healing, run at
+        # most once per engine family, off-thread, after a crash the ladder
+        # could not explain (see engine_doctor.py).
+        self._doctor = None
         # The port the current spawn attempt uses. The configured one by
         # default; a fallback when something else holds it (below).
         self._active_port: int | None = None
@@ -1449,6 +1453,41 @@ class LocalBackend:
         except Exception as e:
             log(f"[BACKEND] crash tracking failed: {e}")
             return False
+
+    def _start_engine_doctor(self, reason: str, family: str) -> None:
+        """Set the engine doctor going, once per family, off this thread.
+
+        Called from the crash path, which is on the startup/watchdog thread -
+        the doctor runs probes that each take up to a minute, so it never
+        runs here. Failures to even start it are logged and ignored: a
+        diagnosis that cannot run must not mask the crash it was meant to
+        explain.
+        """
+        try:
+            if self._doctor is None:
+                from .engine_doctor import EngineDoctor
+
+                self._doctor = EngineDoctor(self)
+            self._doctor.start(reason, family)
+        except Exception as e:
+            log(f"[BACKEND] engine doctor unavailable: {e}")
+
+    def _thread_count(self) -> int:
+        """Threads for the CPU server: the doctor's pin, else usable_cores().
+
+        The doctor writes runtime/engine-threads.txt when it finds the engine
+        only survives with one thread; nothing else writes that file, so its
+        absence (or any garbage in it) falls back to the normal sizing.
+        """
+        try:
+            pinned = int((_runtime_dir(self.config.config_dir)
+                          / "engine-threads.txt").read_text(
+                              encoding="utf-8").strip())
+            if 1 <= pinned <= usable_cores():
+                return pinned
+        except Exception:
+            pass
+        return usable_cores()
 
     def note_healthy(self) -> None:
         """Call when the server has stayed up long enough to trust the bytes."""
@@ -2522,8 +2561,9 @@ class LocalBackend:
             if not self.engine_is_gpu():
                 # Left to itself whisper.cpp takes four threads whatever the
                 # machine has, which is short of the optimum on a desktop and
-                # past it on a two-core laptop. See usable_cores().
-                cmd += ["-t", str(usable_cores())]
+                # past it on a two-core laptop. See usable_cores(); the doctor
+                # can pin one thread if that is the only count that survives.
+                cmd += ["-t", str(self._thread_count())]
             elif self.installed_engine().startswith("cuda") \
                     and sys.platform != "win32":
                 # The source-built engine links the ggml libraries it ships
@@ -2654,6 +2694,17 @@ class LocalBackend:
                                 self._plain_engine_failed = True
                         except Exception:
                             pass
+                        # The ladder is out of rungs when the GPU engine dies
+                        # or the no-BLAS build dies too: hand it to the doctor,
+                        # which probes every engine, hides the per-arch CPU
+                        # kernels, tries one thread, and logs what each shows.
+                        try:
+                            self._start_engine_doctor(
+                                ("cuda engine died" if engine.startswith("cuda")
+                                 else "no-BLAS engine died too"),
+                                "cuda" if engine.startswith("cuda") else "cpu")
+                        except Exception as e:
+                            log(f"[BACKEND] could not start engine doctor: {e}")
                         # Name the faulting DLL, or establish there is none:
                         # a real crash logs an Application Error 1000 naming
                         # the module, while a process killed from outside

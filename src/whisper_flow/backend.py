@@ -163,6 +163,10 @@ def _cuda_lib_dirs(nvcc: str) -> list[Path]:
 # this used to be asked afresh six times while the settings window was being
 # built, which is most of the wait before it appeared.
 ACCELERATOR_ENV = "WHISPER_FLOW_ACCELERATOR"
+# The driver version rides along with the inherited accelerator answer: it is
+# the parent's proof that it probed successfully, so a child that receives
+# both can skip the nvidia-smi call. Without it, a cuda answer is not trusted.
+DRIVER_VERSION_ENV = "WHISPER_FLOW_DRIVER_VERSION"
 _accelerator: str | None = None
 # Full driver version from the probe above (e.g. "537.58"), for diagnostics.
 # Empty when there is no NVIDIA card. Read by machine_facts(); never probed
@@ -182,12 +186,23 @@ def detect_accelerator() -> str:
 
     Cached, and seedable through the environment so the windows the daemon
     launches inherit the answer instead of paying for it again.
+
+    An inherited *cuda* answer is only believed when the parent also handed
+    down the driver version it just read. The variable survives restarts, so
+    a driver that has since been removed would otherwise leave the process
+    believing in a GPU it cannot use: every CPU crash then reads as a GPU
+    failure, the engine gets quarantined after it, and the no-BLAS
+    compatibility fallback is never reached (the 0.4.349 Windows loop).
     """
     global _accelerator
     if _accelerator is not None:
         return _accelerator
     inherited = os.environ.get(ACCELERATOR_ENV, "").strip()
     if inherited in ("cpu", "cuda11", "cuda12"):
+        if (inherited != "cpu"
+                and not os.environ.get(DRIVER_VERSION_ENV, "").strip()):
+            _accelerator = _probe_accelerator()
+            return _accelerator
         _accelerator = inherited
         return _accelerator
     _accelerator = _probe_accelerator()
@@ -563,7 +578,7 @@ def machine_facts() -> str:
     import platform as _plat
     cpu = (_plat.processor() or _plat.machine() or "?").strip() or "?"
     drv = (_driver_version
-           or os.environ.get("WHISPER_FLOW_DRIVER_VERSION", "").strip()
+           or os.environ.get(DRIVER_VERSION_ENV, "").strip()
            or "none")
     ram = avail = 0.0
     try:
@@ -2295,8 +2310,21 @@ class LocalBackend:
                 pass
         except Exception:
             pass
-        log(f"[BACKEND] GPU start failed for {model}, trying CPU fallback with {fallback_model}")
-        self._quarantine_faulty_engine()
+        if self.engine_is_gpu():
+            # Only a GPU engine is moved aside here: it is the binary that
+            # just failed, and its cuBLAS DLLs would poison the CPU fallback.
+            # A CPU engine must never be quarantined on this path - the file
+            # identity is what the crash counter accumulates against, and
+            # renaming it after every failed start reset that count before
+            # the no-BLAS compatibility engine could ever be reached (the
+            # 0.4.349 Windows loop: BLAS download, quarantine, bundled BLAS,
+            # download again, forever).
+            log(f"[BACKEND] GPU start failed for {model}, trying CPU fallback "
+                f"with {fallback_model}")
+            self._quarantine_faulty_engine()
+        else:
+            log(f"[BACKEND] {model} failed to start on the CPU engine, "
+                f"trying {fallback_model}")
         if not self.ensure_cpu_engine(allow_download=allow_download):
             return None
         # If fallback model not installed, download it (e.g. base when only medium was present)

@@ -1417,7 +1417,7 @@ class WhisperFlowDaemon:
         # version string), which left machine_facts reporting nvidia_drv=none
         # after every settings-triggered restart.
         try:
-            env["WHISPER_FLOW_DRIVER_VERSION"] = (
+            env[backend_module.DRIVER_VERSION_ENV] = (
                 backend_module._driver_version or "")
         except Exception:
             pass

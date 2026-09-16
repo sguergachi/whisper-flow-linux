@@ -728,8 +728,15 @@ def test_the_accelerator_is_detected_once_and_remembered(monkeypatch):
 
 
 def test_the_accelerator_can_be_inherited_from_the_environment(monkeypatch):
-    """So the windows the daemon launches do not each pay for the probe."""
+    """So the windows the daemon launches do not each pay for the probe.
+
+    A cuda answer travels with the driver version the parent read: that pair
+    is what makes it trustworthy. See
+    test_inherited_cuda_accelerator_is_reprobed_when_no_driver_is_handed_down
+    for what happens when only the accelerator arrives.
+    """
     monkeypatch.setenv(backend_module.ACCELERATOR_ENV, "cuda12")
+    monkeypatch.setenv(backend_module.DRIVER_VERSION_ENV, "580.65")
     monkeypatch.setattr(
         backend_module.shutil, "which",
         lambda _: pytest.fail("probed despite being told the answer"))
@@ -894,6 +901,89 @@ def test_three_native_crashes_trigger_a_fresh_engine_download(
     assert local_backend.note_crash(3221225477) is False
     assert local_backend.note_crash(3221225477) is True
     assert calls == [1]
+
+
+def test_stale_cuda_accelerator_is_reprobed_when_no_driver_is_handed_down(
+        monkeypatch):
+    """The answer is inherited across restarts; a removed driver must not stick.
+
+    0.4.349 on Windows: the environment still said cuda12 with no NVIDIA
+    driver, so every CPU crash read as a GPU failure and the plain-build
+    fallback was never reached.
+    """
+    monkeypatch.setenv(backend_module.ACCELERATOR_ENV, "cuda12")
+    monkeypatch.delenv(backend_module.DRIVER_VERSION_ENV, raising=False)
+    monkeypatch.setattr(backend_module, "_accelerator", None)
+    monkeypatch.setattr(backend_module, "_probe_accelerator", lambda: "cpu")
+
+    assert backend_module.detect_accelerator() == "cpu"
+
+
+def test_inherited_cuda_accelerator_is_kept_when_a_driver_was_proven(
+        monkeypatch):
+    """The parent hands down the version it read: no second nvidia-smi call."""
+    monkeypatch.setenv(backend_module.ACCELERATOR_ENV, "cuda12")
+    monkeypatch.setenv(backend_module.DRIVER_VERSION_ENV, "580.65")
+    monkeypatch.setattr(backend_module, "_accelerator", None)
+
+    def boom():
+        raise AssertionError("must not re-probe when a driver is proven")
+
+    monkeypatch.setattr(backend_module, "_probe_accelerator", boom)
+    assert backend_module.detect_accelerator() == "cuda12"
+
+
+def test_cpu_fallback_never_quarantines_the_cpu_engine(
+        local_backend, config, monkeypatch):
+    """A CPU crash is not a GPU failure; the file has to survive to be counted.
+
+    Quarantining the runtime binary on the fallback path renamed it after
+    every failed start, which reset the crash counter and left the no-BLAS
+    escalation unreachable.
+    """
+    _install_engine(local_backend, config)
+    exe = Path(config.config_dir) / "runtime" / local_backend._exe_name
+    monkeypatch.setattr(backend_module, "detect_accelerator", lambda: "cuda12")
+    monkeypatch.setattr(LocalBackend, "start", lambda self, *a, **k: None)
+    monkeypatch.setattr(LocalBackend, "ensure_cpu_engine",
+                        lambda self, allow_download=True: True)
+
+    assert local_backend._start_with_fallback_locked(
+        None, allow_download=False) is None
+    assert exe.exists(), "the CPU engine was moved aside by a non-GPU failure"
+    assert not (exe.parent / (exe.name + ".failed")).exists()
+
+
+def test_cpu_crashes_reach_the_plain_engine_through_the_gpu_fallback(
+        local_backend, config, monkeypatch):
+    """The whole 0.4.349 loop, with the quarantine gone.
+
+    Three crashes reinstall the BLAS bytes; three more on those fresh bytes
+    must escalate to the no-BLAS build instead of quarantining and looping.
+    """
+    _install_engine(local_backend, config)
+    monkeypatch.setattr(backend_module, "detect_accelerator", lambda: "cuda12")
+    monkeypatch.setattr(LocalBackend, "start", lambda self, *a, **k: None)
+    monkeypatch.setattr(LocalBackend, "ensure_cpu_engine",
+                        lambda self, allow_download=True: True)
+    reinstalls, plain = [], []
+    monkeypatch.setattr(LocalBackend, "_reinstall_cpu_engine",
+                        lambda self: reinstalls.append(1) or True)
+    monkeypatch.setattr(LocalBackend, "_download_plain_engine",
+                        lambda self: plain.append(1) or True)
+
+    def failing_hotkey():
+        local_backend._start_with_fallback_locked(None, allow_download=False)
+        local_backend.note_crash(0xC0000005)
+
+    for _ in range(3):
+        failing_hotkey()
+    assert reinstalls == [1]
+
+    for _ in range(3):
+        failing_hotkey()
+    assert plain == [1]
+    assert local_backend._plain_fallback_done is True
 
 
 def test_crash_counter_resets_for_a_different_engine_file(

@@ -15,6 +15,7 @@
 
 import glob
 import os
+import sys
 
 from PyInstaller.utils.hooks import collect_submodules
 
@@ -188,6 +189,31 @@ def _dll_closure(roots):
     return sorted(seen.values())
 
 
+def _abi3_forwarder() -> str:
+    """python3.dll, the import library every abi3 extension links against.
+
+    velopack.pyd is a cp37-abi3 wheel and its import table names python3.dll.
+    PyInstaller collects the interpreter (libpython3.14.dll) and no wheel
+    ever carries the forwarder, so the frozen app had nothing by that name:
+    the lazy `import velopack` in updater.available() failed with "DLL load
+    failed while importing velopack: The specified module could not be
+    found", which turned the Windows updater off in silence - a user's
+    0.4.349 log is how this was found. It ships beside the interpreter.
+    """
+    candidates = [
+        os.path.join(GTK_PREFIX, "bin", "python3.dll"),   # MSYS2 UCRT64
+        os.path.join(sys.base_prefix, "bin", "python3.dll"),
+        os.path.join(sys.base_prefix, "python3.dll"),     # python.org layout
+        os.path.join(sys.prefix, "python3.dll"),
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    raise SystemExit(
+        "python3.dll not found - abi3 extensions (velopack) cannot load in "
+        f"the frozen app without it. Looked in: {candidates}")
+
+
 def _cairo_bridge() -> str:
     """The PyGObject extension that hands a cairo_t to pycairo.
 
@@ -271,12 +297,13 @@ def app_icon() -> str:
 
 
 gtk_datas, gtk_binaries = gtk_runtime()
+abi3_forwarder = _abi3_forwarder()
 icon_file = app_icon()
 
 app = Analysis(
     ["../../src/whisper_flow/__main__win__.py"],
     pathex=["../../src"],
-    binaries=gtk_binaries,
+    binaries=gtk_binaries + [(abi3_forwarder, ".")],
     datas=gtk_datas + module_files,
     hiddenimports=hidden,
     excludes=EXCLUDES,

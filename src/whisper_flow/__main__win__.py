@@ -240,6 +240,26 @@ def _selftest() -> int:
             raise RuntimeError(
                 f"win32evtlog not bundled ({e}) - add it to hiddenimports")
 
+        # The updater is a lazy import of a native module: velopack.pyd is a
+        # cp37-abi3 wheel and links python3.dll, which PyInstaller does not
+        # collect. Without it the app reported "DLL load failed while
+        # importing velopack: The specified module could not be found" and
+        # quietly disabled every update feature on Windows - Linux updated
+        # itself and Windows did not. Checked by path rather than by trying
+        # the import, because a build machine's PATH can hide the hole.
+        forwarder = os.path.join(sys._MEIPASS, "python3.dll")
+        if not os.path.exists(forwarder):
+            raise RuntimeError(
+                f"{forwarder} is missing - abi3 extensions (velopack) cannot "
+                f"load; bundle python3.dll in the spec")
+        try:
+            import velopack  # noqa: F401
+            report.append("velopack updater import OK (python3.dll bundled)")
+        except ImportError as e:
+            raise RuntimeError(
+                f"velopack not importable in the frozen app ({e}) - the "
+                f"Windows updater would be dead")
+
         # A generic Adw.Window realized fine while both real windows were
         # broken, which is how this check stayed green through the whole
         # thing. Build the windows the app actually shows, the way it shows

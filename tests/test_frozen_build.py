@@ -105,6 +105,33 @@ def test_every_gtk_namespace_the_ui_imports_ships_a_typelib():
     )
 
 
+def test_the_windows_spec_bundles_the_abi3_forwarder():
+    """velopack.pyd is a cp37-abi3 extension and imports python3.dll.
+
+    PyInstaller ships the interpreter and never the forwarder, so the frozen
+    app failed its lazy `import velopack` with "DLL load failed ... The
+    specified module could not be found" and Windows silently had no updater.
+    The spec has to put python3.dll in the bundle and name it in Analysis.
+    """
+    spec = SPEC.read_text(encoding="utf-8")
+    assert "python3.dll" in spec, (
+        "the spec does not bundle python3.dll; abi3 extensions cannot load "
+        "in the frozen app and the Windows updater turns itself off"
+    )
+    assert "_abi3_forwarder" in spec
+    assert re.search(r"binaries=gtk_binaries\s*\+\s*\[\(abi3_forwarder, \"\.\"\)\]",
+                     spec), "python3.dll is found but not added to the bundle"
+
+
+def test_the_windows_selftest_checks_the_updater_can_load():
+    """The selftest is what CI runs against the frozen app; it must cover
+    this, or the next regression ships the same silent no-updates build."""
+    entry = (Path(__file__).resolve().parents[1]
+             / "src/whisper_flow/__main__win__.py").read_text(encoding="utf-8")
+    assert "python3.dll" in entry
+    assert "velopack updater import OK" in entry
+
+
 def test_the_typelib_path_is_not_left_to_pyinstaller():
     """PyInstaller's gi rthook assigns GI_TYPELIB_PATH before this runs.
 

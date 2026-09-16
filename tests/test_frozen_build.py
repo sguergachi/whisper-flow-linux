@@ -118,6 +118,10 @@ def test_the_windows_spec_bundles_the_abi3_forwarder():
         "the spec does not bundle python3.dll; abi3 extensions cannot load "
         "in the frozen app and the Windows updater turns itself off"
     )
+    assert "libpython3.dll" in spec, (
+        "MSYS2 names its stable-ABI forwarder libpython3.dll; without that "
+        "candidate the build fails on the CI runner"
+    )
     assert "_abi3_forwarder" in spec
     assert re.search(r"binaries=gtk_binaries\s*\+\s*\[\(abi3_forwarder, \"\.\"\)\]",
                      spec), "python3.dll is found but not added to the bundle"

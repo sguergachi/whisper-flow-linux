@@ -15,7 +15,9 @@
 
 import glob
 import os
+import shutil
 import sys
+import tempfile
 
 from PyInstaller.utils.hooks import collect_submodules
 
@@ -193,25 +195,38 @@ def _abi3_forwarder() -> str:
     """python3.dll, the import library every abi3 extension links against.
 
     velopack.pyd is a cp37-abi3 wheel and its import table names python3.dll.
-    PyInstaller collects the interpreter (libpython3.14.dll) and no wheel
-    ever carries the forwarder, so the frozen app had nothing by that name:
-    the lazy `import velopack` in updater.available() failed with "DLL load
-    failed while importing velopack: The specified module could not be
-    found", which turned the Windows updater off in silence - a user's
-    0.4.349 log is how this was found. It ships beside the interpreter.
+    No PyPI wheel carries the forwarder, and PyInstaller only collects the
+    interpreter - libpython3.14.dll here - so the frozen app had nothing that
+    answers to python3.dll: the lazy `import velopack` in
+    updater.available() died with "DLL load failed while importing velopack:
+    The specified module could not be found" and every update feature on
+    Windows was silently off (a 0.4.349 log is how this was found).
+
+    MSYS2 ships the forwarder under its own lib prefix as libpython3.dll; it
+    forwards every stable-ABI symbol to libpython3.14.dll, the interpreter
+    already in the bundle, so it is copied to a temporary file named what
+    the extension actually asks for.
     """
     candidates = [
-        os.path.join(GTK_PREFIX, "bin", "python3.dll"),   # MSYS2 UCRT64
+        os.path.join(GTK_PREFIX, "bin", "python3.dll"),       # python.org
         os.path.join(sys.base_prefix, "bin", "python3.dll"),
-        os.path.join(sys.base_prefix, "python3.dll"),     # python.org layout
+        os.path.join(sys.base_prefix, "python3.dll"),
         os.path.join(sys.prefix, "python3.dll"),
+        os.path.join(GTK_PREFIX, "bin", "libpython3.dll"),    # MSYS2 UCRT64
+        os.path.join(sys.base_prefix, "bin", "libpython3.dll"),
     ]
-    for path in candidates:
-        if os.path.exists(path):
-            return path
-    raise SystemExit(
-        "python3.dll not found - abi3 extensions (velopack) cannot load in "
-        f"the frozen app without it. Looked in: {candidates}")
+    found = next((path for path in candidates if os.path.exists(path)), None)
+    if not found:
+        raise SystemExit(
+            "python3.dll (or MSYS2's libpython3.dll) not found - abi3 "
+            "extensions such as velopack cannot load in the frozen app "
+            f"without it. Looked in: {candidates}")
+    if os.path.basename(found).lower() == "python3.dll":
+        return found
+    renamed = os.path.join(tempfile.mkdtemp(prefix="abi3-forwarder-"),
+                           "python3.dll")
+    shutil.copyfile(found, renamed)
+    return renamed
 
 
 def _cairo_bridge() -> str:

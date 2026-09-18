@@ -34,6 +34,42 @@ def test_linux_appimage_can_update_itself(monkeypatch, tmp_path):
     assert updater.available() is True
 
 
+def test_the_windows_manager_points_velopack_at_our_static_feed(monkeypatch):
+    """A bare URL makes Velopack detect GitHub and query its API instead.
+
+    AutoSource sees "github.com" in the string and treats it as a repository
+    to look up through the GitHub API. Ours is a release download directory,
+    so that lookup answers 404 and the feed the release serves is never read
+    - the 0.4.354 report's "check failed: ... http status: 404". HttpSource
+    asks for releases.{channel}.json directly, which is the file the rolling
+    release publishes.
+    """
+    import types
+
+    built = {}
+
+    class FakeHttpSource:
+        def __init__(self, url):
+            built["url"] = url
+
+    class FakeUpdateManager:
+        def __init__(self, source):
+            built["source"] = source
+
+    fake = types.ModuleType("velopack")
+    fake.HttpSource = FakeHttpSource
+    fake.UpdateManager = FakeUpdateManager
+    monkeypatch.setitem(sys.modules, "velopack", fake)
+
+    updater._manager()
+
+    assert isinstance(built["source"], FakeHttpSource), (
+        "the feed URL was passed as a bare string; Velopack will use its "
+        "GitHub API source and 404"
+    )
+    assert built["url"] == updater.UPDATE_URL
+
+
 def test_nothing_is_attempted_when_unavailable(monkeypatch):
     monkeypatch.setattr(updater, "available", lambda: False)
     monkeypatch.setattr(updater, "_manager",

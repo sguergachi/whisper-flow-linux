@@ -68,9 +68,20 @@ def available() -> bool:
 
 
 def _manager():
+    """Velopack pointed at our static feed, explicitly.
+
+    A bare URL goes through Velopack's AutoSource, which detects github.com
+    by domain and treats the string as a repository to query through the
+    GitHub API. Ours is a release download directory, not a repo URL, so that
+    lookup answers 404 and the check never reaches the feed the release
+    actually serves ("check failed: Network error: Http error: http status:
+    404", 0.4.354 report). HttpSource asks for `releases.{channel}.json`
+    directly - for this app, `releases.win.json`, which the rolling release
+    publishes beside the installer.
+    """
     import velopack
 
-    return velopack.UpdateManager(UPDATE_URL)
+    return velopack.UpdateManager(velopack.HttpSource(UPDATE_URL))
 
 
 def check(notify=None) -> str | None:
@@ -84,7 +95,9 @@ def check(notify=None) -> str | None:
     try:
         update = _discover_update()
     except Exception as e:
-        log(f"[UPDATE] check failed: {e}")
+        # Name the feed: a 404 from a source that asked the wrong URL is
+        # impossible to tell from a release that is genuinely missing.
+        log(f"[UPDATE] check failed against {UPDATE_URL}: {e}")
         if notify:
             notify("Could not check for updates")
         return None

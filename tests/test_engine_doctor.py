@@ -33,6 +33,7 @@ class FakeBackend:
 
     def __init__(self, config_dir):
         self.config = FakeConfig(config_dir)
+        self.cli_mode_enabled = False
         self._exe = Path(config_dir) / "runtime" / self._exe_name
         self._exe.parent.mkdir(parents=True, exist_ok=True)
         self._exe.write_text("")
@@ -46,6 +47,12 @@ class FakeBackend:
     def model_path(self, name=None):
         name = name or self.config.model_name
         return self.config.config_dir / "models" / f"{name}.bin"
+
+    def cli_mode(self):
+        return self.cli_mode_enabled
+
+    def set_cli_mode(self, enabled):
+        self.cli_mode_enabled = bool(enabled)
 
 
 @pytest.fixture
@@ -143,6 +150,37 @@ def test_single_thread_heal_is_pinned_for_later_starts(doctor, monkeypatch):
     pinned = doctor.config_dir / "runtime" / "engine-threads.txt"
     assert pinned.read_text(encoding="utf-8") == "1"
     assert "one thread" in recent_log(200)
+
+
+def test_cli_mode_turns_on_when_only_the_cli_can_decode(doctor, monkeypatch):
+    """No server survives, whisper-cli does: that is a working configuration.
+
+    The machine in the 0.4.356 report is killed at startup by Cortex XDR for
+    every server build while whisper-cli decodes fine. Refusing to switch
+    would leave it permanently unable to transcribe for a fixable reason.
+    """
+    cli = doctor.backend._exe.parent / "whisper-cli.exe"
+    cli.write_text("")
+    monkeypatch.setattr(doctor, "_probe", _probe_decider(lambda l, e: False))
+    monkeypatch.setattr(doctor, "_cli_probe", lambda engines, model: cli)
+
+    doctor.run("no-BLAS engine died too")
+
+    assert doctor.backend.cli_mode_enabled is True
+    log = recent_log(300)
+    assert "HEALED" in log
+    assert "without a server" in log
+
+
+def test_a_server_that_starts_clears_a_stale_cli_mode(doctor, monkeypatch):
+    """CLI mode is a diagnosis, not a setting: retract it when wrong."""
+    doctor.backend.cli_mode_enabled = True
+    monkeypatch.setattr(doctor, "_probe",
+                        _probe_decider(lambda l, e: l.startswith("baseline")))
+
+    doctor.run("cpu died")
+
+    assert doctor.backend.cli_mode_enabled is False
 
 
 def test_verdict_reports_what_was_found(doctor, monkeypatch):

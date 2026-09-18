@@ -178,8 +178,12 @@ class EngineDoctor:
 
         started = self._probe_engines(engines, model, label="baseline")
         if started:
-            self._log(f"[DOCTOR] {started.name} starts on its own - the crash is "
-                f"intermittent or specific to the model that was loading")
+            self._log(f"[DOCTOR] {started.name} starts on its own - the crash "
+                      f"is intermittent or specific to the model that was "
+                      f"loading")
+            # A server starts here, so any CLI-mode marker from an earlier
+            # diagnosis is stale; clear it before the app is told anything.
+            self.backend.set_cli_mode(False)
             self._cli_probe(engines, model)
             return
 
@@ -190,7 +194,22 @@ class EngineDoctor:
             self._findings["healed"] = "pinned one thread"
             return
 
-        self._cli_probe(engines, model)
+        # Last rung: no server survives, but the CLI beside it may decode
+        # without ever touching a socket. That is the difference between a
+        # machine that cannot transcribe and one that transcribes slower -
+        # the usual cause is endpoint security killing the listener.
+        cli = self._cli_probe(engines, model)
+        if cli is not None:
+            self.backend.set_cli_mode(True)
+            self._findings["healed"] = f"CLI transcription via {cli.parent.name}"
+            self._log(
+                "[DOCTOR] HEALED: every server binary is killed at startup "
+                "here, but whisper-cli decodes with the same engine and "
+                "model - switching to transcription without a server. "
+                "Dictation works; there is no live preview and each "
+                "utterance pays the model load.")
+            return
+
         self._verdict(engines, model)
 
     def _engine_binaries(self) -> list[Path]:
@@ -357,49 +376,58 @@ class EngineDoctor:
         return True
 
     # ---------------------------------------------------------- diagnostics
-    def _cli_probe(self, engines, model) -> None:
+    def _cli_probe(self, engines, model) -> Path | None:
         """Does whisper work at all outside the server path?
 
         The server wrapper, its flags and its port handling are extra moving
         parts; whisper-cli loads the same model and runs the same graph with
-        none of them. A CLI that works while the server dies points straight
-        at the wrapper; both dying points at the engine.
+        none of them. A CLI that works while the server dies is both the
+        diagnosis (the engine is fine) and the cure (transcribe with it).
+        Returns the first CLI that decoded, for the caller to switch to.
         """
-        cli = None
+        candidates = []
         for exe in engines:
             candidate = exe.parent / "whisper-cli.exe"
             if candidate.exists():
-                cli = candidate
-                break
-        if cli is None:
-            return
+                candidates.append(candidate)
+        if not candidates:
+            self._log("[DOCTOR] no whisper-cli shipped beside the engines")
+            return None
         wav = self._write_probe_wav()
         if wav is None:
             self._log("[DOCTOR] could not write a probe wav for the CLI check")
-            return
-        started_at = time.monotonic()
+            return None
         try:
-            result = subprocess.run(
-                [str(cli), "-m", str(model), "-f", str(wav), "-l", "en", "-nt"],
-                capture_output=True, text=True, timeout=_CLI_TIMEOUT,
-                cwd=str(cli.parent), creationflags=self._no_console(),
-            )
-            seconds = time.monotonic() - started_at
-            tail = " | ".join((result.stdout or "").strip().splitlines()[-4:])
-            if result.returncode == 0:
-                self._log(f"[DOCTOR] whisper-cli loaded the model and ran in "
-                    f"{seconds:.1f}s - the engine works outside the server")
-            else:
-                self._log(f"[DOCTOR] whisper-cli also failed: exit="
-                    f"0x{(result.returncode | 0) & 0xFFFFFFFF:08X} "
-                    f"after {seconds:.1f}s; output: {tail or '(none)'}")
-        except Exception as e:
-            self._log(f"[DOCTOR] whisper-cli probe failed to run: {e}")
+            for cli in candidates:
+                started_at = time.monotonic()
+                try:
+                    result = subprocess.run(
+                        [str(cli), "-m", str(model), "-f", str(wav),
+                         "-l", "en", "-nt"],
+                        capture_output=True, text=True, timeout=_CLI_TIMEOUT,
+                        cwd=str(cli.parent), creationflags=self._no_console(),
+                    )
+                except Exception as e:
+                    self._log(f"[DOCTOR] {cli.parent.name} whisper-cli probe "
+                              f"failed to run: {e}")
+                    continue
+                seconds = time.monotonic() - started_at
+                if result.returncode == 0:
+                    self._log(
+                        f"[DOCTOR] {cli.parent.name} whisper-cli loaded the "
+                        f"model and ran in {seconds:.1f}s - the engine works "
+                        f"outside the server")
+                    return cli
+                tail = " | ".join((result.stdout or "").strip().splitlines()[-4:])
+                self._log(f"[DOCTOR] {cli.parent.name} whisper-cli also failed: "
+                          f"exit=0x{(result.returncode | 0) & 0xFFFFFFFF:08X} "
+                          f"after {seconds:.1f}s; output: {tail or '(none)'}")
         finally:
             try:
                 os.unlink(wav)
             except OSError:
                 pass
+        return None
 
     @staticmethod
     def _write_probe_wav() -> str | None:

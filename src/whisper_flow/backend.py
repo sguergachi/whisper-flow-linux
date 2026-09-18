@@ -2303,6 +2303,11 @@ class LocalBackend:
             return self._start_with_fallback_locked(model, allow_download)
 
     def _start_with_fallback_locked(self, model, allow_download):
+        if self.cli_mode():
+            # No server here by decree of the doctor: spawning one only
+            # produces another 0xC0000005 and, worse, quarantines engines
+            # that are fine on every machine without this one's EDR.
+            return None
         url = self.start(model, allow_download=allow_download)
         if url:
             return url
@@ -2438,6 +2443,8 @@ class LocalBackend:
         With allow_download=False the pre-flight never fetches: a corrupt
         model or an unhealthy engine is reported, not re-downloaded.
         """
+        if self.cli_mode():
+            return None
         with self._lock:
             if self._process and self._process.poll() is None:
                 return self.url
@@ -2824,20 +2831,91 @@ class LocalBackend:
         self._process = None
         self._active_port = None
 
-    def cli_path(self) -> Path | None:
-        """whisper-cli beside the serving engine, if one shipped.
+    @property
+    def _cli_mode_marker(self) -> Path:
+        return _runtime_dir(self.config.config_dir) / "cli-mode"
 
-        The bundle carries it next to whisper-server; a directory that
-        lost its server to quarantine may still have it (or lose it the
-        same way — the caller treats absence as no fallback).
+    def cli_mode(self) -> bool:
+        """True when this machine must transcribe without a server.
+
+        Set by the engine doctor (engine_doctor.py) when every server binary
+        is killed at startup - an EDR blocking a process that binds a socket,
+        typically - while whisper-cli beside it decodes fine. Dictation then
+        skips the server entirely: the model is loaded per utterance, which
+        is slower, and is the difference between working and not.
         """
         try:
-            name = ("whisper-cli.exe" if sys.platform == "win32"
-                    else "whisper-cli")
-            cli = Path(self.server_exe).parent / name
-            return cli if cli.exists() else None
+            return self._cli_mode_marker.exists()
         except Exception:
-            return None
+            return False
+
+    def set_cli_mode(self, enabled: bool) -> None:
+        try:
+            self._cli_mode_marker.parent.mkdir(parents=True, exist_ok=True)
+            if enabled:
+                self._cli_mode_marker.write_text("1", encoding="utf-8")
+                log("[BACKEND] CLI transcription mode enabled: the server "
+                    "cannot run here, whisper-cli can")
+            else:
+                self._cli_mode_marker.unlink(missing_ok=True)
+                log("[BACKEND] CLI transcription mode disabled")
+        except Exception as e:
+            log(f"[BACKEND] could not set CLI mode: {e}")
+
+    def cli_paths(self) -> list[Path]:
+        """whisper-cli candidates, best first: CUDA, plain, then flat.
+
+        The GPU build decodes fastest when its DLLs load; the plain and flat
+        builds are the same fallback ladder the server uses. A directory that
+        lost its server to quarantine may still hold its CLI, so all three
+        are tried rather than only the one the engine marker points at.
+        """
+        name = ("whisper-cli.exe" if sys.platform == "win32"
+                else "whisper-cli")
+        try:
+            candidates = [
+                _cuda_dir(self.config.config_dir) / name,
+                _plain_dir(self.config.config_dir) / name,
+                _runtime_dir(self.config.config_dir) / name,
+            ]
+        except Exception:
+            return []
+        return [path for path in dict.fromkeys(candidates) if path.exists()]
+
+    def cli_path(self) -> Path | None:
+        """The first whisper-cli candidate; None when there are none."""
+        paths = self.cli_paths()
+        return paths[0] if paths else None
+
+    def _cli_supports_output_file(self, cli: Path) -> bool:
+        """Whether this whisper-cli can write a text file; asked once each.
+
+        Flag names vary across whisper.cpp vintages, and a binary without
+        them silently produces nothing, which reads exactly like a failed
+        transcription.
+        """
+        cache = getattr(self, "_cli_flag_cache", None)
+        if cache is None:
+            cache = {}
+            self._cli_flag_cache = cache
+        key = str(cli)
+        if key in cache:
+            return cache[key]
+        try:
+            probe = subprocess.run(
+                [str(cli), "--help"], capture_output=True, text=True,
+                timeout=15, creationflags=no_console_flags(),
+            )
+            supported = ("output-txt" in (probe.stdout or "")
+                         and "output-file" in (probe.stdout or ""))
+        except Exception as e:
+            log(f"[BACKEND] CLI flag probe failed for {cli}: {e}")
+            supported = False
+        if not supported:
+            log(f"[BACKEND] {cli.name} has no --output-txt/--output-file; "
+                f"not usable for CLI transcription")
+        cache[key] = supported
+        return supported
 
     def transcribe_file_cli(self, wav_path, model=None, language: str = "en",
                             timeout: float = 180.0) -> str | None:
@@ -2849,13 +2927,12 @@ class LocalBackend:
         the transcript text, or None when that did not work either. Never
         raises — failure here must read exactly like the server failing.
         """
-        tmpdir = None
         try:
-            import subprocess as _sp
+            import shutil as _shutil
             import tempfile as _tf
 
-            cli = self.cli_path()
-            if cli is None:
+            candidates = self.cli_paths()
+            if not candidates:
                 return None
             model = model or self.working_model()
             if not model:
@@ -2871,66 +2948,48 @@ class LocalBackend:
                     return None
             except OSError:
                 return None
-            # Flag support varies across whisper.cpp vintages; ask the
-            # binary once per process rather than guessing wrong forever.
-            if getattr(self, "_cli_txt_flag", None) is None:
+
+            for cli in candidates:
+                if not self._cli_supports_output_file(cli):
+                    continue
+                tmpdir = Path(_tf.mkdtemp(prefix="whisper-flow-cli-"))
                 try:
-                    probe = _sp.run(
-                        [str(cli), "--help"], capture_output=True, text=True,
-                        timeout=15,
-                        creationflags=(no_console_flags()
-                                       if sys.platform == "win32" else 0),
-                    )
-                    self._cli_txt_flag = ("output-txt" in (probe.stdout or "")
-                                          and "output-file" in (probe.stdout or ""))
-                except Exception as e:
-                    log(f"[BACKEND] CLI flag probe failed: {e}")
-                    return None
-                if not self._cli_txt_flag:
-                    log("[BACKEND] CLI fallback unavailable: this whisper-cli "
-                        "has no --output-txt/--output-file flags")
-                    return None
-            tmpdir = Path(_tf.mkdtemp(prefix="whisper-flow-cli-"))
-            base = tmpdir / "out"
-            cmd = [str(cli), "-m", str(mpath), "-f", str(wav),
-                   "-l", language or "en",
-                   "--output-txt", "--output-file", str(base)]
-            log(f"[BACKEND] CLI fallback transcribing "
-                f"{wav.stat().st_size // 1024}KB with {model}")
-            try:
-                proc = _sp.run(
-                    cmd, capture_output=True, text=True, timeout=timeout,
-                    creationflags=(no_console_flags()
-                                   if sys.platform == "win32" else 0),
-                    cwd=str(cli.parent),
-                )
-            except _sp.TimeoutExpired:
-                log("[BACKEND] CLI fallback timed out")
-                return None
-            text_file = Path(str(base) + ".txt")
-            try:
-                text = (text_file.read_text(encoding="utf-8",
-                                            errors="replace").strip()
-                        if text_file.exists() else "")
-            except OSError:
-                text = ""
-            if proc.returncode != 0 and not text:
-                tail = (proc.stderr or "")[-500:]
-                log(f"[BACKEND] CLI fallback failed (rc={proc.returncode}): "
-                    f"{tail}")
-                return None
-            return text or None
+                    base = tmpdir / "out"
+                    cmd = [str(cli), "-m", str(mpath), "-f", str(wav),
+                           "-l", language or "en",
+                           "--output-txt", "--output-file", str(base)]
+                    log(f"[BACKEND] CLI fallback transcribing "
+                        f"{wav.stat().st_size // 1024}KB with {model} "
+                        f"({cli.parent.name})")
+                    try:
+                        proc = subprocess.run(
+                            cmd, capture_output=True, text=True,
+                            timeout=timeout,
+                            creationflags=no_console_flags(),
+                            cwd=str(cli.parent),
+                        )
+                    except subprocess.TimeoutExpired:
+                        log(f"[BACKEND] CLI fallback timed out ({cli.parent.name})")
+                        continue
+                    text_file = Path(str(base) + ".txt")
+                    try:
+                        text = (text_file.read_text(encoding="utf-8",
+                                                    errors="replace").strip()
+                                if text_file.exists() else "")
+                    except OSError:
+                        text = ""
+                    if text:
+                        return text
+                    if proc.returncode != 0:
+                        tail = (proc.stderr or "")[-300:]
+                        log(f"[BACKEND] CLI fallback failed on "
+                            f"{cli.parent.name} (rc={proc.returncode}): {tail}")
+                finally:
+                    _shutil.rmtree(tmpdir, ignore_errors=True)
+            return None
         except Exception as e:
             log(f"[BACKEND] CLI fallback failed: {e}")
             return None
-        finally:
-            try:
-                import shutil as _shutil
-
-                if tmpdir is not None:
-                    _shutil.rmtree(tmpdir, ignore_errors=True)
-            except Exception:
-                pass
 
     @property
     def _setup_marker(self) -> Path:

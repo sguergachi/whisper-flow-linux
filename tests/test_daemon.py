@@ -1802,6 +1802,27 @@ def _healing_setup(temp_config_dir, cli_text):
     return daemon, app
 
 
+def test_cli_mode_transcribes_without_touching_the_server(temp_config_dir):
+    """The doctor said there is no server here; do not try to make one.
+
+    Live ticks are still excluded - they would each pay a model load - but
+    the final pass goes straight to whisper-cli instead of crash-looping the
+    engine for a minute first.
+    """
+    daemon, app = _healing_setup(temp_config_dir, "hello cli")
+    daemon.backend.cli_mode = Mock(return_value=True)
+
+    assert daemon._healing_transcribe(app)("/tmp/clip.wav") == "hello cli"
+    app.transcription_service.transcribe_audio.assert_not_called()
+    daemon._ensure_backend_running.assert_not_called()
+
+
+def test_cli_mode_refuses_to_revive_a_server(temp_config_dir):
+    daemon, _ = _idle_daemon(temp_config_dir)
+    daemon.backend.cli_mode = Mock(return_value=True)
+    assert daemon._ensure_backend_running(allow_download=False) is False
+
+
 def test_cli_fallback_saves_a_final_pass(temp_config_dir):
     daemon, app = _healing_setup(temp_config_dir, "hello cli")
     healing = daemon._healing_transcribe(app)

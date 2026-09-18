@@ -998,6 +998,17 @@ class WhisperFlowDaemon:
         orig = getattr(app.transcription_service, func_name)
 
         def healing(*args, **kwargs):
+            live = kwargs.get("max_retries", 3) == 1
+            # CLI mode: the doctor established that no server binary survives
+            # on this machine but whisper-cli does. The final pass goes
+            # straight there - no revive attempt, no crash loop, no waiting
+            # for a server that cannot stay up.
+            if not live and self.backend.cli_mode() is True:
+                text = self._transcribe_via_cli(args, kwargs)
+                if text:
+                    return text
+                log("[DAEMON] CLI mode: the utterance produced no text")
+                raise RuntimeError("No whisper server configured (CLI mode)")
             try:
                 result = orig(*args, **kwargs)
                 if result is not None:
@@ -1011,7 +1022,7 @@ class WhisperFlowDaemon:
                 is_conn = "Cannot reach" in msg or "Connection" in msg or "Failed to connect" in msg
                 if not (is_no_server or is_conn):
                     raise
-                if kwargs.get("max_retries", 3) == 1:
+                if live:
                     # Live passes are disposable. Waiting for model startup
                     # here stalls the streaming worker and its closing pass.
                     self._warm_backend_for_recording()
@@ -1024,31 +1035,39 @@ class WhisperFlowDaemon:
                     # engine loads the model, decodes, and exits. Live ticks
                     # (max_retries=1) are excluded — a model load per second
                     # of speech would bury the words waiting behind it.
-                    try:
-                        if kwargs.get("max_retries", 3) != 1:
-                            audio_path = (args[0] if args
-                                          else kwargs.get("audio_path"))
-                            text = None
-                            if isinstance(audio_path, (str, os.PathLike)):
-                                text = self.backend.transcribe_file_cli(
-                                    audio_path,
-                                    model=self.backend.working_model())
-                            if text:
-                                from .transcription import (
-                                    _normalize, collapse_repetition,
-                                    is_hallucination)
-                                text = collapse_repetition(_normalize(text))
-                                if (text and text != "[BLANK_AUDIO]"
-                                        and not is_hallucination(text)):
-                                    log("[DAEMON] CLI fallback transcribed "
-                                        "the utterance without any server")
-                                    return text
-                    except Exception as ce:
-                        log(f"[DAEMON] CLI fallback failed: {ce}")
+                    text = self._transcribe_via_cli(args, kwargs)
+                    if text:
+                        return text
                     raise
                 return orig(*args, **kwargs)
 
         return healing
+
+    def _transcribe_via_cli(self, args, kwargs) -> str | None:
+        """One utterance through whisper-cli; None when that did not work.
+
+        Shared by the auto-heal's last resort and by CLI mode, so both paths
+        produce text the same way and leave the same log trail.
+        """
+        try:
+            audio_path = args[0] if args else kwargs.get("audio_path")
+            if not isinstance(audio_path, (str, os.PathLike)):
+                return None
+            text = self.backend.transcribe_file_cli(
+                audio_path, model=self.backend.working_model())
+            if not text:
+                return None
+            from .transcription import (_normalize, collapse_repetition,
+                                        is_hallucination)
+
+            text = collapse_repetition(_normalize(text))
+            if text and text != "[BLANK_AUDIO]" and not is_hallucination(text):
+                log("[DAEMON] CLI fallback transcribed the utterance "
+                    "without any server")
+                return text
+        except Exception as ce:
+            log(f"[DAEMON] CLI fallback failed: {ce}")
+        return None
 
     def _record_audio_thread(self, mode: str):
         """Handle audio recording in a separate thread with timeout protection."""
@@ -1702,6 +1721,15 @@ class WhisperFlowDaemon:
         fetched by the watchdog/settings paths; recording still proceeds so
         the closing pass can retry once the engine lands.
         """
+        try:
+            # `is True`: test doubles answer everything, and a Mock must not
+            # decide that this machine has no server.
+            if self.backend.cli_mode() is True:
+                # The doctor proved no server binary survives here; reviving
+                # one is the crash loop, and the final pass uses whisper-cli.
+                return False
+        except Exception:
+            pass
         try:
             # Already have a URL and the process is alive
             if self._backend_alive_now():
@@ -2581,6 +2609,20 @@ Use 'whisper-flow stop' to exit daemon
                 # And a transcription backend, if one is installed
                 self._start_managed_backend()
                 trace_stage("backend started")
+
+                # CLI mode: the engine doctor found that no server binary
+                # survives on this machine while whisper-cli does (an EDR
+                # killing listeners, typically). Say so once - live preview
+                # is gone and each utterance pays the model load, which is
+                # otherwise baffling after a working dictation.
+                try:
+                    if self.backend.cli_mode() is True:
+                        log("[DAEMON] CLI transcription mode: no speech server "
+                            "here, whisper-cli decodes each utterance instead")
+                        self.notify("Compatibility mode: transcribing without "
+                                    "the speech server (no live preview)")
+                except Exception:
+                    pass
 
                 # New releases download themselves in the background; the
                 # tray row flips to "Update to X" when one lands. No-op

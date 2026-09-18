@@ -1658,6 +1658,55 @@ def test_cli_fallback_refuses_unknown_flags(local_backend, config,
     assert local_backend.transcribe_file_cli("/tmp/x.wav") is None
 
 
+def test_cli_mode_marker_round_trip_and_server_short_circuit(
+        local_backend, config, monkeypatch):
+    """CLI mode is on disk (survives restarts) and no server is ever spawned."""
+    assert local_backend.cli_mode() is False
+    local_backend.set_cli_mode(True)
+    assert local_backend.cli_mode() is True
+
+    monkeypatch.setattr(local_backend, "_process", None)
+    assert local_backend.start() is None
+    assert local_backend._start_with_fallback_locked(
+        None, allow_download=False) is None
+
+    local_backend.set_cli_mode(False)
+    assert local_backend.cli_mode() is False
+
+
+def test_cli_fallback_tries_the_next_engine_when_the_first_fails(
+        local_backend, config, monkeypatch, tmp_path):
+    """The CUDA CLI can be broken while the plain one works; try both."""
+    import subprocess
+
+    cuda = Path(config.config_dir) / "runtime" / "cuda" / "whisper-cli.exe"
+    plain = Path(config.config_dir) / "runtime" / "plain" / "whisper-cli.exe"
+    for cli in (cuda, plain):
+        cli.parent.mkdir(parents=True, exist_ok=True)
+        cli.write_text("cli")
+    model = Path(config.config_dir) / "models" / "ggml-base.en-q8_0.bin"
+    model.parent.mkdir(parents=True, exist_ok=True)
+    model.write_text("model")
+    local_backend.config.model_name = "ggml-base.en-q8_0"
+    wav = tmp_path / "clip.wav"
+    wav.write_bytes(b"\x00" * 32000)
+
+    monkeypatch.setattr(local_backend, "cli_paths", lambda: [cuda, plain])
+    monkeypatch.setattr(local_backend, "_cli_supports_output_file",
+                        lambda cli: True)
+
+    def fake_run(cmd, **k):
+        if "cuda" in str(cmd[0]):
+            return types.SimpleNamespace(returncode=1, stdout="", stderr="bad")
+        for i, part in enumerate(cmd):
+            if part == "--output-file":
+                Path(cmd[i + 1] + ".txt").write_text("from plain\n")
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert local_backend.transcribe_file_cli(str(wav)) == "from plain"
+
+
 def test_cli_fallback_returns_file_text(local_backend, config, monkeypatch,
                                         tmp_path):
     import subprocess

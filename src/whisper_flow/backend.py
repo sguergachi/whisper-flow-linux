@@ -1774,7 +1774,16 @@ class LocalBackend:
         only ever downloaded because someone pressed the button asking for it,
         and that has to take effect the moment the window closes, before
         anything has been saved or restarted.
+
+        A fallback this process already took - because the chosen model
+        crashed - wins for the rest of the session, so the daemon does not
+        re-crash the same model on every revive. It is deliberately not
+        persisted: the saved choice stays whatever the user picked, and the
+        next process tries it again.
         """
+        if (self._last_started_model
+                and self.model_path(self._last_started_model).exists()):
+            return self._last_started_model
         chosen = self.chosen_model()
         if chosen and self.model_path(chosen).exists():
             return chosen
@@ -2337,16 +2346,17 @@ class LocalBackend:
                     fallback_model = base_candidate
                 else:
                     fallback_model = base_candidate
+        # The fallback is a session choice, not a new setting. It used to be
+        # written into WHISPER_FLOW_MODEL_NAME, which is the user's own choice
+        # as made in Settings - so one crash silently rewrote it, the radio
+        # moved to base, and picking medium again looked like it did not work
+        # (0.4.354 report: "it still doesn't let me select medium"). It now
+        # lives in this process; a restart tries the user's choice again,
+        # which is also how a fixed engine or the doctor's heal gets picked
+        # up without the user having to re-select anything.
         self._last_started_model = fallback_model
         try:
             self.config.model_name = fallback_model
-            # Persist so working_model() returns the fallback next time, not the crashing medium
-            try:
-                from pathlib import Path as _P
-                import whisper_flow.envfile as _ef
-                _ef.set_values(_P(self.config.config_dir) / ".env", {"WHISPER_FLOW_MODEL_NAME": fallback_model})
-            except Exception:
-                pass
         except Exception:
             pass
         if self.engine_is_gpu():
@@ -2380,17 +2390,11 @@ class LocalBackend:
                     log("[BACKEND] no installed CPU model for fallback after download attempt")
                     return None
                 log(f"[BACKEND] using alternate fallback {fallback_model}")
+        self._last_started_model = fallback_model
         try:
             self.config.model_name = fallback_model
-            try:
-                from pathlib import Path as _P
-                import whisper_flow.envfile as _ef
-                _ef.set_values(_P(self.config.config_dir) / ".env", {"WHISPER_FLOW_MODEL_NAME": fallback_model})
-            except Exception:
-                pass
         except Exception:
             pass
-        self._last_started_model = fallback_model
         return self.start(fallback_model, allow_download=allow_download)
 
     def _pick_port(self) -> int:

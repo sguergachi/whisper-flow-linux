@@ -2082,6 +2082,17 @@ class WhisperFlowDaemon:
 
         if detail:
             report += ["", "Traceback", detail.rstrip()]
+        # The doctor's findings live in their own file: they are written when
+        # the engine crashes, and a session with many crashes scrolls them
+        # out of the ring buffer the report above is cut from.
+        try:
+            from .engine_doctor import recent_findings
+
+            findings = recent_findings(80, self.config.config_dir)
+        except Exception as e:
+            findings = f"(unreadable: {e})"
+        if findings:
+            report += ["", "Engine doctor", findings]
         report += ["", "Recent log", recent_log(200) or "(nothing recorded)"]
         return "\n".join(report)
 

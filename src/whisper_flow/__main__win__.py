@@ -260,6 +260,18 @@ def _selftest() -> int:
                 f"velopack not importable in the frozen app ({e}) - the "
                 f"Windows updater would be dead")
 
+        # The crash doctor is imported lazily from the backend's crash path,
+        # which is the worst place to discover a module never made it into
+        # the bundle: the machine where every engine crashes would get no
+        # diagnosis exactly where one is needed.
+        try:
+            import whisper_flow.engine_doctor  # noqa: F401
+            report.append("engine doctor import OK")
+        except ImportError as e:
+            raise RuntimeError(
+                f"engine doctor not bundled ({e}) - a crashing engine would "
+                f"get no diagnosis")
+
         # A generic Adw.Window realized fine while both real windows were
         # broken, which is how this check stayed green through the whole
         # thing. Build the windows the app actually shows, the way it shows

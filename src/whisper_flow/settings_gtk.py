@@ -1508,8 +1508,11 @@ class SettingsWindow(Adw.ApplicationWindow):
                 check.set_active(True)
             if not item["installed"]:
                 # Stay visible but refuse the choice: an insensitive radio is
-                # so dim on dark theme it looks like the row has none.
-                check.connect("toggled", self._guard_uninstalled)
+                # so dim on dark theme it looks like the row has none. The
+                # refusal explains itself and offers the download, because a
+                # radio that silently snaps back reads as "it will not let me
+                # pick this model" (0.4.354 report, medium).
+                check.connect("toggled", self._offer_download, name)
             # One prefix holding both, in the order they are to appear.
             #
             # Two add_prefix calls put the text to the *left* of the radio and
@@ -1528,8 +1531,9 @@ class SettingsWindow(Adw.ApplicationWindow):
             content.append(check)
             content.append(names)
             row.add_prefix(content)
-            if item["installed"]:
-                row.set_activatable_widget(check)
+            # Activatable either way: on an uninstalled row it is the click
+            # target that starts the download rather than a dead row.
+            row.set_activatable_widget(check)
 
             suffix = Gtk.Box(spacing=6)
             suffix.set_valign(Gtk.Align.CENTER)
@@ -2302,6 +2306,21 @@ class SettingsWindow(Adw.ApplicationWindow):
         """Snap a radio on an uninstalled model straight back off."""
         if check.get_active():
             check.set_active(False)
+
+    def _offer_download(self, check: Gtk.CheckButton, name: str) -> None:
+        """A click on an uninstalled model fetches it instead of doing nothing.
+
+        The radio still refuses - a model that is not on disk cannot be the
+        current one - but silently snapping back left no way to find out why.
+        Starting the download the row is already offering is what the click
+        meant.
+        """
+        if not check.get_active():
+            return
+        check.set_active(False)
+        self._toast(f"{name.replace('ggml-', '')} is not on this machine yet - "
+                    f"downloading it now")
+        self._start_download(name)
 
     # --------------------------------------------------------------- actions
     def _toast(self, message: str, button: str | None = None,

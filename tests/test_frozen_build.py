@@ -136,6 +136,19 @@ def test_the_windows_selftest_checks_the_updater_can_load():
     assert "velopack updater import OK" in entry
 
 
+def test_the_windows_spec_and_selftest_carry_the_engine_doctor():
+    """The doctor is imported on the crash path, lazily.
+
+    If it is not in the bundle, the one machine that needs it - where every
+    engine dies - is the one machine that silently gets no diagnosis.
+    """
+    spec = SPEC.read_text(encoding="utf-8")
+    assert "whisper_flow.engine_doctor" in spec
+    entry = (Path(__file__).resolve().parents[1]
+             / "src/whisper_flow/__main__win__.py").read_text(encoding="utf-8")
+    assert "engine doctor import OK" in entry
+
+
 def test_the_typelib_path_is_not_left_to_pyinstaller():
     """PyInstaller's gi rthook assigns GI_TYPELIB_PATH before this runs.
 

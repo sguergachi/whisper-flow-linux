@@ -78,15 +78,62 @@ def arch_kernels(engine_dir: Path) -> list[Path]:
     return [path for path in found if path.name.lower() != _BASELINE_KERNEL]
 
 
+def recent_findings(limit: int = 80, config_dir: Path | None = None) -> str:
+    """The doctor's durable findings, for the failure report.
+
+    The tray report carries the last 200 log lines, and a crash loop is loud
+    enough to push a diagnosis made early in a session out of that window -
+    which is exactly what happened to the first report with the doctor in it.
+    The file outlives the ring, so the report appends it explicitly.
+    """
+    try:
+        path = Path(config_dir) / "engine-doctor.log"
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return ""
+    return "\n".join(lines[-limit:])
+
+
 class EngineDoctor:
     """Measures why whisper-server dies, heals what it can, logs everything."""
 
     def __init__(self, backend):
         self.backend = backend
         self.config_dir = Path(backend.config.config_dir)
+        self._log_path = self.config_dir / "engine-doctor.log"
         self._lock = threading.Lock()
         self._families_done: set[str] = set()
         self._findings: dict = {}
+        self._trim_findings_file()
+
+    # ------------------------------------------------------------- logging
+    def _log(self, message: str) -> None:
+        """Record a finding in the ring buffer and in a durable file.
+
+        The ring holds 300 lines and one crash writes ten; a diagnosis from
+        the start of the session is long gone by the time a person reads the
+        report. The file is the artifact that survives.
+        """
+        log(message)
+        try:
+            from datetime import datetime
+
+            with open(self._log_path, "a", encoding="utf-8") as handle:
+                handle.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} {message}\n")
+        except Exception:
+            pass                    # a diagnosis is never worth failing over
+
+    def _trim_findings_file(self, keep_lines: int = 500) -> None:
+        """Bound the file's growth without losing the recent history."""
+        try:
+            if self._log_path.stat().st_size < 200_000:
+                return
+            lines = self._log_path.read_text(
+                encoding="utf-8", errors="replace").splitlines()
+            trimmed = "\n".join(lines[-keep_lines:]) + "\n"
+            self._log_path.write_text(trimmed, encoding="utf-8")
+        except Exception:
+            pass
 
     # ------------------------------------------------------------- entry
     def start(self, reason: str, family: str) -> bool:
@@ -96,7 +143,7 @@ class EngineDoctor:
                 return False
             self._families_done.add(family)
         if sys.platform != "win32":
-            log(f"[DOCTOR] engine diagnosis is Windows-only; skipping ({reason})")
+            self._log(f"[DOCTOR] engine diagnosis is Windows-only; skipping ({reason})")
             return False
         thread = threading.Thread(
             target=self._run_guarded, args=(reason,),
@@ -108,11 +155,11 @@ class EngineDoctor:
         try:
             self.run(reason)
         except Exception as e:
-            log(f"[DOCTOR] engine diagnosis failed: {e}")
+            self._log(f"[DOCTOR] engine diagnosis failed: {e}")
 
     # --------------------------------------------------------------- run
     def run(self, reason: str) -> None:
-        log(f"[DOCTOR] starting engine diagnosis ({reason})")
+        self._log(f"[DOCTOR] starting engine diagnosis ({reason})")
         self._facts_machine()
         self._facts_crash_report()
         self._facts_gpu()
@@ -121,17 +168,17 @@ class EngineDoctor:
         model = Path(self.backend.model_path())
         engines = self._engine_binaries()
         if not engines:
-            log("[DOCTOR] no engine binary on disk to probe")
+            self._log("[DOCTOR] no engine binary on disk to probe")
             return
-        log(f"[DOCTOR] model {model.name} present={model.exists()}")
+        self._log(f"[DOCTOR] model {model.name} present={model.exists()}")
         if not model.exists():
-            log("[DOCTOR] the model file is missing - that is the problem, "
+            self._log("[DOCTOR] the model file is missing - that is the problem, "
                 "not the engine")
             return
 
         started = self._probe_engines(engines, model, label="baseline")
         if started:
-            log(f"[DOCTOR] {started.name} starts on its own - the crash is "
+            self._log(f"[DOCTOR] {started.name} starts on its own - the crash is "
                 f"intermittent or specific to the model that was loading")
             self._cli_probe(engines, model)
             return
@@ -219,7 +266,7 @@ class EngineDoctor:
                     break
                 time.sleep(0.2)
         except Exception as e:
-            log(f"[DOCTOR] {label}: could not run ({e})")
+            self._log(f"[DOCTOR] {label}: could not run ({e})")
             return {"ready": False}
         finally:
             if proc is not None:
@@ -237,12 +284,12 @@ class EngineDoctor:
         code = proc.poll() if proc is not None else None
         output = self._tail(out_path)
         if ready:
-            log(f"[DOCTOR] {label}: started and bound its port in {seconds:.1f}s")
+            self._log(f"[DOCTOR] {label}: started and bound its port in {seconds:.1f}s")
         else:
             shown = "none" if code is None else f"0x{(code | 0) & 0xFFFFFFFF:08X}"
-            log(f"[DOCTOR] {label}: died after {seconds:.1f}s (exit={shown})")
+            self._log(f"[DOCTOR] {label}: died after {seconds:.1f}s (exit={shown})")
             if output:
-                log(f"[DOCTOR] {label} last output: {output}")
+                self._log(f"[DOCTOR] {label} last output: {output}")
         try:
             os.unlink(out_path)
         except OSError:
@@ -271,15 +318,15 @@ class EngineDoctor:
                     kernel.rename(disabled)
                     hidden.append((kernel, disabled))
                 except OSError as e:
-                    log(f"[DOCTOR] could not hide {kernel.name}: {e}")
+                    self._log(f"[DOCTOR] could not hide {kernel.name}: {e}")
         if not hidden:
-            log("[DOCTOR] no per-arch CPU kernels to hide (baseline x64 only)")
+            self._log("[DOCTOR] no per-arch CPU kernels to hide (baseline x64 only)")
             return False
         names = ", ".join(kernel.name for kernel, _ in hidden)
-        log(f"[DOCTOR] hid {len(hidden)} per-arch CPU kernel(s): {names}")
+        self._log(f"[DOCTOR] hid {len(hidden)} per-arch CPU kernel(s): {names}")
         started = self._probe_engines(engines, model, label="no-arch-kernels")
         if started:
-            log(f"[DOCTOR] HEALED: {started.name} starts with the per-arch "
+            self._log(f"[DOCTOR] HEALED: {started.name} starts with the per-arch "
                 f"kernels hidden - leaving them disabled. That kernel was the "
                 f"fault; report this so it can be pinned upstream.")
             return True
@@ -287,8 +334,8 @@ class EngineDoctor:
             try:
                 disabled.rename(kernel)
             except OSError as e:
-                log(f"[DOCTOR] could not restore {kernel.name}: {e}")
-        log("[DOCTOR] not the per-arch kernels; restored them")
+                self._log(f"[DOCTOR] could not restore {kernel.name}: {e}")
+        self._log("[DOCTOR] not the per-arch kernels; restored them")
         return False
 
     def _heal_single_thread(self, engines, model) -> bool:
@@ -303,10 +350,10 @@ class EngineDoctor:
             pinned = _runtime_dir(self.config_dir) / "engine-threads.txt"
             pinned.parent.mkdir(parents=True, exist_ok=True)
             pinned.write_text("1", encoding="utf-8")
-            log(f"[DOCTOR] HEALED: {started.name} starts with one thread; "
+            self._log(f"[DOCTOR] HEALED: {started.name} starts with one thread; "
                 f"pinned -t 1 in {pinned.name}")
         except OSError as e:
-            log(f"[DOCTOR] one thread works but pinning it failed: {e}")
+            self._log(f"[DOCTOR] one thread works but pinning it failed: {e}")
         return True
 
     # ---------------------------------------------------------- diagnostics
@@ -328,7 +375,7 @@ class EngineDoctor:
             return
         wav = self._write_probe_wav()
         if wav is None:
-            log("[DOCTOR] could not write a probe wav for the CLI check")
+            self._log("[DOCTOR] could not write a probe wav for the CLI check")
             return
         started_at = time.monotonic()
         try:
@@ -340,14 +387,14 @@ class EngineDoctor:
             seconds = time.monotonic() - started_at
             tail = " | ".join((result.stdout or "").strip().splitlines()[-4:])
             if result.returncode == 0:
-                log(f"[DOCTOR] whisper-cli loaded the model and ran in "
+                self._log(f"[DOCTOR] whisper-cli loaded the model and ran in "
                     f"{seconds:.1f}s - the engine works outside the server")
             else:
-                log(f"[DOCTOR] whisper-cli also failed: exit="
+                self._log(f"[DOCTOR] whisper-cli also failed: exit="
                     f"0x{(result.returncode | 0) & 0xFFFFFFFF:08X} "
                     f"after {seconds:.1f}s; output: {tail or '(none)'}")
         except Exception as e:
-            log(f"[DOCTOR] whisper-cli probe failed to run: {e}")
+            self._log(f"[DOCTOR] whisper-cli probe failed to run: {e}")
         finally:
             try:
                 os.unlink(wav)
@@ -380,9 +427,9 @@ class EngineDoctor:
         try:
             from .backend import machine_facts
 
-            log(f"[DOCTOR] machine: {machine_facts()}")
+            self._log(f"[DOCTOR] machine: {machine_facts()}")
         except Exception as e:
-            log(f"[DOCTOR] machine facts failed: {e}")
+            self._log(f"[DOCTOR] machine facts failed: {e}")
 
     def _facts_crash_report(self) -> None:
         """Was a crash report written at all, and does it name a module?
@@ -398,19 +445,19 @@ class EngineDoctor:
             module = faulting_module("whisper-server.exe")
             if module:
                 self._findings["faulting_module"] = module
-                log(f"[DOCTOR] crash report names the faulting module: {module}")
+                self._log(f"[DOCTOR] crash report names the faulting module: {module}")
             else:
                 unreadable = event_log_reader()
                 if unreadable:
-                    log(f"[DOCTOR] Application log unreadable ({unreadable}); "
+                    self._log(f"[DOCTOR] Application log unreadable ({unreadable}); "
                         f"no crash-report conclusion can be drawn")
                 else:
                     self._findings["no_crash_report"] = True
-                    log("[DOCTOR] no Application Error event was written: the "
+                    self._log("[DOCTOR] no Application Error event was written: the "
                         "process was killed from outside (EDR/AV) or Windows "
                         "Error Reporting is disabled")
         except Exception as e:
-            log(f"[DOCTOR] crash-report facts failed: {e}")
+            self._log(f"[DOCTOR] crash-report facts failed: {e}")
         self._registry_dword(
             "Windows Error Reporting disabled",
             r"SOFTWARE\Microsoft\Windows\Windows Error Reporting", "Disabled",
@@ -426,15 +473,15 @@ class EngineDoctor:
             )
             info = (result.stdout or "").strip()
             if info:
-                log(f"[DOCTOR] nvidia-smi: {info}")
+                self._log(f"[DOCTOR] nvidia-smi: {info}")
             else:
-                log(f"[DOCTOR] nvidia-smi printed nothing (exit={result.returncode})")
+                self._log(f"[DOCTOR] nvidia-smi printed nothing (exit={result.returncode})")
         except Exception as e:
-            log(f"[DOCTOR] nvidia-smi unavailable: {e}")
+            self._log(f"[DOCTOR] nvidia-smi unavailable: {e}")
         system32 = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32"
         for name in ("msvcp140.dll", "vcruntime140_1.dll"):
             present = (system32 / name).exists()
-            log(f"[DOCTOR] {name}: {'present' if present else 'MISSING'}"
+            self._log(f"[DOCTOR] {name}: {'present' if present else 'MISSING'}"
                 + ("" if present else " - install the MSVC 2015-2022 x64 "
                                       "redistributable"))
 
@@ -456,24 +503,24 @@ class EngineDoctor:
             names = (result.stdout or "").strip()
             if names:
                 self._findings["security_products"] = names
-                log(f"[DOCTOR] security products on this machine: {names}")
+                self._log(f"[DOCTOR] security products on this machine: {names}")
             else:
-                log("[DOCTOR] no security product registered in SecurityCenter2")
+                self._log("[DOCTOR] no security product registered in SecurityCenter2")
         except Exception as e:
-            log(f"[DOCTOR] security-product query failed: {e}")
+            self._log(f"[DOCTOR] security-product query failed: {e}")
 
-    @staticmethod
-    def _registry_dword(label: str, key: str, value: str, note: str = "") -> None:
+    def _registry_dword(self, label: str, key: str, value: str,
+                        note: str = "") -> None:
         try:
             import winreg
 
             with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key) as handle:
                 data, _ = winreg.QueryValueEx(handle, value)
-            log(f"[DOCTOR] {label}: {data}" + (f" ({note})" if note else ""))
+            self._log(f"[DOCTOR] {label}: {data}" + (f" ({note})" if note else ""))
         except FileNotFoundError:
-            log(f"[DOCTOR] {label}: not set" + (f" ({note})" if note else ""))
+            self._log(f"[DOCTOR] {label}: not set" + (f" ({note})" if note else ""))
         except Exception as e:
-            log(f"[DOCTOR] {label} unreadable: {e}")
+            self._log(f"[DOCTOR] {label} unreadable: {e}")
 
     # ------------------------------------------------------------- verdict
     def _verdict(self, engines, model) -> None:
@@ -490,5 +537,5 @@ class EngineDoctor:
         products = self._findings.get("security_products")
         if products:
             parts.append(f"on a machine running {products}")
-        log("[DOCTOR] verdict: " + "; ".join(parts) + ". Send this log with "
+        self._log("[DOCTOR] verdict: " + "; ".join(parts) + ". Send this log with "
             "the tray's Copy log before changing anything else.")

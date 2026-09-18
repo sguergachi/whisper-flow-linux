@@ -173,6 +173,23 @@ def test_the_real_probe_spawns_and_reports_a_dead_engine(doctor):
     assert "fake" in recent_log(50)
 
 
+def test_findings_survive_the_log_ring(doctor, monkeypatch):
+    """The crash loop scrolled the first doctor run out of the tray report.
+
+    Everything the doctor says is also appended to engine-doctor.log, which
+    the report attaches separately.
+    """
+    from whisper_flow.engine_doctor import recent_findings
+
+    monkeypatch.setattr(doctor, "_probe", _probe_decider(lambda l, e: False))
+    doctor.run("cpu died")
+
+    findings = recent_findings(80, doctor.config_dir)
+    assert "starting engine diagnosis" in findings
+    assert "verdict" in findings
+    assert (doctor.config_dir / "engine-doctor.log").exists()
+
+
 def test_probe_wav_is_a_real_second_of_16k_mono():
     path = EngineDoctor._write_probe_wav()
     try:

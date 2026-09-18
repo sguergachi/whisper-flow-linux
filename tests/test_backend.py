@@ -986,6 +986,42 @@ def test_cpu_crashes_reach_the_plain_engine_through_the_gpu_fallback(
     assert local_backend._plain_fallback_done is True
 
 
+def test_a_crash_fallback_never_rewrites_the_saved_model_choice(
+        local_backend, config, monkeypatch):
+    """0.4.354: selecting medium "did not work" because one crash saved base.
+
+    The fallback to base is a decision for this session. Persisting it over
+    WHISPER_FLOW_MODEL_NAME - the key the Settings radio is read from - moved
+    the radio to base, so the user's own choice looked like it had been
+    refused. It must survive; the next process tries it again.
+    """
+    env = Path(config.config_dir) / ".env"
+    env.write_text("WHISPER_FLOW_MODEL_NAME=ggml-medium.en-q8_0\n",
+                   encoding="utf-8")
+    config.model_name = "ggml-medium.en-q8_0"
+    for name in ("ggml-medium.en-q8_0", "ggml-base.en-q8_0"):
+        model = Path(config.config_dir) / "models" / f"{name}.bin"
+        model.parent.mkdir(parents=True, exist_ok=True)
+        model.write_text("")
+    # The fallback path only opens when the machine looks GPU-capable, which
+    # is the machine that reported this.
+    monkeypatch.setattr(backend_module, "detect_accelerator", lambda: "cuda12")
+    monkeypatch.setattr(LocalBackend, "start", lambda self, *a, **k: None)
+    monkeypatch.setattr(LocalBackend, "ensure_cpu_engine",
+                        lambda self, allow_download=True: True)
+
+    assert local_backend._start_with_fallback_locked(
+        None, allow_download=False) is None
+
+    assert "ggml-medium.en-q8_0" in env.read_text(encoding="utf-8")
+    # This session falls back to base...
+    assert local_backend._last_started_model == "ggml-base.en-q8_0"
+    assert local_backend.working_model() == "ggml-base.en-q8_0"
+    # ...and a fresh process asks for the user's model again.
+    fresh = LocalBackend(FakeConfig(config.config_dir))
+    assert fresh.working_model() == "ggml-medium.en-q8_0"
+
+
 def test_crash_counter_resets_for_a_different_engine_file(
         local_backend, config, monkeypatch):
     """A fresh download gets a clean slate; only the same bytes accumulate."""

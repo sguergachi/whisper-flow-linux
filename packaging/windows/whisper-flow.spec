@@ -272,6 +272,11 @@ hidden = collect_submodules("pydantic") + [
     # import first runs, in front of the user.
     "pystray",
     "velopack",
+    # The crash doctor is imported from the backend's crash path, which is
+    # the worst possible place to discover it was never bundled: the machine
+    # where every engine crashes would get no diagnosis exactly where it is
+    # needed. Named here, and imported by --selftest so the build proves it.
+    "whisper_flow.engine_doctor",
     # Read lazily inside faulting_module(); without these the frozen build
     # cannot read the Application log and every native crash misreports as
     # "killed externally" that was never established.

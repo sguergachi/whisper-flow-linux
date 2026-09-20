@@ -1342,3 +1342,83 @@ def test_ensure_path_leaves_keyboard_free_when_proxy_unavailable(listener,
 
     assert listener._ensure_forwarding_path() is False
     assert listener._kbd_devices == []
+
+
+def _stalled(listener, age, dev):
+    """A listener with a turning thread but a pump older than ``age``."""
+    import time
+
+    listener._running = True
+    listener._started_at = time.monotonic() - 30.0
+    listener._thread = _alive_thread()
+    listener._last_pump_at = time.monotonic() - age
+    listener._kbd_devices = [dev]
+    notified = []
+    listener.on_emergency = notified.append
+    return notified
+
+
+def test_a_soft_stall_with_nothing_held_keeps_the_keyboard(listener):
+    """A slow-but-idle loop is not a wedge: do not churn the grab.
+
+    Freeing the keyboard closes the grabbed fds, discarding whatever the
+    user types while the next proxy is built and the keyboard re-grabbed.
+    That cycle is the reported 'keys randomly stop working', so with no key
+    held and the kernel answering, the keyboard is left alone.
+    """
+    from whisper_flow.hotkey_evdev import PUMP_HARD_STALL_SECONDS
+
+    dev = _Kbd("/dev/input/event9", held=[])
+    notified = _stalled(listener, min(5.0, PUMP_HARD_STALL_SECONDS - 1.0), dev)
+
+    listener._supervise_once()
+
+    assert notified == []
+    assert dev.grabbed is True
+    assert listener._kbd_devices == [dev]
+
+
+def test_a_soft_stall_with_a_held_key_still_frees(listener):
+    """A held key during a stall is input at risk: the keyboard is freed."""
+    dev = _Kbd("/dev/input/event9", held=[ecodes.KEY_A])
+    notified = _stalled(listener, 5.0, dev)
+
+    listener._supervise_once()
+
+    assert dev.grabbed is False
+    assert len(notified) == 1 and "stalled" in notified[0]
+
+
+def test_a_hard_stall_frees_even_an_idle_keyboard(listener):
+    """Past the hard threshold the loop is wedged whatever is held."""
+    from whisper_flow.hotkey_evdev import PUMP_HARD_STALL_SECONDS
+
+    dev = _Kbd("/dev/input/event9", held=[])
+    notified = _stalled(listener, PUMP_HARD_STALL_SECONDS + 1.0, dev)
+
+    listener._supervise_once()
+
+    assert dev.grabbed is False
+    assert len(notified) == 1 and "stalled" in notified[0]
+
+
+def test_a_reader_pass_error_never_kills_the_loop(listener, monkeypatch):
+    """A transient scan/open failure must free the grabs, not the thread.
+
+    A dead reader with a live grab is the locked keyboard; the auto-heal
+    that revives it rebuilds the grab and proxy (the keystroke-dropping
+    churn). One failed pass has to leave the loop able to retry.
+    """
+    dev = _Kbd("/dev/input/event9", held=[])
+
+    def boom():
+        raise OSError("device vanished mid-scan")
+
+    listener._kbd_devices = [dev]
+    listener._running = True
+    monkeypatch.setattr(listener, "_pump_until_devices_change", boom)
+
+    assert listener._run_once() is False
+    assert dev.grabbed is False
+    assert listener._kbd_devices == []
+

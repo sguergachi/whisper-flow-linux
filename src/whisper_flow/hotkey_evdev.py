@@ -56,6 +56,14 @@ RESCAN_SECONDS = 3.0
 # exact shape of "the desktop stopped responding to the keyboard".
 PUMP_STALL_SECONDS = 1.5
 
+# A soft stall only matters when there is input at risk. Freeing the keyboard
+# means closing the grabbed fds, and closing them discards whatever the user
+# typed during the stall - so doing it for a merely slow loop while nothing is
+# held loses keystrokes and re-grabs in a cycle, which is exactly "keys
+# randomly stop working". Past this much silence the loop is genuinely wedged
+# and the keyboard is freed whether or not a key is down.
+PUMP_HARD_STALL_SECONDS = 8.0
+
 # Consecutive forwarded-event write failures that prove the uinput proxy is
 # dead rather than glitching. One failure is noise; dozens in a row with
 # events flowing means every keystroke is being swallowed.
@@ -190,6 +198,9 @@ class EvdevHotkeyListener:
         # logs and diagnostics. Loud emergencies keep their own counter and
         # their tray notification; a heal that worked needs no toast.
         self._heal_times: list = []
+        # A soft stall with nothing held was already reported (once per
+        # stall): a slow reader on a loaded machine must not fill the log.
+        self._stall_deferred = False
 
     def register_hotkey(self, name, key_string, callback_press, callback_release=None,
                         release_modifiers=False):
@@ -329,16 +340,39 @@ class EvdevHotkeyListener:
         """
         try:
             while self._running:
-                if not self._ensure_forwarding_path():
+                if not self._run_once():
                     time.sleep(RESCAN_SECONDS)      # nothing to read yet
-                    continue
-                self._pump_until_devices_change()
-                # Always ungrab before rebuilding. Devices must never stay
-                # grabbed by a loop that is no longer reading them, or the
-                # user loses their keyboard entirely.
-                self._abandon_devices()
         finally:
             self._release_devices()
+
+    def _run_once(self) -> bool:
+        """One reader pass. False means "back off and try again".
+
+        A pass can fail transiently - evdev.list_devices during a device
+        re-enumeration, an InputDevice that vanished between the scan and the
+        open. That must never kill the reader while it holds the grabs: a
+        dead reader with a live grab is the locked keyboard this class exists
+        to prevent, and the auto-heal that revives it tears down and rebuilds
+        the grab and proxy, which is the churn that drops the user's
+        keystrokes. Free the keyboard and let the loop try again instead.
+        Never raises.
+        """
+        try:
+            if not self._ensure_forwarding_path():
+                return False
+            self._pump_until_devices_change()
+            # Always ungrab before rebuilding. Devices must never stay
+            # grabbed by a loop that is no longer reading them, or the
+            # user loses their keyboard entirely.
+            self._abandon_devices()
+            return True
+        except Exception:
+            log.exception("keyboard reader pass failed; freeing the keyboard")
+            try:
+                self._abandon_devices()
+            except Exception:
+                log.exception("failed to release devices after a reader error")
+            return False
 
     def _ensure_forwarding_path(self) -> bool:
         """Proxy alive plus keyboards grabbed. False when there is nothing
@@ -557,7 +591,24 @@ class EvdevHotkeyListener:
             except Exception:
                 log.exception("input sweep failed")
             self._detect_event_starvation(now)
+            self._stall_deferred = False
             return
+        # A soft stall with nothing held is not an emergency. The reader is
+        # slow - a loaded machine, the GIL, a long ioctl - but no input is
+        # being lost by waiting, and freeing the keyboard would close the
+        # grabbed fds (discarding anything typed in the meantime) only to
+        # re-grab moments later. That cycle is the churn that reads as "keys
+        # randomly stop working"; it is why this branch is silent. Only past
+        # the hard threshold, or with a key actually held, is the loop
+        # provably wedged and the keyboard freed.
+        if age < PUMP_HARD_STALL_SECONDS:
+            held = self._kernel_held_keys()
+            if held is not None and not held:
+                if not self._stall_deferred:
+                    self._stall_deferred = True
+                    app_log(f"[HOTKEY] reader slow ({age:.1f}s) with no key "
+                            "held - keeping the keyboard, will retry")
+                return
         self._emergency_recover(f"reader stalled ({age:.1f}s without pumping)")
 
     def _detect_event_starvation(self, now: float) -> None:

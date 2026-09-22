@@ -1729,6 +1729,116 @@ def test_cli_fallback_returns_file_text(local_backend, config, monkeypatch,
     assert local_backend.transcribe_file_cli(str(wav)) == "hello cli"
 
 
+def test_cli_probe_timeout_tries_transcription_anyway(
+        local_backend, config, monkeypatch, tmp_path):
+    """A --help that times out (EDR scan, cold DLL map) is not a verdict.
+
+    The 0.4.358 report: the CUDA whisper-cli probe timed out after 15s and
+    the timeout was cached as "unsupported", so CLI transcription silently
+    did nothing for the rest of the process.
+    """
+    import subprocess
+
+    cli = _cli_backend(local_backend, config, tmp_path)
+    wav = tmp_path / "clip.wav"
+    wav.write_bytes(b"\x00" * 32000)
+    probes = []
+
+    def fake_run(cmd, **k):
+        if "--help" in cmd:
+            probes.append(cmd)
+            # Beside the binary, so its DLL set resolves without a search.
+            assert k.get("cwd") == str(Path(cmd[0]).parent)
+            raise subprocess.TimeoutExpired(cmd, 30)
+        for i, part in enumerate(cmd):
+            if part == "--output-file":
+                Path(cmd[i + 1] + ".txt").write_text("hello cli\n")
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert local_backend.transcribe_file_cli(str(wav)) == "hello cli"
+    assert str(cli) not in getattr(local_backend, "_cli_flag_cache", {})
+
+
+def test_cli_probe_crash_tries_transcription_anyway(
+        local_backend, config, monkeypatch, tmp_path):
+    """A nonzero --help exit proves nothing about the flags either."""
+    import subprocess
+
+    _cli_backend(local_backend, config, tmp_path)
+    wav = tmp_path / "clip.wav"
+    wav.write_bytes(b"\x00" * 32000)
+
+    def fake_run(cmd, **k):
+        if "--help" in cmd:
+            return types.SimpleNamespace(returncode=1, stdout="", stderr="bad")
+        for i, part in enumerate(cmd):
+            if part == "--output-file":
+                Path(cmd[i + 1] + ".txt").write_text("hello cli\n")
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert local_backend.transcribe_file_cli(str(wav)) == "hello cli"
+
+
+def test_cli_stdout_fallback_when_no_text_file(
+        local_backend, config, monkeypatch, tmp_path):
+    """Flags present but no .txt written: read stdout minus timestamps."""
+    import subprocess
+
+    _cli_backend(local_backend, config, tmp_path)
+    wav = tmp_path / "clip.wav"
+    wav.write_bytes(b"\x00" * 32000)
+
+    def fake_run(cmd, **k):
+        if "--help" in cmd:
+            return types.SimpleNamespace(
+                returncode=0,
+                stdout="--output-txt --output-file -m -f", stderr="")
+        return types.SimpleNamespace(
+            returncode=0,
+            stdout="[00:00:00.000 --> 00:00:02.000]  hello cli\n",
+            stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert local_backend.transcribe_file_cli(str(wav)) == "hello cli"
+
+
+def test_cli_mode_stale_marker_reprobes_server(local_backend, config):
+    """CLI mode diagnosed for one model must not block another.
+
+    The 0.4.358 report: the doctor settled on CLI mode while base was
+    selected, and large-v3-turbo was then never even attempted - start()
+    short-circuited on the stale marker.
+    """
+    _install_engine(local_backend, config)
+    local_backend.set_cli_mode(True)
+    assert local_backend.cli_mode() is True
+    big = Path(config.config_dir) / "models" / "ggml-large-v3-turbo.bin"
+    big.write_text("model")
+    local_backend.config.model_name = "ggml-large-v3-turbo"
+    assert local_backend._reconsider_cli_mode("ggml-large-v3-turbo") is False
+    assert local_backend.cli_mode() is False
+
+
+def test_cli_mode_fresh_marker_short_circuits(local_backend, config):
+    """Same model and engine as diagnosed: no server is spawned."""
+    _install_engine(local_backend, config)
+    local_backend.set_cli_mode(True)
+    assert local_backend._reconsider_cli_mode(None) is True
+    assert local_backend.cli_mode() is True
+
+
+def test_legacy_cli_marker_reprobes_once(local_backend, config):
+    """Markers from before model/engine tracking carry no context."""
+    _install_engine(local_backend, config)
+    marker = Path(config.config_dir) / "runtime" / "cli-mode"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("1", encoding="utf-8")
+    assert local_backend._reconsider_cli_mode(None) is False
+    assert local_backend.cli_mode() is False
+
+
 # ------------------------------------------------- forensics honesty
 def test_event_log_reader_names_a_missing_reader(monkeypatch):
     import sys

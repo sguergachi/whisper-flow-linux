@@ -1823,6 +1823,43 @@ def test_cli_mode_refuses_to_revive_a_server(temp_config_dir):
     assert daemon._ensure_backend_running(allow_download=False) is False
 
 
+def test_cli_mode_live_tick_stays_quiet(temp_config_dir):
+    """In CLI mode a live pass returns None instead of failing noisily.
+
+    There is no server for live passes and a model load per tick would
+    bury the dictation; the closing pass decodes via whisper-cli.
+    """
+    daemon, app = _healing_setup(temp_config_dir, "hello cli")
+    daemon.backend.cli_mode = Mock(return_value=True)
+    healing = daemon._healing_transcribe(app)
+    assert healing("/tmp/clip.wav", max_retries=1, timeout=1.0) is None
+    daemon.backend.transcribe_file_cli.assert_not_called()
+
+
+def test_cli_mode_records_without_the_live_loop(temp_config_dir):
+    """CLI mode has no server for live passes: plain push-to-talk instead."""
+    from unittest.mock import Mock
+
+    daemon, _ = _idle_daemon(temp_config_dir)
+    daemon.config.live_transcription = True
+    daemon.backend.cli_mode = Mock(return_value=True)
+    app = Mock()
+    app.run_voice_flow_push_to_talk_daemon = Mock(return_value=True)
+    app.run_voice_flow_push_to_talk_live = Mock(return_value=True)
+    daemon._get_app_for_mode = Mock(return_value=app)
+    daemon._show_hud_now = Mock()
+    daemon._stop_recording = Mock()
+    daemon._release_stuck_modifiers = Mock()
+    daemon._finish_processing = Mock()
+    daemon.stop_recording_event = Mock()
+    daemon._level_file = None
+
+    daemon._record_audio_thread("transcribe")
+
+    app.run_voice_flow_push_to_talk_daemon.assert_called_once()
+    app.run_voice_flow_push_to_talk_live.assert_not_called()
+
+
 def test_cli_fallback_saves_a_final_pass(temp_config_dir):
     daemon, app = _healing_setup(temp_config_dir, "hello cli")
     healing = daemon._healing_transcribe(app)

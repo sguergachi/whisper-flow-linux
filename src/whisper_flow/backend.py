@@ -1322,6 +1322,27 @@ def _adopt_into_job(job, process) -> bool:
         return False
 
 
+def _cli_stdout_text(stdout: str | None) -> str:
+    """Transcript out of whisper-cli's stdout: timestamps stripped.
+
+    whisper-cli prints one segment per line, each prefixed with its window
+    ("[00:00:00.000 --> 00:00:02.000]  hello"), plus the occasional log
+    line. Only the fallback path uses this (the --output-txt file wins),
+    so being conservative is fine: drop timestamp brackets and blank
+    lines, keep the rest in order.
+    """
+    import re as _re
+
+    if not stdout:
+        return ""
+    words: list[str] = []
+    for line in stdout.splitlines():
+        line = _re.sub(r"\[[^\]]*\]", " ", line).strip()
+        if line:
+            words.append(line)
+    return " ".join(words).strip()
+
+
 class LocalBackend:
     """Downloads, starts and supervises a local whisper.cpp server."""
 
@@ -2303,7 +2324,7 @@ class LocalBackend:
             return self._start_with_fallback_locked(model, allow_download)
 
     def _start_with_fallback_locked(self, model, allow_download):
-        if self.cli_mode():
+        if self._reconsider_cli_mode(model):
             # No server here by decree of the doctor: spawning one only
             # produces another 0xC0000005 and, worse, quarantines engines
             # that are fine on every machine without this one's EDR.
@@ -2443,7 +2464,7 @@ class LocalBackend:
         With allow_download=False the pre-flight never fetches: a corrupt
         model or an unhealthy engine is reported, not re-downloaded.
         """
-        if self.cli_mode():
+        if self._reconsider_cli_mode(model):
             return None
         with self._lock:
             if self._process and self._process.poll() is None:
@@ -2853,7 +2874,18 @@ class LocalBackend:
         try:
             self._cli_mode_marker.parent.mkdir(parents=True, exist_ok=True)
             if enabled:
-                self._cli_mode_marker.write_text("1", encoding="utf-8")
+                # The diagnosis belongs to this model on this engine: a
+                # server killed while loading one model may start fine
+                # under another (or after an engine reinstall), so the
+                # marker records what was actually diagnosed. Asking for
+                # something else later re-probes the server instead of
+                # trusting a stale verdict forever.
+                try:
+                    context = (f"{self.working_model()}|"
+                               f"{self.installed_engine()}")
+                except Exception:
+                    context = "unknown"
+                self._cli_mode_marker.write_text(context, encoding="utf-8")
                 log("[BACKEND] CLI transcription mode enabled: the server "
                     "cannot run here, whisper-cli can")
             else:
@@ -2861,6 +2893,44 @@ class LocalBackend:
                 log("[BACKEND] CLI transcription mode disabled")
         except Exception as e:
             log(f"[BACKEND] could not set CLI mode: {e}")
+
+    def _reconsider_cli_mode(self, model: str | None) -> bool:
+        """True when CLI mode still holds for this start attempt.
+
+        Clears the marker and returns False when it was diagnosed for a
+        different model or engine (or carries no context at all): the
+        verdict may not apply to what is being started now, and a single
+        server attempt is how a stale diagnosis gets corrected - either
+        the server starts, or the doctor re-diagnoses and re-sets the
+        marker with fresh context. Never raises.
+        """
+        try:
+            if not self.cli_mode():
+                return False
+            try:
+                current = (f"{model or self.working_model()}|"
+                           f"{self.installed_engine()}")
+            except Exception:
+                return True             # cannot tell: keep the diagnosis
+            try:
+                recorded = self._cli_mode_marker.read_text(
+                    encoding="utf-8").strip()
+            except OSError:
+                return False
+            if recorded and recorded not in ("1", "unknown") \
+                    and recorded == current:
+                return True
+            if recorded in ("1", "unknown", ""):
+                log("[BACKEND] CLI-mode marker predates model/engine "
+                    "tracking — re-probing the server once")
+            else:
+                log(f"[BACKEND] CLI mode was diagnosed for {recorded}; "
+                    f"asked for {current} now — re-probing the server once")
+            self.set_cli_mode(False)
+            return False
+        except Exception as e:
+            log(f"[BACKEND] CLI-mode reconsider failed: {e}")
+            return True
 
     def cli_paths(self) -> list[Path]:
         """whisper-cli candidates, best first: CUDA, plain, then flat.
@@ -2893,6 +2963,15 @@ class LocalBackend:
         Flag names vary across whisper.cpp vintages, and a binary without
         them silently produces nothing, which reads exactly like a failed
         transcription.
+
+        Only a clean --help that lacks the flags counts as "unsupported".
+        A probe that times out or crashes says nothing about the flags: on
+        an EDR-scanned machine the first spawn of the CUDA binary can take
+        far longer than the old 15s budget (cold 1GB DLL map under scan),
+        and caching that as unsupported silently disabled CLI transcription
+        for the rest of the process. So timeouts/errors are never cached
+        and read as "try it anyway" - a real attempt that produces no
+        output file still returns None, exactly as before.
         """
         cache = getattr(self, "_cli_flag_cache", None)
         if cache is None:
@@ -2904,13 +2983,19 @@ class LocalBackend:
         try:
             probe = subprocess.run(
                 [str(cli), "--help"], capture_output=True, text=True,
-                timeout=15, creationflags=no_console_flags(),
+                timeout=30, creationflags=no_console_flags(),
+                cwd=str(Path(cli).parent),
             )
-            supported = ("output-txt" in (probe.stdout or "")
-                         and "output-file" in (probe.stdout or ""))
         except Exception as e:
-            log(f"[BACKEND] CLI flag probe failed for {cli}: {e}")
-            supported = False
+            log(f"[BACKEND] CLI flag probe failed for {cli}: {e} — "
+                f"trying transcription anyway")
+            return True
+        if probe.returncode != 0:
+            log(f"[BACKEND] CLI flag probe exited {probe.returncode} for "
+                f"{cli} — trying transcription anyway")
+            return True
+        supported = ("output-txt" in (probe.stdout or "")
+                     and "output-file" in (probe.stdout or ""))
         if not supported:
             log(f"[BACKEND] {cli.name} has no --output-txt/--output-file; "
                 f"not usable for CLI transcription")
@@ -2978,6 +3063,11 @@ class LocalBackend:
                                 if text_file.exists() else "")
                     except OSError:
                         text = ""
+                    if not text:
+                        # The flags existed but no file appeared (a vintage
+                        # that writes elsewhere, or a flag renamed again):
+                        # fall back to stdout, minus whisper's timestamps.
+                        text = _cli_stdout_text(proc.stdout if proc else "")
                     if text:
                         return text
                     if proc.returncode != 0:

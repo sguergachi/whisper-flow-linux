@@ -1025,6 +1025,15 @@ class WhisperFlowDaemon:
                 if live:
                     # Live passes are disposable. Waiting for model startup
                     # here stalls the streaming worker and its closing pass.
+                    try:
+                        cli = self.backend.cli_mode() is True
+                    except Exception:
+                        cli = False
+                    if cli:
+                        # No server by diagnosis, and a model load per live
+                        # tick would bury the dictation: stay quiet and let
+                        # the closing pass decode via whisper-cli.
+                        return None
                     self._warm_backend_for_recording()
                     raise
                 log(f"[DAEMON] transcribe failed with '{e}' — auto-healing backend and retrying once")
@@ -1099,7 +1108,17 @@ class WhisperFlowDaemon:
             elif mode == "transcribe":
                 # Push-to-talk: hold to talk, release to stop.
                 hotkey = self.config.hotkey_transcribe
-                if self.config.live_transcription:
+                try:
+                    cli_mode = self.backend.cli_mode() is True
+                except Exception:
+                    cli_mode = False
+                # In CLI mode there is no server for live passes (and a
+                # model load per second of speech would bury the dictation):
+                # record plainly and let the closing pass decode via
+                # whisper-cli. The doctor's heal says exactly this - no
+                # live preview - so the loop must not be started at all
+                # rather than failing one pass per interval.
+                if self.config.live_transcription and not cli_mode:
                     log(f"[DAEMON] Running LIVE push-to-talk with stop key: {hotkey}")
                     success = app.run_voice_flow_push_to_talk_live(
                         stop_key=hotkey,
@@ -1834,6 +1853,19 @@ class WhisperFlowDaemon:
                 threading.Thread(target=self._fetch_model_in_background,
                                  args=(model,), daemon=True,
                                  name="whisper-flow-model-fetch").start()
+                return
+            try:
+                cli = self.backend.cli_mode() is True
+            except Exception:
+                cli = False
+            if cli:
+                # No start was attempted: the doctor diagnosed that no
+                # server survives here, so whisper-cli decodes each
+                # utterance instead. Say that - not "failed to start",
+                # which sends people hunting a server log for a server
+                # that was never launched.
+                log(f"[BACKEND] CLI transcription mode for {model}: no "
+                    f"server start attempted, whisper-cli decodes instead")
                 return
             # Startup is the only place a silent failure becomes "No whisper
             # server configured" on the first real dictation, which reads as

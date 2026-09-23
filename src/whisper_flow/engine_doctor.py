@@ -164,6 +164,7 @@ class EngineDoctor:
         self._facts_crash_report()
         self._facts_gpu()
         self._facts_security()
+        self._facts_defender_log()
 
         model = Path(self.backend.model_path())
         engines = self._engine_binaries()
@@ -176,6 +177,13 @@ class EngineDoctor:
                 "not the engine")
             return
 
+        # Trigger isolation first: --help loads no model and binds no
+        # socket. If even that dies, the image itself is flagged (path /
+        # reputation / userland-execution rule) and no engine from the same
+        # directory will ever run. If --help lives but serving dies, the
+        # trigger is the listener or the model load - which is what decides
+        # between "run it from somewhere safer" and "stop binding a port".
+        self._probe_help_all(engines)
         started = self._probe_engines(engines, model, label="baseline")
         if started:
             self._log(f"[DOCTOR] {started.name} starts on its own - the crash "
@@ -213,14 +221,35 @@ class EngineDoctor:
         self._verdict(engines, model)
 
     def _engine_binaries(self) -> list[Path]:
-        """Every engine this install could run, CUDA first, deduplicated."""
-        from .backend import _cuda_dir, _plain_dir, _runtime_dir
+        """Every engine this install could run, CUDA first, deduplicated.
+
+        The bundled install-dir copy is last: same bytes as a fresh
+        download, but admin-written rather than app-downloaded into a
+        user-writable path - which is exactly the distinction reputation
+        and userland-execution rules care about. When the AppData copies
+        are killed at startup and this one binds, the fix is to run from
+        here, not to download again. Skipped for GPU-only models, which
+        the CPU-only bundle cannot serve (probing it would just time out
+        mid-load and muddy the result).
+        """
+        from .backend import (_cuda_dir, _plain_dir, _runtime_dir,
+                              GPU_MODELS, bundled_dir)
 
         candidates = [
             _cuda_dir(self.config_dir) / self.backend._exe_name,
             _plain_dir(self.config_dir) / self.backend._exe_name,
             _runtime_dir(self.config_dir) / self.backend._exe_name,
         ]
+        try:
+            model_name = Path(self.backend.model_path()).stem
+        except Exception:
+            model_name = ""
+        bundled = bundled_dir()
+        if bundled is not None and model_name not in GPU_MODELS:
+            candidates.append(bundled / "engine" / self.backend._exe_name)
+        elif bundled is not None:
+            self._log(f"[DOCTOR] install-dir engine skipped for {model_name}: "
+                      f"the bundle is CPU-only and cannot serve it")
         seen: set[str] = set()
         present: list[Path] = []
         for path in candidates:
@@ -314,6 +343,47 @@ class EngineDoctor:
         except OSError:
             pass
         return {"ready": ready, "exit": code, "seconds": seconds}
+
+    def _probe_help_all(self, engines) -> None:
+        """Run each engine's --help: no model, no socket, just the image.
+
+        Cheap (seconds) and decisive next to the serve probes: it separates
+        "this binary may not execute here" from "this binary may not serve
+        here". Results feed the verdict; nothing is healed or hidden.
+        """
+        for exe in engines:
+            self._probe_help(exe)
+
+    def _probe_help(self, exe: Path) -> dict:
+        """What --help does: exit code and how long the image survived."""
+        label = f"help {exe.parent.name}"
+        started_at = time.monotonic()
+        try:
+            result = subprocess.run(
+                [str(exe), "--help"],
+                capture_output=True, text=True, timeout=20,
+                cwd=str(Path(exe).parent),
+                creationflags=self._no_console(),
+            )
+        except subprocess.TimeoutExpired:
+            self._log(f"[DOCTOR] {label}: still alive after 20s on --help "
+                      f"(hung or suspended, not crashed)")
+            return {"help": "hung"}
+        except Exception as e:
+            self._log(f"[DOCTOR] {label}: could not run ({e})")
+            return {"help": "unrunnable"}
+        seconds = time.monotonic() - started_at
+        code = result.returncode
+        if (code & 0xFFFFFFFF) == 0xC0000005:
+            self._log(f"[DOCTOR] {label}: died even for --help "
+                      f"(exit=0xC0000005 after {seconds:.1f}s) - the image "
+                      f"itself is flagged here, not the listener or the model")
+            self._findings["help_dies"] = exe.parent.name
+        else:
+            self._log(f"[DOCTOR] {label}: exited {code} in {seconds:.1f}s - "
+                      f"the image runs, the trigger is serving/loading")
+            self._findings.setdefault("help_lives", []).append(exe.parent.name)
+        return {"help": code, "seconds": seconds}
 
     @staticmethod
     def _tail(path: str, lines: int = 8) -> str:
@@ -537,6 +607,69 @@ class EngineDoctor:
         except Exception as e:
             self._log(f"[DOCTOR] security-product query failed: {e}")
 
+    def _facts_defender_log(self) -> None:
+        """Did Defender itself record blocking whisper? Best effort.
+
+        Cortex kills leave no local trace, but Windows Defender's own
+        operational channel logs its ASR-rule blocks and detections
+        (ids 1006-1015, 1116/1117, 1121/1122). A whisper hit there names
+        the exact rule - e.g. blocking low-prevalence executables in
+        user-writable paths - which is both the diagnosis and the text
+        of the exclusion to ask IT for.
+        """
+        if sys.platform != "win32":
+            return
+        try:
+            import win32evtlog
+        except ImportError as e:
+            self._log(f"[DOCTOR] Defender log unreadable ({e})")
+            return
+        channel = "Microsoft-Windows-Windows Defender/Operational"
+        try:
+            hand = win32evtlog.OpenEventLog(None, channel)
+        except Exception as e:
+            self._log(f"[DOCTOR] Defender log unavailable ({e})")
+            return
+        try:
+            flags = (win32evtlog.EVENTLOG_BACKWARDS_READ
+                     | win32evtlog.EVENTLOG_SEQUENTIAL_READ)
+            seen = 0
+            for _ in range(6):
+                try:
+                    events = win32evtlog.ReadEventLog(hand, flags, 0)
+                except Exception:
+                    break
+                if not events:
+                    break
+                for ev in events:
+                    seen += 1
+                    if seen > 60:
+                        break
+                    try:
+                        data = getattr(ev, "StringInserts", None) or ()
+                        blob = "\n".join(str(part) for part in data)
+                        if "whisper" not in blob.lower():
+                            continue
+                        eid = getattr(ev, "EventID", 0) & 0xFFFF
+                        first = next((line.strip() for line in blob.splitlines()
+                                      if line.strip()), "(no detail)")
+                        self._findings["defender_hit"] = (
+                            f"event {eid}: {first[:200]}")
+                        self._log(f"[DOCTOR] Defender log names whisper: "
+                                  f"event {eid}: {first[:200]}")
+                    except Exception:
+                        continue
+                if seen > 60:
+                    break
+            if "defender_hit" not in self._findings:
+                self._log("[DOCTOR] Defender log: no whisper block in the "
+                          "newest events")
+        finally:
+            try:
+                win32evtlog.CloseEventLog(hand)
+            except Exception:
+                pass
+
     def _registry_dword(self, label: str, key: str, value: str,
                         note: str = "") -> None:
         try:
@@ -567,3 +700,20 @@ class EngineDoctor:
             parts.append(f"on a machine running {products}")
         self._log("[DOCTOR] verdict: " + "; ".join(parts) + ". Send this log with "
             "the tray's Copy log before changing anything else.")
+        if self._findings.get("help_dies"):
+            self._log("[DOCTOR] even --help dies, so the binary itself may not "
+                      "execute from the user profile here - ask IT to allow it "
+                      "by path (below), not by hash: hashes change per release")
+        defender_hit = self._findings.get("defender_hit")
+        if defender_hit:
+            self._log(f"[DOCTOR] Defender recorded this itself: {defender_hit} "
+                      f"- quote that event id to IT")
+        if self._findings.get("no_crash_report") and products:
+            self._log("[DOCTOR] exclusion request for IT: allow "
+                      f"{self.config_dir}\\runtime\\whisper-server.exe plus "
+                      f"{self.config_dir}\\runtime\\cuda\\ and "
+                      f"{self.config_dir}\\runtime\\plain\\ (behavioral "
+                      f"protection / userland execution), or seed "
+                      f"%PROGRAMDATA%\\whisper-flow\\ with the engine and "
+                      f"models - the app runs those read-only with no "
+                      f"downloads")

@@ -196,6 +196,123 @@ def test_verdict_reports_what_was_found(doctor, monkeypatch):
     assert "CrowdStrike Falcon" in log
 
 
+# ------------------------------------------------- trigger isolation
+def _help_run(monkeypatch, behavior):
+    """Stand in subprocess.run for the --help probe only."""
+    import subprocess as _sp
+
+    def fake(cmd, **kwargs):
+        assert cmd[-1] == "--help"
+        assert kwargs.get("cwd") == str(Path(cmd[0]).parent)
+        if behavior == "lives":
+            return _ns(0)
+        if behavior == "flagged":
+            return _ns(0xC0000005)
+        if behavior == "hung":
+            raise _sp.TimeoutExpired(cmd, 20)
+        raise OSError("exec format")
+
+    monkeypatch.setattr(doctor_module.subprocess, "run", fake)
+
+
+class _ns:
+    def __init__(self, returncode):
+        self.returncode = returncode
+        self.stdout = ""
+        self.stderr = ""
+
+
+def test_help_probe_lives_means_serve_is_the_trigger(doctor, monkeypatch):
+    """--help exits, serving dies: the listener/load is the trigger."""
+    _help_run(monkeypatch, "lives")
+    clear_log()
+
+    doctor._probe_help(doctor.backend._exe)
+
+    assert doctor._findings["help_lives"] == ["runtime"]
+    assert "the image runs" in recent_log(50)
+
+
+def test_help_probe_dies_means_the_image_is_flagged(doctor, monkeypatch):
+    """Even --help dies: no binary from that directory will ever run."""
+    _help_run(monkeypatch, "flagged")
+    clear_log()
+
+    doctor._probe_help(doctor.backend._exe)
+
+    assert doctor._findings["help_dies"] == "runtime"
+    assert "itself is flagged" in recent_log(50)
+
+
+def test_help_probe_hung_and_unrunnable(doctor, monkeypatch):
+    _help_run(monkeypatch, "hung")
+    clear_log()
+    assert doctor._probe_help(doctor.backend._exe) == {"help": "hung"}
+    assert "hung or suspended" in recent_log(50)
+    _help_run(monkeypatch, "missing")
+    assert doctor._probe_help(doctor.backend._exe) == {"help": "unrunnable"}
+
+
+def test_bundled_engine_is_probed_but_not_for_gpu_models(
+        doctor, monkeypatch, tmp_path):
+    """The install-dir copy is the safe-path experiment, except for large."""
+    from whisper_flow import backend as backend_module
+
+    bundle = tmp_path / "bundle"
+    engine = bundle / "engine" / "whisper-server.exe"
+    engine.parent.mkdir(parents=True, exist_ok=True)
+    engine.write_text("bundled")
+    monkeypatch.setattr(backend_module, "bundled_dir", lambda: bundle)
+    clear_log()
+
+    binaries = doctor._engine_binaries()
+    assert engine in binaries
+    # CUDA first, bundled last.
+    assert binaries[-1] == engine
+
+    doctor.backend.config.model_name = "ggml-large-v3-turbo"
+    clear_log()
+    assert engine not in doctor._engine_binaries()
+    assert "CPU-only and cannot serve it" in recent_log(50)
+
+
+def test_verdict_prints_an_it_exclusion_request(doctor):
+    """The verdict hands IT the exact paths to allowlist."""
+    doctor._findings["no_crash_report"] = True
+    doctor._findings["security_products"] = "Cortex XDR"
+    clear_log()
+
+    doctor._verdict([doctor.backend._exe], doctor.backend.model_path())
+
+    log = recent_log(50)
+    assert "exclusion request for IT" in log
+    assert "runtime\\whisper-server.exe" in log
+    assert "%PROGRAMDATA%\\whisper-flow\\" in log
+
+
+def test_defender_log_hit_is_quoted(doctor, monkeypatch):
+    """A Defender ASR block naming whisper is evidence, not a guess."""
+    import types
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    event = types.SimpleNamespace(EventID=1121,
+                                  StringInserts=("whisper-server.exe blocked",))
+    fake_log = types.SimpleNamespace(
+        OpenEventLog=lambda *a: "hand",
+        CloseEventLog=lambda *a: None,
+        ReadEventLog=lambda hand, flags, n: [event],
+        EVENTLOG_BACKWARDS_READ=1,
+        EVENTLOG_SEQUENTIAL_READ=2,
+    )
+    monkeypatch.setitem(sys.modules, "win32evtlog", fake_log)
+    clear_log()
+
+    doctor._facts_defender_log()
+
+    assert "1121" in doctor._findings["defender_hit"]
+    assert "Defender log names whisper" in recent_log(50)
+
+
 # --------------------------------------------------------------- diagnostics
 def test_the_real_probe_spawns_and_reports_a_dead_engine(doctor):
     """_probe itself, not a stand-in: spawn, wait, report, clean up.

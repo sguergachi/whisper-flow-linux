@@ -1839,6 +1839,109 @@ def test_legacy_cli_marker_reprobes_once(local_backend, config):
     assert local_backend.cli_mode() is False
 
 
+def test_cli_probe_reads_help_from_stderr(local_backend, config, monkeypatch,
+                                          tmp_path):
+    """whisper.cpp prints usage to stderr on several vintages.
+
+    The 0.4.360 report: a working plain CLI was skipped twice because
+    stdout was empty - stdout alone misreads those builds as flagless.
+    """
+    import subprocess
+
+    _cli_backend(local_backend, config, tmp_path)
+
+    def fake_run(cmd, **k):
+        assert "--help" in cmd
+        return types.SimpleNamespace(
+            returncode=0, stdout="",
+            stderr="--output-txt --output-file -m -f")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert local_backend._cli_supports_output_file(
+        local_backend.cli_path()) is True
+
+
+def test_cli_probe_rejection_names_the_dir(local_backend, config, monkeypatch,
+                                           tmp_path):
+    _cli_backend(local_backend, config, tmp_path)
+    import subprocess
+
+    from whisper_flow.logging import clear_log, recent_log
+
+    def fake_run(cmd, **k):
+        return types.SimpleNamespace(returncode=0, stdout="usage",
+                                      stderr="usage")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    clear_log()
+    assert local_backend._cli_supports_output_file(
+        local_backend.cli_path()) is False
+    assert "runtime/whisper-cli" in recent_log(50)
+
+
+def test_cli_dead_candidate_skipped_for_the_session(
+        local_backend, config, monkeypatch, tmp_path):
+    """A CLI that 0xC0000005s on model load is not retried per utterance.
+
+    The 0.4.360 report: CUDA died after 18s of loading, every attempt.
+    """
+    import subprocess
+
+    from pathlib import Path as _Path
+
+    cuda = _Path(config.config_dir) / "runtime" / "cuda" / "whisper-cli.exe"
+    plain = _Path(config.config_dir) / "runtime" / "plain" / "whisper-cli.exe"
+    for cli in (cuda, plain):
+        cli.parent.mkdir(parents=True, exist_ok=True)
+        cli.write_text("cli")
+    model = _Path(config.config_dir) / "models" / "ggml-base.en-q8_0.bin"
+    model.parent.mkdir(parents=True, exist_ok=True)
+    model.write_text("model")
+    local_backend.config.model_name = "ggml-base.en-q8_0"
+    wav = tmp_path / "clip.wav"
+    wav.write_bytes(b"\x00" * 32000)
+    attempts = []
+
+    def fake_run(cmd, **k):
+        if "--help" in cmd:
+            return types.SimpleNamespace(
+                returncode=0,
+                stdout="--output-txt --output-file -m -f", stderr="")
+        attempts.append(_Path(cmd[0]).parent.name)
+        if "cuda" in cmd[0]:
+            return types.SimpleNamespace(returncode=3221225477,
+                                          stdout="", stderr="")
+        for i, part in enumerate(cmd):
+            if part == "--output-file":
+                _Path(cmd[i + 1] + ".txt").write_text("from plain\n")
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(local_backend, "cli_paths", lambda: [cuda, plain])
+    assert local_backend.transcribe_file_cli(str(wav)) == "from plain"
+    assert local_backend.transcribe_file_cli(str(wav)) == "from plain"
+    assert attempts == ["cuda", "plain", "plain"]
+
+
+def test_working_cli_is_tried_first(local_backend, config, tmp_path):
+    """The doctor's (or a transcription's) proven decoder outranks CUDA."""
+    import sys as _sys
+
+    from pathlib import Path as _Path
+
+    name = "whisper-cli.exe" if _sys.platform == "win32" else "whisper-cli"
+    cuda = _Path(config.config_dir) / "runtime" / "cuda" / name
+    plain = _Path(config.config_dir) / "runtime" / "plain" / name
+    for cli in (cuda, plain):
+        cli.parent.mkdir(parents=True, exist_ok=True)
+        cli.write_text("cli")
+    assert [p.parent.name for p in local_backend.cli_paths()] == [
+        "cuda", "plain"]
+    local_backend._record_working_cli(plain)
+    assert [p.parent.name for p in local_backend.cli_paths()] == [
+        "plain", "cuda"]
+
+
 # ------------------------------------------------- forensics honesty
 def test_event_log_reader_names_a_missing_reader(monkeypatch):
     import sys

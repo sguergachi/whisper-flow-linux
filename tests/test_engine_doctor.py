@@ -313,6 +313,84 @@ def test_defender_log_hit_is_quoted(doctor, monkeypatch):
     assert "Defender log names whisper" in recent_log(50)
 
 
+# ------------------------------------------------- quarantine hygiene
+def test_stale_kernel_hides_are_restored(doctor):
+    """A run killed mid-heal must not disable kernels forever.
+
+    The 0.4.360 log: WinError 183 on every hide, probing a half-disabled
+    set, because an earlier run never restored its .off files.
+    """
+    runtime = doctor.backend._exe.parent
+    # skylakex is not among the fixture's kernels: a pure stale hide.
+    stale = runtime / "ggml-cpu-skylakex.dll.off"
+    stale.write_text("")
+    redundant = runtime / "ggml-cpu-alderlake.dll.off"
+    redundant.write_text("")
+    (runtime / "ggml-cpu-alderlake.dll").write_text("")
+    clear_log()
+
+    doctor._restore_stale_kernel_hides([doctor.backend._exe])
+
+    assert (runtime / "ggml-cpu-skylakex.dll").exists()
+    assert not stale.exists()
+    assert not redundant.exists()
+    assert "restored stale hide ggml-cpu-skylakex.dll" in recent_log(50)
+
+
+def test_vanishing_binary_is_named_not_just_failing(doctor):
+    """Present at the scan, gone at the probe: removal, not a crash."""
+    clear_log()
+    result = doctor._probe(Path("/tmp/whisper-flow-nope/whisper-server.exe"),
+                           Path("/tmp/none.bin"), "ghost", timeout=5.0)
+    assert result["ready"] is False
+    assert doctor._findings["vanished"] == "whisper-flow-nope"
+    assert "vanished since the scan" in recent_log(50)
+
+
+def test_stale_thread_pin_is_removed_when_it_stops_helping(
+        doctor, monkeypatch):
+    """A -t 1 pin from a flake heal must not hobble the engine forever."""
+    monkeypatch.setattr(doctor, "_probe",
+                        _probe_decider(lambda l, e: False))
+    pinned = doctor.config_dir / "runtime" / "engine-threads.txt"
+    pinned.parent.mkdir(parents=True, exist_ok=True)
+    pinned.write_text("1", encoding="utf-8")
+    clear_log()
+
+    assert doctor._heal_single_thread(
+        [doctor.backend._exe], doctor.backend.model_path()) is False
+    assert not pinned.exists()
+    assert "unpinned the stale -t 1" in recent_log(100)
+
+
+def test_cli_probe_records_the_working_cli(doctor, monkeypatch, tmp_path):
+    """The transcription path tries the proven decoder first."""
+    import types as _types
+
+    cuda = tmp_path / "cuda"
+    cuda.mkdir()
+    cli = cuda / "whisper-cli.exe"
+    cli.write_text("cli")
+    recorded = []
+    doctor.backend._record_working_cli = recorded.append
+    monkeypatch.setattr(doctor_module.subprocess, "run",
+                        lambda *a, **k: _types.SimpleNamespace(
+                            returncode=0, stdout="", stderr=""))
+    wav = tmp_path / "probe.wav"
+    with wave.open(str(wav), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(16000)
+        wf.writeframes(b"\x00" * 3200)
+    monkeypatch.setattr(doctor, "_write_probe_wav", lambda: str(wav))
+    clear_log()
+
+    # The fixture neuters _cli_probe; call the real one explicitly.
+    assert EngineDoctor._cli_probe(doctor, [cuda / "whisper-server.exe"],
+                                   wav) == cli
+    assert recorded == [cli]
+
+
 # --------------------------------------------------------------- diagnostics
 def test_the_real_probe_spawns_and_reports_a_dead_engine(doctor):
     """_probe itself, not a stand-in: spawn, wait, report, clean up.

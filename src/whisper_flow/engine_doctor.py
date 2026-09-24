@@ -291,6 +291,15 @@ class EngineDoctor:
         the server is actually usable, and a model-load-then-die crash never
         reaches it.
         """
+        if not Path(exe).exists():
+            # Present at the scan, gone at the probe seconds later: nothing
+            # in this app deletes engines mid-diagnosis, so this is an
+            # external removal in progress - quarantine, not a crash. The
+            # 0.4.360 log shows runtime/ vanishing exactly this way.
+            self._log(f"[DOCTOR] {label}: {Path(exe).name} vanished since the "
+                      f"scan - removed externally (quarantine?) mid-diagnosis")
+            self._findings["vanished"] = exe.parent.name
+            return {"ready": False, "vanished": True}
         port = _free_port()
         cmd = [str(exe), "-m", str(model), "-l", "en",
                "--host", "127.0.0.1", "--port", str(port), *extra_args]
@@ -399,6 +408,7 @@ class EngineDoctor:
     # -------------------------------------------------------------- heals
     def _heal_without_arch_kernels(self, engines, model) -> bool:
         """Hide the per-arch CPU kernels, keep the hiding only if it helps."""
+        self._restore_stale_kernel_hides(engines)
         hidden: list[tuple[Path, Path]] = []
         for exe in engines:
             for kernel in arch_kernels(exe.parent):
@@ -427,11 +437,64 @@ class EngineDoctor:
         self._log("[DOCTOR] not the per-arch kernels; restored them")
         return False
 
+    def _restore_stale_kernel_hides(self, engines) -> None:
+        """Restore .dll.off files a previous run left behind.
+
+        A doctor run killed mid-heal (or one whose restore failed) leaves
+        kernels disabled: later runs then fail to hide them (WinError 183),
+        probe a half-disabled set, and can never evaluate the kernels
+        honestly again. The 0.4.360 log shows exactly this accumulation.
+        """
+        for exe in engines:
+            try:
+                parent = Path(exe).parent
+            except Exception:
+                continue
+            try:
+                offs = sorted(parent.glob("ggml-cpu-*.dll.off"))
+            except OSError:
+                continue
+            for disabled in offs:
+                kernel = disabled.with_suffix("")
+                # with_suffix("") strips only ".off", leaving ".dll".
+                if not kernel.name.lower().endswith(".dll"):
+                    continue
+                try:
+                    if kernel.exists():
+                        # A fresh download restored the kernel while the old
+                        # hide lingered: the .off is redundant, drop it so
+                        # future hides do not trip over it (WinError 183).
+                        disabled.unlink()
+                        self._log(f"[DOCTOR] dropped redundant hide "
+                                  f"{disabled.name} ({kernel.name} is back)")
+                    else:
+                        disabled.rename(kernel)
+                        self._log(f"[DOCTOR] restored stale hide {kernel.name} "
+                                  f"from an earlier run")
+                except OSError as e:
+                    self._log(f"[DOCTOR] could not restore stale "
+                              f"{kernel.name}: {e}")
+
     def _heal_single_thread(self, engines, model) -> bool:
         """One thread: a dodge for thread-pool/affinity faults at init."""
         started = self._probe_engines(engines, model, label="single-thread",
                                       extra_args=("-t", "1"))
         if not started:
+            # A pin from an earlier heal that no longer reproduces was a
+            # flake (the 0.4.360 log: -t 1 bound once, then died every run
+            # after). Do not hobble the CPU engine at one thread forever
+            # for a heal that no longer heals.
+            try:
+                from .backend import _runtime_dir
+
+                pinned = _runtime_dir(self.config_dir) / "engine-threads.txt"
+                if pinned.exists():
+                    pinned.unlink()
+                    self._log("[DOCTOR] one thread no longer starts either - "
+                              "unpinned the stale -t 1 so the engine runs "
+                              "at full threads")
+            except OSError as e:
+                self._log(f"[DOCTOR] could not unpin stale thread count: {e}")
             return False
         try:
             from .backend import _runtime_dir
@@ -487,6 +550,10 @@ class EngineDoctor:
                         f"[DOCTOR] {cli.parent.name} whisper-cli loaded the "
                         f"model and ran in {seconds:.1f}s - the engine works "
                         f"outside the server")
+                    try:
+                        self.backend._record_working_cli(cli)
+                    except Exception:
+                        pass
                     return cli
                 tail = " | ".join((result.stdout or "").strip().splitlines()[-4:])
                 self._log(f"[DOCTOR] {cli.parent.name} whisper-cli also failed: "
@@ -704,6 +771,11 @@ class EngineDoctor:
             self._log("[DOCTOR] even --help dies, so the binary itself may not "
                       "execute from the user profile here - ask IT to allow it "
                       "by path (below), not by hash: hashes change per release")
+        if self._findings.get("vanished"):
+            self._log(f"[DOCTOR] {self._findings['vanished']}'s engine binary "
+                      f"disappeared mid-diagnosis - that is removal, not a "
+                      f"crash; check antivirus/EDR quarantine for it before "
+                      f"downloading anything again")
         defender_hit = self._findings.get("defender_hit")
         if defender_hit:
             self._log(f"[DOCTOR] Defender recorded this itself: {defender_hit} "

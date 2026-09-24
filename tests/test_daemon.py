@@ -1836,6 +1836,40 @@ def test_cli_mode_live_tick_stays_quiet(temp_config_dir):
     daemon.backend.transcribe_file_cli.assert_not_called()
 
 
+def test_backoff_notification_fires_once(temp_config_dir):
+    """The per-minute backoff notify fired unattended for an hour (0.4.360).
+
+    The log notes every backoff; the user is told on the first trip and
+    then at most every half hour.
+    """
+    import time as _time
+
+    daemon, _ = _idle_daemon(temp_config_dir)
+    daemon.notify = Mock()
+    daemon.config.local_whisper_url = ""
+    daemon.backend.working_model = Mock(return_value="ggml-base.en-q8_0")
+    daemon.backend._process = None
+    daemon._ensure_backend_running = Mock(return_value=False)
+    now = _time.time()
+    daemon._revive_failures = [now] * 5
+    daemon._revive_backoff_until = 0.0
+    daemon._last_backend_revive = 0.0
+    daemon._start_watchdog()
+    try:
+        deadline = _time.time() + 2.0
+        while daemon.notify.call_count == 0 and _time.time() < deadline:
+            _time.sleep(0.05)
+        assert daemon.notify.call_count == 1
+        # Force a second trip inside the throttle window.
+        daemon._revive_backoff_until = 0.0
+        daemon._last_backend_revive = 0.0
+        _time.sleep(0.4)
+        assert daemon.notify.call_count == 1
+    finally:
+        daemon.is_running = False
+        daemon.watchdog_thread.join(timeout=2)
+
+
 def test_cli_mode_records_without_the_live_loop(temp_config_dir):
     """CLI mode has no server for live passes: plain push-to-talk instead."""
     from unittest.mock import Mock

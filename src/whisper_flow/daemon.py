@@ -353,13 +353,22 @@ class WhisperFlowDaemon:
                                     self._revive_failures.append(now)
                                     if not revived and len(self._revive_failures) >= 5:
                                         # Circuit breaker: this is not a blip.
-                                        # Back off for a minute and say so once.
+                                        # Back off for a minute. The log notes
+                                        # every backoff, but the user is told
+                                        # only on the first trip and then at
+                                        # most every half hour: the 0.4.360
+                                        # report shows the per-minute notify
+                                        # firing unattended for an hour.
                                         self._revive_backoff_until = now + 60
                                         log("[DAEMON] backend keeps failing — backing off revives for 60s")
-                                        try:
-                                            self.notify("Speech engine keeps crashing — open Settings to pick another model, or check the log")
-                                        except Exception:
-                                            pass
+                                        last_told = getattr(
+                                            self, "_last_backoff_notify", 0.0)
+                                        if now - last_told >= 1800:
+                                            self._last_backoff_notify = now
+                                            try:
+                                                self.notify("Speech engine keeps crashing — open Settings to pick another model, or check the log")
+                                            except Exception:
+                                                pass
                     except Exception as e:
                         log(f"[DAEMON] backend watchdog failed (auto-heal will retry): {e}")
 

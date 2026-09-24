@@ -2932,10 +2932,33 @@ class LocalBackend:
             log(f"[BACKEND] CLI-mode reconsider failed: {e}")
             return True
 
+    @property
+    def _cli_working_marker(self) -> Path:
+        """Which engine dir last decoded via whisper-cli, if any."""
+        return _runtime_dir(self.config.config_dir) / "cli-working.txt"
+
+    def _record_working_cli(self, cli: Path) -> None:
+        """Remember a CLI that decoded, so it is tried first next time.
+
+        On a machine where the CUDA binary dies on model load but the
+        plain one decodes, every utterance wasting 18s on CUDA first is
+        the difference between slow dictation and a timeout. Written by
+        the doctor's probe and by real transcriptions alike; a dir name,
+        so engine reinstalls invalidate nothing.
+        """
+        try:
+            self._cli_working_marker.parent.mkdir(parents=True, exist_ok=True)
+            self._cli_working_marker.write_text(Path(cli).parent.name,
+                                                encoding="utf-8")
+        except Exception:
+            pass
+
     def cli_paths(self) -> list[Path]:
         """whisper-cli candidates, best first: CUDA, plain, then flat.
 
-        The GPU build decodes fastest when its DLLs load; the plain and flat
+        Except the one that last decoded goes first regardless: a proven
+        decoder outranks a faster one that dies on this machine. The GPU
+        build decodes fastest when its DLLs load; the plain and flat
         builds are the same fallback ladder the server uses. A directory that
         lost its server to quarantine may still hold its CLI, so all three
         are tried rather than only the one the engine marker points at.
@@ -2950,7 +2973,15 @@ class LocalBackend:
             ]
         except Exception:
             return []
-        return [path for path in dict.fromkeys(candidates) if path.exists()]
+        paths = [path for path in dict.fromkeys(candidates) if path.exists()]
+        try:
+            first = self._cli_working_marker.read_text(
+                encoding="utf-8").strip()
+        except OSError:
+            first = ""
+        if first:
+            paths.sort(key=lambda p: 0 if p.parent.name == first else 1)
+        return paths
 
     def cli_path(self) -> Path | None:
         """The first whisper-cli candidate; None when there are none."""
@@ -2994,11 +3025,15 @@ class LocalBackend:
             log(f"[BACKEND] CLI flag probe exited {probe.returncode} for "
                 f"{cli} — trying transcription anyway")
             return True
-        supported = ("output-txt" in (probe.stdout or "")
-                     and "output-file" in (probe.stdout or ""))
+        # whisper.cpp prints usage to stderr on several vintages; stdout
+        # alone misreads those builds as flagless (the 0.4.360 report, where
+        # a working plain CLI was skipped twice for exactly this reason).
+        help_text = ((probe.stdout or "") + "\n" + (probe.stderr or ""))
+        supported = ("output-txt" in help_text
+                     and "output-file" in help_text)
         if not supported:
-            log(f"[BACKEND] {cli.name} has no --output-txt/--output-file; "
-                f"not usable for CLI transcription")
+            log(f"[BACKEND] {Path(cli).parent.name}/{Path(cli).name} has no "
+                f"--output-txt/--output-file; not usable for CLI transcription")
         cache[key] = supported
         return supported
 
@@ -3034,7 +3069,16 @@ class LocalBackend:
             except OSError:
                 return None
 
+            # CLIs that died natively this session stay dead: retrying a
+            # binary that 0xC0000005s on model load wastes a model load
+            # (18s on the report machine) per utterance, per candidate.
+            dead = getattr(self, "_cli_dead", None)
+            if dead is None:
+                dead = set()
+                self._cli_dead = dead
             for cli in candidates:
+                if str(cli) in dead:
+                    continue
                 if not self._cli_supports_output_file(cli):
                     continue
                 tmpdir = Path(_tf.mkdtemp(prefix="whisper-flow-cli-"))
@@ -3069,11 +3113,16 @@ class LocalBackend:
                         # fall back to stdout, minus whisper's timestamps.
                         text = _cli_stdout_text(proc.stdout if proc else "")
                     if text:
+                        self._record_working_cli(cli)
                         return text
                     if proc.returncode != 0:
                         tail = (proc.stderr or "")[-300:]
                         log(f"[BACKEND] CLI fallback failed on "
                             f"{cli.parent.name} (rc={proc.returncode}): {tail}")
+                        if (proc.returncode & 0xFFFFFFFF) == 0xC0000005:
+                            dead.add(str(cli))
+                            log(f"[BACKEND] {cli.parent.name} whisper-cli dies "
+                                f"natively — skipped for the rest of this run")
                 finally:
                     _shutil.rmtree(tmpdir, ignore_errors=True)
             return None

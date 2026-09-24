@@ -1473,12 +1473,21 @@ def test_shared_store_serves_a_locked_down_machine(
     assert "shared store" in local_backend.describe()
 
 
-def test_user_downloads_win_over_shared(local_backend, config, shared_store):
+def test_shared_wins_over_user_downloads(local_backend, config, shared_store):
+    """Admin-written provenance outranks an AppData download.
+
+    On a machine whose endpoint protection kills user-profile binaries,
+    the same bytes from the shared store are the experiment worth
+    trying - and it happens automatically once anything is seeded there.
+    Which copy won is in describe(), so shadowing stays visible.
+    """
     _seed_shared(shared_store, local_backend)
     exe = Path(config.config_dir) / "runtime" / local_backend._exe_name
     exe.parent.mkdir(parents=True, exist_ok=True)
     exe.write_text("user engine")
-    assert local_backend.server_exe == exe
+    assert local_backend.server_exe == (
+        shared_store / "runtime" / local_backend._exe_name)
+    assert "shared store" in local_backend.describe()
 
 
 def test_shared_cuda_reads_as_cuda(local_backend, config, shared_store):
@@ -1921,6 +1930,96 @@ def test_cli_dead_candidate_skipped_for_the_session(
     assert local_backend.transcribe_file_cli(str(wav)) == "from plain"
     assert local_backend.transcribe_file_cli(str(wav)) == "from plain"
     assert attempts == ["cuda", "plain", "plain"]
+
+
+def _shared_env(monkeypatch, tmp_path):
+    """Point the machine-wide store at a tmp dir."""
+    shared = tmp_path / "shared"
+    monkeypatch.setenv("WHISPER_FLOW_SHARED_DIR", str(shared))
+    return shared
+
+
+def test_shared_engine_preferred_over_downloaded(
+        local_backend, config, monkeypatch, tmp_path):
+    """Admin-written beats app-downloaded: provenance decides.
+
+    Same bytes in %PROGRAMDATA% outrank the AppData copy, which is the
+    whole point of seeding the shared store on a machine whose endpoint
+    protection kills user-profile binaries.
+    """
+    from whisper_flow import backend as backend_module
+
+    shared = _shared_env(monkeypatch, tmp_path)
+    user_cuda = (Path(config.config_dir) / "runtime" / "cuda"
+                 / local_backend._exe_name)
+    user_cuda.parent.mkdir(parents=True, exist_ok=True)
+    user_cuda.write_text("user")
+    shared_cuda = shared / "runtime" / "cuda" / local_backend._exe_name
+    shared_cuda.parent.mkdir(parents=True, exist_ok=True)
+    shared_cuda.write_text("shared")
+    (Path(config.config_dir) / "runtime" / "engine.kind").write_text("cuda12")
+
+    assert local_backend.installed_engine() == "cuda12"
+    assert local_backend.server_exe == shared_cuda
+    assert "shared store" in local_backend.describe()
+
+
+def test_shared_engine_used_when_nothing_downloaded(
+        local_backend, config, monkeypatch, tmp_path):
+    shared = _shared_env(monkeypatch, tmp_path)
+    exe = shared / "runtime" / local_backend._exe_name
+    exe.parent.mkdir(parents=True, exist_ok=True)
+    exe.write_text("shared")
+    assert local_backend.installed_engine() == "cpu"
+    assert local_backend.server_exe == exe
+
+
+def test_seed_shared_store_copies_engine_and_models(
+        local_backend, config, monkeypatch, tmp_path):
+    """The seeder copies engines whole, models as-is, state never."""
+    shared = _shared_env(monkeypatch, tmp_path)
+    runtime = Path(config.config_dir) / "runtime"
+    (runtime / "cuda").mkdir(parents=True)
+    (runtime / "cuda" / local_backend._exe_name).write_text("cuda")
+    (runtime / "cuda" / "cublas64_12.dll").write_text("dll")
+    (runtime / local_backend._exe_name).write_text("cpu")
+    (runtime / "engine.kind").write_text("cuda12")
+    (runtime / "install.lock").write_text("x")
+    (runtime / "cli-mode").write_text("x")
+    (runtime / "engine-doctor.log").write_text("x")
+    (runtime / "half.zip.part").write_text("x")
+    (runtime / "ggml-cpu-x.dll.off").write_text("x")
+    models = Path(config.config_dir) / "models"
+    models.mkdir()
+    (models / "ggml-base.en-q8_0.bin").write_text("model")
+
+    ok, message = local_backend.seed_shared_store()
+
+    assert ok, message
+    assert (shared / "runtime" / "cuda" / local_backend._exe_name).exists()
+    assert (shared / "runtime" / "cuda" / "cublas64_12.dll").exists()
+    assert (shared / "runtime" / local_backend._exe_name).exists()
+    assert (shared / "runtime" / "engine.kind").read_text(
+        encoding="utf-8") == "cuda12"
+    assert (shared / "models" / "ggml-base.en-q8_0.bin").exists()
+    for junk in ("install.lock", "cli-mode", "engine-doctor.log",
+                 "half.zip.part", "ggml-cpu-x.dll.off"):
+        assert not (shared / "runtime" / junk).exists()
+        assert not (shared / "runtime" / "cuda" / junk).exists()
+    assert local_backend.shared_store_seeded() is True
+
+
+def test_seed_shared_store_empty_is_honest(local_backend, config,
+                                           monkeypatch, tmp_path):
+    _shared_env(monkeypatch, tmp_path)
+    ok, message = local_backend.seed_shared_store()
+    assert ok is False
+    assert message
+
+
+def test_is_admin_returns_a_bool():
+    from whisper_flow.backend import is_admin
+    assert isinstance(is_admin(), bool)
 
 
 def test_working_cli_is_tried_first(local_backend, config, tmp_path):

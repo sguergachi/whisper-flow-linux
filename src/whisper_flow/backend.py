@@ -120,6 +120,27 @@ def _shared_models() -> Path:
     return shared_data_dir() / "models"
 
 
+def is_admin() -> bool:
+    """Whether this process can write the machine-wide shared store."""
+    if sys.platform != "win32":
+        return os.geteuid() == 0 if hasattr(os, "geteuid") else False
+    try:
+        import ctypes
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+# User-state files that must never be seeded machine-wide: locks, mode
+# markers, partial downloads and logs describe this user, this process,
+# this moment - not the engine.
+_SEED_SKIP_SUFFIXES = (".part", ".lock", ".log", ".off", ".failed", ".new")
+_SEED_SKIP_NAMES = {
+    "cli-mode", "cli-working.txt", "setup-seen", "engine-threads.txt",
+    "install.lock", "seed-shared-result.txt",
+}
+
+
 def _cuda_dir(config_dir: Path) -> Path:
     """Where the CUDA engine lives (runtime/cuda/).
 
@@ -1582,34 +1603,36 @@ class LocalBackend:
     def server_exe(self) -> Path:
         """The engine binary that will actually run.
 
-        Downloaded engines win over the bundled one - a downloaded engine
-        only exists because this machine has a GPU and the better engine
-        was fetched for it. On Linux the source-built CUDA engine lives in
-        its own directory (runtime/cuda), so it is the one that wins there.
-        A machine-wide shared store (%PROGRAMDATA%\\whisper-flow) sits
-        between the user downloads and the bundle: read-only at runtime,
-        so locked-down machines run from it with no downloads at all.
+        The shared store wins over user downloads of the same kind: it is
+        admin-written (or IT-seeded) rather than app-downloaded into a
+        user-writable path, which is exactly the provenance distinction
+        reputation rules and userland-execution policies care about. On a
+        machine where endpoint protection kills user-profile binaries,
+        running the same bytes from %PROGRAMDATA% is the experiment worth
+        trying - and it happens automatically once anything is seeded
+        there. Which copy won is logged at every start, so a stale shared
+        engine shadowing a fresh download is visible, not silent.
         """
         if self.installed_engine().startswith("cuda"):
-            cuda = _cuda_dir(self.config.config_dir) / self._exe_name
-            if cuda.exists():
-                return cuda
             shared_cuda = _shared_runtime() / "cuda" / self._exe_name
             if shared_cuda.exists():
                 return shared_cuda
+            cuda = _cuda_dir(self.config.config_dir) / self._exe_name
+            if cuda.exists():
+                return cuda
         if self.installed_engine() == "cpu-plain":
-            plain = _plain_dir(self.config.config_dir) / self._exe_name
-            if plain.exists():
-                return plain
             shared_plain = _shared_runtime() / "plain" / self._exe_name
             if shared_plain.exists():
                 return shared_plain
-        downloaded = _runtime_dir(self.config.config_dir) / self._exe_name
-        if downloaded.exists():
-            return downloaded
+            plain = _plain_dir(self.config.config_dir) / self._exe_name
+            if plain.exists():
+                return plain
         shared = _shared_runtime() / self._exe_name
         if shared.exists():
             return shared
+        downloaded = _runtime_dir(self.config.config_dir) / self._exe_name
+        if downloaded.exists():
+            return downloaded
         bundled = bundled_dir()
         if bundled:
             return bundled / "engine" / self._exe_name
@@ -2104,6 +2127,100 @@ class LocalBackend:
         except Exception:
             return None
         return recorded
+
+    def shared_store_seeded(self) -> bool:
+        """Whether the machine-wide store holds a runnable engine already."""
+        try:
+            name = self._exe_name
+            return any((
+                (_shared_runtime() / name).exists(),
+                (_shared_runtime() / "cuda" / name).exists(),
+                (_shared_runtime() / "plain" / name).exists(),
+            ))
+        except Exception:
+            return False
+
+    def seed_shared_store(self) -> tuple[bool, str]:
+        """Copy the local engine + models into the machine-wide store.
+
+        Must run elevated (or as IT): %PROGRAMDATA% is not user-writable,
+        which is the whole point - binaries there carry admin-written
+        provenance instead of app-downloaded-into-AppData. Copies engine
+        directories whole (each kind owns its dir, DLL sets must never
+        mix), plus models and the engine-kind marker; user state (locks,
+        markers, partials, logs) is left behind. Returns (ok, message);
+        never raises. Next start prefers the shared copies automatically.
+        """
+        try:
+            src_runtime = _runtime_dir(self.config.config_dir)
+            src_models = _model_dir(self.config.config_dir)
+            if not src_runtime.exists():
+                return False, "no local engine to copy yet"
+            dst_runtime = _shared_runtime()
+            dst_models = _shared_models()
+            try:
+                dst_runtime.mkdir(parents=True, exist_ok=True)
+                dst_models.mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                return False, f"cannot write {shared_data_dir()} ({e})"
+            copied, skipped, failed = 0, 0, []
+            for src in sorted(src_runtime.rglob("*")):
+                try:
+                    rel = src.relative_to(src_runtime)
+                except ValueError:
+                    continue
+                if src.is_dir():
+                    try:
+                        (dst_runtime / rel).mkdir(parents=True, exist_ok=True)
+                    except OSError as e:
+                        failed.append(f"{rel}: {e}")
+                    continue
+                if (src.name in _SEED_SKIP_NAMES
+                        or src.suffix in _SEED_SKIP_SUFFIXES):
+                    skipped += 1
+                    continue
+                try:
+                    shutil.copy2(src, dst_runtime / rel)
+                    copied += 1
+                except OSError as e:
+                    failed.append(f"{src.name}: {e}")
+            # The kind marker tells installed_engine() what the shared
+            # copy is without sniffing; models are data, copied as-is.
+            try:
+                kind = self._engine_marker.read_text(
+                    encoding="utf-8").strip()
+            except OSError:
+                kind = ""
+            if kind:
+                try:
+                    (dst_runtime / "engine.kind").write_text(
+                        kind, encoding="utf-8")
+                    copied += 1
+                except OSError as e:
+                    failed.append(f"engine.kind: {e}")
+            if src_models.exists():
+                for model in sorted(src_models.glob("*.bin")):
+                    if model.name.endswith(".part"):
+                        skipped += 1
+                        continue
+                    try:
+                        shutil.copy2(model, dst_models / model.name)
+                        copied += 1
+                    except OSError as e:
+                        failed.append(f"{model.name}: {e}")
+            if failed:
+                return False, "could not copy " + "; ".join(failed[:3])
+            if not copied:
+                return False, "nothing to copy"
+            try:
+                self._notify(f"Shared engine installed ({copied} files)")
+            except Exception:
+                pass
+            log(f"[BACKEND] seeded {shared_data_dir()} with {copied} "
+                f"files ({skipped} state files skipped)")
+            return True, f"installed {copied} files machine-wide"
+        except Exception as e:
+            return False, str(e)
 
     @staticmethod
     def has_mark_of_the_web(path) -> bool | None:

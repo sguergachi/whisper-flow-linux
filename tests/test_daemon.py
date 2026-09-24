@@ -1836,6 +1836,27 @@ def test_cli_mode_live_tick_stays_quiet(temp_config_dir):
     daemon.backend.transcribe_file_cli.assert_not_called()
 
 
+def test_cli_mode_suggests_the_shared_install_once(temp_config_dir,
+                                                    monkeypatch):
+    """Compatibility mode should point at the way out, exactly once."""
+    import sys as _sys
+
+    monkeypatch.setattr(_sys, "platform", "win32")
+    daemon = _model_daemon(temp_config_dir, Mock())
+    daemon.backend.working_model.return_value = "ggml-base.en-q8_0"
+    daemon.backend.is_installed.return_value = True
+    daemon.backend.cli_mode = Mock(return_value=True)
+    daemon.backend.shared_store_seeded = Mock(return_value=False)
+    daemon._backend_start = Mock(return_value=None)
+
+    daemon._start_managed_backend()
+    daemon._start_managed_backend()
+
+    tips = [call[0][0] for call in daemon.notify.call_args_list
+            if "Install for all users" in call[0][0]]
+    assert len(tips) == 1
+
+
 def test_backoff_notification_fires_once(temp_config_dir):
     """The per-minute backoff notify fired unattended for an hour (0.4.360).
 

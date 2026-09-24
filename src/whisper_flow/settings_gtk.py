@@ -1604,6 +1604,15 @@ class SettingsWindow(Adw.ApplicationWindow):
         icon.add_css_class("daemon-ok" if accelerated else "daemon-bad")
         row.add_prefix(icon)
 
+        try:
+            from .backend import shared_data_dir
+            shared = str(self.backend.server_exe).startswith(
+                str(shared_data_dir()))
+        except Exception:
+            shared = False
+        if shared:
+            row.set_subtitle(summary + " - shared install for all users")
+
         if self.backend.needs_gpu_upgrade():
             row.set_subtitle(
                 summary + " - " + self.backend.gpu_upgrade_note())
@@ -1612,6 +1621,18 @@ class SettingsWindow(Adw.ApplicationWindow):
             button.set_valign(Gtk.Align.CENTER)
             button.connect("clicked", lambda _b: self._start_engine_download())
             self._download_buttons["engine"] = button
+            row.add_suffix(button)
+        elif sys.platform == "win32" and not shared:
+            # Endpoint protection kills user-profile binaries on some
+            # machines while the same bytes run fine from the admin-written
+            # shared store. One click seeds it (UAC prompt included).
+            button = Gtk.Button(label="Install for all users")
+            button.set_tooltip_text(
+                "Copy the engine machine-wide (needs admin) - "
+                "helps where security software blocks AppData binaries")
+            button.set_valign(Gtk.Align.CENTER)
+            button.connect("clicked",
+                           lambda _b: self._install_shared_engine())
             row.add_suffix(button)
             cancel = Gtk.Button(icon_name="window-close-symbolic")
             cancel.add_css_class("flat")
@@ -1703,6 +1724,32 @@ class SettingsWindow(Adw.ApplicationWindow):
                              toast_ok="Installed and restarted.",
                              toast_fail_prefix="Installed, but could not "
                                                "restart")
+
+    def _install_shared_engine(self):
+        """Seed the machine-wide store via an elevated self-relaunch.
+
+        The unelevated --seed-shared child prompts for admin itself and
+        does the copy; this process just starts it and says what happens
+        next. A restart picks the shared binaries up automatically.
+        """
+        if sys.platform != "win32":
+            self._toast("Machine-wide install is a Windows feature")
+            return
+        try:
+            if self.backend.shared_store_seeded():
+                self._toast("Already installed for all users")
+                return
+        except Exception:
+            pass
+        try:
+            subprocess.Popen(
+                [sys.executable, "--seed-shared"],
+                creationflags=getattr(subprocess, "DETACHED_PROCESS", 0),
+            )
+        except Exception as e:
+            self._toast(f"Could not start the installer: {e}")
+            return
+        self._toast("Approve the admin prompt, then restart the app")
 
     # ------------------------------------------------------------------ rows
     def _build_row(self, field) -> Gtk.Widget:

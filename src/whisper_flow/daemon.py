@@ -1875,6 +1875,20 @@ class WhisperFlowDaemon:
                 # that was never launched.
                 log(f"[BACKEND] CLI transcription mode for {model}: no "
                     f"server start attempted, whisper-cli decodes instead")
+                # Once per process: on Windows the shared install may run
+                # where the user-profile copy is killed. Point at it
+                # instead of leaving slow mode as the unexplained status.
+                try:
+                    import sys as _sys
+                    if _sys.platform == "win32" and not getattr(
+                            self, "_shared_tip_shown", False):
+                        self._shared_tip_shown = True
+                        if not self.backend.shared_store_seeded():
+                            self.notify("Compatibility mode (slow) — Settings "
+                                        "→ Speech → 'Install for all users' "
+                                        "may restore the fast engine")
+                except Exception:
+                    pass
                 return
             # Startup is the only place a silent failure becomes "No whisper
             # server configured" on the first real dictation, which reads as

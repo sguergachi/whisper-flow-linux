@@ -298,6 +298,66 @@ def _selftest() -> int:
     return status
 
 
+def _seed_shared() -> int:
+    """Copy the engine + models into %PROGRAMDATA%\\whisper-flow.
+
+    Two roles in one flag. Unelevated, this re-launches itself with a UAC
+    prompt (runas) and exits: the elevated child does the copy, because
+    %PROGRAMDATA% is not user-writable - which is precisely why binaries
+    there carry better provenance than AppData downloads. Elevated (or in
+    a source checkout, where elevation is the caller's business), it does
+    the copy directly. The result lands in the config dir for diagnostics;
+    the Settings window that launched this tells the user to approve the
+    prompt and restart, so no IPC is needed.
+    """
+    from pathlib import Path
+
+    from whisper_flow.backend import is_admin
+    from whisper_flow.config import Config
+
+    try:
+        config_dir = Path(Config().config_dir)
+    except Exception:
+        config_dir = None
+
+    def _result(text: str) -> None:
+        """Leave the seed outcome where diagnostics can find it."""
+        if config_dir is None:
+            return
+        try:
+            config_dir.mkdir(parents=True, exist_ok=True)
+            (config_dir / "seed-shared-result.txt").write_text(
+                text, encoding="utf-8")
+        except Exception:
+            pass
+
+    if getattr(sys, "frozen", False) and not is_admin():
+        try:
+            import ctypes
+            rc = ctypes.windll.shell32.ShellExecuteW(
+                None, "runas", sys.executable, "--seed-shared", None, 0)
+            if rc is not None and int(rc) <= 32:
+                _result(f"elevation failed (code {rc})")
+                return 1
+            _result("elevated installer launched - approve the prompt")
+            return 0
+        except Exception as e:
+            _result(f"elevation failed: {e}")
+            return 1
+    try:
+        from whisper_flow.backend import LocalBackend
+        from whisper_flow.config import Config as _Config
+
+        config = _Config()
+        backend = LocalBackend(config, notify=lambda msg: None)
+        ok, message = backend.seed_shared_store()
+        _result(("ok: " if ok else "failed: ") + message)
+        return 0 if ok else 1
+    except Exception as e:
+        _result(f"failed: {e}")
+        return 1
+
+
 def _stop_running_app() -> None:
     """Take the previous version down, so the installer can replace it.
 
@@ -357,6 +417,9 @@ def main() -> int:
     if "--settings" in sys.argv:
         from whisper_flow.settings_gtk import main as settings_main
         return settings_main()
+
+    if "--seed-shared" in sys.argv:
+        return _seed_shared()
 
     # Velopack's hooks, before anything else in the application starts.
     #

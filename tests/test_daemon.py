@@ -1408,6 +1408,29 @@ def test_background_fetch_adopts_a_landed_model(temp_config_dir):
     assert any("ready" in note for note in notes)
 
 
+def test_background_fetch_is_ready_when_only_the_cli_can_decode(
+        temp_config_dir, tmp_path):
+    """A downloaded model with no surviving server is still transcription.
+
+    The 0.4.361 machine: every whisper-server dies, whisper-cli decodes.
+    Treating that as a failed install left the large model on disk and
+    told the user to open Settings.
+    """
+    daemon = _model_daemon(temp_config_dir, Mock())
+    daemon.backend.install.return_value = True
+    cli = tmp_path / "whisper-cli"
+    cli.write_text("cli", encoding="utf-8")
+    daemon.backend.cli_path.return_value = cli
+    daemon._backend_start = Mock(return_value=None)
+    daemon._use_backend_url = Mock()
+
+    daemon._fetch_model_in_background("ggml-large-v3-turbo")
+
+    daemon._use_backend_url.assert_not_called()
+    notes = [call[0][0] for call in daemon.notify.call_args_list]
+    assert any("ready" in note for note in notes)
+
+
 def test_background_fetch_reports_a_failed_download(temp_config_dir):
     daemon = _model_daemon(temp_config_dir, Mock())
     daemon.backend.install.return_value = False

@@ -1071,8 +1071,12 @@ class WhisperFlowDaemon:
             audio_path = args[0] if args else kwargs.get("audio_path")
             if not isinstance(audio_path, (str, os.PathLike)):
                 return None
+            try:
+                model = self.backend.decode_model()
+            except Exception:
+                model = self.backend.working_model()
             text = self.backend.transcribe_file_cli(
-                audio_path, model=self.backend.working_model())
+                audio_path, model=model)
             if not text:
                 return None
             from .transcription import (_normalize, collapse_repetition,
@@ -1819,7 +1823,17 @@ class WhisperFlowDaemon:
             return
         if (self.config.local_whisper_url or "").strip():
             return          # pointed at something else already
+        adopted = None
+        try:
+            adopted = self.backend.adopt_gpu_model()
+        except Exception as e:
+            log(f"[DAEMON] GPU model adopt failed: {e}")
         model = self.backend.working_model()
+        try:
+            if adopted and not self.backend.model_path(adopted).exists():
+                model = adopted
+        except Exception:
+            pass
         if not model:
             # Nothing can transcribe yet, so this is the whole difference
             # between a working app and a dead one. Open settings, where the
@@ -1963,10 +1977,11 @@ class WhisperFlowDaemon:
                         else:
                             def _bg_gpu_install():
                                 try:
-                                    model = self.backend.working_model()
+                                    model = "ggml-large-v3-turbo"
                                     log(f"[BACKEND] silent background GPU engine install for {model}")
                                     ok = self.backend.install(model)
                                     if ok:
+                                        self.backend.adopt_gpu_model(force=True)
                                         log("[BACKEND] silent GPU install succeeded, restarting server on GPU")
                                         self.backend.stop()
                                         url = self._backend_start(model)
@@ -2060,6 +2075,18 @@ class WhisperFlowDaemon:
                 return
             url = self._backend_start(model, allow_download=False)
             if not url:
+                # On the machines where every server dies, whisper-cli is
+                # the decoder. The weights landing is the whole job; saying
+                # the engine failed sends the user back to Settings after
+                # a 1.6GB download that actually succeeded.
+                try:
+                    cli = self.backend.cli_path()
+                except Exception:
+                    cli = None
+                if isinstance(cli, Path):
+                    log(f"[BACKEND] {model} downloaded; whisper-cli will decode it")
+                    self.notify(f"{model} downloaded - transcription ready")
+                    return
                 log(f"[BACKEND] {model} downloaded but the server would not start")
                 self.notify("Speech engine failed to start - open Settings")
                 return

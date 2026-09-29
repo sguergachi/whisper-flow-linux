@@ -1681,13 +1681,17 @@ class SettingsWindow(Adw.ApplicationWindow):
             bar.set_visible(True)
             bar.set_fraction(0.0)
 
-        model = self._current_model or self._selected_model() or None
+        # The bundled default is base.en. This button is the GPU model,
+        # large-v3-turbo, not a faster copy of whatever is already selected.
+        model = "ggml-large-v3-turbo"
         cancel_evt = self._download_cancel
 
         def work():
             try:
                 ok = self.backend.install(model, progress=self._on_progress,
                                           cancel_event=cancel_evt)
+                if ok:
+                    self.backend.adopt_gpu_model(force=True)
                 err = None
             except Exception as e:
                 log(f"[SETTINGS] engine download failed: {e}")

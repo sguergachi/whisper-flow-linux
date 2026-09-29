@@ -1014,12 +1014,138 @@ def test_a_crash_fallback_never_rewrites_the_saved_model_choice(
         None, allow_download=False) is None
 
     assert "ggml-medium.en-q8_0" in env.read_text(encoding="utf-8")
-    # This session falls back to base...
+    # This session falls back to base for the server...
     assert local_backend._last_started_model == "ggml-base.en-q8_0"
     assert local_backend.working_model() == "ggml-base.en-q8_0"
+    # ...but a CLI decode still loads the model the user saved. The
+    # server fallback is what turned an installed large model into base.en.
+    assert local_backend.decode_model() == "ggml-medium.en-q8_0"
+    assert local_backend.config.model_name == "ggml-medium.en-q8_0"
     # ...and a fresh process asks for the user's model again.
     fresh = LocalBackend(FakeConfig(config.config_dir))
     assert fresh.working_model() == "ggml-medium.en-q8_0"
+
+
+def test_a_gpu_server_crash_leaves_the_cuda_engine_in_place(
+        local_backend, config, monkeypatch):
+    """0.4.361: the first server death quarantined the engine just installed.
+
+    Every server on that PC dies with 0xC0000005. whisper-cli in the CUDA
+    directory still decodes. Deleting the server binary made the install
+    look like it had never happened.
+    """
+    runtime = Path(config.config_dir) / "runtime"
+    cuda = runtime / "cuda"
+    cuda.mkdir(parents=True)
+    exe = cuda / local_backend._exe_name
+    exe.write_text("cuda")
+    local_backend._record_engine("cuda12")
+    models = Path(config.config_dir) / "models"
+    models.mkdir(parents=True)
+    for name in ("ggml-large-v3-turbo", "ggml-base.en-q8_0"):
+        (models / f"{name}.bin").write_text("")
+    env = Path(config.config_dir) / ".env"
+    env.write_text("WHISPER_FLOW_MODEL_NAME=ggml-large-v3-turbo\n",
+                   encoding="utf-8")
+    monkeypatch.setattr(backend_module, "detect_accelerator", lambda: "cuda12")
+    monkeypatch.setattr(LocalBackend, "start", lambda self, *a, **k: None)
+    monkeypatch.setattr(LocalBackend, "ensure_cpu_engine",
+                        lambda self, allow_download=True: True)
+
+    assert local_backend._start_with_fallback_locked(
+        "ggml-large-v3-turbo", allow_download=False) is None
+
+    assert exe.exists()
+    assert not exe.with_suffix(exe.suffix + ".failed").exists()
+    assert local_backend.installed_engine() == "cuda12"
+    assert local_backend.working_model() == "ggml-base.en-q8_0"
+    assert local_backend.decode_model() == "ggml-large-v3-turbo"
+
+
+def test_a_cpu_fallback_download_does_not_hide_the_cuda_engine(
+        local_backend, config):
+    runtime = Path(config.config_dir) / "runtime"
+    (runtime / "cuda").mkdir(parents=True)
+    (runtime / "cuda" / local_backend._exe_name).write_text("cuda")
+    local_backend._record_engine("cuda12")
+    (runtime / local_backend._exe_name).write_text("cpu")
+
+    local_backend._record_cpu_fallback("cpu")
+
+    assert local_backend.installed_engine() == "cuda12"
+    assert "cuda12" in (runtime / "engine.kind").read_text(encoding="utf-8")
+
+
+def test_adopting_the_gpu_engine_forgets_a_plain_cli(local_backend, config):
+    """The doctor records whichever cli decoded. That memory must not stay
+    ahead of CUDA after the GPU engine is installed, or dictation never
+    leaves the CPU binary.
+    """
+    name = "whisper-cli.exe" if sys.platform == "win32" else "whisper-cli"
+    runtime = Path(config.config_dir) / "runtime"
+    for folder in ("cuda", "plain", ""):
+        directory = runtime / folder if folder else runtime
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / name).write_text("cli")
+    (runtime / "cuda" / local_backend._exe_name).write_text("cuda")
+    local_backend._record_engine("cuda12")
+    (runtime / "cli-working.txt").write_text("plain", encoding="utf-8")
+    assert local_backend.cli_paths()[0].parent.name == "plain"
+
+    local_backend._clear_stale_cli_preference()
+
+    assert local_backend.cli_paths()[0].parent.name == "cuda"
+
+
+def test_adopting_the_gpu_model_replaces_only_the_bundled_default(
+        local_backend, config):
+    runtime = Path(config.config_dir) / "runtime"
+    cuda = runtime / "cuda"
+    cuda.mkdir(parents=True)
+    (cuda / local_backend._exe_name).write_text("cuda")
+    local_backend._record_engine("cuda12")
+    models = Path(config.config_dir) / "models"
+    models.mkdir(parents=True)
+    (models / "ggml-base.en-q8_0.bin").write_text("")
+    env = Path(config.config_dir) / ".env"
+    env.write_text("WHISPER_FLOW_MODEL_NAME=ggml-base.en-q8_0\n",
+                   encoding="utf-8")
+
+    assert local_backend.adopt_gpu_model() == "ggml-large-v3-turbo"
+    assert envfile_model(env) == "ggml-large-v3-turbo"
+    assert not (runtime / "gpu-model-adopted").exists()
+
+    (models / "ggml-large-v3-turbo.bin").write_text("")
+    assert local_backend.adopt_gpu_model() == "ggml-large-v3-turbo"
+    assert (runtime / "gpu-model-adopted").read_text(encoding="utf-8").strip() == "adopted"
+    local_backend._last_started_model = "ggml-base.en-q8_0"
+    assert local_backend.working_model() == "ggml-base.en-q8_0"
+    assert local_backend.decode_model() == "ggml-large-v3-turbo"
+
+
+def test_an_explicit_model_choice_survives_gpu_adoption(local_backend, config):
+    runtime = Path(config.config_dir) / "runtime"
+    cuda = runtime / "cuda"
+    cuda.mkdir(parents=True)
+    (cuda / local_backend._exe_name).write_text("cuda")
+    local_backend._record_engine("cuda12")
+    models = Path(config.config_dir) / "models"
+    models.mkdir(parents=True)
+    (models / "ggml-medium.en-q8_0.bin").write_text("")
+    env = Path(config.config_dir) / ".env"
+    env.write_text("WHISPER_FLOW_MODEL_NAME=ggml-medium.en-q8_0\n",
+                   encoding="utf-8")
+
+    assert local_backend.adopt_gpu_model() is None
+    assert envfile_model(env) == "ggml-medium.en-q8_0"
+    assert "kept" in (runtime / "gpu-model-adopted").read_text(encoding="utf-8")
+
+
+def envfile_model(env: Path) -> str:
+    for line in env.read_text(encoding="utf-8").splitlines():
+        if line.startswith("WHISPER_FLOW_MODEL_NAME="):
+            return line.split("=", 1)[1]
+    return ""
 
 
 def test_crash_counter_resets_for_a_different_engine_file(
@@ -1947,8 +2073,6 @@ def test_shared_engine_preferred_over_downloaded(
     whole point of seeding the shared store on a machine whose endpoint
     protection kills user-profile binaries.
     """
-    from whisper_flow import backend as backend_module
-
     shared = _shared_env(monkeypatch, tmp_path)
     user_cuda = (Path(config.config_dir) / "runtime" / "cuda"
                  / local_backend._exe_name)

@@ -1847,6 +1847,101 @@ class LocalBackend:
             return self.config.model_name
         return self.bundled_model()
 
+    def decode_model(self) -> str | None:
+        """The model whisper-cli should load for one utterance.
+
+        working_model() prefers a server fallback (_last_started_model),
+        which is how a GPU crash shrunk the session to base.en. The CLI
+        path is the one that still runs when the server cannot stay up,
+        and it has to load the model the user installed. A saved choice
+        wins. With no saved choice, a GPU engine uses large-v3-turbo when
+        that file is on disk.
+        """
+        chosen = self.chosen_model()
+        if chosen and self.model_path(chosen).exists():
+            return chosen
+        if self.engine_is_gpu() or self._cuda_cli_present():
+            recommended = "ggml-large-v3-turbo"
+            if self.model_path(recommended).exists():
+                return recommended
+        return self.working_model()
+
+    def _cuda_cli_present(self) -> bool:
+        name = "whisper-cli.exe" if sys.platform == "win32" else "whisper-cli"
+        try:
+            return (_cuda_dir(self.config.config_dir) / name).exists()
+        except OSError:
+            return False
+
+    def adopt_gpu_model(self, force: bool = False) -> str | None:
+        """Switch an installed GPU engine onto large-v3-turbo.
+
+        Install GPU engine used to keep whatever model was already
+        selected, which on a fresh install is the bundled base.en. The
+        GPU engine then transcribed with the small model. Once, when the
+        saved choice is still that default, persist large-v3-turbo. An
+        explicit other choice is kept. force=True is the Settings button:
+        that click is the request for the GPU model.
+        """
+        if not (self.engine_is_gpu() or self._cuda_cli_present()):
+            if not force:
+                return None
+        marker = _runtime_dir(self.config.config_dir) / "gpu-model-adopted"
+        model = "ggml-large-v3-turbo"
+        try:
+            if marker.exists() and not force:
+                return None
+        except OSError:
+            pass
+        chosen = self.chosen_model()
+        if (not force and chosen
+                and chosen not in ("ggml-base.en-q8_0", model)):
+            try:
+                marker.parent.mkdir(parents=True, exist_ok=True)
+                marker.write_text("kept\n", encoding="utf-8")
+            except OSError:
+                pass
+            return None
+        self._persist_model_choice(model)
+        self._clear_stale_cli_preference()
+        # No marker until the weights are actually here. Writing it first
+        # would swallow a failed download and leave the next launch on base.
+        if not self.model_path(model).exists():
+            return model
+        try:
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text("adopted\n", encoding="utf-8")
+        except OSError as e:
+            log(f"[BACKEND] could not mark the GPU model adopted: {e}")
+        return model
+
+    def _persist_model_choice(self, model: str) -> None:
+        try:
+            envfile.set_values(
+                Path(self.config.config_dir) / ".env",
+                {"WHISPER_FLOW_MODEL_NAME": model})
+        except Exception as e:
+            log(f"[BACKEND] could not save the model choice: {e}")
+        try:
+            self.config.model_name = model
+        except Exception:
+            pass
+        self._last_started_model = None
+
+    def _clear_stale_cli_preference(self) -> None:
+        """A plain cli remembered before the GPU engine existed must not stay first.
+
+        CLI mode itself stays. It is the diagnosis that no server survives
+        on this machine, and dropping it puts every hotkey back on the
+        crash loop while large-v3-turbo is still downloading. A later
+        server start still re-probes once when the model or engine
+        differs from the diagnosis (0.4.358).
+        """
+        try:
+            self._cli_working_marker.unlink(missing_ok=True)
+        except Exception:
+            pass
+
     # ------------------------------------------------------------- install
     def install(self, model: str | None = None, force_download: bool = False,
                 progress=None, cancel_event=None) -> bool:
@@ -2103,6 +2198,23 @@ class LocalBackend:
         except OSError as e:
             log(f"[BACKEND] could not record the engine kind: {e}")
 
+    def _record_cpu_fallback(self, kind: str) -> None:
+        """Record a CPU build without hiding a CUDA engine that is still here.
+
+        The crash ladder downloads a CPU binary beside the GPU one. Writing
+        engine.kind=cpu at that moment made installed_engine() ignore the
+        CUDA directory, so the engine the user had installed stopped being
+        the one that ran (0.4.361: cuda12 detected, engine cpu, base.en).
+        """
+        try:
+            if self._engine_exe("cuda12").exists():
+                log(f"[BACKEND] {kind} engine is on disk beside CUDA; "
+                    f"leaving the GPU engine selected")
+                return
+        except Exception:
+            pass
+        self._record_engine(kind)
+
     def engine_removed_externally(self) -> str | None:
         """The kind of engine that was here and now is not, or None.
 
@@ -2330,7 +2442,11 @@ class LocalBackend:
         Returns True if a CPU engine is now present (downloaded, shared,
         or bundled).
         """
-        # Already have a working CPU engine
+        # Already have a working CPU engine. A CUDA engine in its own
+        # directory does not count: the CPU binary beside it is the
+        # fallback, and re-downloading it must not happen on every crash.
+        if self._engine_exe("cpu").exists() or self._engine_exe("cpu-plain").exists():
+            return True
         if self.server_exe.exists() and not self.engine_is_gpu():
             return True
         # Bundled CPU engine counts — quarantine will already have exposed it
@@ -2375,7 +2491,7 @@ class LocalBackend:
                     (runtime / self._exe_name).chmod(0o755)
                 except OSError:
                     pass
-            self._record_engine("cpu")
+            self._record_cpu_fallback("cpu")
             log("[BACKEND] fresh CPU engine installed")
             return True
         except Exception as e:
@@ -2416,7 +2532,7 @@ class LocalBackend:
                 pass
             _unpack_engine(archive_path, _plain_dir(self.config.config_dir),
                            self._exe_name, "plain")
-            self._record_engine("cpu-plain")
+            self._record_cpu_fallback("cpu-plain")
             log("[BACKEND] plain compatibility engine installed")
             self._notify("Compatibility engine ready — slower, but stable on this PC")
             return True
@@ -2489,31 +2605,23 @@ class LocalBackend:
                     fallback_model = base_candidate
                 else:
                     fallback_model = base_candidate
-        # The fallback is a session choice, not a new setting. It used to be
-        # written into WHISPER_FLOW_MODEL_NAME, which is the user's own choice
-        # as made in Settings - so one crash silently rewrote it, the radio
-        # moved to base, and picking medium again looked like it did not work
-        # (0.4.354 report: "it still doesn't let me select medium"). It now
-        # lives in this process; a restart tries the user's choice again,
-        # which is also how a fixed engine or the doctor's heal gets picked
-        # up without the user having to re-select anything.
+        # The fallback is a session choice for the *server*, not a new
+        # setting and not the model whisper-cli decodes. It used to be
+        # written into WHISPER_FLOW_MODEL_NAME, which is the user's own
+        # choice as made in Settings - so one crash silently rewrote it,
+        # the radio moved to base, and picking medium again looked like it
+        # did not work (0.4.354). It stays in this process. config.model_name
+        # is left alone too: the tray report prints it, and overwriting it
+        # made an installed large-v3-turbo look like base.en (0.4.361).
         self._last_started_model = fallback_model
-        try:
-            self.config.model_name = fallback_model
-        except Exception:
-            pass
         if self.engine_is_gpu():
-            # Only a GPU engine is moved aside here: it is the binary that
-            # just failed, and its cuBLAS DLLs would poison the CPU fallback.
-            # A CPU engine must never be quarantined on this path - the file
-            # identity is what the crash counter accumulates against, and
-            # renaming it after every failed start reset that count before
-            # the no-BLAS compatibility engine could ever be reached (the
-            # 0.4.349 Windows loop: BLAS download, quarantine, bundled BLAS,
-            # download again, forever).
+            # The CUDA engine lives in its own directory, so its DLLs cannot
+            # poison the CPU binary. Quarantining it here deleted the engine
+            # the user had just installed the first time the server died —
+            # and on the machines where every server dies, whisper-cli in
+            # that directory is the decoder that still works.
             log(f"[BACKEND] GPU start failed for {model}, trying CPU fallback "
                 f"with {fallback_model}")
-            self._quarantine_faulty_engine()
         else:
             log(f"[BACKEND] {model} failed to start on the CPU engine, "
                 f"trying {fallback_model}")
@@ -2534,10 +2642,6 @@ class LocalBackend:
                     return None
                 log(f"[BACKEND] using alternate fallback {fallback_model}")
         self._last_started_model = fallback_model
-        try:
-            self.config.model_name = fallback_model
-        except Exception:
-            pass
         return self.start(fallback_model, allow_download=allow_download)
 
     def _pick_port(self) -> int:
@@ -3079,6 +3183,10 @@ class LocalBackend:
         builds are the same fallback ladder the server uses. A directory that
         lost its server to quarantine may still hold its CLI, so all three
         are tried rather than only the one the engine marker points at.
+
+        A plain cli remembered before the GPU engine existed is dropped
+        when that engine is adopted (_clear_stale_cli_preference), so it
+        does not stay ahead of CUDA after the install.
         """
         name = ("whisper-cli.exe" if sys.platform == "win32"
                 else "whisper-cli")

@@ -105,7 +105,6 @@ jobs:
             mingw-w64-ucrt-x86_64-gcc
             mingw-w64-ucrt-x86_64-python-pydantic
             mingw-w64-ucrt-x86_64-python-pydantic-core
-            mingw-w64-ucrt-x86_64-python-webrtcvad
             mingw-w64-ucrt-x86_64-python-numpy
             mingw-w64-ucrt-x86_64-python-pillow
             mingw-w64-ucrt-x86_64-python-pywin32
@@ -130,6 +129,10 @@ jobs:
           tar -C "$work/src" --strip-components=1 -xf "$work"/[Pp]y[Aa]udio-*.tar.gz
           sed -i "s|[\"']/MT[\"']||g" "$work/src/setup.py"
           pip install "$work/src"
+          # MSYS2 dropped mingw-w64-ucrt-x86_64-python-webrtcvad from the
+          # repo (pacman: target not found). PyPI has no mingw wheel, and
+          # the same 2.0.10 sources are what that package built with gcc.
+          pip install "webrtcvad==2.0.10"
           # velopack has no MSYS2 wheel and is lazily imported and fully
           # mocked in tests. The dev extra's linters are Rust builds PyPI
           # cannot serve here either; pytest is all it needs.
@@ -365,7 +368,6 @@ jobs:
             mingw-w64-ucrt-x86_64-gcc
             mingw-w64-ucrt-x86_64-python-pydantic
             mingw-w64-ucrt-x86_64-python-pydantic-core
-            mingw-w64-ucrt-x86_64-python-webrtcvad
             mingw-w64-ucrt-x86_64-python-numpy
             mingw-w64-ucrt-x86_64-python-pillow
             mingw-w64-ucrt-x86_64-python-pywin32
@@ -395,6 +397,10 @@ jobs:
           tar -C "$work/src" --strip-components=1 -xf "$work"/[Pp]y[Aa]udio-*.tar.gz
           sed -i "s|[\"']/MT[\"']||g" "$work/src/setup.py"
           pip install "$work/src"
+          # MSYS2 dropped mingw-w64-ucrt-x86_64-python-webrtcvad from the
+          # repo (pacman: target not found). PyPI has no mingw wheel, and
+          # the same 2.0.10 sources are what that package built with gcc.
+          pip install "webrtcvad==2.0.10"
           sed -i "/velopack/d" pyproject.toml
           pyd_ver=$(pacman -Q mingw-w64-ucrt-x86_64-python-pydantic | awk '{print $2}' | cut -d- -f1)
           core_ver=$(pacman -Q mingw-w64-ucrt-x86_64-python-pydantic-core | awk '{print $2}' | cut -d- -f1)

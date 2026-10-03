@@ -527,11 +527,16 @@ jobs:
           cp native-build/whisper-flow-worker.exe "$target/"
           cp native-build/_deps/whisper-src/LICENSE "$target/whisper.cpp-LICENSE.txt"
           cp /ucrt64/share/licenses/vulkan-loader/LICENSE* "$target/"
-          # The MinGW C++/gcc runtimes are statically linked; collect any
-          # remaining redistributable dependencies from this build's prefix.
-          ldd native-build/whisper-flow-worker.exe > native-build/dependencies.txt
-          awk '/\/ucrt64\/bin\/.*\.dll/ {print $3}' native-build/dependencies.txt |
-            while IFS= read -r dll; do cp "$dll" "$target/"; done
+          # Copy imports from the build prefix by name. ldd can resolve
+          # vulkan-1.dll to the runner's System32 driver installation and
+          # silently omit it from an app-local package.
+          objdump -p native-build/whisper-flow-worker.exe |
+            awk '/DLL Name:/ {print $3}' > native-build/dependencies.txt
+          while IFS= read -r dll; do
+            if [[ -f "/ucrt64/bin/$dll" ]]; then cp "/ucrt64/bin/$dll" "$target/"; fi
+          done < native-build/dependencies.txt
+          test -s "$target/vulkan-1.dll"
+          test -s "$target/libwinpthread-1.dll"
           "$target/whisper-flow-worker.exe" --help
 
       - name: Bundle the app-local Visual C++ runtime
@@ -559,7 +564,7 @@ jobs:
           python native/smoke.py \
             packaging/windows/dist/whisper-flow/worker/whisper-flow-worker.exe \
             packaging/windows/dist/whisper-flow/models/ggml-base.en-q8_0.bin \
-            native-build/_deps/whisper-src/samples/jfk.wav --unicode-path
+            native-build/_deps/whisper-src/samples/jfk.wav --unicode-path --isolated-dlls
 
       - name: Build the installer with Velopack
         # Velopack rather than Inno Setup, and rather than Squirrel.Windows,
@@ -613,6 +618,17 @@ jobs:
             --icon packaging/windows/whisper-flow.ico `
             --outputDir installer-out
           if ($LASTEXITCODE -ne 0) { throw "vpk pack failed with $LASTEXITCODE" }
+
+          # Verify the downloadable zip, not just the build directory.
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [System.IO.Compression.ZipFile]::OpenRead("$PWD/installer-out/WhisperFlow-win-Portable.zip")
+          try {
+            foreach ($file in @('worker/whisper-flow-worker.exe', 'worker/vulkan-1.dll', 'worker/libwinpthread-1.dll', 'native-runtime/vcruntime140_1.dll')) {
+              if (-not ($zip.Entries | Where-Object { $_.FullName.EndsWith("/$file") -and $_.Length -gt 0 })) {
+                throw "Published portable package is missing $file"
+              }
+            }
+          } finally { $zip.Dispose() }
 
           Get-ChildItem installer-out | ForEach-Object {
             "{0}  {1:N0}MB" -f $_.Name, ($_.Length / 1MB) | Write-Host

@@ -730,7 +730,9 @@ class WhisperFlow:
             return [{
                 "name": "Transcription backend",
                 "status": "pass",
-                "message": f"Local whisper.cpp server at {local}",
+                "message": ("Resident local speech worker (private pipes)" if
+                            local == "pipe://whisper-flow" else
+                            f"Local whisper.cpp server at {local}"),
             }]
         return [{
             "name": "Transcription backend",
@@ -744,6 +746,15 @@ class WhisperFlow:
         local = (self.config.local_whisper_url or "").strip()
         if not local:
             return []
+
+        if local == "pipe://whisper-flow":
+            backend = getattr(self.transcription_service, "resident_backend", None)
+            reachable = bool(backend and backend.is_ready)
+            return [{
+                "name": "Local speech worker",
+                "status": "pass" if reachable else "fail",
+                "message": "Model loaded and ready" if reachable else "Speech worker is not ready",
+            }]
 
         try:
             import requests

@@ -509,6 +509,58 @@ jobs:
           "{0:N0}MB bundled" -f ((Get-ChildItem $dist -Recurse |
             Measure-Object Length -Sum).Sum / 1MB) | Write-Host
 
+      - name: Build the resident Vulkan speech worker
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          pacman -S --noconfirm --needed \
+            mingw-w64-ucrt-x86_64-cmake \
+            mingw-w64-ucrt-x86_64-ninja \
+            mingw-w64-ucrt-x86_64-vulkan-headers \
+            mingw-w64-ucrt-x86_64-vulkan-loader \
+            mingw-w64-ucrt-x86_64-shaderc \
+            mingw-w64-ucrt-x86_64-spirv-headers
+          cmake -S native -B native-build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build native-build --target whisper-flow-worker -j 4
+          target=packaging/windows/dist/whisper-flow/worker
+          mkdir -p "$target"
+          cp native-build/whisper-flow-worker.exe "$target/"
+          cp native-build/_deps/whisper-src/LICENSE "$target/whisper.cpp-LICENSE.txt"
+          cp /ucrt64/share/licenses/vulkan-loader/LICENSE* "$target/"
+          # The MinGW C++/gcc runtimes are statically linked; collect any
+          # remaining redistributable dependencies from this build's prefix.
+          ldd native-build/whisper-flow-worker.exe > native-build/dependencies.txt
+          awk '/\/ucrt64\/bin\/.*\.dll/ {print $3}' native-build/dependencies.txt |
+            while IFS= read -r dll; do cp "$dll" "$target/"; done
+          "$target/whisper-flow-worker.exe" --help
+
+      - name: Bundle the app-local Visual C++ runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $vswhere = "${env:ProgramFiles(x86)}/Microsoft Visual Studio/Installer/vswhere.exe"
+          $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw "Visual Studio's redistributable runtime is missing" }
+          $crt = Get-ChildItem "$vs/VC/Redist/MSVC/*/x64/Microsoft.VC*.CRT" -Directory |
+                 Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $crt) { throw "No official x64 CRT redistributable directory found" }
+          $dist = "packaging/windows/dist/whisper-flow"
+          New-Item -ItemType Directory -Force "$dist/native-runtime" | Out-Null
+          Copy-Item "$($crt.FullName)/*.dll" "$dist/native-runtime/"
+          Copy-Item "$($crt.FullName)/*.dll" "$dist/engine/"
+          foreach ($name in @('msvcp140.dll', 'vcruntime140.dll', 'vcruntime140_1.dll')) {
+            if (-not (Test-Path "$dist/native-runtime/$name")) { throw "Missing $name" }
+          }
+
+      - name: Verify resident inference with the bundled model
+        shell: msys2 {0}
+        run: |
+          source .venv/bin/activate
+          python native/smoke.py \
+            packaging/windows/dist/whisper-flow/worker/whisper-flow-worker.exe \
+            packaging/windows/dist/whisper-flow/models/ggml-base.en-q8_0.bin \
+            native-build/_deps/whisper-src/samples/jfk.wav
+
       - name: Build the installer with Velopack
         # Velopack rather than Inno Setup, and rather than Squirrel.Windows,
         # which its own authors describe as unmaintained. Two things matter

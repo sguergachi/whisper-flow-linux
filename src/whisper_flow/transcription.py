@@ -304,6 +304,12 @@ class TranscriptionService:
             Transcribed text
 
         """
+        if self.local_url == "pipe://whisper-flow":
+            backend = getattr(self, "resident_backend", None)
+            if backend is None:
+                raise RuntimeError("Cannot reach resident speech worker")
+            return backend.transcribe_resident(
+                audio_path, timeout=timeout, prompt=prompt, temperature=temperature)
         inference_url = f"{self.local_url}/inference"
 
         # Sized per request rather than once at startup: the server takes

@@ -26,6 +26,7 @@ _PROBE = {
     "frame_ms": ("20", 20),
     "pystray_backend": ("xorg", "xorg"),
     "local_server_port": ("18081", 18081),
+    "local_engine_transport": ("server", "server"),
     "notification_timeout": ("5000", 5000),
     "live_interval": ("1.7", 1.7),
     "silence_timeout": ("2.5", 2.5),
@@ -221,4 +222,3 @@ def test_hotkey_fields_explain_hold_vs_tap():
 
     hotkeys_help = settings_def.GROUP_HELP[("Hotkeys", "Shortcuts")].lower()
     assert "hold" in hotkeys_help and "tap" in hotkeys_help
-

@@ -1622,7 +1622,8 @@ class SettingsWindow(Adw.ApplicationWindow):
             button.connect("clicked", lambda _b: self._start_engine_download())
             self._download_buttons["engine"] = button
             row.add_suffix(button)
-        elif sys.platform == "win32" and not shared:
+        elif (sys.platform == "win32" and not shared
+              and not self.backend.resident_available()):
             # Endpoint protection kills user-profile binaries on some
             # machines while the same bytes run fine from the admin-written
             # shared store. One click seeds it (UAC prompt included).

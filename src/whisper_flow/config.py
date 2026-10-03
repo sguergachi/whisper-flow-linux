@@ -3,6 +3,7 @@
 import os
 import sys
 from pathlib import Path
+from typing import Literal
 
 IS_WINDOWS = sys.platform == "win32"
 
@@ -254,6 +255,11 @@ class Config(BaseSettings):
         ge=1024,
         le=65535,
         env="WHISPER_FLOW_LOCAL_SERVER_PORT",
+    )
+    local_engine_transport: Literal["auto", "server"] = Field(
+        default="auto",
+        description="Auto uses the resident Windows worker; server uses whisper.cpp HTTP",
+        env="WHISPER_FLOW_LOCAL_ENGINE_TRANSPORT",
     )
     smart_voice_amplification: bool = Field(
         default=True,

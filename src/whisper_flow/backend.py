@@ -23,6 +23,7 @@ import sys
 import tarfile
 import threading
 import time
+import urllib.error
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -230,57 +231,6 @@ def detect_accelerator() -> str:
     return _accelerator
 
 
-def _ensure_vcredist_silent() -> bool:
-    """Try to ensure VCRedist is available without prompting the user.
-
-    Called when the user hits 'Install GPU engine' — per request, the app
-    should handle everything in the background, no manual download. Tries to
-    download vc_redist.x64.exe and run it /quiet. Returns True if VCRedist
-    is now available (or was already), False if silent install failed
-    (needs admin). In the latter case the caller should fallback to CPU or
-    show the manual link, but the Install button itself should not prompt.
-    """
-    if _is_vcredist_available():
-        return True
-    try:
-        import tempfile as _tf
-        fd, tmp = _tf.mkstemp(suffix=".exe", prefix="vc_redist-")
-        import os as _os
-        _os.close(fd)
-        url = "https://aka.ms/vs/17/release/vc_redist.x64.exe"
-        log("[BACKEND] VCRedist missing — downloading silently for GPU/CPU engine")
-        _download(url, Path(tmp), progress=None)
-        import subprocess as _sp
-        import ctypes as _ct
-        try:
-            result = _sp.run([tmp, "/install", "/quiet", "/norestart"], timeout=300, creationflags=no_console_flags())
-            rc = result.returncode
-        except Exception as e:
-            log(f"[BACKEND] direct VCRedist install failed: {e}, trying runas")
-            rc = None
-        if rc not in (0, 1638, 3010):
-            try:
-                _ct.windll.shell32.ShellExecuteW(None, "runas", tmp, "/install /quiet /norestart", None, 0)
-                time.sleep(5)
-                rc = 0
-            except Exception as e:
-                log(f"[BACKEND] runas VCRedist install failed: {e}")
-                rc = 1
-        try:
-            Path(tmp).unlink(missing_ok=True)
-        except Exception:
-            pass
-        if rc in (0, 1638, 3010):
-            log(f"[BACKEND] VCRedist silent install exit {rc}")
-            time.sleep(1)
-            if _is_vcredist_available():
-                log("[BACKEND] VCRedist now available after silent install")
-                return True
-        log(f"[BACKEND] VCRedist silent install failed (exit {rc}), will try DLL fallback")
-    except Exception as e:
-        log(f"[BACKEND] VCRedist silent install failed: {e}")
-    return _is_vcredist_available()
-
 def _verify_model_file(model: str, path: Path) -> bool:
     """Check if model file is not truncated/corrupted."""
     try:
@@ -435,24 +385,50 @@ def faulting_module(exe_name: str) -> str | None:
     return _faulting_module_cache.get(key)
 
 def _is_vcredist_available() -> bool:
-    """Check if MSVC VCRedist is present (needed for both CPU and GPU whisper-server)."""
+    """Whether all required 64-bit MSVC libraries are installed centrally."""
     # Use platform.system() not sys.platform — tests mock sys.platform to win32 on Linux
     if platform.system() != "Windows":
         return True
     if sys.platform != "win32":
         return True
     try:
-        import pathlib as _P
-        # Check common locations
-        candidates = [
-            _P.Path(r"C:\Windows\System32\vcruntime140.dll"),
-            _P.Path(r"C:\Windows\System32\vcruntime140_1.dll"),
-            _P.Path(r"C:\Windows\System32\msvcp140.dll"),
-            _P.Path(r"C:\Windows\SysWOW64\vcruntime140.dll"),
-        ]
-        return any(c.exists() for c in candidates)
+        system = Path(os.environ.get("WINDIR", r"C:\Windows")) / "System32"
+        return all((system / name).is_file() for name in _MSVC_REQUIRED)
     except Exception:
-        return True  # assume present if check fails
+        return False
+
+
+_MSVC_REQUIRED = ("msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll")
+
+
+def _prepare_engine_runtime(engine_dir: Path) -> None:
+    """Deploy the packaged MSVC runtime beside an engine, without elevation.
+
+    Only the official Visual Studio redistributable directory is bundled by
+    CI. Windows resolves these app-local DLLs beside the engine executable.
+    System32 and the machine's configuration are never written to.
+    """
+    if sys.platform != "win32" or platform.system() != "Windows":
+        return
+    engine_dir = Path(engine_dir)
+    if all((engine_dir / name).is_file() for name in _MSVC_REQUIRED):
+        return
+    bundled = bundled_dir()
+    source = bundled / "native-runtime" if bundled else None
+    if source and all((source / name).is_file() for name in _MSVC_REQUIRED):
+        engine_dir.mkdir(parents=True, exist_ok=True)
+        # Copy a complete set from one runtime version, including companions
+        # such as msvcp140_atomic_wait.dll, rather than mixing versions.
+        for dll in source.glob("*.dll"):
+            shutil.copy2(dll, engine_dir / dll.name)
+        log(f"[BACKEND] deployed app-local MSVC runtime to {engine_dir}")
+        return
+    if _is_vcredist_available():
+        return
+    raise RuntimeError(
+        "The Windows package is missing its 64-bit Visual C++ runtime. "
+        "Install the latest whisper-flow package, which includes it "
+        "without an administrator or a separate runtime installer.")
 
 def no_console_flags() -> int:
     """creationflags so a console-subsystem child does not flash a prompt.
@@ -980,28 +956,77 @@ def _download(url: str, dest: Path, progress=None, cancel_event=None,
     """
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(dest.suffix + ".part")
-    with urllib.request.urlopen(url, timeout=60) as response:
-        total = int(response.headers.get("Content-Length", 0))
-        done = 0
-        last_report = 0.0
-        with open(tmp, "wb") as f:
-            while True:
-                chunk = response.read(1 << 20)
-                if not chunk:
-                    break
-                f.write(chunk)
-                done += len(chunk)
-                _touch(keepalive)
-                if cancel_event and cancel_event.is_set():
-                    raise RuntimeError("cancelled")
-                # Often enough for a progress bar to look continuous;
-                # callers that only want notifications throttle further.
-                if progress and total and time.monotonic() - last_report > 0.25:
-                    last_report = time.monotonic()
-                    progress(done / total)
-        if progress and total:
-            progress(1.0)
-    tmp.replace(dest)
+    import http.client
+    import re
+    import ssl
+
+    done, total, validator = 0, 0, None
+    for attempt in range(3):
+        if cancel_event and cancel_event.is_set():
+            raise RuntimeError("cancelled")
+        offset = done if validator else 0
+        request = url
+        if offset:
+            request = urllib.request.Request(url, headers={
+                "Range": f"bytes={offset}-", "If-Range": validator,
+                "Accept-Encoding": "identity",
+            })
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                status = getattr(response, "status", 200)
+                if status == 206:
+                    match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)",
+                                         response.headers.get("Content-Range", ""))
+                    if not offset or not match or int(match[1]) != offset:
+                        raise RuntimeError("Download server returned an invalid byte range")
+                    total = int(match[3])
+                else:
+                    # Range ignored or If-Range found a changed file: replace
+                    # the partial bytes, never append a second complete file.
+                    offset = 0
+                    total = int(response.headers.get("Content-Length", 0))
+                    etag = response.headers.get("ETag", "")
+                    validator = (etag if etag and not etag.startswith("W/") else
+                                 response.headers.get("Last-Modified"))
+                done = offset
+                last_report = 0.0
+                with open(tmp, "ab" if offset else "wb") as f:
+                    while True:
+                        if cancel_event and cancel_event.is_set():
+                            raise RuntimeError("cancelled")
+                        chunk = response.read(1 << 20)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        done += len(chunk)
+                        _touch(keepalive)
+                        if progress and total and time.monotonic() - last_report > 0.25:
+                            last_report = time.monotonic()
+                            progress(min(done / total, 1.0))
+                if not done or (total and done != total):
+                    raise OSError(f"Incomplete download: received {done} of {total} bytes")
+            tmp.replace(dest)
+            if progress:
+                progress(1.0)
+            return
+        except (OSError, http.client.HTTPException) as e:
+            # Retrying denied access or a TLS trust failure cannot fix it.
+            # Respect the configured proxy and certificate verification.
+            reason = getattr(e, "reason", e)
+            if isinstance(reason, ssl.SSLCertVerificationError):
+                raise
+            if isinstance(e, urllib.error.HTTPError) and e.code not in (408, 429, 500, 502, 503, 504):
+                raise
+            if attempt == 2:
+                raise
+            log(f"[BACKEND] download interrupted at {done} bytes; retry {attempt + 1}/2")
+            _touch(keepalive)
+            delay = 2 ** attempt
+            if cancel_event:
+                if cancel_event.wait(delay):
+                    raise RuntimeError("cancelled") from None
+            else:
+                time.sleep(delay)
 
 
 def _stop_strays_win(exe_path, keep_pid: int | None = None) -> int:
@@ -1406,6 +1431,66 @@ class LocalBackend:
         self._active_port: int | None = None
         # Held for the life of this process; closing it kills the server.
         self._job = _kill_on_exit_job()
+        self._resident = None
+        self._resident_failed = False
+
+    def resident_available(self) -> bool:
+        if sys.platform != "win32" or self._resident_failed:
+            return False
+        if getattr(self.config, "local_engine_transport", "auto") == "server":
+            return False
+        bundle = bundled_dir()
+        return bool(bundle and (bundle / "worker" / "whisper-flow-worker.exe").is_file())
+
+    def _start_resident(self, model: str | None) -> str | None:
+        from .resident import ResidentWorker
+
+        with self._lock:
+            if self._resident and self._resident.alive:
+                return self.url
+            self._stop_locked()
+            model = model or self.decode_model()
+            if not model or not self.model_path(model).is_file():
+                return None
+            gpu = detect_accelerator().startswith("cuda")
+            if model in GPU_MODELS and not gpu:
+                log(f"[BACKEND] {model} needs a GPU; not loading it on the CPU worker")
+                return None
+            try:
+                exe = bundled_dir() / "worker" / "whisper-flow-worker.exe"
+                self._resident = ResidentWorker(
+                    exe, self.model_path(model), self._thread_count(), gpu,
+                    Path(self.config.config_dir) / "resident-worker.log",
+                    creationflags=no_console_flags(),
+                    adopt=lambda proc: _adopt_into_job(self._job, proc),
+                )
+                self._process = self._resident.process
+                self._ready = True
+                self._last_started_model = model
+                self.set_cli_mode(False)
+                log(f"[BACKEND] resident {'Vulkan GPU' if gpu else 'CPU'} worker ready "
+                    f"with {model}; model stays loaded, no HTTP listener")
+                return self.url
+            except Exception as e:
+                self._resident_failed = True
+                self._stop_locked()
+                self.set_cli_mode(True)
+                log(f"[BACKEND] resident worker failed: {e}; see resident-worker.log")
+                return None
+
+    def transcribe_resident(self, audio_path, timeout=180, prompt=None,
+                            temperature=None) -> str:
+        worker = self._resident
+        if not worker or not worker.alive:
+            raise RuntimeError("Cannot reach resident speech worker")
+        try:
+            return worker.transcribe(audio_path, self.config, timeout, prompt, temperature)
+        except Exception:
+            if not worker.alive:
+                self._resident_failed = True
+                self._ready = False
+                self.set_cli_mode(True)
+            raise RuntimeError("Cannot reach resident speech worker") from None
 
     def _engine_identity(self, path) -> str:
         """What uniquely names an engine file: path + size + mtime."""
@@ -1427,6 +1512,12 @@ class LocalBackend:
         the no-BLAS plain build — slower, but a different compute path that
         dodges OpenBLAS/CPU-dispatch faults.
         """
+        if self._resident is not None:
+            self._resident_failed = True
+            self._ready = False
+            self.set_cli_mode(True)
+            log("[BACKEND] resident worker exited; using CLI fallback without engine re-downloads")
+            return False
         try:
             crashed = code if isinstance(code, int) else -1
             if (crashed & 0xFFFFFFFF) != 0xC0000005:
@@ -1613,6 +1704,8 @@ class LocalBackend:
         there. Which copy won is logged at every start, so a stale shared
         engine shadowing a fresh download is visible, not silent.
         """
+        if self.resident_available():
+            return bundled_dir() / "worker" / "whisper-flow-worker.exe"
         if self.installed_engine().startswith("cuda"):
             shared_cuda = _shared_runtime() / "cuda" / self._exe_name
             if shared_cuda.exists():
@@ -1671,6 +1764,8 @@ class LocalBackend:
         is checked against what is actually on disk: a marker left pointing
         at an engine that has since been deleted must not win.
         """
+        if self.resident_available():
+            return "vulkan" if detect_accelerator().startswith("cuda") else "cpu-resident"
         flat = _runtime_dir(self.config.config_dir) / self._exe_name
         cuda = _cuda_dir(self.config.config_dir) / self._exe_name
         plain = _plain_dir(self.config.config_dir) / self._exe_name
@@ -1710,7 +1805,7 @@ class LocalBackend:
         return "cpu"
 
     def engine_is_gpu(self) -> bool:
-        return self.installed_engine().startswith("cuda")
+        return self.installed_engine() == "vulkan" or self.installed_engine().startswith("cuda")
 
     def model_path(self, name: str | None = None) -> Path:
         name = name or self.config.model_name
@@ -1980,7 +2075,7 @@ class LocalBackend:
         model = model or recommended_model(accelerator)
         log(f"[BACKEND] accelerator={accelerator} model={model}")
 
-        wanted = wanted_engine(accelerator)
+        wanted = self.installed_engine() if self.resident_available() else wanted_engine(accelerator)
         downloaded_model = _model_dir(self.config.config_dir) / f"{model}.bin"
         # The engine this machine wants does not always live in the flat
         # runtime directory: on Linux the source-built CUDA engine has its
@@ -1998,6 +2093,8 @@ class LocalBackend:
         # utterance, during which every further press was dropped as busy and
         # the text landed wherever the focus had wandered to by the time it
         # arrived.
+        if self.resident_available():
+            have_exe = True
         if have_exe and self.installed_engine() != wanted:
             log(f"[BACKEND] the installed {self.installed_engine()} engine is "
                 f"not the {wanted} one this machine wants; fetching it")
@@ -2008,12 +2105,6 @@ class LocalBackend:
 
         try:
             if not have_exe:
-                if sys.platform == "win32" and not _is_vcredist_available():
-                    log("[BACKEND] VCRedist missing — trying silent install for background GPU/CPU engine")
-                    if not _ensure_vcredist_silent():
-                        log("[BACKEND] VCRedist still missing — whisper-server would crash 0xC0000005")
-                        self._notify("Speech engine needs Microsoft Visual C++ Redistributable — install from https://aka.ms/vs/17/release/vc_redist.x64.exe then retry")
-                        return False
                 if sys.platform != "win32" and wanted.startswith("cuda"):
                     # Upstream ships no Linux CUDA binary; build one. Raises
                     # on a missing toolkit or a failed compile, and the
@@ -2062,6 +2153,7 @@ class LocalBackend:
                               if wanted.startswith("cuda") else runtime)
                     _unpack_engine(archive_path, target, self._exe_name,
                                    "cuda" if wanted.startswith("cuda") else "cpu")
+                    _prepare_engine_runtime(target)
                     # Prove the binary survived the unpack: antivirus on
                     # Windows loves whisper-server.exe, and without this the
                     # install "succeeds", the server never starts, and every
@@ -2486,6 +2578,7 @@ class LocalBackend:
             except OSError:
                 pass
             _unpack_engine(archive_path, runtime, self._exe_name, "cpu")
+            _prepare_engine_runtime(runtime)
             if sys.platform != "win32":
                 try:
                     (runtime / self._exe_name).chmod(0o755)
@@ -2532,6 +2625,7 @@ class LocalBackend:
                 pass
             _unpack_engine(archive_path, _plain_dir(self.config.config_dir),
                            self._exe_name, "plain")
+            _prepare_engine_runtime(_plain_dir(self.config.config_dir))
             self._record_cpu_fallback("cpu-plain")
             log("[BACKEND] plain compatibility engine installed")
             self._notify("Compatibility engine ready — slower, but stable on this PC")
@@ -2557,6 +2651,8 @@ class LocalBackend:
             return self._start_with_fallback_locked(model, allow_download)
 
     def _start_with_fallback_locked(self, model, allow_download):
+        if self.resident_available():
+            return self.start(model, allow_download=allow_download)
         if self._reconsider_cli_mode(model):
             # No server here by decree of the doctor: spawning one only
             # produces another 0xC0000005 and, worse, quarantines engines
@@ -2685,6 +2781,8 @@ class LocalBackend:
         With allow_download=False the pre-flight never fetches: a corrupt
         model or an unhealthy engine is reported, not re-downloaded.
         """
+        if self.resident_available():
+            return self._start_resident(model)
         if self._reconsider_cli_mode(model):
             return None
         with self._lock:
@@ -2742,16 +2840,12 @@ class LocalBackend:
                     pass
             except Exception as e:
                 log(f"[BACKEND] engine facts failed: {e}")
-            if sys.platform == "win32" and not _is_vcredist_available():
-                log("[BACKEND] VCRedist missing — whisper-server.exe will crash 0xC0000005")
-                log("[BACKEND] hint: install Microsoft Visual C++ Redistributable from https://aka.ms/vs/17/release/vc_redist.x64.exe")
-                if not allow_download:
-                    return None
-                # Try silent install once per process
-                if _ensure_vcredist_silent():
-                    log("[BACKEND] VCRedist now available after silent install, continuing")
-                else:
-                    return None
+            try:
+                _prepare_engine_runtime(self.server_exe.parent)
+            except Exception as e:
+                log(f"[BACKEND] engine runtime unavailable: {e}")
+                self._notify(str(e))
+                return None
             # Pre-flight: verify model file not truncated and engine can at least run --help
             try:
                 mpath = self.model_path(model)
@@ -3001,6 +3095,8 @@ class LocalBackend:
 
     @property
     def url(self) -> str:
+        if self._resident and self._resident.alive:
+            return "pipe://whisper-flow"
         port = getattr(self, "_active_port", None) or self.config.local_server_port
         return f"http://127.0.0.1:{port}"
 
@@ -3059,6 +3155,12 @@ class LocalBackend:
     def _stop_locked(self) -> None:
         """Reap the child while the caller owns the lifecycle lock."""
         self._ready = False
+        if self._resident:
+            try:
+                self._resident.stop()
+            except Exception as e:
+                log(f"[BACKEND] could not stop resident worker: {e}")
+            self._resident = None
         process = self._process
         if process is not None:
             try:
@@ -3087,6 +3189,8 @@ class LocalBackend:
         is slower, and is the difference between working and not.
         """
         try:
+            if self.resident_available():
+                return False
             return self._cli_mode_marker.exists()
         except Exception:
             return False
@@ -3415,6 +3519,10 @@ class LocalBackend:
     def engine_summary(self) -> str:
         """What the speech engine runs on, in words, for the settings window."""
         engine = self.installed_engine()
+        if engine == "vulkan":
+            return "Vulkan GPU, model kept loaded"
+        if engine == "cpu-resident":
+            return f"CPU, {usable_cores()} threads, model kept loaded"
         if engine.startswith("cuda"):
             return f"NVIDIA GPU ({engine})"
         if engine == "cpu-plain":

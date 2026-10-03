@@ -277,6 +277,7 @@ hidden = collect_submodules("pydantic") + [
     # where every engine crashes would get no diagnosis exactly where it is
     # needed. Named here, and imported by --selftest so the build proves it.
     "whisper_flow.engine_doctor",
+    "whisper_flow.resident",
     # Read lazily inside faulting_module(); without these the frozen build
     # cannot read the Application log and every native crash misreports as
     # "killed externally" that was never established.

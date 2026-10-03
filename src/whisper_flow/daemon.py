@@ -1705,7 +1705,7 @@ class WhisperFlowDaemon:
                 except TypeError:
                     # Mock backends (and old callers) take only the model.
                     url = self.backend.start_with_fallback(model)
-                if isinstance(url, str) and url.startswith("http"):
+                if isinstance(url, str) and url.startswith(("http", "pipe://")):
                     return url
                 # Mock or non-URL — try plain start as the test expects
                 if url is not None and not isinstance(url, str):
@@ -1718,7 +1718,7 @@ class WhisperFlowDaemon:
                             model, allow_download=allow_download)
                     except TypeError:
                         plain = self.backend.start(model)
-                    if isinstance(plain, str) and plain.startswith("http"):
+                    if isinstance(plain, str) and plain.startswith(("http", "pipe://")):
                         return plain
                     return url
             except Exception as e:
@@ -1732,7 +1732,7 @@ class WhisperFlowDaemon:
                 url = self.backend.start(model, allow_download=allow_download)
             except TypeError:
                 url = self.backend.start(model)
-            if isinstance(url, str) and url.startswith("http"):
+            if isinstance(url, str) and url.startswith(("http", "pipe://")):
                 return url
             return None if not isinstance(url, str) else url
         except Exception as e:
@@ -1946,60 +1946,31 @@ class WhisperFlowDaemon:
                     # (8GB+ RAM, 4+ cores) to avoid downloading 1.6GB onto a thin client
                     import whisper_flow.backend as _be
                     if _be.total_ram_gb() >= 8 and _be.usable_cores() >= 4:
-                        # Check VCRedist first — GPU engine will crash 0xC0000005 without it
-                        has_vcr = True
-                        if __import__("sys").platform == "win32":
+                        def _bg_gpu_install():
                             try:
-                                import pathlib as _P
-                                # Check System32 and SysWOW64 for vcruntime
-                                sys32 = _P.Path(r"C:\Windows\System32\vcruntime140.dll")
-                                wow64 = _P.Path(r"C:\Windows\SysWOW64\vcruntime140.dll")
-                                has_vcr = sys32.exists() or wow64.exists()
-                                if not has_vcr:
-                                    # Try via WinSxS or just check msvcp
-                                    has_vcr = _P.Path(r"C:\Windows\System32\msvcp140.dll").exists()
-                            except Exception:
-                                has_vcr = True  # assume present if check fails
-                        if not has_vcr:
-                            log("[BACKEND] VCRedist missing — trying silent install before GPU engine")
-                            try:
-                                import whisper_flow.backend as _be2
-                                if _be2._ensure_vcredist_silent():
-                                    log("[BACKEND] VCRedist silent install succeeded, proceeding with GPU engine")
-                                    has_vcr = True
+                                model = "ggml-large-v3-turbo"
+                                log(f"[BACKEND] silent background GPU engine install for {model}")
+                                ok = self.backend.install(model)
+                                if ok:
+                                    self.backend.adopt_gpu_model(force=True)
+                                    log("[BACKEND] silent GPU install succeeded, restarting server on GPU")
+                                    self.backend.stop()
+                                    url = self._backend_start(model)
+                                    if url:
+                                        self._backend_model = model
+                                        self._backend_engine = self.backend.installed_engine()
+                                        self._use_backend_url(url)
+                                        self.notify(f"GPU engine installed in background — now on {self.backend.engine_summary()}")
+                                    self.backend.mark_setup_seen()
                                 else:
-                                    log("[BACKEND] VCRedist silent install failed, will notify")
-                            except Exception as _e:
-                                log(f"[BACKEND] VCRedist silent check failed: {_e}")
-                            if not has_vcr:
-                                log("[BACKEND] VCRedist missing — GPU engine would crash, not auto-installing; ask user to install VC++ Redist")
-                                self.notify("GPU engine needs Visual C++ Redistributable — install it from https://aka.ms/vs/17/release/vc_redist.x64.exe then retry GPU engine in Settings")
-                        else:
-                            def _bg_gpu_install():
-                                try:
-                                    model = "ggml-large-v3-turbo"
-                                    log(f"[BACKEND] silent background GPU engine install for {model}")
-                                    ok = self.backend.install(model)
-                                    if ok:
-                                        self.backend.adopt_gpu_model(force=True)
-                                        log("[BACKEND] silent GPU install succeeded, restarting server on GPU")
-                                        self.backend.stop()
-                                        url = self._backend_start(model)
-                                        if url:
-                                            self._backend_model = model
-                                            self._backend_engine = self.backend.installed_engine()
-                                            self._use_backend_url(url)
-                                            self.notify(f"GPU engine installed in background — now on {self.backend.engine_summary()}")
-                                        self.backend.mark_setup_seen()
-                                    else:
-                                        log("[BACKEND] silent GPU install failed, will offer again later")
-                                except Exception as e:
-                                    log(f"[BACKEND] silent GPU install failed: {e}")
-                            import threading as _th
-                            _th.Thread(target=_bg_gpu_install, daemon=True, name="whisper-flow-gpu-auto").start()
-                            # Mark seen so we don't auto-retry every boot if it fails
-                            # (user can still manually Install GPU engine in Settings)
-                            self.backend.mark_setup_seen()
+                                    log("[BACKEND] silent GPU install failed, will offer again later")
+                            except Exception as e:
+                                log(f"[BACKEND] silent GPU install failed: {e}")
+                        import threading as _th
+                        _th.Thread(target=_bg_gpu_install, daemon=True, name="whisper-flow-gpu-auto").start()
+                        # Mark seen so we don't auto-retry every boot if it fails
+                        # (user can still manually Install GPU engine in Settings)
+                        self.backend.mark_setup_seen()
             except Exception as e:
                 log(f"[DAEMON] auto GPU install check failed: {e}")
 
@@ -2309,6 +2280,8 @@ class WhisperFlowDaemon:
                     self.command_app):
             app.config.local_whisper_url = url
             app.transcription_service.local_url = url.rstrip("/")
+            app.transcription_service.resident_backend = (
+                self.backend if url == "pipe://whisper-flow" else None)
 
     def open_settings(self, icon=None, item=None):
         """Open the settings window, as its own process.

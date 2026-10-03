@@ -12,8 +12,8 @@ It lives in the notification area — there is no main window.
 
 ## What you need
 
-* A [whisper.cpp](https://github.com/ggerganov/whisper.cpp) server. The
-  installer bundles one and manages it for you.
+* The installer includes a resident [whisper.cpp](https://github.com/ggml-org/whisper.cpp)
+  worker and a starter model. No separate server installation is needed.
 * A microphone.
 
 ## Configuration
@@ -34,6 +34,33 @@ WHISPER_FLOW_NOTIFICATIONS_ENABLED=true
 With live transcription on, words are typed as you speak rather than all at
 once at the end. A word is only typed once two consecutive passes agree on
 it, so what lands is what the final transcript says.
+
+## Windows machines without administrator access
+
+The default local engine keeps the model loaded in a private worker process
+and exchanges audio over process pipes. It opens no HTTP listening port and
+requires no Windows service, firewall change, CUDA toolkit, or administrator
+access. On an NVIDIA machine it uses Vulkan through the existing graphics
+driver. CPU machines use the same resident worker on the CPU.
+
+**Settings → Speech → Install GPU engine** downloads and selects
+`ggml-large-v3-turbo`. The Windows Vulkan worker is already included, so
+there is no CUDA engine archive to install. The model download is about
+1.6 GB; interrupted downloads retry and resume when the server supplies a
+file validator. The model stays loaded between recordings, including live
+preview passes. GPU shader compilation can make the first decode slower.
+
+The legacy HTTP engine is still available under **Speech → Advanced → Local
+engine → server**, or with `WHISPER_FLOW_LOCAL_ENGINE_TRANSPORT=server`.
+Its Visual C++ runtime DLLs ship alongside the application and are copied
+beside downloaded engines; there is no separate elevated runtime installer.
+An explicit Server URL continues to use that external server.
+
+If the worker fails, the app records the reason in
+`%LOCALAPPDATA%\whisper-flow\resident-worker.log` and uses the existing
+CLI fallback. It does not repeatedly download or relaunch the failed
+worker. The worker remains subject to the machine's application and GPU
+security policies; this design does not disable or alter them.
 
 ## How it works here, and how that differs from Linux
 

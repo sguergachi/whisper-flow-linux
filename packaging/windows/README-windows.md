@@ -48,7 +48,8 @@ driver. CPU machines use the same resident worker on the CPU.
 there is no CUDA engine archive to install. The model download is about
 1.6 GB; interrupted downloads retry and resume when the server supplies a
 file validator. The model stays loaded between recordings, including live
-preview passes. GPU shader compilation can make the first decode slower.
+preview passes. GPU shaders are warmed before the worker reports ready,
+so their first-use compilation does not time out the first live pass.
 
 The legacy HTTP engine is still available under **Speech → Advanced → Local
 engine → server**, or with `WHISPER_FLOW_LOCAL_ENGINE_TRANSPORT=server`.

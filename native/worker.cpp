@@ -134,6 +134,20 @@ static int run(const std::vector<std::string> & args) {
         reply("Could not load the speech model", 1);
         return 3;
     }
+    // Vulkan compiles pipelines on first use. Pay that cost before READY,
+    // rather than letting the first live pass hit its short timeout and
+    // invalidate an otherwise working worker. Never publish warmup text.
+    auto warm = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
+    warm.n_threads = threads;
+    warm.no_context = warm.no_timestamps = true;
+    warm.print_progress = warm.print_realtime = warm.print_timestamps = warm.print_special = false;
+    warm.language = "en";
+    warm.greedy.best_of = 2;
+    std::vector<float> silence(16000, 0.0f);
+    if (whisper_full(ctx.get(), warm, silence.data(), int(silence.size()))) {
+        reply("Speech worker warmup failed", 1);
+        return 3;
+    }
     reply(cp.use_gpu ? "READY GPU" : "READY CPU");
     for (;;) {
         std::array<unsigned char, 40> h{};

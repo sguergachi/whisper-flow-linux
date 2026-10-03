@@ -2235,6 +2235,10 @@ class SettingsWindow(Adw.ApplicationWindow):
         for field in settings_def.FIELDS:
             value = getattr(self.config, field.key, None)
             row = self._rows[field.key]
+            if field.key == "speedup_audio" and sys.platform == "win32":
+                value = 1.0
+                row.set_sensitive(False)
+                row.set_tooltip_text("Windows dictation preserves natural voice speed and pitch")
             if field.kind == "bool":
                 row.set_active(bool(value))
                 self._current[field.key] = bool(value)

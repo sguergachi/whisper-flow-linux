@@ -58,6 +58,7 @@ SPOIL_INTERVAL = 0.1
 # How often the foreground is checked, while a Super hotkey is held, for a
 # Start menu that opened anyway. See _close_start_menu_if_it_opened.
 START_MENU_CHECK = 0.2
+START_RELEASE_GRACE = 0.75
 
 # While this app is injecting keystrokes of its own, the key state is not the
 # user's and must not be read as if it were.
@@ -158,6 +159,7 @@ class WinHotkeyListener:
         self.escape_callback = None
         self._spoil_due = 0.0
         self._start_menu_check_due = 0.0
+        self._start_release_until = 0.0
         self._user32 = ctypes.WinDLL("user32", use_last_error=True)
         self._user32.GetAsyncKeyState.restype = ctypes.c_short
         self._user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
@@ -178,6 +180,11 @@ class WinHotkeyListener:
 
     def is_alive(self):
         return bool(self._running and self._thread and self._thread.is_alive())
+
+    def status_snapshot(self) -> dict:
+        return {"backend": "windows-poll", "alive": self.is_alive(),
+                "held": len(self._press_triggered),
+                "callbacks_pending": self._callbacks.qsize()}
 
     def triggered_keys(self) -> frozenset:
         """Every key of every binding currently firing."""
@@ -248,6 +255,11 @@ class WinHotkeyListener:
                     continue
                 down = {VK_ALIASES.get(vk, vk)
                         for vk in watched if get(vk) & HELD_MASK}
+                super_vk = NAME_TO_VK["super"]
+                if super_vk in down and super_vk not in previous:
+                    # A new Windows-key press belongs to the user. Do not
+                    # close a deliberately opened menu after dictation.
+                    self._start_release_until = 0.0
                 if down != previous:
                     self._check_bindings(down, rising=len(down) > len(previous))
                     previous = down
@@ -344,9 +356,10 @@ class WinHotkeyListener:
         """
         keys = self.triggered_keys()
         super_vk = NAME_TO_VK["super"]
-        if super_vk not in keys or super_vk not in down:
-            return False
         now = time.monotonic()
+        held = super_vk in keys and super_vk in down
+        if not held and now >= self._start_release_until:
+            return False
         if now < self._start_menu_check_due:
             return False
         self._start_menu_check_due = now + START_MENU_CHECK
@@ -377,6 +390,10 @@ class WinHotkeyListener:
                         self._callbacks.put((name, "press", cb_press))
             elif name in self._press_triggered:
                 self._press_triggered.discard(name)
+                if NAME_TO_VK["super"] in _keys:
+                    # Start opens on release, precisely when triggered_keys
+                    # stops containing Super. Keep the check alive briefly.
+                    self._start_release_until = time.monotonic() + START_RELEASE_GRACE
                 if cb_release:
                     self._callbacks.put((name, "release", cb_release))
 

@@ -175,7 +175,7 @@ class HotkeyManager:
 
     def input_status(self) -> dict:
         """Listener health snapshot for logs and diagnostics. Counts only."""
-        listener = self._evdev_listener
+        listener = self._evdev_listener or self.keyboard_listener
         snapshot = getattr(listener, "status_snapshot", None)
         if snapshot is not None:
             try:
@@ -256,7 +256,7 @@ class HotkeyManager:
             # One backend per platform: a low-level hook on Windows, evdev on
             # Wayland, pynput's X11 listener otherwise.
             if _is_windows():
-                log("[HOTKEY] Windows detected, using keyboard hook backend")
+                log("[HOTKEY] Windows detected, using keyboard state polling")
                 self._start_windows()
             elif _is_wayland():
                 log("[HOTKEY] Wayland detected, using evdev backend")

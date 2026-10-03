@@ -381,11 +381,9 @@ class AudioRecorder:
                     # convert; handing it back meant the platform default
                     # through MME, which is the same microphone several
                     # times quieter.
-                    log(f"[AUDIO] WASAPI device {device} will not do "
-                        f"{self.config.sample_rate}Hz; capturing at "
-                        f"{self._native_rate(device)}Hz and converting")
+                    self._log_device_choice(device, self._native_rate(device))
                     return device
-                log(f"[AUDIO] using WASAPI input device {device}")
+                self._log_device_choice(device, self.config.sample_rate)
                 return device
         except Exception as e:
             log(f"[AUDIO] could not pick a WASAPI device: {e}")
@@ -505,6 +503,18 @@ class AudioRecorder:
             return rate if rate > 0 else self.config.sample_rate
         except Exception:
             return self.config.sample_rate
+
+    def _log_device_choice(self, device: int, rate: int) -> None:
+        # Idle identity checks run every two seconds. They do not open a
+        # stream, and must not evict dictation evidence from the report.
+        choice = (device, rate, self.config.sample_rate)
+        if choice == getattr(self, "_logged_device_choice", None):
+            return
+        self._logged_device_choice = choice
+        conversion = (f", converting to {self.config.sample_rate}Hz"
+                      if rate != self.config.sample_rate else "")
+        log(f"[AUDIO] using WASAPI input {self._device_name(device)} "
+            f"(index {device}) @ {rate}Hz{conversion}")
 
     def _resample(self, data: bytes, source_rate: int, samples_out: int) -> bytes:
         """Convert captured audio to the rate whisper is given.
@@ -1358,8 +1368,13 @@ class AudioRecorder:
 
         # Apply speedup if enabled (not 1.0). After the trim, which counts on
         # frames still being the length the voice detector expects.
-        if self.config.speedup_audio != 1.0:
-            frames = self._speedup_audio_frames(frames, self.config.speedup_audio)
+        speed = self.config.speedup_audio
+        if sys.platform == "win32" and speed != 1.0:
+            log(f"[AUDIO] ignoring legacy {speed:g}x audio speed on Windows; "
+                "preserving voice pitch and timing")
+            speed = 1.0
+        if speed != 1.0:
+            frames = self._speedup_audio_frames(frames, speed)
 
         audio = b"".join(frames)
         raw_trimmed = audio
@@ -1404,6 +1419,7 @@ class AudioRecorder:
                         self.config, "mic_device_index", None),
                     "rescue_latched": bool(self._rescue_latched),
                     "force_rescue": force_rescue,
+                    "audio_speed": speed,
                 },
                 mode=getattr(self, "_debug_mode", "") or "",
             )

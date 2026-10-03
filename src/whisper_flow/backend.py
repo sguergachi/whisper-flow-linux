@@ -1443,7 +1443,7 @@ class LocalBackend:
         return bool(bundle and (bundle / "worker" / "whisper-flow-worker.exe").is_file())
 
     def _start_resident(self, model: str | None) -> str | None:
-        from .resident import ResidentWorker
+        from .resident import ReferenceDecodeError, ResidentWorker
 
         with self._lock:
             if self._resident and self._resident.alive:
@@ -1459,12 +1459,31 @@ class LocalBackend:
             try:
                 exe = bundled_dir() / "worker" / "whisper-flow-worker.exe"
                 self._stderr_path = Path(self.config.config_dir) / "resident-worker.log"
-                self._resident = ResidentWorker(
-                    exe, self.model_path(model), self._thread_count(), gpu,
-                    self._stderr_path,
-                    creationflags=no_console_flags(),
-                    adopt=lambda proc: _adopt_into_job(self._job, proc),
-                )
+                reference = exe.parent / "reference.wav"
+                if not reference.is_file():
+                    raise RuntimeError("Bundled speech reference is missing")
+                for standard_kernels in (False, True) if gpu else (False,):
+                    env = os.environ.copy()
+                    if standard_kernels:
+                        env["GGML_VK_DISABLE_COOPMAT2"] = "1"
+                    self._resident = ResidentWorker(
+                        exe, self.model_path(model), self._thread_count(), gpu,
+                        self._stderr_path,
+                        creationflags=no_console_flags(),
+                        adopt=lambda proc: _adopt_into_job(self._job, proc), env=env,
+                        flash_attn=not standard_kernels,
+                    )
+                    try:
+                        errors = self._resident.verify_reference(reference)
+                        log(f"[BACKEND] known-speech check passed twice: {errors}; "
+                            f"standard kernels={standard_kernels}")
+                        break
+                    except ReferenceDecodeError as e:
+                        self._resident.stop()
+                        self._resident = None
+                        if not gpu or standard_kernels:
+                            raise
+                        log(f"[BACKEND] {e}; retrying Vulkan without cooperative matrix 2")
                 self._process = self._resident.process
                 self._ready = True
                 self._last_started_model = model

@@ -298,6 +298,23 @@ def test_suppression_failing_does_not_stop_the_hotkey(listener, monkeypatch):
 
 
 # --------------------------------------- closing one that opened anyway
+def test_start_menu_opening_on_hotkey_release_is_still_checked(listener, monkeypatch):
+    import time
+    module = listener._module
+    closed = []
+    _fake_system_win(monkeypatch, lambda: None,
+                     dismiss=lambda: (closed.append(1), True)[1])
+    listener.register_hotkey("transcribe", "super+alt", lambda: None)
+    listener._check_bindings({module.NAME_TO_VK["super"], module.NAME_TO_VK["alt"]}, rising=True)
+    listener._check_bindings(set(), rising=False)
+    assert not listener.triggered_keys()
+    assert listener._close_start_menu_if_it_opened(set()) is True
+    listener._start_release_until = time.monotonic() - 1
+    listener._start_menu_check_due = 0
+    assert listener._close_start_menu_if_it_opened(set()) is False
+    assert len(closed) == 1
+
+
 def test_a_start_menu_that_opened_is_closed_during_the_hold(listener,
                                                             monkeypatch):
     """The typing path only notices when it has words to deliver.

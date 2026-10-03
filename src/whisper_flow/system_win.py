@@ -36,10 +36,9 @@ INJECTED_TAG = 0x5748464C
 VK_CONTROL, VK_MENU, VK_SHIFT, VK_LWIN, VK_RWIN = 0x11, 0x12, 0x10, 0x5B, 0x5C
 VK_V = 0x56
 VK_ESCAPE = 0x1B
-# Reserved by Windows as a key that does nothing. Used to mark the
-# Windows key as having been combined with something, so releasing it
-# does not open the Start menu.
-VK_NONAME = 0xFC
+# Unassigned menu-mask key. VK_NONAME (0xFC) is reserved, rather than
+# documented as an ordinary unassigned key, and can be ignored by the shell.
+VK_MENU_MASK = 0xE8
 MODIFIERS = (VK_CONTROL, VK_MENU, VK_SHIFT, VK_LWIN, VK_RWIN)
 # Cleared for typing. Super is deliberately excluded: KEYUP+KEYDOWN of the
 # Windows key mid-hold is what arms the Start menu for the next release
@@ -497,8 +496,8 @@ def _spoil_events() -> list:
     release of the modifiers is exactly that shape.
     """
     return [
-        _key_event(VK_NONAME, 0, 0),
-        _key_event(VK_NONAME, 0, KEYEVENTF_KEYUP),
+        _key_event(VK_MENU_MASK, 0, 0),
+        _key_event(VK_MENU_MASK, 0, KEYEVENTF_KEYUP),
     ]
 
 
@@ -510,9 +509,8 @@ def spoil_start_menu() -> None:
     release, so letting go opened Start and the dictated text went into its
     search box.
 
-    Pressing any key while Windows is still down marks the press as used, and
-    the release is then ignored. VK_NONAME is reserved as a no-op precisely
-    for this: it reaches no application and does nothing on its way past.
+    The unassigned vkE8 mask marks the Windows-key press as used, without
+    typing a character or invoking a shortcut.
     """
     _note("sent the no-op key on its own")
     _send(_spoil_events())

@@ -175,6 +175,7 @@ def format_report(meta: dict) -> str:
         f"smart_voice={meta.get('smart_voice_amplification', meta.get('noise_filter'))}",
         f"trim_silence={meta.get('trim_silence')}  "
         f"vad_mode={meta.get('vad_mode')}",
+        f"audio_speed={meta.get('audio_speed', '(not recorded)')}",
         "",
         "--- raw (untrimmed) ---",
     ]

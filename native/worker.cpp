@@ -68,10 +68,10 @@ static void reply(const std::string & text, uint32_t status = 0) {
 
 static int run(const std::vector<std::string> & args) {
     if (args.size() == 2 && args[1] == "--help") {
-        std::fprintf(stderr, "whisper-flow-worker MODEL THREADS GPU(0/1)\n");
+        std::fprintf(stderr, "whisper-flow-worker MODEL THREADS GPU(0/1) [FLASH_ATTN(0/1)]\n");
         return 0;
     }
-    if (args.size() != 4) return 2;
+    if (args.size() != 4 && args.size() != 5) return 2;
     int threads = std::stoi(args[2]);
     if (threads < 1 || threads > 64) return 2;
 #ifdef _WIN32
@@ -82,7 +82,7 @@ static int run(const std::vector<std::string> & args) {
     auto cp = whisper_context_default_params();
     whisper_log_set(engine_log, nullptr);
     cp.use_gpu = args[3] == "1";
-    cp.flash_attn = cp.use_gpu;
+    cp.flash_attn = cp.use_gpu && (args.size() == 4 || args[4] == "1");
     // Select a real GPU before loading a large model. whisper.cpp otherwise
     // silently falls back to CPU, making large-v3-turbo unusably slow.
     if (cp.use_gpu) {

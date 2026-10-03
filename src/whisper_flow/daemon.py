@@ -2137,6 +2137,13 @@ class WhisperFlowDaemon:
         except Exception as e:
             report.append(f"  engine            : unavailable ({e})")
         try:
+            recorder = self.transcribe_app.audio_recorder
+            device = recorder._input_device_index()
+            report.append(f"  microphone        : {recorder._device_name(device)} "
+                          f"(index {device}) @ {recorder._native_rate(device)}Hz")
+        except Exception as e:
+            report.append(f"  microphone        : unavailable ({e})")
+        try:
             status = self.hotkey_manager.input_status()
             report.append(
                 "  input             : backend={backend} alive={alive} "
@@ -2181,6 +2188,14 @@ class WhisperFlowDaemon:
                     handle.seek(max(0, worker_log.stat().st_size - 16000))
                     tail = handle.read().decode("utf-8", errors="replace")
                 report += ["", "Resident speech worker", tail.rstrip()]
+        except Exception:
+            pass
+        try:
+            from .audio_debug import last_dir
+            capture_report = last_dir(self.config.config_dir) / "report.txt"
+            if capture_report.is_file():
+                report += ["", "Last recording (raw and processed)",
+                           capture_report.read_text(encoding="utf-8", errors="replace")[:16000]]
         except Exception:
             pass
         report += ["", "Recent log", recent_log(200) or "(nothing recorded)"]

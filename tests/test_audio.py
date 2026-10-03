@@ -27,6 +27,23 @@ def _cancel_warm_timer(recorder: AudioRecorder) -> None:
         recorder._warm_timer = None
 
 
+def test_windows_final_decode_preserves_voice_speed_even_with_legacy_225x(tmp_path, monkeypatch):
+    recorder = _recorder()
+    recorder.config.smart_voice_amplification = False
+    recorder.config.trim_silence = False
+    recorder.config.speedup_audio = 2.25
+    recorder.config.config_dir = tmp_path
+    monkeypatch.setattr(sys, "platform", "win32")
+    samples = (np.sin(np.arange(16000) * 2 * np.pi * 440 / 16000) * 5000).astype(np.int16)
+    frames = [samples[i:i+480].tobytes() for i in range(0, len(samples), 480)]
+    path = tmp_path / "sent.wav"
+    recorder._save_wav_file(str(path), frames)
+    import wave
+    with wave.open(str(path), "rb") as wav:
+        assert wav.getnframes() == 16000
+        assert wav.readframes(16000) == samples.tobytes()
+
+
 def test_warm_stream_is_reused_when_the_chunk_matches():
     recorder = _recorder()
     stream = Mock()

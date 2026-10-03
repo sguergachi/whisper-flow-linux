@@ -32,6 +32,18 @@ def recorder():
 
 
 # ------------------------------------------------------------ device choice
+def test_idle_device_probes_do_not_fill_the_report_with_rate_messages(recorder, monkeypatch):
+    messages = []
+    monkeypatch.setattr("whisper_flow.audio.log", messages.append)
+    recorder.pa.get_device_info_by_index.return_value = {"name": "Laptop Mic"}
+    for _ in range(100):
+        recorder._log_device_choice(15, 48000)
+    assert len(messages) == 1
+    assert "Laptop Mic" in messages[0] and "48000Hz" in messages[0]
+    recorder._log_device_choice(16, 48000)
+    assert len(messages) == 2
+
+
 def test_an_explicit_supported_device_wins(recorder, monkeypatch):
     monkeypatch.setattr(sys, "platform", "win32")
     recorder.config.mic_device_index = 7

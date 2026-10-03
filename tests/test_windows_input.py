@@ -255,7 +255,7 @@ def test_letting_go_of_the_injected_super_does_not_open_start(win):
 
     system_win.release_injected_modifiers()
 
-    noop = _order_of(batches, system_win.VK_NONAME)
+    noop = _order_of(batches, system_win.VK_MENU_MASK)
     supers = _order_of(batches, system_win.VK_LWIN)
     assert noop, "nothing marked the Super press as used"
     assert supers, "Super was never released"

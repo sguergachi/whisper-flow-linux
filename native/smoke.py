@@ -30,8 +30,10 @@ def main():
             shutil.copyfile(model, target)
             model = target
         worker = ResidentWorker(exe, model,
-                                4, "--gpu" in sys.argv[4:], Path(directory) / "worker.log")
+                                4, "--gpu" in sys.argv[4:], Path(directory) / "worker.log",
+                                flash_attn="--no-flash-attention" not in sys.argv[4:])
         try:
+            print("known-speech check:", worker.verify_reference(Path(sys.argv[3])))
             pid = worker.process.pid
             for i in range(2):
                 start = time.monotonic()

@@ -51,6 +51,18 @@ file validator. The model stays loaded between recordings, including live
 preview passes. GPU shaders are warmed before the worker reports ready,
 so their first-use compilation does not time out the first live pass.
 
+Before accepting a worker, the app decodes a bundled known
+speech sample twice with the selected model and checks its words. This runs
+locally and does not record the microphone. If the GPU produces incorrect
+reference words, the app retries once without flash attention and cooperative matrix 2 kernels,
+while keeping inference on the GPU. A running process that fails both checks
+is rejected rather than being reported as a working transcription engine.
+
+Windows dictation preserves natural voice speed and pitch. Legacy audio-speed
+settings are ignored: shortening recordings by resampling changed the pitch
+and made live and final decoding hear different speech. The app's speed comes
+from the GPU and keeping the model loaded.
+
 The legacy HTTP engine is still available under **Speech → Advanced → Local
 engine → server**, or with `WHISPER_FLOW_LOCAL_ENGINE_TRANSPORT=server`.
 Its Visual C++ runtime DLLs ship alongside the application and are copied

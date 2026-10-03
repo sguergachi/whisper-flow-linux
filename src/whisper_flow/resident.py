@@ -7,19 +7,44 @@ the tray. Audio stays in memory and only the child's stderr reaches disk.
 from __future__ import annotations
 
 import queue
+import re
 import struct
 import subprocess
 import threading
 import time
 import wave
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 
 
+class ReferenceDecodeError(RuntimeError):
+    """The process runs but does not correctly decode known speech."""
+
+
+REFERENCE_TEXT = ("and so my fellow americans ask not what your country can do for you "
+                  "ask what you can do for your country")
+
+
+def reference_error_rate(text: str) -> float:
+    """Word edit distance; punctuation/case are irrelevant to the check."""
+    expected = REFERENCE_TEXT.split()
+    actual = re.findall(r"[a-z]+", text.lower())
+    previous = list(range(len(actual) + 1))
+    for i, word in enumerate(expected, 1):
+        row = [i]
+        for j, received in enumerate(actual, 1):
+            row.append(min(row[-1] + 1, previous[j] + 1,
+                           previous[j - 1] + (word != received)))
+        previous = row
+    return previous[-1] / len(expected)
+
+
 class ResidentWorker:
     def __init__(self, exe: Path, model: Path, threads: int, gpu: bool,
-                 log_path: Path, creationflags: int = 0, adopt=None):
+                 log_path: Path, creationflags: int = 0, adopt=None,
+                 flash_attn: bool = True, env=None):
         self.exe, self.model, self.gpu = Path(exe), Path(model), gpu
         self._lock = threading.Lock()
         self._responses = queue.Queue()
@@ -30,9 +55,10 @@ class ResidentWorker:
             log_path.parent.mkdir(parents=True, exist_ok=True)
             self._stderr = open(log_path, "ab")
             self.process = subprocess.Popen(
-                [str(self.exe), str(self.model), str(threads), "1" if gpu else "0"],
+                [str(self.exe), str(self.model), str(threads), "1" if gpu else "0",
+                 "1" if flash_attn else "0"],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self._stderr,
-                cwd=str(self.exe.parent), creationflags=creationflags, bufsize=0,
+                cwd=str(self.exe.parent), creationflags=creationflags, bufsize=0, env=env,
             )
             if adopt:
                 adopt(self.process)
@@ -49,6 +75,25 @@ class ResidentWorker:
     @property
     def alive(self) -> bool:
         return bool(self.ready and self.process and self.process.poll() is None)
+
+    def verify_reference(self, audio_path: Path) -> list[float]:
+        """Check real speech twice, after warmup, in the same GPU context.
+
+        Silence can execute corrupt GPU kernels without exposing incorrect
+        output. The bundled public reference bypasses microphones, gain,
+        denoising and live prompts so those cannot mask a numerical failure.
+        """
+        config = SimpleNamespace(language="en", beam_size=1, best_of=2,
+                                 fast_encoder=False, no_speech_thold=0.6)
+        errors = []
+        for _ in range(2):
+            text = self.transcribe(audio_path, config, timeout=90)
+            error = reference_error_rate(text)
+            if error > 0.25:
+                raise ReferenceDecodeError(
+                    f"Known-speech check failed ({error:.0%} word error): {text[:240]!r}")
+            errors.append(error)
+        return errors
 
     @staticmethod
     def _read_exact(stream, length: int) -> bytes:

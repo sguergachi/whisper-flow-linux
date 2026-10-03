@@ -525,6 +525,7 @@ jobs:
           target=packaging/windows/dist/whisper-flow/worker
           mkdir -p "$target"
           cp native-build/whisper-flow-worker.exe "$target/"
+          cp native-build/_deps/whisper-src/samples/jfk.wav "$target/reference.wav"
           cp native-build/_deps/whisper-src/LICENSE "$target/whisper.cpp-LICENSE.txt"
           cp /ucrt64/share/licenses/vulkan-loader/LICENSE* "$target/"
           # Copy imports from the build prefix by name. ldd can resolve
@@ -623,7 +624,7 @@ jobs:
           Add-Type -AssemblyName System.IO.Compression.FileSystem
           $zip = [System.IO.Compression.ZipFile]::OpenRead("$PWD/installer-out/WhisperFlow-win-Portable.zip")
           try {
-            foreach ($file in @('worker/whisper-flow-worker.exe', 'worker/vulkan-1.dll', 'worker/libwinpthread-1.dll', 'native-runtime/vcruntime140_1.dll')) {
+            foreach ($file in @('worker/whisper-flow-worker.exe', 'worker/reference.wav', 'worker/vulkan-1.dll', 'worker/libwinpthread-1.dll', 'native-runtime/vcruntime140_1.dll')) {
               if (-not ($zip.Entries | Where-Object { $_.FullName.EndsWith("/$file") -and $_.Length -gt 0 })) {
                 throw "Published portable package is missing $file"
               }

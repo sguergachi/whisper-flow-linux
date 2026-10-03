@@ -11,7 +11,8 @@ import pytest
 
 from whisper_flow import backend as bm
 from whisper_flow.backend import LocalBackend
-from whisper_flow.resident import ResidentWorker
+from whisper_flow.resident import (REFERENCE_TEXT, ReferenceDecodeError,
+                                   ResidentWorker, reference_error_rate)
 
 
 @pytest.fixture
@@ -131,6 +132,7 @@ def windows_backend(tmp_path, monkeypatch):
     exe = bundle / "worker" / "whisper-flow-worker.exe"
     exe.parent.mkdir(parents=True)
     exe.touch()
+    (exe.parent / "reference.wav").touch()
     model = tmp_path / "models" / f"{cfg.model_name}.bin"
     model.parent.mkdir()
     model.touch()
@@ -193,3 +195,44 @@ def test_worker_failure_can_use_bundled_cli_without_a_download(windows_backend):
     cli.touch()
     windows_backend._resident_failed = True
     assert cli in windows_backend.cli_paths()
+
+
+def test_known_speech_check_rejects_running_worker_with_wrong_values(audio):
+    worker = object.__new__(ResidentWorker)
+    worker.transcribe = Mock(side_effect=[REFERENCE_TEXT, "Thank you for watching."])
+    with pytest.raises(ReferenceDecodeError, match="Known-speech"):
+        worker.verify_reference(audio)
+    assert worker.transcribe.call_count == 2
+
+
+def test_known_speech_check_accepts_case_punctuation_and_minor_variation(audio):
+    worker = object.__new__(ResidentWorker)
+    worker.transcribe = Mock(side_effect=[REFERENCE_TEXT.upper()+"!", REFERENCE_TEXT.replace("and so ", "")])
+    assert worker.verify_reference(audio) == pytest.approx([0, 2/22])
+    assert reference_error_rate("") == 1
+    assert reference_error_rate(REFERENCE_TEXT + " garbage" * 30) > 1
+
+
+def test_corrupt_gpu_result_retries_standard_kernels_and_stops_failed_process(windows_backend, monkeypatch):
+    bad, good = Mock(alive=True), Mock(alive=True)
+    bad.verify_reference.side_effect = ReferenceDecodeError("wrong speech")
+    good.verify_reference.return_value = [0, 0]
+    factory = Mock(side_effect=[bad, good])
+    monkeypatch.setattr("whisper_flow.resident.ResidentWorker", factory)
+    assert windows_backend.start("ggml-large-v3-turbo") == "pipe://whisper-flow"
+    bad.stop.assert_called_once()
+    assert factory.call_args_list[1].kwargs["env"]["GGML_VK_DISABLE_COOPMAT2"] == "1"
+    assert windows_backend._resident is good
+    windows_backend.stop()
+
+
+def test_wrong_speech_on_both_gpu_paths_is_not_advertised_as_ready(windows_backend, monkeypatch):
+    bad = Mock(alive=True)
+    bad.verify_reference.side_effect = ReferenceDecodeError("wrong speech")
+    factory = Mock(return_value=bad)
+    monkeypatch.setattr("whisper_flow.resident.ResidentWorker", factory)
+    assert windows_backend.start("ggml-large-v3-turbo") is None
+    assert not windows_backend.is_ready
+    assert windows_backend.cli_mode()
+    assert bad.stop.call_count == 2
+    assert factory.call_count == 2

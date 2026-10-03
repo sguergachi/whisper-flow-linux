@@ -70,8 +70,13 @@ def test_resident_requests_reuse_process_and_forward_decode_options(tmp_path, au
     worker = child(tmp_path)
     try:
         pid = worker.process.pid
-        assert worker.transcribe(audio, config, prompt="Echo", temperature=0.4) == f"{pid}:1:en:Echo:5:3"
-        assert worker.transcribe(audio, config) == f"{pid}:2:en::5:3"
+        first = worker.transcribe(audio, config, prompt="Echo", temperature=0.4)
+        decoder_pid, result = first.split(":", 1)
+        assert result == "1:en:Echo:5:3"
+        # MSYS2's venv Python executable launches the real interpreter, so
+        # its Popen PID can differ from os.getpid() inside the test child.
+        assert worker.transcribe(audio, config) == f"{decoder_pid}:2:en::5:3"
+        assert worker.process.pid == pid
         assert worker.alive
     finally:
         worker.stop()
@@ -179,3 +184,12 @@ def test_explicit_http_transport_keeps_windows_server(windows_backend):
     windows_backend.config.local_engine_transport = "server"
     assert windows_backend.resident_available() is False
     assert windows_backend.server_exe.name == "whisper-server.exe"
+
+
+def test_worker_failure_can_use_bundled_cli_without_a_download(windows_backend):
+    bundle = bm.bundled_dir()
+    cli = bundle / "engine" / "whisper-cli.exe"
+    cli.parent.mkdir()
+    cli.touch()
+    windows_backend._resident_failed = True
+    assert cli in windows_backend.cli_paths()

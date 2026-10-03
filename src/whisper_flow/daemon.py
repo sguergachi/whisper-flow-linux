@@ -2174,6 +2174,15 @@ class WhisperFlowDaemon:
             findings = f"(unreadable: {e})"
         if findings:
             report += ["", "Engine doctor", findings]
+        try:
+            worker_log = Path(self.config.config_dir) / "resident-worker.log"
+            if worker_log.is_file():
+                with open(worker_log, "rb") as handle:
+                    handle.seek(max(0, worker_log.stat().st_size - 16000))
+                    tail = handle.read().decode("utf-8", errors="replace")
+                report += ["", "Resident speech worker", tail.rstrip()]
+        except Exception:
+            pass
         report += ["", "Recent log", recent_log(200) or "(nothing recorded)"]
         return "\n".join(report)
 

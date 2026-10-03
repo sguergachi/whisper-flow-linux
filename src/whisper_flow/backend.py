@@ -3297,10 +3297,16 @@ class LocalBackend:
                 else "whisper-cli")
         try:
             candidates = [
+                _shared_runtime() / "cuda" / name,
                 _cuda_dir(self.config.config_dir) / name,
+                _shared_runtime() / "plain" / name,
                 _plain_dir(self.config.config_dir) / name,
+                _shared_runtime() / name,
                 _runtime_dir(self.config.config_dir) / name,
             ]
+            bundle = bundled_dir()
+            if bundle:
+                candidates.append(bundle / "engine" / name)
         except Exception:
             return []
         paths = [path for path in dict.fromkeys(candidates) if path.exists()]

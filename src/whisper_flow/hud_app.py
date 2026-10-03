@@ -1093,6 +1093,22 @@ class HudWindow(Gtk.Window):
             return HEIGHT + STOP_BTN_H - STOP_OVERLAP
         return HEIGHT
 
+    def _warm_chrome(self) -> bool:
+        """Pre-build the cached pill picture while the overlay is parked.
+
+        The first frame of the first recording otherwise builds every
+        outline path and gradient in the chrome while the user is already
+        speaking. Doing it here, right after the resident overlay starts,
+        moves that cost to login, next to the process startup the prewarm
+        is already paying. A recording with a stop button resizes and
+        rebuilds anyway; the common pill is still covered.
+        """
+        try:
+            self._chrome_surface(WIDTH, self._window_height())
+        except Exception:
+            pass
+        return False
+
     def _stop_rect(self):
         """The button's rectangle, in the area's own coordinates."""
         y0 = HEIGHT - STOP_OVERLAP
@@ -1457,8 +1473,23 @@ class HudWindow(Gtk.Window):
         with self._levels_lock:
             risk_target = self.noise_risk
         self.shown_risk += (risk_target - self.shown_risk) * RISK_EASE
+        if self._drag_holds_paint():
+            # The drag moves the whole window with SetWindowPos; repainting
+            # its contents sixty times a second while it moves is what made
+            # the pill stutter under the cursor. The bars keep easing above
+            # and are painted on release, so the meter is a moment stale
+            # rather than the move visibly rough. Anything actually
+            # animated - a fade, the processing sweep, a toast - keeps
+            # painting instead.
+            return True
         self.area.queue_draw()
         return True
+
+    def _drag_holds_paint(self) -> bool:
+        """True when a drag is in flight and the picture is standing still."""
+        return (self._dragging and not self.processing
+                and self.toast_text is None and self._fade_out_t0 is None
+                and self.alpha >= 0.999)
 
     def _processing_levels(self, now):
         """Bar heights for the processing sweep. See hud_anim.sweep."""
@@ -1921,6 +1952,8 @@ def main() -> int:
         # Realize now so the window, its HWND and its styling all exist
         # before the first show; a show is then just a map, not a build.
         win.realize()
+        # And the cached picture with it, so the first frame is a blit.
+        win._warm_chrome()
         threading.Thread(target=_command_loop, args=(win,), daemon=True,
                          name="whisper-flow-hud-commands").start()
     else:

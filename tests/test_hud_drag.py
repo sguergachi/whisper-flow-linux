@@ -8,6 +8,8 @@ once, on the transition between docked and dragged.
 """
 
 import sys
+import threading
+from collections import deque
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -144,3 +146,78 @@ def test_win32_pin_recorded_before_any_window(monkeypatch):
     win._pin = None
     win._apply_position_win32(300, 400)
     assert win._pin == (300, 400)
+
+
+# ------------------------------------------- still content while dragging
+def _frame_window():
+    """A window with enough state to run one frame, paint recorded."""
+    win = hud_app_module.HudWindow.__new__(hud_app_module.HudWindow)
+    win._resident = True
+    win.get_visible = lambda: True
+    win._placed = True
+    win._fade_in_t0 = 0.0
+    win._fade_out_t0 = None
+    win.alpha = 1.0
+    win._blur = None
+    win.want_hover = False
+    win.hover = 0.0
+    win.stop_hover = 0.0
+    win.stop_hover_target = 0.0
+    win.processing = False
+    win.toast_text = None
+    win.targets = deque([0.5] * hud_app_module.BARS)
+    win.shown = [0.0] * hud_app_module.BARS
+    win._levels_lock = threading.Lock()
+    win.noise_risk = 0.0
+    win.shown_risk = 0.0
+    win._dragging = False
+    win.area = Mock()
+    return win
+
+
+def test_drag_holds_paint_while_the_picture_is_steady():
+    """Moving the window needs no repaint; the bars ease underneath."""
+    win = _frame_window()
+    win._dragging = True
+    assert win._frame() is True
+    win.area.queue_draw.assert_not_called()
+    # Levels still follow the audio, so release paints them current.
+    assert win.shown[0] > 0.0
+
+
+def test_release_resumes_paint_on_the_next_frame():
+    win = _frame_window()
+    win._dragging = True
+    win._frame()
+    win._dragging = False
+    win._frame()
+    win.area.queue_draw.assert_called_once()
+
+
+def test_animated_states_keep_painting_through_a_drag():
+    """A fade, the processing sweep or a toast is watched; keep it live."""
+    win = _frame_window()
+    win._dragging = True
+    win.processing = True
+    win._processing_t0 = 0.0
+    assert win._drag_holds_paint() is False
+    win.processing = False
+    win.toast_text = "mic switched"
+    assert win._drag_holds_paint() is False
+    win.toast_text = None
+    win.alpha = 0.5
+    assert win._drag_holds_paint() is False
+    win.alpha = 1.0
+    assert win._drag_holds_paint() is True
+
+
+def test_chrome_is_built_at_startup_not_on_the_first_frame():
+    """The resident warmup blits on first show instead of building."""
+    win = hud_app_module.HudWindow.__new__(hud_app_module.HudWindow)
+    win._chrome = None
+    win._chrome_size = None
+    win._style = None
+    win.stop_button = False
+    win.processing = False
+    assert win._warm_chrome() is False
+    assert win._chrome is not None

@@ -1458,9 +1458,10 @@ class LocalBackend:
                 return None
             try:
                 exe = bundled_dir() / "worker" / "whisper-flow-worker.exe"
+                self._stderr_path = Path(self.config.config_dir) / "resident-worker.log"
                 self._resident = ResidentWorker(
                     exe, self.model_path(model), self._thread_count(), gpu,
-                    Path(self.config.config_dir) / "resident-worker.log",
+                    self._stderr_path,
                     creationflags=no_console_flags(),
                     adopt=lambda proc: _adopt_into_job(self._job, proc),
                 )

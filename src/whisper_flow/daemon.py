@@ -2799,7 +2799,7 @@ Use 'whisper-flow stop' to exit daemon
         self.is_running = False
         log("[DAEMON] Cleanup complete")
 
-    def _start_tray(self, background: bool = False) -> bool:
+    def _start_tray(self, background: bool = False, retry_sleep=None) -> bool:
         """Create the tray icon and run it, retrying a slow desktop.
 
         At login this process can start before Explorer's notification area
@@ -2810,6 +2810,7 @@ Use 'whisper-flow stop' to exit daemon
         True while the icon ran (returns when it stops).
         """
         attempts = 3
+        retry_sleep = retry_sleep or time.sleep
         for attempt in range(1, attempts + 1):
             trace_stage(f"tray starting (attempt {attempt})")
             try:
@@ -2827,7 +2828,7 @@ Use 'whisper-flow stop' to exit daemon
                 log(f"[DAEMON] Tray setup failed (attempt {attempt}): {e}")
                 trace_stage(f"tray failed: {e}")
                 if attempt < attempts:
-                    time.sleep(5)
+                    retry_sleep(5)
         return False
 
     @staticmethod

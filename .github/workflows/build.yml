@@ -559,7 +559,7 @@ jobs:
           python native/smoke.py \
             packaging/windows/dist/whisper-flow/worker/whisper-flow-worker.exe \
             packaging/windows/dist/whisper-flow/models/ggml-base.en-q8_0.bin \
-            native-build/_deps/whisper-src/samples/jfk.wav
+            native-build/_deps/whisper-src/samples/jfk.wav --unicode-path
 
       - name: Build the installer with Velopack
         # Velopack rather than Inno Setup, and rather than Squirrel.Windows,

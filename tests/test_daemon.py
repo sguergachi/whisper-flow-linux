@@ -1309,12 +1309,12 @@ def test_tray_retry_rides_out_a_slow_desktop(temp_config_dir):
     fake_pystray = Mock()
     fake_pystray.Icon.side_effect = [RuntimeError("no tray yet"),
                                      RuntimeError("no tray yet"), icon]
+    mock_sleep = Mock()
     with (
         patch("whisper_flow.daemon._pystray", return_value=fake_pystray),
         patch("whisper_flow.daemon.trace_stage"),
-        patch("time.sleep") as mock_sleep,
     ):
-        assert daemon._start_tray() is True
+        assert daemon._start_tray(retry_sleep=mock_sleep) is True
     assert fake_pystray.Icon.call_count == 3
     assert mock_sleep.call_count == 2
     icon.run.assert_called_once()
@@ -1324,12 +1324,12 @@ def test_tray_gives_up_after_three_attempts(temp_config_dir):
     daemon = _tray_daemon(temp_config_dir)
     fake_pystray = Mock()
     fake_pystray.Icon.side_effect = RuntimeError("no tray")
+    mock_sleep = Mock()
     with (
         patch("whisper_flow.daemon._pystray", return_value=fake_pystray),
         patch("whisper_flow.daemon.trace_stage"),
-        patch("time.sleep") as mock_sleep,
     ):
-        assert daemon._start_tray() is False
+        assert daemon._start_tray(retry_sleep=mock_sleep) is False
     assert fake_pystray.Icon.call_count == 3
     assert mock_sleep.call_count == 2
 

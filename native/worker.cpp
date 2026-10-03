@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -86,17 +87,49 @@ static int run(const std::vector<std::string> & args) {
     // silently falls back to CPU, making large-v3-turbo unusably slow.
     if (cp.use_gpu) {
         ggml_backend_load_all();
-        bool gpu = false;
+        int selected = -1, gpu_index = 0;
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
-            if (ggml_backend_dev_type(ggml_backend_dev_get(i)) == GGML_BACKEND_DEVICE_TYPE_GPU) gpu = true;
+            auto dev = ggml_backend_dev_get(i);
+            auto type = ggml_backend_dev_type(dev);
+            if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU) continue;
+            // This path is selected on NVIDIA machines. Do not accidentally
+            // put their large model on an Intel iGPU enumerated first.
+            if (type == GGML_BACKEND_DEVICE_TYPE_GPU && selected < 0) selected = gpu_index;
+            if (std::strstr(ggml_backend_dev_description(dev), "NVIDIA")) {
+                selected = gpu_index;
+                break;
+            }
+            ++gpu_index;
         }
-        if (!gpu) {
+        if (selected < 0) {
             reply("No Vulkan GPU is available", 1);
             return 3;
         }
+        cp.gpu_device = selected;
     }
+    // MinGW's upstream file initializer uses a narrow ifstream path. Open
+    // with Windows' Unicode API so non-ASCII user names work as well.
+#ifdef _WIN32
+    FILE * file = _wfopen(std::filesystem::u8path(args[1]).c_str(), L"rb");
+#else
+    FILE * file = std::fopen(args[1].c_str(), "rb");
+#endif
+    std::unique_ptr<FILE, decltype(&std::fclose)> model_file(file, std::fclose);
+    if (!model_file) {
+        reply("Could not open the speech model", 1);
+        return 3;
+    }
+    whisper_model_loader loader{};
+    loader.context = model_file.get();
+    loader.read = [](void * ctx, void * out, size_t size) {
+        return std::fread(out, 1, size, static_cast<FILE *>(ctx));
+    };
+    loader.eof = [](void * ctx) { return std::feof(static_cast<FILE *>(ctx)) != 0; };
+    loader.close = [](void *) {};  // The unique_ptr owns the file.
+    std::fprintf(stderr, "worker: loading model\n");
     std::unique_ptr<whisper_context, decltype(&whisper_free)> ctx(
-        whisper_init_from_file_with_params(args[1].c_str(), cp), whisper_free);
+        whisper_init_with_params(&loader, cp), whisper_free);
+    model_file.reset();
     if (!ctx || (cp.use_gpu && gpu_failed)) {
         reply("Could not load the speech model", 1);
         return 3;

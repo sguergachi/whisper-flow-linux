@@ -135,13 +135,13 @@ def test_a_launch_failure_reports_false_so_the_caller_can_fall_back(
 
 
 # --------------------------------------------------------- when it is shown
-def test_a_missing_model_opens_settings_instead_of_a_notification(daemon):
+def test_a_missing_model_never_opens_settings_without_a_click(daemon):
     daemon.backend.working_model.return_value = None
     with patch.object(daemon, "_open_settings_window", return_value=True) as opened:
         with patch.object(daemon, "notify") as notify:
             daemon._start_managed_backend()
-    opened.assert_called_once()
-    notify.assert_not_called()
+    opened.assert_not_called()
+    assert "speech model" in notify.call_args[0][0].lower()
     daemon.backend.start.assert_not_called()
 
 
@@ -521,6 +521,14 @@ def test_a_headless_machine_builds_nothing_in_advance(daemon, monkeypatch):
     monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
     monkeypatch.setattr("whisper_flow.daemon._adopt_session_display_env",
                         lambda: None)
+    with patch.object(daemon, "_start_tool_window") as start:
+        daemon.prewarm_settings()
+    start.assert_not_called()
+
+
+def test_linux_never_prewarms_a_hidden_settings_process(daemon, monkeypatch):
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")
     with patch.object(daemon, "_start_tool_window") as start:
         daemon.prewarm_settings()
     start.assert_not_called()

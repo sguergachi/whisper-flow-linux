@@ -5,7 +5,6 @@ import os
 import sys
 from pathlib import Path
 
-import pystray
 import pytest
 from PIL import Image, ImageDraw
 
@@ -41,6 +40,10 @@ def test_tray_menu():
     """Test tray icon with menu."""
     # Force GTK backend
     os.environ["PYSTRAY_BACKEND"] = "gtk"
+    # Keep the optional GTK 3 tray backend out of test collection. Other test
+    # modules legitimately load GTK 4, and PyGObject cannot load both major
+    # versions in one process.
+    import pystray
 
     try:
         import gi  # noqa: F401

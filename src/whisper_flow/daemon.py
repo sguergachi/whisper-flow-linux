@@ -1326,6 +1326,13 @@ class WhisperFlowDaemon:
         On a thread, like the overlay's: this starts a process that loads GTK,
         and the tray icon must not wait for it.
         """
+        # Linux startup must not leave a hidden GTK process capable of
+        # surfacing without an explicit tray click.  It was observed mapping
+        # itself 55 seconds after launch with no "Settings menu item clicked"
+        # event.  Linux builds the window quickly enough on demand; retain
+        # prewarming only for the slow Windows runtime it was designed for.
+        if sys.platform != "win32":
+            return
         if not _has_display():
             return                      # headless: there is no window to warm
 
@@ -1850,11 +1857,11 @@ class WhisperFlowDaemon:
         except Exception:
             pass
         if not model:
-            # Nothing can transcribe yet, so this is the whole difference
-            # between a working app and a dead one. Open settings, where the
-            # model is chosen and downloaded, straight away.
-            if not self._open_settings_window():
-                self.notify("No speech model yet - open Settings in the tray")
+            # Never seize focus with an unrequested settings window. Apart
+            # from being disruptive, it can surface between recording and
+            # paste and swallow the transcript. The tray remains the explicit
+            # place to open Settings.
+            self.notify("No speech model yet - open Settings in the tray")
             return
 
         url = self._backend_start(model, allow_download=False)

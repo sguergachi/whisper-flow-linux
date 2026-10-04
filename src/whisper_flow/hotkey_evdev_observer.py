@@ -97,7 +97,10 @@ class EvdevHotkeyObserver:
         devices = []
         for path in evdev.list_devices():
             try:
-                dev = evdev.InputDevice(path)
+                # Enforce observation-only access at the file-descriptor
+                # boundary too.  python-evdev otherwise tries O_RDWR first,
+                # even if the caller never invokes a mutating operation.
+                dev = evdev.InputDevice(path, readonly=True)
                 # Never observe virtual injectors such as ydotool: dictated
                 # text must not feed back into the hotkey matcher.
                 if dev.info.bustype == BUS_VIRTUAL:
@@ -118,7 +121,7 @@ class EvdevHotkeyObserver:
         failures = []
         for path in self._find_keyboard_devices():
             try:
-                opened.append(evdev.InputDevice(path))
+                opened.append(evdev.InputDevice(path, readonly=True))
             except OSError as exc:
                 failures.append((path, exc))
         self._kbd_devices = opened
@@ -245,6 +248,8 @@ class EvdevHotkeyObserver:
     def _handle_key(self, event):
         code = CODE_ALIASES.get(event.code, event.code)
         value = event.value
+        if value not in (0, 1, 2):
+            return
         if value == 2:
             return
         if value == 1:

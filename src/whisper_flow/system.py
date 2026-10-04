@@ -309,6 +309,29 @@ class SystemManager:
         except Exception:
             return False
 
+    def _activate_window_and_wait(self, window_id: str,
+                                  timeout: float = 1.0) -> bool:
+        """Restore the dictation target and wait for KWin to confirm it.
+
+        ``kdotool windowactivate`` only queues an activation request.  Typing
+        immediately after its successful exit races KWin and can send the
+        whole transcript to the HUD (or another window) before focus moves.
+        """
+        if not window_id:
+            return False
+        if self._get_active_window() == window_id:
+            return True
+        if not self._activate_window(window_id):
+            return False
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self._get_active_window() == window_id:
+                return True
+            time.sleep(0.025)
+        log("[PASTE] target window did not receive focus; preserving text "
+            "on the clipboard instead of typing into the wrong window")
+        return False
+
     def paste_text(self, text: str) -> bool:
         """Paste text into the current application.
 
@@ -348,10 +371,12 @@ class SystemManager:
             if self._is_wayland():
                 target_window = self._saved_window or self._get_active_window()
 
-                if target_window and self._kdotool_available():
-                    self._activate_window(target_window)
-
                 sanitized = text.replace('\n', ' ')
+
+                if (target_window and self._kdotool_available()
+                        and not self._activate_window_and_wait(target_window)):
+                    self.copy_to_clipboard(sanitized)
+                    return False
 
                 if self._ydotool_type(sanitized):
                     return True

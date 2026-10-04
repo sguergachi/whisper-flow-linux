@@ -1938,6 +1938,29 @@ def test_cli_mode_records_without_the_live_loop(temp_config_dir):
     app.run_voice_flow_push_to_talk_live.assert_not_called()
 
 
+def test_fail_open_keyboard_buffers_until_hotkey_release(temp_config_dir):
+    """Never inject letters while physical Super+Alt still reaches KDE."""
+    daemon, hotkeys = _idle_daemon(temp_config_dir)
+    daemon.config.live_transcription = True
+    daemon.backend.cli_mode = Mock(return_value=False)
+    hotkeys.input_status.return_value = {"backend": "evdev-observer"}
+    app = Mock()
+    app.run_voice_flow_push_to_talk_daemon = Mock(return_value=True)
+    app.run_voice_flow_push_to_talk_live = Mock(return_value=True)
+    daemon._get_app_for_mode = Mock(return_value=app)
+    daemon._show_hud_now = Mock()
+    daemon._stop_recording = Mock()
+    daemon._release_stuck_modifiers = Mock()
+    daemon._finish_processing = Mock()
+    daemon.stop_recording_event = Mock()
+    daemon._level_file = None
+
+    daemon._record_audio_thread("transcribe")
+
+    app.run_voice_flow_push_to_talk_daemon.assert_called_once()
+    app.run_voice_flow_push_to_talk_live.assert_not_called()
+
+
 def test_cli_fallback_saves_a_final_pass(temp_config_dir):
     daemon, app = _healing_setup(temp_config_dir, "hello cli")
     healing = daemon._healing_transcribe(app)

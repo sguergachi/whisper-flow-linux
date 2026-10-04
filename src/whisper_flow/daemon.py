@@ -1125,13 +1125,25 @@ class WhisperFlowDaemon:
                     cli_mode = self.backend.cli_mode() is True
                 except Exception:
                     cli_mode = False
+                try:
+                    input_backend = self.hotkey_manager.input_status().get(
+                        "backend")
+                except Exception:
+                    input_backend = None
+                # The fail-open observer deliberately leaves the physical
+                # modifiers connected to the compositor. Injecting live text
+                # while Super+Alt is still held would turn its letters into
+                # desktop shortcuts. Buffer the utterance until key release;
+                # safety is worth more than a live preview.
+                observer_mode = input_backend == "evdev-observer"
                 # In CLI mode there is no server for live passes (and a
                 # model load per second of speech would bury the dictation):
                 # record plainly and let the closing pass decode via
                 # whisper-cli. The doctor's heal says exactly this - no
                 # live preview - so the loop must not be started at all
                 # rather than failing one pass per interval.
-                if self.config.live_transcription and not cli_mode:
+                if (self.config.live_transcription and not cli_mode
+                        and not observer_mode):
                     log(f"[DAEMON] Running LIVE push-to-talk with stop key: {hotkey}")
                     success = app.run_voice_flow_push_to_talk_live(
                         stop_key=hotkey,
@@ -1140,6 +1152,9 @@ class WhisperFlowDaemon:
                         on_ready=self._show_hud_now,
                     )
                 else:
+                    if self.config.live_transcription and observer_mode:
+                        log("[DAEMON] Fail-open keyboard mode: buffering text "
+                            "until the hotkey is released")
                     log(f"[DAEMON] Running push-to-talk mode with stop key: {hotkey}")
                     success = app.run_voice_flow_push_to_talk_daemon(
                         stop_key=hotkey,
@@ -2960,13 +2975,12 @@ Use 'whisper-flow stop' to exit daemon
     def _maybe_heal_hotkeys(self) -> bool:
         """Revive a dead hotkey listener, throttled. True when revived.
 
-        A listener that failed at startup (keyboards grabbed elsewhere,
-        no permission) used to stay dead, tray-only, until a manual
+        A listener that failed at startup (usually no input permission) used
+        to stay dead, tray-only, until a manual
         restart: the watchdog probed hasattr(hm, "is_alive") for a method
         that did not exist, so the whole block never ran. Now it retries,
-        at most every 15s so a permanently-grabbed keyboard does not get
-        a fresh uinput proxy and two log lines every 2s forever. Never
-        raises.
+        at most every 15s so a persistent permission failure does not create
+        two log lines every 2s forever. Never raises.
         """
         try:
             hm = getattr(self, "hotkey_manager", None)

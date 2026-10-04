@@ -87,12 +87,9 @@ class HotkeyManager:
         self._emergency_callback: Callable[[str], None] | None = None
         # start, stop and restart each replace the backend listener, and
         # they are called from three threads: the daemon's setup, its
-        # watchdog and the heartbeat. Two starts racing at login each built
-        # a listener; one grabbed the keyboards, the other failed with EBUSY
-        # and took its place, so the working one was orphaned - still
-        # holding every keyboard, never stopped - and each restart after
-        # that failed against it, every ten seconds for the rest of the
-        # session.
+        # watchdog and the heartbeat. The observer is fail-open, but duplicate
+        # readers would still fire callbacks twice, so lifecycle replacement
+        # remains serialized.
         self._lifecycle_lock = threading.RLock()
 
         # Simple state
@@ -142,13 +139,7 @@ class HotkeyManager:
         log("[HOTKEY] Processing callback registered")
 
     def set_emergency_callback(self, callback: Callable[[str], None]) -> None:
-        """Called as callback(reason) when input had to be forcibly reset.
-
-        A wedged reader or dead proxy means the user's keyboard was just
-        freed from an exclusive grab; that must surface as a notification,
-        not silence. Stored for the current listener and any future one
-        (restarts create a new listener object).
-        """
+        """Retain the backend failure callback across listener restarts."""
         self._emergency_callback = callback
         listener = self._evdev_listener
         if listener is not None and hasattr(listener, "on_emergency"):
@@ -253,13 +244,13 @@ class HotkeyManager:
             for name, binding in self.active_bindings.items():
                 log(f"[HOTKEY]   {name}: {binding.keys} ({binding.mode.value})")
 
-            # One backend per platform: a low-level hook on Windows, evdev on
-            # Wayland, pynput's X11 listener otherwise.
+            # One backend per platform: a low-level hook on Windows, a
+            # fail-open evdev observer on Wayland, pynput otherwise.
             if _is_windows():
                 log("[HOTKEY] Windows detected, using keyboard state polling")
                 self._start_windows()
             elif _is_wayland():
-                log("[HOTKEY] Wayland detected, using evdev backend")
+                log("[HOTKEY] Wayland detected, using fail-open evdev observer")
                 self._start_evdev()
             else:
                 self.keyboard_listener = keyboard.Listener(
@@ -332,10 +323,8 @@ class HotkeyManager:
         """Start a new backend listener, and only then make it the current one.
 
         A listener that fails to start is never installed, so it cannot
-        displace one that works; and whatever was current before is stopped
-        first, so no listener is ever left running with nothing pointing at
-        it - an orphan still holding the keyboard grab is exactly what
-        nothing else could ever release.
+        displace one that works; whatever was current before is stopped first,
+        so no orphan observer can fire duplicate callbacks.
         """
         previous = self._evdev_listener
         if previous is not None and previous is not listener:
@@ -348,10 +337,10 @@ class HotkeyManager:
         self._evdev_listener = listener
 
     def _start_evdev(self):
-        """Start the evdev-based keyboard listener for Wayland."""
-        from .hotkey_evdev import EvdevHotkeyListener
+        """Observe Wayland hotkeys without grabbing or proxying keyboards."""
+        from .hotkey_evdev_observer import EvdevHotkeyObserver
 
-        listener = EvdevHotkeyListener()
+        listener = EvdevHotkeyObserver()
         listener.escape_callback = self._handle_escape_key
         if self._emergency_callback is not None:
             listener.on_emergency = self._emergency_callback
@@ -362,18 +351,16 @@ class HotkeyManager:
             press_cb = binding.callback_press
             release_cb = binding.callback_release if binding.mode == HotkeyMode.PUSH_TO_TALK else None
 
-            # Mute the chord from the compositor for every binding, not only
-            # push-to-talk. Single-press auto (ctrl+alt+space) was leaving
-            # Space held as far as the desktop was concerned, so the press
-            # typed a space (or fired a desktop shortcut) and looked like
-            # auto-transcribe "did nothing".
+            # Observer mode never withholds or synthesises a physical event.
+            # The argument stays false explicitly: turning it on must never
+            # silently recreate the old exclusive proxy architecture.
             listener.register_hotkey(
                 name, key_str, press_cb, release_cb,
-                release_modifiers=True,
+                release_modifiers=False,
             )
 
         self._install_listener(listener)
-        log("[HOTKEY] Evdev hotkey listener started")
+        log("[HOTKEY] Fail-open evdev hotkey observer started")
 
     def stop(self) -> None:
         """Stop the hotkey listener."""

@@ -643,7 +643,7 @@ class TestHotkeyManager:
         # evdev exists on Linux only; without it the backend module cannot
         # even be imported, so there is nothing to patch on Windows.
         pytest.importorskip("evdev")
-        import whisper_flow.hotkey_evdev  # noqa: F401  (ensures patch target)
+        import whisper_flow.hotkey_evdev_observer  # noqa: F401
 
         manager = HotkeyManager()
         built = []
@@ -666,7 +666,7 @@ class TestHotkeyManager:
 
         with patch("whisper_flow.hotkey_manager._is_windows", return_value=False), \
                 patch("whisper_flow.hotkey_manager._is_wayland", return_value=True), \
-                patch("whisper_flow.hotkey_evdev.EvdevHotkeyListener", SlowListener), \
+                patch("whisper_flow.hotkey_evdev_observer.EvdevHotkeyObserver", SlowListener), \
                 patch.object(manager, "_start_heartbeat"):
             threads = [threading.Thread(target=manager.start) for _ in range(2)]
             for t in threads:

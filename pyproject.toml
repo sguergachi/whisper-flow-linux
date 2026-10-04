@@ -23,8 +23,9 @@ dependencies = [
     "numpy>=1.24.0",
     "pystray>=0.19.0",
     "pillow>=10.0.0",
-    # Reading the keyboard on Linux. Imported by hotkey_evdev, and previously
-    # undeclared, so a clean install failed at first hotkey use.
+    # Observing the keyboard on Linux. Imported by the fail-open Wayland
+    # backend, and previously undeclared, so a clean install failed at first
+    # hotkey use.
     "evdev>=1.6.1; sys_platform == 'linux'",
     # X11 fallback listener. Not used on the Wayland path and has no purpose
     # on Windows, where the native listener handles hotkeys.

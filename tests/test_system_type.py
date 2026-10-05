@@ -63,12 +63,18 @@ def test_wayland_paste_waits_until_saved_window_is_really_active(
     monkeypatch.setattr(manager, "_get_active_window", lambda: next(active))
     activate = Mock(return_value=True)
     monkeypatch.setattr(manager, "_activate_window", activate)
+    copied = Mock(return_value=True)
+    pasted = Mock(return_value=True)
     typed = Mock(return_value=True)
+    monkeypatch.setattr(manager, "copy_to_clipboard", copied)
+    monkeypatch.setattr(manager, "_send_paste_keystroke", pasted)
     monkeypatch.setattr(manager, "_ydotool_type", typed)
 
     assert manager.paste_text("arrives safely") is True
     activate.assert_called_once_with("target")
-    typed.assert_called_once_with("arrives safely")
+    copied.assert_called_once_with("arrives safely")
+    pasted.assert_called_once_with()
+    typed.assert_not_called()
 
 
 def test_wayland_paste_preserves_text_if_focus_never_reaches_target(
@@ -88,3 +94,21 @@ def test_wayland_paste_preserves_text_if_focus_never_reaches_target(
     assert manager.paste_text("do not lose me") is False
     typed.assert_not_called()
     copied.assert_called_once_with("do not lose me")
+
+
+def test_wayland_paste_falls_back_to_direct_type_if_clipboard_paste_fails(
+        tmp_path, monkeypatch):
+    monkeypatch.setattr("whisper_flow.system.IS_WINDOWS", False)
+    manager = SystemManager(Config(config_dir=tmp_path))
+    monkeypatch.setattr(manager, "_is_wayland", lambda: True)
+    monkeypatch.setattr(manager, "_kdotool_available", lambda: False)
+    monkeypatch.setattr(manager, "copy_to_clipboard", lambda _text: True)
+    monkeypatch.setattr(manager, "_send_paste_keystroke", lambda: False)
+    wtype = Mock(return_value=True)
+    ydotool = Mock(return_value=True)
+    monkeypatch.setattr(manager, "_wtype_type", wtype)
+    monkeypatch.setattr(manager, "_ydotool_type", ydotool)
+
+    assert manager.paste_text("fallback") is True
+    wtype.assert_called_once_with("fallback")
+    ydotool.assert_not_called()

@@ -378,17 +378,18 @@ class SystemManager:
                     self.copy_to_clipboard(sanitized)
                     return False
 
-                if self._ydotool_type(sanitized):
+                # Electron/Chromium can accept ydotool's synthetic key events
+                # and return success while dropping the resulting text. A
+                # clipboard paste follows the same path as a user's Ctrl+V
+                # and, crucially, leaves the transcript recoverable even if
+                # the target control refuses the paste.
+                if (self.copy_to_clipboard(sanitized)
+                        and self._send_paste_keystroke()):
                     return True
 
-                if self._wtype_type(sanitized):
-                    return True
-
-                log("[PASTE] direct typing failed, falling back to the clipboard")
-                if not self.copy_to_clipboard(sanitized):
-                    return False
-
-                return self._send_paste_keystroke()
+                log("[PASTE] clipboard paste failed, trying direct typing")
+                return (self._wtype_type(sanitized)
+                        or self._ydotool_type(sanitized))
 
             if shutil.which("xdotool"):
                 subprocess.run(
@@ -454,8 +455,12 @@ class SystemManager:
 
     def _send_paste_keystroke(self) -> bool:
         if self._wtype_paste():
+            log("[PASTE] clipboard paste keystroke sent with wtype")
             return True
-        return self._ydotool_paste()
+        if self._ydotool_paste():
+            log("[PASTE] clipboard paste keystroke sent with ydotool")
+            return True
+        return False
 
     def copy_to_clipboard(self, text: str) -> bool:
         """Copy text to the system clipboard.

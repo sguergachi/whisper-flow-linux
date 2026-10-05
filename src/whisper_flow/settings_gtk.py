@@ -370,10 +370,8 @@ def _gdk_key_to_hotkey_part(keyval: int, state: int = 0) -> str | None:
     the layout-switch keysyms stand for: see _GROUP_SWITCH_KEYSYMS.
     """
     keyval = Gdk.keyval_to_lower(keyval)
-    if keyval == Gdk.KEY_Control_L:
+    if keyval in (Gdk.KEY_Control_L, Gdk.KEY_Control_R):
         return "ctrl"
-    if keyval == Gdk.KEY_Control_R:
-        return "rightctrl"
     if keyval in (Gdk.KEY_Alt_L, Gdk.KEY_Alt_R):
         return "alt"
     if keyval in (Gdk.KEY_Shift_L, Gdk.KEY_Shift_R):

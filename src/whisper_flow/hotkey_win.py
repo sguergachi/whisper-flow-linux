@@ -29,7 +29,6 @@ log = logging.getLogger(__name__)
 # Virtual key codes, under the names the config uses.
 NAME_TO_VK = {
     "ctrl": 0x11, "control": 0x11,
-    "rightctrl": 0xA3,
     "alt": 0x12,
     "shift": 0x10,
     "cmd": 0x5B, "super": 0x5B, "win": 0x5B, "meta": 0x5B,

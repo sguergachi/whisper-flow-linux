@@ -24,6 +24,7 @@ NAME_TO_CODE = {
     "super": ecodes.KEY_LEFTMETA, "cmd": ecodes.KEY_LEFTMETA,
     "win": ecodes.KEY_LEFTMETA, "meta": ecodes.KEY_LEFTMETA,
     "ctrl": ecodes.KEY_LEFTCTRL, "control": ecodes.KEY_LEFTCTRL,
+    "rightctrl": ecodes.KEY_RIGHTCTRL,
     "alt": ecodes.KEY_LEFTALT,
     "shift": ecodes.KEY_LEFTSHIFT,
     "space": ecodes.KEY_SPACE,
@@ -92,6 +93,12 @@ class EvdevHotkeyObserver:
             if code:
                 codes.add(code)
         return frozenset(codes)
+
+    def _normalize_code(self, code: int) -> int:
+        """Collapse modifier sides unless a binding names this side exactly."""
+        if code in self._binding_codes:
+            return code
+        return CODE_ALIASES.get(code, code)
 
     def _find_keyboard_devices(self):
         devices = []
@@ -219,7 +226,7 @@ class EvdevHotkeyObserver:
         for dev in self._kbd_devices:
             try:
                 for code in dev.active_keys():
-                    merged.add(CODE_ALIASES.get(code, code))
+                    merged.add(self._normalize_code(code))
                 any_ok = True
             except OSError:
                 continue
@@ -246,7 +253,7 @@ class EvdevHotkeyObserver:
         return repaired
 
     def _handle_key(self, event):
-        code = CODE_ALIASES.get(event.code, event.code)
+        code = self._normalize_code(event.code)
         value = event.value
         if value not in (0, 1, 2):
             return

@@ -116,6 +116,27 @@ def test_all_left_right_modifier_and_press_release_orders():
                 assert observer._press_triggered == set()
 
 
+def test_right_ctrl_binding_is_side_specific_and_preserves_focus():
+    observer = EvdevHotkeyObserver()
+    fired = []
+    observer.register_hotkey(
+        "transcribe", "rightctrl",
+        lambda: fired.append("press"),
+        lambda: fired.append("release"),
+    )
+
+    observer._handle_key(_event(ecodes.KEY_LEFTCTRL, 1))
+    observer._handle_key(_event(ecodes.KEY_LEFTCTRL, 0))
+    _drain(observer)
+    assert fired == []
+
+    observer._handle_key(_event(ecodes.KEY_RIGHTCTRL, 1))
+    observer._handle_key(_event(ecodes.KEY_RIGHTCTRL, 2))
+    observer._handle_key(_event(ecodes.KEY_RIGHTCTRL, 0))
+    _drain(observer)
+    assert fired == ["press", "release"]
+
+
 def test_exhaustive_short_event_sequences_match_reference_model():
     """Exercise 9,331 sequences including bounce, repeats, and stray ups."""
     meta = ecodes.KEY_LEFTMETA

@@ -131,6 +131,121 @@ class SystemManager:
         except Exception:
             return False
 
+    @staticmethod
+    def _hotkey_is_modifier_only_alt(hotkey: str) -> bool:
+        """Whether a hotkey can leave an application's Alt menu focused.
+
+        A read-only global observer deliberately lets the physical shortcut
+        reach the focused application.  Electron and other Linux toolkits use
+        a released Alt key to move focus from the editor into their menu bar.
+        That is only a concern for modifier-only chords: a chord containing a
+        regular key is handled as an ordinary accelerator instead.
+        """
+        aliases = {
+            "control": "ctrl",
+            "ctl": "ctrl",
+            "win": "super",
+            "windows": "super",
+            "meta": "super",
+            "option": "alt",
+        }
+        modifiers = {
+            "ctrl", "left_ctrl", "right_ctrl",
+            "alt", "left_alt", "right_alt", "alt_gr", "altgr",
+            "super", "left_super", "right_super",
+            "shift", "left_shift", "right_shift",
+        }
+        parts = [
+            aliases.get(part.strip().lower(), part.strip().lower())
+            for part in hotkey.split("+") if part.strip()
+        ]
+        return (bool(parts)
+                and all(part in modifiers for part in parts)
+                and any(part in {"alt", "left_alt", "right_alt"}
+                        for part in parts))
+
+    def _repair_modifier_only_alt_focus(self) -> bool:
+        """Dismiss the menu focus caused by a fail-open Alt-only chord.
+
+        Escape is sent only for the configured modifier-only Alt transcription
+        hotkey.  It is delayed until transcription is complete, so all of the
+        user's physical shortcut keys have long since been released.
+        """
+        hotkey = getattr(self.config, "hotkey_transcribe", "")
+        if not self._hotkey_is_modifier_only_alt(hotkey):
+            return False
+
+        try:
+            if self._ydotool_available():
+                clear_codes = [f"{code}:0" for code in self.MODIFIER_CODES]
+                subprocess.run(
+                    ["ydotool", "key", *clear_codes],
+                    check=False, capture_output=True,
+                )
+                result = subprocess.run(
+                    ["ydotool", "key", "1:1", "1:0"],
+                    check=False, capture_output=True,
+                )
+                if result.returncode == 0:
+                    time.sleep(0.05)
+                    log("[PASTE] dismissed modifier-only Alt menu focus")
+                    return True
+            if shutil.which("wtype"):
+                result = subprocess.run(
+                    ["wtype", "-k", "Escape"],
+                    check=False, capture_output=True,
+                )
+                if result.returncode == 0:
+                    time.sleep(0.05)
+                    log("[PASTE] dismissed modifier-only Alt menu focus")
+                    return True
+        except Exception as exc:
+            log(f"[PASTE] could not dismiss Alt menu focus: {exc}")
+        return False
+
+    def _xdotool_paste_if_target_is_x11(self, target_window: str | None) -> bool:
+        """Use XTest when KWin's active target is an XWayland window.
+
+        ydotool travels through the compositor's virtual input path.  Electron
+        under XWayland can silently discard that event while the helper still
+        exits successfully.  XTest is the native path for those windows.  PID
+        matching prevents an X event from being sent when a native Wayland
+        window (represented by XWayland's focus proxy) is actually in front.
+        """
+        if (not target_window or not shutil.which("xdotool")
+                or not self._kdotool_available()):
+            return False
+        try:
+            target = subprocess.run(
+                ["kdotool", "getwindowpid", target_window],
+                check=False, capture_output=True, text=True, timeout=5,
+            )
+            active = subprocess.run(
+                ["xdotool", "getactivewindow"],
+                check=False, capture_output=True, text=True, timeout=5,
+            )
+            if target.returncode != 0 or active.returncode != 0:
+                return False
+            target_pid = target.stdout.strip()
+            active_xid = active.stdout.strip()
+            if not target_pid or not active_xid:
+                return False
+            active_pid = subprocess.run(
+                ["xdotool", "getwindowpid", active_xid],
+                check=False, capture_output=True, text=True, timeout=5,
+            )
+            if (active_pid.returncode != 0
+                    or active_pid.stdout.strip() != target_pid):
+                return False
+
+            result = subprocess.run(
+                ["xdotool", "key", "ctrl+v"],
+                check=False, capture_output=True, timeout=5,
+            )
+            return result.returncode == 0
+        except Exception:
+            return False
+
     def _wtype_type(self, text: str) -> bool:
         """Type text directly using wtype (Wayland-native keyboard simulator)."""
         if not shutil.which("wtype"):
@@ -378,14 +493,22 @@ class SystemManager:
                     self.copy_to_clipboard(sanitized)
                     return False
 
+                # A fail-open modifier-only Alt chord reaches the target app.
+                # Electron/Chromium commonly leaves its menu focused after the
+                # release, so a perfectly valid Ctrl+V has no editable target.
+                self._repair_modifier_only_alt_focus()
+
                 # Electron/Chromium can accept ydotool's synthetic key events
                 # and return success while dropping the resulting text. A
                 # clipboard paste follows the same path as a user's Ctrl+V
                 # and, crucially, leaves the transcript recoverable even if
                 # the target control refuses the paste.
-                if (self.copy_to_clipboard(sanitized)
-                        and self._send_paste_keystroke()):
-                    return True
+                if self.copy_to_clipboard(sanitized):
+                    if self._xdotool_paste_if_target_is_x11(target_window):
+                        log("[PASTE] clipboard paste keystroke sent with xdotool")
+                        return True
+                    if self._send_paste_keystroke():
+                        return True
 
                 log("[PASTE] clipboard paste failed, trying direct typing")
                 return (self._wtype_type(sanitized)

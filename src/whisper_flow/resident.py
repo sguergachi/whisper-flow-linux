@@ -129,15 +129,40 @@ class ResidentWorker:
 
     @staticmethod
     def _request(audio_path, config, prompt=None, temperature=None) -> bytes:
+        # The worker ingests 16 kHz f32 PCM. Recordings may have been written
+        # at a higher (or lower) rate, so resample here instead of refusing:
+        # a config sample rate of 32 kHz would otherwise make every dictation
+        # fail with "Cannot reach resident speech worker" even though the bytes
+        # are perfectly decodable.
+        target_rate = 16000
         with wave.open(str(audio_path), "rb") as wav:
-            if wav.getframerate() != 16000 or wav.getnchannels() != 1 or wav.getsampwidth() != 2:
+            channels = wav.getnchannels()
+            sample_width = wav.getsampwidth()
+            source_rate = wav.getframerate()
+            n_frames = wav.getnframes()
+            if (channels != 1 or sample_width != 2 or source_rate <= 0):
                 raise ValueError("Speech worker requires mono 16 kHz PCM16 WAV audio")
-            if wav.getnframes() > 16000 * 600:
-                raise ValueError("Speech worker accepts at most ten minutes of audio")
-            raw = wav.readframes(wav.getnframes())
-        pcm = (np.frombuffer(raw, dtype="<i2").astype("<f4") / 32768.0).astype("<f4")
-        if not len(pcm):
+            raw = wav.readframes(n_frames)
+        samples = np.frombuffer(raw, dtype="<i2")
+        if samples.size != n_frames:
+            samples = samples[:n_frames]
+        if source_rate != target_rate:
+            if samples.size == 0:
+                raise ValueError("Empty audio recording")
+            source_times = np.arange(samples.size, dtype=np.float64) / float(source_rate)
+            destination_count = int(round(samples.size * target_rate / float(source_rate)))
+            if destination_count <= 0:
+                raise ValueError("Empty audio recording")
+            destination_times = np.arange(destination_count, dtype=np.float64) / float(target_rate)
+            destination_times = np.clip(destination_times, source_times[0],
+                                       source_times[-1])
+            samples = np.interp(destination_times, source_times,
+                                samples.astype(np.float64))
+        pcm = (np.asarray(samples).astype("<f4") / 32768.0).astype("<f4")
+        if not pcm.size:
             raise ValueError("Empty audio recording")
+        if pcm.size > target_rate * 600:
+            raise ValueError("Speech worker accepts at most ten minutes of audio")
         language = (getattr(config, "language", None) or "en").encode("utf-8")
         prompt = (prompt or "").encode("utf-8")
         if len(language) > 32 or len(prompt) > 65536:

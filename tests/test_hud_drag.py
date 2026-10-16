@@ -1,10 +1,9 @@
 """The pill must track the cursor while dragging, not trail it.
 
-Each motion event used to re-assert all three layer-shell anchors before
-moving the margins. Every anchor call costs a configure round-trip with the
-compositor, so a drag paid three round-trips per motion event and the pill
-lagged visibly behind the pointer. A move is just margins; anchors are set
-once, on the transition between docked and dragged.
+Gesture offsets are local to the moving surface, so they cannot measure
+cursor travel on Wayland. Relative pointer motion must track independently
+of those offsets. Position changes stay coalesced, with anchors set only on
+the transition between docked and dragged.
 """
 
 import sys
@@ -144,3 +143,75 @@ def test_win32_pin_recorded_before_any_window(monkeypatch):
     win._pin = None
     win._apply_position_win32(300, 400)
     assert win._pin == (300, 400)
+
+
+def test_relative_motion_tracks_cursor_across_surface_moves(monkeypatch):
+    win, calls = _dragging_window(monkeypatch)
+    win._relative_pointer = Mock(available=True)
+    gesture = Mock()
+    gesture.get_current_sequence.return_value = None
+    win._on_drag_begin(gesture, 10, 10)
+    # First physical movement; the compositor has not moved the pill yet.
+    win._on_relative_motion(30, 12)
+    win._on_drag_update(gesture, 30, 12)
+    win._flush_pos()
+    assert win._pos == (130, 212)
+    # Another identical movement after the surface follows the pointer:
+    # widget-local offset is still 30,12, not cumulative cursor travel.
+    win._on_relative_motion(30, 12)
+    win._on_drag_update(gesture, 30, 12)
+    win._flush_pos()
+    assert win._pos == (160, 224)
+    # At release, local coordinates return to the original grab point.
+    # This must still save a drag, rather than trigger a tap/close action.
+    win._on_drag_end(gesture, 0, 0)
+    assert calls["saved"] == [("test", 160, 224)]
+
+
+def test_relative_motion_coalesces_and_preserves_fractional_deltas(monkeypatch):
+    win, calls = _dragging_window(monkeypatch)
+    win._relative_pointer = Mock(available=True)
+    gesture = Mock()
+    gesture.get_current_sequence.return_value = None
+    win._on_drag_begin(gesture, 10, 10)
+    for _ in range(20):
+        win._on_relative_motion(0.25, -0.5)
+    assert len(calls["idle"]) == 1
+    assert win._pos == (105, 190)
+    win._flush_pos()
+    assert ("L", 105) in calls["margin"]
+    win._on_drag_end(gesture, 0, 0)
+    win._on_relative_motion(100, 100)
+    assert win._pos == (105, 190)
+
+
+def test_touch_keeps_using_gesture_offsets(monkeypatch):
+    win, _ = _dragging_window(monkeypatch)
+    win._relative_pointer = Mock(available=True)
+    gesture = Mock()  # non-null sequence denotes touch
+    win._on_drag_begin(gesture, 10, 10)
+    win._on_relative_motion(90, 90)
+    win._on_drag_update(gesture, 20, 30)
+    assert win._pos == (120, 230)
+
+
+def test_wayland_motion_uses_accelerated_signed_fixed_deltas():
+    module = hud_app_module._load_sibling("wayland_pointer")
+    pointer = module.RelativePointer.__new__(module.RelativePointer)
+    pointer._on_motion = Mock()
+    pointer._motion(None, None, 0, 0, -128, 320, -1000, 1000)
+    pointer._on_motion.assert_called_once_with(-0.5, 1.25)
+
+
+def test_wayland_pointer_close_releases_only_owned_proxies():
+    module = hud_app_module._load_sibling("wayland_pointer")
+    pointer = module.RelativePointer.__new__(module.RelativePointer)
+    pointer._wl = Mock()
+    pointer._relative, pointer._manager, pointer._registry = 11, 12, 13
+    pointer._pointer = 99  # borrowed from GDK; must never destroy this proxy
+    pointer.close()
+    pointer.close()
+    destroyed = [c.args[0].value for c in pointer._wl.wl_proxy_marshal_flags.call_args_list]
+    assert destroyed == [11, 12]
+    assert pointer._wl.wl_proxy_destroy.call_args.args[0].value == 13
+    assert pointer._wl.wl_proxy_destroy.call_count == 1

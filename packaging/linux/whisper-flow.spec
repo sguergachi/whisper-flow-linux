@@ -158,6 +158,7 @@ EXCLUDES = [
 
 module_files = [
     ("../../src/whisper_flow/wayland_blur.py", "."),
+    ("../../src/whisper_flow/wayland_pointer.py", "."),
     ("../../src/whisper_flow/hud_anim.py", "."),
 ]
 

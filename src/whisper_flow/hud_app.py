@@ -471,9 +471,7 @@ class HudWindow(Gtk.Window):
         # so a recording always takes the pill back.
         self.toast_text: str | None = None
         self._toast_token = 0
-        # Which layer-shell anchoring is currently applied. Dragging only
-        # moves margins; re-asserting anchors per motion event is what
-        # made the pill trail the cursor.
+        # Which layer-shell anchoring is currently applied.
         self._layer_top_left = False
         # Which mode this overlay is showing for. A resident overlay learns
         # it per recording, from the show command; one spawned per recording
@@ -481,6 +479,7 @@ class HudWindow(Gtk.Window):
         self.stop_button = os.environ.get("WHISPER_FLOW_HUD_STOP_BUTTON") == "1"
         self.stop_hover = 0.0
         self.stop_hover_target = 0.0
+        self.set_decorated(False)
         self.set_default_size(WIDTH, self._window_height())
         self.set_resizable(False)
 
@@ -499,7 +498,6 @@ class HudWindow(Gtk.Window):
             # Negative: never reserve space, so windows do not get resized.
             LayerShell.set_exclusive_zone(self, -1)
         else:
-            self.set_decorated(False)
             # Must not steal keyboard focus: typing is in progress and the
             # pill is just an indicator. Without this, present() makes the
             # HUD the foreground window and SendInput types into it instead
@@ -535,6 +533,9 @@ class HudWindow(Gtk.Window):
         # pill stands down so the two never fight over it.
         self._dragging = False
         self._pos_flush_queued = False
+        self._relative_pointer = None
+        self._drag_relative = False
+        self._drag_delta = (0.0, 0.0)
         self._apply_position()
         print(f"[HUD] output={self._connector} position="
               f"{self._pos if self._pos else 'bottom-centre (default)'}", flush=True)
@@ -595,6 +596,8 @@ class HudWindow(Gtk.Window):
             for sig in (signal.SIGTERM, signal.SIGINT):
                 _unix_signal_add(sig, self._on_signal)
         self.connect("realize", self._on_realize)
+        if not IS_WINDOWS:
+            self.connect("unrealize", self._on_unrealize)
         if IS_WINDOWS:
             # Position again once the window is on screen. Placing it at
             # realize is too early: GTK sets the surface's own position as
@@ -717,6 +720,7 @@ class HudWindow(Gtk.Window):
         if IS_WINDOWS:
             self._realize_win32()
             return
+        self._setup_relative_pointer()
         if os.environ.get("WHISPER_FLOW_HUD_NO_BLUR"):
             print("[HUD] blur disabled by env", flush=True)
             return
@@ -740,6 +744,38 @@ class HudWindow(Gtk.Window):
             print(f"[HUD] blur {'enabled' if self._blur else 'unavailable'}", flush=True)
         except Exception as e:
             print(f"[HUD] blur setup failed: {e}", flush=True)
+
+    def _setup_relative_pointer(self):
+        if self._relative_pointer is not None:
+            return
+        try:
+            display = Gdk.Display.get_default()
+            device = display.get_default_seat().get_pointer()
+            lib = ctypes.CDLL("libgtk-4.so.1")
+            get_display = lib.gdk_wayland_display_get_wl_display
+            get_pointer = lib.gdk_wayland_device_get_wl_pointer
+            for get in (get_display, get_pointer):
+                get.restype = ctypes.c_void_p
+                get.argtypes = [ctypes.c_void_p]
+            self._relative_pointer = _load_sibling("wayland_pointer").RelativePointer(
+                get_display(_gobject_pointer(display)),
+                get_pointer(_gobject_pointer(device)), self._on_relative_motion)
+        except Exception as e:
+            print(f"[HUD] relative pointer unavailable: {e}", flush=True)
+
+    def _on_unrealize(self, *_):
+        if self._relative_pointer is not None:
+            self._relative_pointer.close()
+            self._relative_pointer = None
+
+    def _on_relative_motion(self, dx, dy):
+        if not self._dragging or not self._drag_relative:
+            return
+        x, y = self._drag_delta
+        self._drag_delta = (x + dx, y + dy)
+        ox, oy = self._drag_origin
+        self._pos = self._clamp(ox + x + dx, oy + y + dy)
+        self._request_pos_flush()
 
     # ------------------------------------------------------------- Windows
     def _win32_hwnd(self):
@@ -1299,9 +1335,8 @@ class HudWindow(Gtk.Window):
             self._layer_top_left = False
             return
         x, y = self._pos
-        # Anchors only on transition: re-asserting them on every motion
-        # event costs a configure round-trip each, which is what made the
-        # pill trail the cursor while dragging. A move is just margins.
+        # Anchors only on transition; each setter can schedule a GTK layout.
+        # Subsequent moves only need margins.
         if not getattr(self, "_layer_top_left", False):
             LayerShell.set_anchor(self, LayerShell.Edge.BOTTOM, False)
             LayerShell.set_anchor(self, LayerShell.Edge.LEFT, True)
@@ -1325,6 +1360,11 @@ class HudWindow(Gtk.Window):
         self._drag_origin = self._pos if self._pos is not None else self._default_pos()
         self._drag_start_xy = (sx, sy)
         self._dragging = True
+        pointer = getattr(self, "_relative_pointer", None)
+        # Touch sequences have no wl_pointer relative motion.
+        self._drag_relative = bool(pointer and pointer.available and gesture
+                                   and gesture.get_current_sequence() is None)
+        self._drag_delta = (0.0, 0.0)
         if os.environ.get("WHISPER_FLOW_HUD_DEBUG_DRAG"):
             print(f"[HUD] drag begin origin={self._drag_origin} "
                   f"press=({sx:.0f},{sy:.0f})", flush=True)
@@ -1332,16 +1372,13 @@ class HudWindow(Gtk.Window):
     def _request_pos_flush(self):
         """Apply the latest drag target, at most once per main-loop turn.
 
-        A drag delivers many motion events per frame; each one used to
-        commit a position straight to the compositor (or SetWindowPos),
-        queuing a configure round-trip per event that the pill then chased
-        for the rest of the gesture. Coalescing to one apply per turn keeps
-        the target always fresh without the queue.
+        Keep margin/layout changes coalesced without delaying input behind
+        GLib's default low-priority idle callbacks.
         """
         if getattr(self, "_pos_flush_queued", False):
             return
         self._pos_flush_queued = True
-        GLib.idle_add(self._flush_pos)
+        GLib.idle_add(self._flush_pos, priority=GLib.PRIORITY_DEFAULT)
 
     def _flush_pos(self):
         self._pos_flush_queued = False
@@ -1358,6 +1395,12 @@ class HudWindow(Gtk.Window):
     def _on_drag_update(self, gesture, dx, dy):
         if self._drag_origin is None:
             return
+        if self._drag_relative:
+            # GestureDrag offsets are local to the moving widget. Using
+            # origin + offset feeds our own surface movement back into the
+            # target (roughly half-speed tracking). Relative motion above
+            # measures the pointer independently of compositor placement.
+            return
         ox, oy = self._drag_origin
         self._pos = self._clamp(ox + dx, oy + dy)
         self._request_pos_flush()
@@ -1365,6 +1408,8 @@ class HudWindow(Gtk.Window):
     def _on_drag_end(self, gesture, dx, dy):
         if self._drag_origin is None:
             return
+        if self._drag_relative:
+            dx, dy = self._drag_delta
         moved = abs(dx) + abs(dy)
         self._drag_origin = None
         self._dragging = False

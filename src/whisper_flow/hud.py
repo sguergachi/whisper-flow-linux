@@ -13,6 +13,7 @@ import tempfile
 import threading
 
 from .logging import log
+from .paths import find_wayland_socket
 
 IS_WINDOWS = sys.platform == "win32"
 # Raw values: these constants only exist on Windows, but the freeze-time
@@ -111,8 +112,22 @@ class HUD:
         """Environment for the overlay process."""
         env = os.environ.copy()
         if not IS_WINDOWS:
-            # The overlay is a Wayland layer-shell surface; it has no X11 path.
-            env.setdefault("WAYLAND_DISPLAY", "wayland-0")
+            # The overlay is a Wayland layer-shell surface; it has no X11
+            # path. find_wayland_socket answers the socket the session
+            # actually published - seen here as wayland-1, not the
+            # wayland-0 of habit - and speaks up both when the daemon
+            # started before the desktop published anything and when the
+            # inherited name never existed in this session at all.
+            socket = find_wayland_socket()
+            if socket:
+                inherited = env.get("WAYLAND_DISPLAY")
+                env["WAYLAND_DISPLAY"] = socket
+                if inherited:
+                    log(f"[HUD] compositor socket is {socket} here, not "
+                        f"{inherited!r}; adopting it")
+                else:
+                    log(f"[HUD] session had no compositor socket; "
+                        f"using {socket}")
             env["GDK_BACKEND"] = "wayland"
         env.setdefault("NO_AT_BRIDGE", "1")
         # The pill is a few hundred pixels of 2D cairo drawing. GTK4's GPU

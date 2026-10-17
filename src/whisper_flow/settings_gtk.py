@@ -2831,6 +2831,14 @@ class SettingsWindow(Adw.ApplicationWindow):
         if not (os.environ.get("WAYLAND_DISPLAY")
                 or os.environ.get("XDG_SESSION_TYPE") == "wayland"):
             return
+        if wayland_blur.gtk_claims_background_effects():
+            # As in hud_app: asking for a second effect object answers
+            # background_effect_exists, and the compositor kills the whole
+            # connection over it. A plain window is worth more than no
+            # window.
+            log("[SETTINGS] backdrop blur: GTK owns this surface's effect; "
+                "blur request skipped")
+            return
         try:
             display = Gdk.Display.get_default()
             surface = self.get_surface()

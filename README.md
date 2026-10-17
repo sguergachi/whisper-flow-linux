@@ -116,6 +116,13 @@ that flag on download).
   upstream publishes no Linux CUDA binary, so it is compiled on your
   machine once, from the whisper.cpp sources
 
+One more Wayland nuance: since GTK 4.23.3, the toolkit itself claims the
+compositor's background-effect surface for every window, and the protocol
+allows one claim per surface — so asking for one again kills the
+connection at the first frame. The HUD and the settings window now skip
+the layout: on those runtimes there is no frosted backdrop behind the pill
+(any window tint still applies), on older stacks nothing changes.
+
 ```bash
 # Debian/Ubuntu (gtk4-layer-shell is not packaged; see install.sh)
 sudo apt install python3-gi gir1.2-gtk-4.0 libadwaita-1-0 ydotool cmake \

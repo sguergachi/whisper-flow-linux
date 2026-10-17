@@ -231,6 +231,8 @@ class WhisperFlowDaemon:
         # the current request finishes instead of killing the recording.
         self._update_apply_deferred = False
         self._instance_lock = None
+        # Backend episodes already surfaced to the user for this setup.
+        self._backend_notified: set[str] = set()
 
         # Initialize WhisperFlow instances for different modes
         log("[DAEMON] Creating WhisperFlow instances...")
@@ -602,6 +604,22 @@ class WhisperFlowDaemon:
                 lambda reason: self.notify(
                     f"⌨️ Keyboard input was emergency-reset ({reason})"))
 
+            # Backend episodes (portal pending/bound/fallback) surface here
+            # for one user-visible notification each; the manager itself
+            # only logs. Reset per setup so a reconfigure re-arms them.
+            self._backend_notified: set[str] = set()
+            self.hotkey_manager.status_callback = self._on_hotkey_backend_status
+            # Let the paste path ask whether the active backend's shortcuts
+            # are consumed by the compositor. Portal-consumed chords never
+            # reach applications, so no Alt-menu repair must follow a paste.
+            for app in (self.transcribe_app, self.auto_transcribe_app,
+                        self.command_app):
+                try:
+                    app.system_manager.hotkey_consumer = (
+                        self.hotkey_manager.hotkeys_consumed)
+                except Exception as e:
+                    log(f"[DAEMON] could not wire hotkey consumer: {e}")
+
             # Start the hotkey manager
             try:
                 self.hotkey_manager.start()
@@ -635,6 +653,33 @@ class WhisperFlowDaemon:
     def _is_processing(self) -> bool:
         """Check if system is currently processing a request."""
         return self.is_processing or self.is_recording
+
+    def _on_hotkey_backend_status(self, state: str, detail: str) -> None:
+        """Surface one backend episode to the user, exactly once per setup.
+
+        The portal bind waits on the user (an approval dialog) and can be
+        denied; either way the session keeps working hotkeys - portal with
+        live streaming, or the fail-open observer with a buffered paste -
+        and the user should know which one they got and why.
+        """
+        try:
+            notified = self._backend_notified
+        except Exception:
+            return
+        if state in notified:
+            return
+        notified.add(state)
+        if state == "pending":
+            log(f"[DAEMON] global shortcuts pending: {detail}")
+            self.notify("Approve the global-shortcuts dialog "
+                        "to enable push-to-talk")
+        elif state == "bound":
+            log(f"[DAEMON] global shortcuts active: {detail}")
+        elif state == "fallback":
+            log(f"[DAEMON] basic hotkeys in use: {detail}")
+            self.notify("Global shortcuts unavailable - using basic hotkeys "
+                        "(no live preview; assign keys in System Settings "
+                        "for the full experience)")
 
     def _handle_hotkey_press(self, mode: str):
         """Handle hotkey press with queuing support."""

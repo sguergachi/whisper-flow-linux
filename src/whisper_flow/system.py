@@ -30,6 +30,12 @@ class SystemManager:
         self._xdg_session = os.environ.get("XDG_SESSION_TYPE", "")
         self._saved_window = None
         self._last_notified: dict[str, float] = {}
+        # Optional provider answering whether the active hotkey backend's
+        # shortcuts are consumed by the compositor (portal global shortcuts
+        # are; observed keys are not). Set by the daemon; when True, pastes
+        # skip the Alt-menu repair, which would otherwise send a stray
+        # Escape into the user's editor for a chord no app ever saw.
+        self.hotkey_consumer = None
 
     def notify(self, message: str) -> None:
         """Send a desktop notification, unless it is a repeat.
@@ -174,6 +180,12 @@ class SystemManager:
         hotkey = getattr(self.config, "hotkey_transcribe", "")
         if not self._hotkey_is_modifier_only_alt(hotkey):
             return False
+        try:
+            consumed = self.hotkey_consumer
+            if callable(consumed) and consumed():
+                return False
+        except Exception:
+            pass
 
         try:
             if self._ydotool_available():

@@ -274,3 +274,29 @@ def test_xdotool_paste_uses_xtest_only_after_pid_match(
 
     assert manager._xdotool_paste_if_target_is_x11("target") is True
     assert calls[-1] == ["xdotool", "key", "ctrl+v"]
+
+
+def test_alt_repair_skipped_when_compositor_consumes_the_chord(
+        tmp_path, monkeypatch):
+    """A portal-consumed chord never reaches apps: no stray Escape."""
+    manager = SystemManager(
+        Config(config_dir=tmp_path, hotkey_transcribe="super+alt"))
+    manager.hotkey_consumer = lambda: True
+    monkeypatch.setattr(manager, "_ydotool_available", lambda: True)
+
+    assert manager._repair_modifier_only_alt_focus() is False
+
+
+def test_alt_repair_still_runs_for_observed_chords(tmp_path, monkeypatch):
+    """The fail-open observer leaks Alt: the repair stays mandatory."""
+    manager = SystemManager(
+        Config(config_dir=tmp_path, hotkey_transcribe="super+alt"))
+    manager.hotkey_consumer = lambda: False
+    monkeypatch.setattr(manager, "_ydotool_available", lambda: False)
+    monkeypatch.setattr("whisper_flow.system.shutil.which", lambda tool: tool)
+    monkeypatch.setattr("whisper_flow.system.time.sleep", lambda _delay: None)
+    run = Mock(return_value=Mock(returncode=0))
+    monkeypatch.setattr("whisper_flow.system.subprocess.run", run)
+
+    assert manager._repair_modifier_only_alt_focus() is True
+    run.assert_called_once()

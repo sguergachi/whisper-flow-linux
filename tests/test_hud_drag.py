@@ -215,3 +215,82 @@ def test_wayland_pointer_close_releases_only_owned_proxies():
     assert destroyed == [11, 12]
     assert pointer._wl.wl_proxy_destroy.call_args.args[0].value == 13
     assert pointer._wl.wl_proxy_destroy.call_count == 1
+
+
+# ------------------------------------------------------- taps on the pill
+def _tap_window(monkeypatch, sx, sy, stop_button=False, processing=False):
+    """A window mid-tap at the given widget-local point."""
+    win = _dragging_window(monkeypatch)[0]
+    win.stop_button = stop_button
+    win.processing = processing
+    win.level_file = "/tmp/irrelevant.levels"
+    win._drag_origin = (100, 200)
+    win._drag_start_xy = (sx, sy)
+    win._drag_relative = False
+    win._drag_delta = (0.0, 0.0)
+    win._dragging = True
+    quit_calls = []
+    stop_calls = []
+    monkeypatch.setattr(win, "quit", lambda: quit_calls.append(True))
+    monkeypatch.setattr(win, "_request_stop",
+                        lambda: stop_calls.append(True))
+    return win, quit_calls, stop_calls
+
+
+def test_tapping_the_close_x_dismisses_the_pill(monkeypatch):
+    """The X is the top-right corner; a tap there must close the overlay.
+
+    This is the whole point of the affordance: the HUD is a separate process
+    the daemon cannot reach, so a tap is the only way to dismiss it without
+    a recording to stop.
+    """
+    import whisper_flow.hud_app as m
+
+    win, quit_calls, stop_calls = _tap_window(monkeypatch, m.WIDTH - 8, 10)
+
+    win._on_drag_end(None, 0, 0)          # no movement: a tap, not a drag
+
+    assert quit_calls == [True]
+    assert stop_calls == []
+
+
+def test_tapping_the_close_x_while_recording_also_stops(monkeypatch):
+    """Closing mid-recording must not leave the mic listening unseen."""
+    import whisper_flow.hud_app as m
+
+    win, quit_calls, stop_calls = _tap_window(
+        monkeypatch, m.WIDTH - 8, 10, stop_button=True)
+
+    win._on_drag_end(None, 0, 0)
+
+    assert quit_calls == [True]
+    assert stop_calls == [True]
+
+
+def test_tapping_the_pill_body_does_nothing(monkeypatch):
+    """A short drag must not vanish or stop the pill; only the two do."""
+    import whisper_flow.hud_app as m
+
+    win, quit_calls, stop_calls = _tap_window(monkeypatch, m.WIDTH // 2, 10)
+
+    win._on_drag_end(None, 0, 0)
+
+    assert quit_calls == []
+    assert stop_calls == []
+
+
+def test_tapping_the_stop_tab_stops_without_closing(monkeypatch):
+    """The hanging tab ends the recording; it must not also dismiss the pill."""
+    import whisper_flow.hud_app as m
+
+    probe = _dragging_window(monkeypatch)[0]
+    x0, y0, x1, y1 = probe._stop_rect()
+    sx, sy = (x0 + x1) // 2, (y0 + y1) // 2
+    win, quit_calls, stop_calls = _tap_window(
+        monkeypatch, sx, sy, stop_button=True)
+    assert 0 < y0 < m.HEIGHT          # the tab really does hang below
+
+    win._on_drag_end(None, 0, 0)
+
+    assert stop_calls == [True]
+    assert quit_calls == []

@@ -5,6 +5,12 @@ KWin ignores the older X11 `_KDE_NET_WM_BLUR_BEHIND_REGION` property in a
 Wayland session, and a client cannot read the pixels behind its own surface to
 blur them itself.
 
+Not every timeline may run them, though: a surface may hold at most one
+background effect object, and GTK 4.23.3+ claims one for every surface it
+creates. gtk_claims_background_effects gates the callers; still requesting
+there is the background_effect_exists protocol error and, with it, the death
+of the whole connection.
+
 There are no Python bindings for the protocol, so the two requests we need are
 marshalled by hand through libwayland-client. That means declaring the wire
 description (wl_interface / wl_message) for the two interfaces exactly as the
@@ -62,6 +68,54 @@ _GLOBAL_REMOVE_CB = ctypes.CFUNCTYPE(
 
 class _RegistryListener(ctypes.Structure):
     _fields_ = [("global_", _GLOBAL_CB), ("global_remove", _GLOBAL_REMOVE_CB)]
+
+
+# --- who owns the effect object ---------------------------------------------
+
+# GTK 4.23.3 began creating an ext_background_effect_surface_v1 for every
+# wl_surface the moment the compositor advertises the manager (GTK !10145;
+# GNOME/gtk#8344). The protocol allows one effect object per surface, so a
+# second get_background_effect - the only way these hand-marshalled requests
+# can reach the protocol - answers background_effect_exists, and that error
+# kills the whole connection: the HUD died the moment blur was switched on.
+# GTK gives its own object no blur region (nothing in its scene tree
+# produces one and no public API to ask for a blur exists), so on these
+# runtimes no client has compositor blur, ours or anyone's. Stand down
+# before the realise dance instead of dying: a missing frosted backdrop is
+# temporary, a dead display connection is the overlay gone for good.
+#
+# !10225 (not merged as of GTK 4.24.1) would create the object lazily,
+# which would make our second request legal again; this constant is where a
+# runtime that does so is taught to the module. Until then, treat every GTK
+# at or past 4.23.3 - including 4.23.x snapshots, which number their
+# micro-version - as claiming the effect.
+GTK_CLAIMS_BACKGROUND_EFFECTS_AT = (4, 23, 3)
+
+
+def gtk_versions_claim_background_effects(major: int, minor: int,
+                                          micro: int) -> bool:
+    """Whether this GTK version takes each surface's background effect."""
+    return (major, minor, micro) >= GTK_CLAIMS_BACKGROUND_EFFECTS_AT
+
+
+def gtk_claims_background_effects() -> bool:
+    """Same question, asked of the Gtk runtime already loaded in this process.
+
+    Introspection failing is answered the conservative way, as a claim:
+    skipping the blur costs a material, while racing a claimed surface
+    kills the window the moment it appears.
+    """
+    try:
+        import gi
+
+        gi.require_version("Gtk", "4.0")
+        from gi.repository import Gtk
+
+        return gtk_versions_claim_background_effects(
+            Gtk.get_major_version(), Gtk.get_minor_version(),
+            Gtk.get_micro_version())
+    except Exception:
+        return True
 
 
 MANAGER_NAME = b"ext_background_effect_manager_v1"

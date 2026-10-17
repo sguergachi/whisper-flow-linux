@@ -536,6 +536,35 @@ class HudWindow(Gtk.Window):
         self._relative_pointer = None
         self._drag_relative = False
         self._drag_delta = (0.0, 0.0)
+        # evdev fallback for compositors (KWin) that never deliver pointer
+        # events to layer-shell surfaces. evdev gives relative motion and
+        # button state from the raw input device, independent of the
+        # compositor, so drag works where the protocol path cannot.
+        self._evdev_device = None
+        self._evdev_cursor = (0.0, 0.0)
+        self._evdev_down = False
+        try:
+            import evdev as _evdev
+            from evdev import ecodes as _ecodes
+            for path in _evdev.list_devices():
+                dev = _evdev.InputDevice(path)
+                caps = dev.capabilities()
+                keys = caps.get(_ecodes.EV_KEY, [])
+                if (_ecodes.EV_REL in caps
+                        and _ecodes.REL_X in caps.get(_ecodes.EV_REL, [])
+                        and _ecodes.BTN_LEFT in keys):
+                    self._evdev_device = dev
+                    self._evdev_device.grab = False
+                    # Non-blocking reads.
+                    self._evdev_device.fd  # touch
+                    import os as _os
+                    import fcntl as _fcntl
+                    _fcntl.fcntl(self._evdev_device.fd, _fcntl.F_SETFL,
+                                 _fcntl.fcntl(self._evdev_device.fd,
+                                              _fcntl.F_GETFL) | _os.O_NONBLOCK)
+                    break
+        except Exception:
+            self._evdev_device = None
         # X11 polling fallback for compositors (KWin) that never deliver
         # pointer events to layer-shell surfaces. XWayland is present on
         # almost every Wayland session and gives absolute cursor position.
@@ -810,6 +839,13 @@ class HudWindow(Gtk.Window):
             except Exception:
                 pass
             self._x_display = None
+        dev = getattr(self, "_evdev_device", None)
+        if dev is not None:
+            try:
+                dev.close()
+            except Exception:
+                pass
+            self._evdev_device = None
 
     def _on_relative_motion(self, dx, dy):
         if not self._dragging or not self._drag_relative:
@@ -1403,6 +1439,10 @@ class HudWindow(Gtk.Window):
         self._quitting = False
         self._window_resize()
         self._apply_position()
+        # Reset the evdev virtual cursor to the pill's centre so a
+        # drag that starts on this show follows the pointer 1:1.
+        self._evdev_cursor = (0.0, 0.0)
+        self._evdev_down = False
         # A window already on screen gets no map event, so no correction is
         # coming and the position applied just above is the final one. Nor is
         # one needed when the position is pinned: the map cannot move the
@@ -1481,8 +1521,72 @@ class HudWindow(Gtk.Window):
         return (max(0, min(int(x), g.width - WIDTH)),
                 max(0, min(int(y), g.height - self._window_height())))
 
+    def _evdev_poll(self):
+        """Poll the mouse via evdev and drive drag on compositors (KWin)
+        that never deliver pointer events to layer-shell surfaces.
+
+        evdev gives relative motion and button state from the raw input
+        device, independent of the compositor, so drag works where the
+        protocol path cannot. The cursor is tracked as a virtual position
+        starting at the pill's centre when the HUD shows, so the pill
+        follows the pointer 1:1 without an absolute-position source.
+        """
+        dev = getattr(self, "_evdev_device", None)
+        if dev is None:
+            return
+        try:
+            from evdev import ecodes as _ecodes
+            for event in dev.read():
+                if event.type == _ecodes.EV_REL:
+                    if event.code == _ecodes.REL_X:
+                        self._evdev_cursor = (self._evdev_cursor[0] + event.value,
+                                              self._evdev_cursor[1])
+                    elif event.code == _ecodes.REL_Y:
+                        self._evdev_cursor = (self._evdev_cursor[0],
+                                              self._evdev_cursor[1] + event.value)
+                elif event.type == _ecodes.EV_KEY and event.code == _ecodes.BTN_LEFT:
+                    if event.value == 1 and not self._evdev_down:
+                        self._evdev_down = True
+                        if not self._dragging:
+                            pos = (self._pos if self._pos is not None
+                                   else self._default_pos())
+                            self._drag_origin = pos
+                            self._dragging = True
+                            self._evdev_grab = self._evdev_cursor
+                            if os.environ.get("WHISPER_FLOW_HUD_DEBUG_DRAG"):
+                                print(f"[HUD] evdev drag begin origin={pos}",
+                                      flush=True)
+                    elif event.value == 0 and self._evdev_down:
+                        self._evdev_down = False
+                        if self._dragging:
+                            self._dragging = False
+                            self._drag_origin = None
+                            self._pos_flush_queued = False
+                            try:
+                                self._apply_position()
+                            except Exception:
+                                pass
+                            if self._pos is not None:
+                                _save_position(self._connector, *self._pos)
+                                print(f"[HUD] position saved for "
+                                      f"{self._connector}: {self._pos}",
+                                      flush=True)
+        except BlockingIOError:
+            pass
+        except Exception:
+            pass
+
+        if self._dragging and self._evdev_down:
+            ox, oy = self._drag_origin
+            gx, gy = self._evdev_grab
+            cx, cy = self._evdev_cursor
+            self._pos = self._clamp(ox + (cx - gx), oy + (cy - gy))
+            self._request_pos_flush()
+
     def _on_drag_begin(self, gesture, sx, sy):
         if getattr(self, "_x_display", None) is not None:
+            return
+        if getattr(self, "_evdev_device", None) is not None:
             return
         self._drag_origin = self._pos if self._pos is not None else self._default_pos()
         self._drag_start_xy = (sx, sy)
@@ -1600,6 +1704,7 @@ class HudWindow(Gtk.Window):
         self.stop_hover_target = 0.0
 
     def _frame(self):
+        self._evdev_poll()
         self._x11_drag_poll()
         if self._resident and not self.get_visible():
             return True                 # parked between recordings

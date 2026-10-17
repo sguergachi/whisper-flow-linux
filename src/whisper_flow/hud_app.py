@@ -439,9 +439,10 @@ def _open_pointer_device():
     import evdev
     from evdev import ecodes
 
+    forced = _os.environ.get("WHISPER_FLOW_HUD_POINTER_DEVICE")
     letters = {getattr(ecodes, f"KEY_{c}") for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"}
     candidates = []
-    for path in evdev.list_devices():
+    for path in ([forced] if forced else evdev.list_devices()):
         try:
             dev = evdev.InputDevice(path)
             caps = dev.capabilities()
@@ -890,6 +891,11 @@ class HudWindow(Gtk.Window):
         is unavailable this is a no-op and the GestureDrag path takes over.
         """
         if getattr(self, "_x_display", None) is None:
+            return
+        # evdev is the primary source when it is available: it sees the raw
+        # device, while XWayland's pointer can be stale or detached. Letting
+        # both run would have each cancel the other's drag.
+        if getattr(self, "_evdev_device", None) is not None:
             return
         if getattr(self, "_quitting", False):
             return

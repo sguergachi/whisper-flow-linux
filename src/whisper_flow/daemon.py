@@ -231,6 +231,8 @@ class WhisperFlowDaemon:
         # the current request finishes instead of killing the recording.
         self._update_apply_deferred = False
         self._instance_lock = None
+        # Backend episodes already surfaced to the user for this setup.
+        self._backend_notified: set[str] = set()
 
         # Initialize WhisperFlow instances for different modes
         log("[DAEMON] Creating WhisperFlow instances...")
@@ -602,6 +604,22 @@ class WhisperFlowDaemon:
                 lambda reason: self.notify(
                     f"⌨️ Keyboard input was emergency-reset ({reason})"))
 
+            # Backend episodes (portal pending/bound/fallback) surface here
+            # for one user-visible notification each; the manager itself
+            # only logs. Reset per setup so a reconfigure re-arms them.
+            self._backend_notified: set[str] = set()
+            self.hotkey_manager.status_callback = self._on_hotkey_backend_status
+            # Let the paste path ask whether the active backend's shortcuts
+            # are consumed by the compositor. Portal-consumed chords never
+            # reach applications, so no Alt-menu repair must follow a paste.
+            for app in (self.transcribe_app, self.auto_transcribe_app,
+                        self.command_app):
+                try:
+                    app.system_manager.hotkey_consumer = (
+                        self.hotkey_manager.hotkeys_consumed)
+                except Exception as e:
+                    log(f"[DAEMON] could not wire hotkey consumer: {e}")
+
             # Start the hotkey manager
             try:
                 self.hotkey_manager.start()
@@ -635,6 +653,33 @@ class WhisperFlowDaemon:
     def _is_processing(self) -> bool:
         """Check if system is currently processing a request."""
         return self.is_processing or self.is_recording
+
+    def _on_hotkey_backend_status(self, state: str, detail: str) -> None:
+        """Surface one backend episode to the user, exactly once per setup.
+
+        The portal bind waits on the user (an approval dialog) and can be
+        denied; either way the session keeps working hotkeys - portal with
+        live streaming, or the fail-open observer with a buffered paste -
+        and the user should know which one they got and why.
+        """
+        try:
+            notified = self._backend_notified
+        except Exception:
+            return
+        if state in notified:
+            return
+        notified.add(state)
+        if state == "pending":
+            log(f"[DAEMON] global shortcuts pending: {detail}")
+            self.notify("Approve the global-shortcuts dialog "
+                        "to enable push-to-talk")
+        elif state == "bound":
+            log(f"[DAEMON] global shortcuts active: {detail}")
+        elif state == "fallback":
+            log(f"[DAEMON] basic hotkeys in use: {detail}")
+            self.notify("Global shortcuts unavailable - using basic hotkeys "
+                        "(no live preview; assign keys in System Settings "
+                        "for the full experience)")
 
     def _handle_hotkey_press(self, mode: str):
         """Handle hotkey press with queuing support."""
@@ -1125,13 +1170,25 @@ class WhisperFlowDaemon:
                     cli_mode = self.backend.cli_mode() is True
                 except Exception:
                     cli_mode = False
+                try:
+                    input_backend = self.hotkey_manager.input_status().get(
+                        "backend")
+                except Exception:
+                    input_backend = None
+                # The fail-open observer deliberately leaves the physical
+                # modifiers connected to the compositor. Injecting live text
+                # while Super+Alt is still held would turn its letters into
+                # desktop shortcuts. Buffer the utterance until key release;
+                # safety is worth more than a live preview.
+                observer_mode = input_backend == "evdev-observer"
                 # In CLI mode there is no server for live passes (and a
                 # model load per second of speech would bury the dictation):
                 # record plainly and let the closing pass decode via
                 # whisper-cli. The doctor's heal says exactly this - no
                 # live preview - so the loop must not be started at all
                 # rather than failing one pass per interval.
-                if self.config.live_transcription and not cli_mode:
+                if (self.config.live_transcription and not cli_mode
+                        and not observer_mode):
                     log(f"[DAEMON] Running LIVE push-to-talk with stop key: {hotkey}")
                     success = app.run_voice_flow_push_to_talk_live(
                         stop_key=hotkey,
@@ -1140,6 +1197,9 @@ class WhisperFlowDaemon:
                         on_ready=self._show_hud_now,
                     )
                 else:
+                    if self.config.live_transcription and observer_mode:
+                        log("[DAEMON] Fail-open keyboard mode: buffering text "
+                            "until the hotkey is released")
                     log(f"[DAEMON] Running push-to-talk mode with stop key: {hotkey}")
                     success = app.run_voice_flow_push_to_talk_daemon(
                         stop_key=hotkey,
@@ -1311,6 +1371,13 @@ class WhisperFlowDaemon:
         On a thread, like the overlay's: this starts a process that loads GTK,
         and the tray icon must not wait for it.
         """
+        # Linux startup must not leave a hidden GTK process capable of
+        # surfacing without an explicit tray click.  It was observed mapping
+        # itself 55 seconds after launch with no "Settings menu item clicked"
+        # event.  Linux builds the window quickly enough on demand; retain
+        # prewarming only for the slow Windows runtime it was designed for.
+        if sys.platform != "win32":
+            return
         if not _has_display():
             return                      # headless: there is no window to warm
 
@@ -1835,11 +1902,11 @@ class WhisperFlowDaemon:
         except Exception:
             pass
         if not model:
-            # Nothing can transcribe yet, so this is the whole difference
-            # between a working app and a dead one. Open settings, where the
-            # model is chosen and downloaded, straight away.
-            if not self._open_settings_window():
-                self.notify("No speech model yet - open Settings in the tray")
+            # Never seize focus with an unrequested settings window. Apart
+            # from being disruptive, it can surface between recording and
+            # paste and swallow the transcript. The tray remains the explicit
+            # place to open Settings.
+            self.notify("No speech model yet - open Settings in the tray")
             return
 
         url = self._backend_start(model, allow_download=False)
@@ -2960,13 +3027,12 @@ Use 'whisper-flow stop' to exit daemon
     def _maybe_heal_hotkeys(self) -> bool:
         """Revive a dead hotkey listener, throttled. True when revived.
 
-        A listener that failed at startup (keyboards grabbed elsewhere,
-        no permission) used to stay dead, tray-only, until a manual
+        A listener that failed at startup (usually no input permission) used
+        to stay dead, tray-only, until a manual
         restart: the watchdog probed hasattr(hm, "is_alive") for a method
         that did not exist, so the whole block never ran. Now it retries,
-        at most every 15s so a permanently-grabbed keyboard does not get
-        a fresh uinput proxy and two log lines every 2s forever. Never
-        raises.
+        at most every 15s so a persistent permission failure does not create
+        two log lines every 2s forever. Never raises.
         """
         try:
             hm = getattr(self, "hotkey_manager", None)

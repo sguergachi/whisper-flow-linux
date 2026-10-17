@@ -185,7 +185,11 @@ def test_the_linux_spec_declares_lazy_pystray():
     """Linux freeze is a separate spec; it must hide the same lazy imports."""
     text = LINUX_SPEC.read_text(encoding="utf-8")
     assert '"pystray"' in text
-    assert "hotkey_evdev" in text
+    assert '"whisper_flow.hotkey_evdev_observer"' in text
+    assert '"whisper_flow.hotkey_evdev",' not in text, (
+        "the frozen app must not package the retired exclusive keyboard "
+        "grab/proxy backend"
+    )
     assert "hotkey_win" in text  # excluded, not included as a hiddenimport
     assert "whisper_flow.hotkey_win" in text  # appears under EXCLUDES
 

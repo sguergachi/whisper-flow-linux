@@ -121,7 +121,10 @@ def _cairo_bridge() -> str:
 
 hidden = collect_submodules("pydantic") + [
     _cairo_bridge(),
-    "whisper_flow.hotkey_evdev",
+    # Production Linux hotkeys are observation-only. Do not package the old
+    # exclusive grab/proxy backend: the frozen app must not contain a path
+    # that can interpose itself between a physical keyboard and the desktop.
+    "whisper_flow.hotkey_evdev_observer",
     "whisper_flow.system",
     "whisper_flow.hud_app",
     "whisper_flow.settings_gtk",

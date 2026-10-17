@@ -1938,6 +1938,29 @@ def test_cli_mode_records_without_the_live_loop(temp_config_dir):
     app.run_voice_flow_push_to_talk_live.assert_not_called()
 
 
+def test_fail_open_keyboard_buffers_until_hotkey_release(temp_config_dir):
+    """Never inject letters while physical Super+Alt still reaches KDE."""
+    daemon, hotkeys = _idle_daemon(temp_config_dir)
+    daemon.config.live_transcription = True
+    daemon.backend.cli_mode = Mock(return_value=False)
+    hotkeys.input_status.return_value = {"backend": "evdev-observer"}
+    app = Mock()
+    app.run_voice_flow_push_to_talk_daemon = Mock(return_value=True)
+    app.run_voice_flow_push_to_talk_live = Mock(return_value=True)
+    daemon._get_app_for_mode = Mock(return_value=app)
+    daemon._show_hud_now = Mock()
+    daemon._stop_recording = Mock()
+    daemon._release_stuck_modifiers = Mock()
+    daemon._finish_processing = Mock()
+    daemon.stop_recording_event = Mock()
+    daemon._level_file = None
+
+    daemon._record_audio_thread("transcribe")
+
+    app.run_voice_flow_push_to_talk_daemon.assert_called_once()
+    app.run_voice_flow_push_to_talk_live.assert_not_called()
+
+
 def test_cli_fallback_saves_a_final_pass(temp_config_dir):
     daemon, app = _healing_setup(temp_config_dir, "hello cli")
     healing = daemon._healing_transcribe(app)
@@ -1998,3 +2021,43 @@ def test_repeated_warm_requests_share_one_worker(temp_config_dir):
         thread.call_args.kwargs['target']()
         daemon._warm_backend_for_recording()
         assert thread.call_count == 2
+
+
+def test_backend_status_notifies_each_episode_once(temp_config_dir):
+    """Portal pending/denied must be visible, not silent and not spammy."""
+    daemon, _ = _idle_daemon(temp_config_dir)
+    daemon.notify = Mock()
+
+    daemon._on_hotkey_backend_status("pending", "waiting")
+    daemon._on_hotkey_backend_status("pending", "waiting")
+    daemon._on_hotkey_backend_status("fallback", "denied")
+    daemon._on_hotkey_backend_status("fallback", "denied")
+    daemon._on_hotkey_backend_status("bound", "ok")
+
+    messages = [call[0][0] for call in daemon.notify.call_args_list]
+    assert len(messages) == 2
+    assert any("Approve" in message for message in messages)
+    assert any("basic hotkeys" in message for message in messages)
+
+
+def test_portal_backend_streams_live(temp_config_dir):
+    """A compositor-consumed chord is invisible to apps: streaming is safe."""
+    daemon, hotkeys = _idle_daemon(temp_config_dir)
+    daemon.config.live_transcription = True
+    daemon.backend.cli_mode = Mock(return_value=False)
+    hotkeys.input_status.return_value = {"backend": "portal"}
+    app = Mock()
+    app.run_voice_flow_push_to_talk_daemon = Mock(return_value=True)
+    app.run_voice_flow_push_to_talk_live = Mock(return_value=True)
+    daemon._get_app_for_mode = Mock(return_value=app)
+    daemon._show_hud_now = Mock()
+    daemon._stop_recording = Mock()
+    daemon._release_stuck_modifiers = Mock()
+    daemon._finish_processing = Mock()
+    daemon.stop_recording_event = Mock()
+    daemon._level_file = None
+
+    daemon._record_audio_thread("transcribe")
+
+    app.run_voice_flow_push_to_talk_live.assert_called_once()
+    app.run_voice_flow_push_to_talk_daemon.assert_not_called()

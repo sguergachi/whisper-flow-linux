@@ -87,12 +87,9 @@ class HotkeyManager:
         self._emergency_callback: Callable[[str], None] | None = None
         # start, stop and restart each replace the backend listener, and
         # they are called from three threads: the daemon's setup, its
-        # watchdog and the heartbeat. Two starts racing at login each built
-        # a listener; one grabbed the keyboards, the other failed with EBUSY
-        # and took its place, so the working one was orphaned - still
-        # holding every keyboard, never stopped - and each restart after
-        # that failed against it, every ten seconds for the rest of the
-        # session.
+        # watchdog and the heartbeat. The observer is fail-open, but duplicate
+        # readers would still fire callbacks twice, so lifecycle replacement
+        # remains serialized.
         self._lifecycle_lock = threading.RLock()
 
         # Simple state
@@ -129,7 +126,32 @@ class HotkeyManager:
             "command": "cmd",
         }
 
+        # Portal backend state (Wayland): preferred when usable, because the
+        # compositor consumes its shortcuts and held chords never reach the
+        # focused app. ``status_callback`` carries backend episodes to the
+        # daemon for user notification ("pending"/"bound"/"fallback").
+        self.status_callback: Callable[[str, str], None] | None = None
+        self._portal_failed = False
+
         log("[HOTKEY] HotkeyManager initialized")
+
+    def hotkeys_consumed(self) -> bool:
+        """Whether the active backend's shortcuts are consumed upstream.
+
+        True only for a bound portal backend: KWin intercepts its triggers,
+        so the physical chord never reaches applications and injected text
+        needs no modifier cleanup or Alt-menu repair. Every other backend
+        observes passively and reports False.
+        """
+        listener = self._evdev_listener
+        try:
+            # Identity, not truthiness: a Mock listener answers truthy to
+            # any attribute, which must never read as "consumed" and skip
+            # the Alt-menu repair the observer path depends on.
+            return (getattr(listener, "shortcuts_consumed", False) is True
+                    and getattr(listener, "is_bound", False) is True)
+        except Exception:
+            return False
 
     def register_processing_callback(self, callback: Callable[[], bool]) -> None:
         """Register callback to check if system is processing.
@@ -142,13 +164,7 @@ class HotkeyManager:
         log("[HOTKEY] Processing callback registered")
 
     def set_emergency_callback(self, callback: Callable[[str], None]) -> None:
-        """Called as callback(reason) when input had to be forcibly reset.
-
-        A wedged reader or dead proxy means the user's keyboard was just
-        freed from an exclusive grab; that must surface as a notification,
-        not silence. Stored for the current listener and any future one
-        (restarts create a new listener object).
-        """
+        """Retain the backend failure callback across listener restarts."""
         self._emergency_callback = callback
         listener = self._evdev_listener
         if listener is not None and hasattr(listener, "on_emergency"):
@@ -212,6 +228,15 @@ class HotkeyManager:
         """
         key_set = self._parse_hotkey_combination(keys)
         mods_only = bool(key_set) and key_set <= _MODS_ONLY
+
+        # A (re)registration means the bindings may have changed, so a
+        # portal bind refused earlier deserves one fresh attempt: with
+        # unchanged triggers the portal rebinds silently out of its store.
+        if self._portal_failed:
+            current = self.active_bindings.get(name)
+            if current is None or current.keys != key_set:
+                log("[HOTKEY] hotkey set changed, portal gets a fresh attempt")
+                self._portal_failed = False
         if (mode == HotkeyMode.SINGLE_PRESS and mods_only
                 and len(key_set) <= _MAX_SAFE_MODIFIER_ONLY_KEYS):
             # Nothing non-modifier in the chord (the layout-switch shortcut
@@ -253,14 +278,14 @@ class HotkeyManager:
             for name, binding in self.active_bindings.items():
                 log(f"[HOTKEY]   {name}: {binding.keys} ({binding.mode.value})")
 
-            # One backend per platform: a low-level hook on Windows, evdev on
-            # Wayland, pynput's X11 listener otherwise.
+            # One backend per platform: a low-level hook on Windows, the
+            # portal-consumed global shortcuts (observer fallback) on
+            # Wayland, pynput otherwise.
             if _is_windows():
                 log("[HOTKEY] Windows detected, using keyboard state polling")
                 self._start_windows()
             elif _is_wayland():
-                log("[HOTKEY] Wayland detected, using evdev backend")
-                self._start_evdev()
+                self._start_wayland_locked()
             else:
                 self.keyboard_listener = keyboard.Listener(
                     on_press=self._on_key_press,
@@ -332,10 +357,8 @@ class HotkeyManager:
         """Start a new backend listener, and only then make it the current one.
 
         A listener that fails to start is never installed, so it cannot
-        displace one that works; and whatever was current before is stopped
-        first, so no listener is ever left running with nothing pointing at
-        it - an orphan still holding the keyboard grab is exactly what
-        nothing else could ever release.
+        displace one that works; whatever was current before is stopped first,
+        so no orphan observer can fire duplicate callbacks.
         """
         previous = self._evdev_listener
         if previous is not None and previous is not listener:
@@ -348,10 +371,10 @@ class HotkeyManager:
         self._evdev_listener = listener
 
     def _start_evdev(self):
-        """Start the evdev-based keyboard listener for Wayland."""
-        from .hotkey_evdev import EvdevHotkeyListener
+        """Observe Wayland hotkeys without grabbing or proxying keyboards."""
+        from .hotkey_evdev_observer import EvdevHotkeyObserver
 
-        listener = EvdevHotkeyListener()
+        listener = EvdevHotkeyObserver()
         listener.escape_callback = self._handle_escape_key
         if self._emergency_callback is not None:
             listener.on_emergency = self._emergency_callback
@@ -362,18 +385,114 @@ class HotkeyManager:
             press_cb = binding.callback_press
             release_cb = binding.callback_release if binding.mode == HotkeyMode.PUSH_TO_TALK else None
 
-            # Mute the chord from the compositor for every binding, not only
-            # push-to-talk. Single-press auto (ctrl+alt+space) was leaving
-            # Space held as far as the desktop was concerned, so the press
-            # typed a space (or fired a desktop shortcut) and looked like
-            # auto-transcribe "did nothing".
+            # Observer mode never withholds or synthesises a physical event.
+            # The argument stays false explicitly: turning it on must never
+            # silently recreate the old exclusive proxy architecture.
             listener.register_hotkey(
                 name, key_str, press_cb, release_cb,
-                release_modifiers=True,
+                release_modifiers=False,
             )
 
         self._install_listener(listener)
-        log("[HOTKEY] Evdev hotkey listener started")
+        log("[HOTKEY] Fail-open evdev hotkey observer started")
+
+    def _start_wayland_locked(self) -> None:
+        """Pick the Wayland backend: portal when usable, observer otherwise.
+
+        The portal's shortcuts are consumed by the compositor, so a held
+        chord never reaches the focused app and live words stream cleanly.
+        The observer never consumes anything, so holding its chord turns
+        injected text into shortcuts and live mode stays off there.
+        """
+        if not self._portal_failed:
+            try:
+                self._start_portal()
+                return
+            except Exception as exc:
+                log(f"[HOTKEY] portal backend unavailable ({exc}), "
+                    "falling back to the fail-open observer")
+        else:
+            log("[HOTKEY] portal previously failed, using fail-open observer")
+        self._report_backend_status("fallback", "portal unavailable")
+        self._start_evdev()
+
+    def _start_portal(self) -> None:
+        """Bind Wayland hotkeys as compositor-consumed global shortcuts."""
+        from .hotkey_portal import PortalHotkeyListener
+
+        listener = PortalHotkeyListener(
+            on_bind_complete=self._on_portal_bind_complete)
+        listener.escape_callback = self._handle_escape_key
+        if self._emergency_callback is not None and hasattr(
+                listener, "on_emergency"):
+            listener.on_emergency = self._emergency_callback
+        for name, binding in self.active_bindings.items():
+            key_str = "+".join(sorted(binding.keys))
+            release_cb = (binding.callback_release
+                          if binding.mode == HotkeyMode.PUSH_TO_TALK else None)
+            listener.register_hotkey(
+                name, key_str, binding.callback_press, release_cb,
+                release_modifiers=False,
+            )
+        self._install_listener(listener)
+        log("[HOTKEY] Portal global-shortcut backend started "
+            "(binding in progress)")
+
+    def _report_backend_status(self, state: str, detail: str) -> None:
+        callback = self.status_callback
+        if callback is None:
+            return
+        try:
+            callback(state, detail)
+        except Exception as e:
+            log(f"[HOTKEY] backend status callback failed: {e}")
+
+    def _on_portal_bind_complete(self, ok: bool | None, detail: str) -> None:
+        """Route the portal bind outcome (runs on the portal worker thread)."""
+        with self._lifecycle_lock:
+            if ok is None:
+                log(f"[HOTKEY] portal bind pending: {detail}")
+                self._report_backend_status("pending", detail)
+                return
+            if ok:
+                log(f"[HOTKEY] portal bind complete: {detail}")
+                self._report_backend_status("bound", detail)
+                return
+            log(f"[HOTKEY] portal bind failed: {detail}")
+            self._fallback_to_observer_locked(detail)
+
+    def _fallback_to_observer(self, reason: str) -> None:
+        """Swap a failed portal backend for the observer, exactly once."""
+        with self._lifecycle_lock:
+            self._fallback_to_observer_locked(reason)
+
+    def _fallback_to_observer_locked(self, reason: str) -> None:
+        if self._portal_failed:
+            return
+        listener = self._evdev_listener
+        if listener is None or (
+                getattr(listener, "backend_name", None) != "portal"):
+            return
+        self._portal_failed = True
+        log(f"[HOTKEY] falling back to the fail-open observer ({reason})")
+        try:
+            self._evdev_listener = None
+            listener.stop()
+        except Exception as e:
+            log(f"[HOTKEY] Error stopping failed portal backend: {e}")
+        try:
+            self._start_evdev()
+        except Exception as e:
+            log(f"[HOTKEY] observer fallback failed: {e}")
+        self._report_backend_status("fallback", reason)
+
+    def _portal_needs_fallback(self) -> bool:
+        listener = self._evdev_listener
+        return bool(
+            listener is not None
+            and getattr(listener, "backend_name", None) == "portal"
+            and getattr(listener, "bind_failed", False)
+            and not self._portal_failed)
 
     def stop(self) -> None:
         """Stop the hotkey listener."""
@@ -817,6 +936,10 @@ class HotkeyManager:
                 self.current_push_to_talk = None
 
         # Check if the keyboard listener is still alive
+        if self._portal_needs_fallback():
+            log("[HOTKEY] Portal bind failed, falling back to observer")
+            self._fallback_to_observer("bind failed")
+            return
         if not self._listener_alive():
             log("[HOTKEY] Warning: Keyboard listener died, attempting restart")
             self._restart_listener()
@@ -900,7 +1023,7 @@ class HotkeyManager:
             if _is_windows():
                 self._start_windows()
             elif _is_wayland():
-                self._start_evdev()
+                self._start_wayland_locked()
             else:
                 self.keyboard_listener = keyboard.Listener(
                     on_press=self._on_key_press,

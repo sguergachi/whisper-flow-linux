@@ -831,6 +831,8 @@ class HudWindow(Gtk.Window):
         """
         if getattr(self, "_x_display", None) is None:
             return
+        if getattr(self, "_quitting", False):
+            return
         try:
             root_ret = ctypes.c_ulong()
             child_ret = ctypes.c_ulong()

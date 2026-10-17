@@ -724,6 +724,16 @@ class HudWindow(Gtk.Window):
         if os.environ.get("WHISPER_FLOW_HUD_NO_BLUR"):
             print("[HUD] blur disabled by env", flush=True)
             return
+        if _wayland_blur.gtk_claims_background_effects():
+            # GTK >= 4.23.3 holds the one effect object every surface may
+            # have; asking for a second has the compositor kill the
+            # connection and the pill dies before it is ever seen. The
+            # handle staying None turns every later set_active and
+            # set_region into a no-op, which is exactly how the pill
+            # behaves with the blur env off too.
+            print("[HUD] blur: GTK owns this surface's background effect; "
+                  "blur request skipped", flush=True)
+            return
         try:
             display = Gdk.Display.get_default()
             surface = self.get_surface()

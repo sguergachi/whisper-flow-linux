@@ -28,6 +28,7 @@ from .logging import log, recent_log, set_logging_enabled, write_crash_report
 from .logging import reset_stage_log, trace_stage
 from .paths import lock_file as _lock_file
 from .paths import pid_file as _pid_file
+from .paths import find_wayland_socket
 from .version import build_version
 
 # Modes driven by holding a hotkey down; they cannot be deferred and replayed.
@@ -53,6 +54,23 @@ SETTINGS_CLICK_DEBOUNCE_S = 1.5
 _DISPLAY_ENV = ("WAYLAND_DISPLAY", "DISPLAY", "XAUTHORITY")
 
 
+def _wayland_claim_is_live() -> bool:
+    """Whether the inherited WAYLAND_DISPLAY names a socket that exists.
+
+    systemd units get the variable pinned at write time - seen here as
+    wayland-0 outliving a session whose compositor is wayland-1 - and a
+    value like that reads as healthy while every window aimed at it dies
+    in connect. The session's runtime dir holds the sockets; existence
+    there is the whole truth.
+    """
+    if sys.platform == "win32":
+        return True
+    claim = os.environ.get("WAYLAND_DISPLAY")
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    return bool(claim and runtime
+                and os.path.exists(os.path.join(runtime, claim)))
+
+
 def _has_display() -> bool:
     """Whether a window started from here can reach a desktop.
 
@@ -62,11 +80,13 @@ def _has_display() -> bool:
     D-Bus) and no display for the rest of its life, so every Settings click
     fell back to a notification naming the config directory, with nothing
     in the log to say why. The desktop has published them by the time
-    anyone clicks, so ask again before concluding there is no desktop.
+    anyone clicks, so ask again before concluding there is no desktop - and
+    a pinned WAYLAND_DISPLAY whose socket never showed up counts as
+    unpublished, because it will reach no compositor at any later time.
     """
     if sys.platform == "win32":
         return True
-    if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+    if os.environ.get("DISPLAY") or _wayland_claim_is_live():
         return True
     _adopt_session_display_env()
     return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
@@ -86,14 +106,16 @@ def _adopt_session_display_env() -> None:
         if sep and name in _DISPLAY_ENV and value and not os.environ.get(name):
             os.environ[name] = value
             adopted.append(f"{name}={value}")
-    if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
-        # No systemd user manager to ask: a Wayland session's socket is
-        # still there to be found.
-        runtime = os.environ.get("XDG_RUNTIME_DIR")
-        if (runtime and os.environ.get("XDG_SESSION_TYPE") == "wayland"
-                and os.path.exists(os.path.join(runtime, "wayland-0"))):
-            os.environ["WAYLAND_DISPLAY"] = "wayland-0"
-            adopted.append("WAYLAND_DISPLAY=wayland-0")
+    if not os.environ.get("DISPLAY"):
+        # No X server: hand windows to the compositor via the socket the
+        # session actually published. find_wayland_socket returns nothing
+        # when the inherited claim already names a live socket, so a
+        # systemd-pinned name whose socket never appeared (wayland-0 under
+        # a wayland-1 session) is corrected right here.
+        socket = find_wayland_socket()
+        if socket:
+            os.environ["WAYLAND_DISPLAY"] = socket
+            adopted.append(f"WAYLAND_DISPLAY={socket}")
     if adopted:
         log(f"[DAEMON] started without a display; adopted {', '.join(adopted)}")
 

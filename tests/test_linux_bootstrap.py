@@ -70,3 +70,24 @@ def test_runtime_mode_is_source_when_not_frozen(monkeypatch):
         monkeypatch.delattr(sys, "frozen")
     entry = importlib.reload(_import_entry())
     assert entry.RUNTIME_MODE == "source"
+
+
+def test_glib_2_88_hosts_still_import_after_the_patch():
+    """The moved signal helper must not kill the first Gtk import.
+
+    GLib 2.88 moved unix_signal_add to GLibUnix and pygobject 3.56+ still
+    binds the old name in its override module; a frozen build compiles the
+    fresh source and dies on import. The bootstrap's patch gives that name
+    back when glib took it away, so importing Gtk anywhere succeeds.
+    """
+    _import_entry()._patch_pygobject_deprecation_assertion()
+
+    gi = pytest.importorskip("gi")
+    gi.require_version("Gtk", "4.0")
+    from gi.repository import GLib, Gtk
+
+    assert Gtk.get_major_version() == 4
+    if hasattr(GLib, "unix_signal_add"):
+        # Whatever object answers the old name must be installable in a main
+        # loop, not a deprecation stub that raises when called.
+        assert callable(GLib.unix_signal_add)

@@ -38,17 +38,44 @@ _BUNDLE_ENV_KEYS = (
 )
 
 
-def _patch_pygobject_deprecation_assertion() -> None:
-    """Work around pygobject's GLib override crash on glib >= 2.88.
+def _trace(label, *detail):
+    """Append a line to WHISPER_FLOW_GI_TRACE, when that file is asked for.
 
-    glib 2.88 moved GLib.unix_signal_add to GLibUnix.signal_add. The GLib
-    override module in PyGObject 3.56 still registers the old name as a
-    deprecated alias without defining it, and gi.overrides.load_overrides
-    raises AssertionError when a registered deprecation is not in the
-    module's __all__. Surface runtimes hide it with a stale .pyc; a frozen
-    build compiles the fresh source and dies on the first Gtk import.
-    Dropping deprecations for names the module does not export is exactly
-    what the assertion is enforcing anyway.
+    The override-loading dance below runs inside frozen processes whose only
+    symptom is a traceback that never reaches a log. Asking for a trace on
+    such a host is how this code got written, so it stays cheap and closed.
+    """
+    path = os.environ.get("WHISPER_FLOW_GI_TRACE")
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(" ".join([label, *map(str, detail)]) + "\n")
+    except OSError:
+        pass
+
+
+def _patch_pygobject_deprecation_assertion() -> None:
+    """Keep gi.repository.GLib importable on hosts past GLib 2.88.
+
+    GLib 2.88 moved unix_signal_add and friends into the GLibUnix namespace.
+    Two pygobject gaps then break a plain `from gi.repository import Gtk`:
+
+    The GLib override module still registers unix_signal_add_full as a
+    deprecated alias whenever the platform namespace has signal_add, but its
+    own export of that name sits behind `hasattr(GLib, "unix_signal_add")` -
+    false on a moved host - so load_overrides raises the assertion it wrote
+    for exactly this mismatch ("... wasn't added to __all__"). Deregistering
+    deprecations the override does not export is what the assertion asks
+    for, and pygobject 3.56 kept the registry as a list of pairs where
+    3.58 switched to a dict, so both shapes are cleaned as they are found.
+    The failed attempt also leaves a half-executed override module in
+    sys.modules; the retry re-executes it whole.
+
+    Before any of that, the raw GLib namespace is given the moved
+    implementation back, so bindings and deprecation descriptors have a
+    real function to hand out rather than an absent symbol; anything that
+    says GLib.unix_signal_add then works, calling GLibUnix.signal_add.
     """
     try:
         import gi.importer as _importer
@@ -59,25 +86,80 @@ def _patch_pygobject_deprecation_assertion() -> None:
             return
 
         def _load_patched(introspection_module):
+            ns = introspection_module.__name__.rsplit(".", 1)[-1]
+            _bridge_moved_unix_signal(introspection_module)
             try:
                 return _load(introspection_module)
             except AssertionError:
-                ns = introspection_module.__name__.rsplit(".", 1)[-1]
                 override_mod = sys.modules.get(f"gi.overrides.{ns}")
                 if override_mod is None or not hasattr(override_mod, "__all__"):
                     raise
                 exported = set(override_mod.__all__)
-                _overrides._deprecated_attrs[ns] = [
-                    (attr, replacement)
-                    for attr, replacement in _overrides._deprecated_attrs.get(ns, [])
-                    if attr in exported
-                ]
-                return _load(introspection_module)
+                deprec = _overrides._deprecated_attrs.get(ns)
+                if hasattr(deprec, "items"):
+                    _overrides._deprecated_attrs[ns] = {
+                        attr: replacement
+                        for attr, replacement in deprec.items()
+                        if attr in exported
+                    }
+                elif deprec is not None:
+                    _overrides._deprecated_attrs[ns] = [
+                        (attr, replacement)
+                        for attr, replacement in deprec
+                        if attr in exported
+                    ]
+                # The first attempt died mid-execution, leaving a half-built
+                # override module cached - the retry would see exactly the
+                # broken shape it just claimed. Drop it so the module
+                # re-executes whole against the trimmed deprecation list.
+                sys.modules.pop(f"gi.overrides.{ns}", None)
+                try:
+                    return _load(introspection_module)
+                except Exception as second:
+                    _trace("retry-failed", ns, type(second).__name__, second)
+                    raise
 
         _load_patched._wf_patched = True
         _importer.load_overrides = _load_patched
-    except Exception:
-        pass
+        _trace("patched", "gi.importer.load_overrides")
+    except Exception as why:
+        _trace("patch-err", type(why).__name__, why)
+
+
+def _bridge_moved_unix_signal(introspection_module):
+    """Give the raw GLib namespace its moved signal helper back.
+
+    GLib >= 2.88 hosts remove unix_signal_add from the GLib namespace, and
+    the override module's export of unix_signal_add_full checks for it
+    before binding. Importing GLibUnix here instead would re-enter the
+    namespace loader from inside the GLib load it is servicing - a
+    recursion the loader does not survive - so the bound object is a
+    forwarder that resolves GLibUnix at call time, after the load has
+    finished. Everything about the name then behaves as before the move:
+    hasattr sees a function, the override exports both spellings, and the
+    deprecation machinery hands out a callable rather than a dead import.
+
+    Only a GLib namespace without the symbol is touched; hosts from
+    Debian bookworm to Arch load through here, and must never see this
+    become the thing that breaks import.
+    """
+    try:
+        name = introspection_module.__name__.rsplit(".", 1)[-1]
+        if name != "GLib" or hasattr(introspection_module, "unix_signal_add"):
+            return
+
+        def _unix_signal_forwarder(priority, signum, handler, *user_data):
+            from gi.repository import GLibUnix
+
+            return GLibUnix.signal_add(priority, signum, handler, *user_data)
+
+        introspection_module.unix_signal_add = _unix_signal_forwarder
+        if hasattr(introspection_module, "unix_signal_add"):
+            _trace("bridged", "GLib.unix_signal_add -> GLibUnix.signal_add")
+        else:
+            _trace("bridge-set-failed", "GLib")
+    except Exception as why:
+        _trace("bridge-err", type(why).__name__, why)
 
 
 def _bootstrap_gtk_runtime() -> None:

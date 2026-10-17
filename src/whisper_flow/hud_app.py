@@ -1528,21 +1528,27 @@ class HudWindow(Gtk.Window):
             LayerShell.set_anchor(self, LayerShell.Edge.BOTTOM, True)
             LayerShell.set_margin(self, LayerShell.Edge.BOTTOM, BOTTOM_MARGIN)
             self._layer_top_left = False
+            self._applied_pos = None
             return
         x, y = self._pos
-        # Anchors only on transition; each setter can schedule a GTK layout.
-        # Subsequent moves only need margins.
+        # Anchors, and the zeroed BOTTOM margin, only on the transition.
+        # Each setter can schedule a GTK layout and a compositor commit, and
+        # re-sending values that have not changed made the compositor
+        # re-place the surface every frame: the pill visibly lagged and
+        # flickered between its old and new spot. Margins on unanchored
+        # edges are ignored per spec; zeroing BOTTOM once stops a
+        # compositor that honours a stale margin from fighting the drag.
         if not getattr(self, "_layer_top_left", False):
             LayerShell.set_anchor(self, LayerShell.Edge.BOTTOM, False)
             LayerShell.set_anchor(self, LayerShell.Edge.LEFT, True)
             LayerShell.set_anchor(self, LayerShell.Edge.TOP, True)
+            LayerShell.set_margin(self, LayerShell.Edge.BOTTOM, 0)
             self._layer_top_left = True
+        if (int(x), int(y)) == getattr(self, "_applied_pos", None):
+            return
+        self._applied_pos = (int(x), int(y))
         LayerShell.set_margin(self, LayerShell.Edge.LEFT, int(x))
         LayerShell.set_margin(self, LayerShell.Edge.TOP, int(y))
-        # Margins on unanchored edges are ignored per spec, but say so
-        # explicitly: a compositor that honours a stale BOTTOM margin
-        # anyway would fight every drag.
-        LayerShell.set_margin(self, LayerShell.Edge.BOTTOM, 0)
 
     def _clamp(self, x, y):
         if self._monitor is None:
@@ -1610,8 +1616,10 @@ class HudWindow(Gtk.Window):
             ox, oy = self._drag_origin
             gx, gy = self._evdev_grab
             cx, cy = self._evdev_cursor
-            self._pos = self._clamp(ox + (cx - gx), oy + (cy - gy))
-            self._request_pos_flush()
+            target = self._clamp(ox + (cx - gx), oy + (cy - gy))
+            if target != self._pos:
+                self._pos = target
+                self._request_pos_flush()
 
     def _on_drag_begin(self, gesture, sx, sy):
         if getattr(self, "_x_display", None) is not None:

@@ -1619,7 +1619,13 @@ class HudWindow(Gtk.Window):
             target = self._clamp(ox + (cx - gx), oy + (cy - gy))
             if target != self._pos:
                 self._pos = target
-                self._request_pos_flush()
+                # Applied here, not through the flush idle: the idle runs
+                # after the frame's drawing work, which put the new margin
+                # a whole frame behind the cursor.
+                try:
+                    self._apply_position()
+                except Exception:
+                    pass
 
     def _on_drag_begin(self, gesture, sx, sy):
         if getattr(self, "_x_display", None) is not None:

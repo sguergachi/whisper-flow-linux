@@ -424,6 +424,48 @@ def _gobject_pointer(obj) -> int:
     return ctypes.pythonapi.PyCapsule_GetPointer(obj.__gpointer__, None)
 
 
+def _open_pointer_device():
+    """The physical mouse, as an InputDevice, or None.
+
+    A keyboard can advertise EV_REL and BTN_LEFT too - the SONiX here does -
+    and picking whichever device came first meant reading keystrokes as
+    cursor motion. Only a device with no letter keys is a mouse; among those
+    the one named "mouse" wins, so the real pointer beats a virtual one a
+    test tool left behind.
+    """
+    import os as _os
+    import fcntl as _fcntl
+
+    import evdev
+    from evdev import ecodes
+
+    letters = {getattr(ecodes, f"KEY_{c}") for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"}
+    candidates = []
+    for path in evdev.list_devices():
+        try:
+            dev = evdev.InputDevice(path)
+            caps = dev.capabilities()
+        except OSError:
+            continue
+        keys = set(caps.get(ecodes.EV_KEY, []))
+        rel = caps.get(ecodes.EV_REL, [])
+        if ecodes.EV_REL not in caps or ecodes.REL_X not in rel:
+            continue
+        if ecodes.BTN_LEFT not in keys:
+            continue
+        if keys & letters:
+            continue
+        candidates.append(dev)
+    if not candidates:
+        return None
+    device = next(
+        (d for d in candidates if "mouse" in d.name.lower()), candidates[0])
+    # Non-blocking, so _frame never waits on an empty queue.
+    _fcntl.fcntl(device.fd, _fcntl.F_SETFL,
+                 _fcntl.fcntl(device.fd, _fcntl.F_GETFL) | _os.O_NONBLOCK)
+    return device
+
+
 class HudWindow(Gtk.Window):
     """The pill itself."""
 
@@ -544,25 +586,7 @@ class HudWindow(Gtk.Window):
         self._evdev_cursor = (0.0, 0.0)
         self._evdev_down = False
         try:
-            import evdev as _evdev
-            from evdev import ecodes as _ecodes
-            for path in _evdev.list_devices():
-                dev = _evdev.InputDevice(path)
-                caps = dev.capabilities()
-                keys = caps.get(_ecodes.EV_KEY, [])
-                if (_ecodes.EV_REL in caps
-                        and _ecodes.REL_X in caps.get(_ecodes.EV_REL, [])
-                        and _ecodes.BTN_LEFT in keys):
-                    self._evdev_device = dev
-                    self._evdev_device.grab = False
-                    # Non-blocking reads.
-                    self._evdev_device.fd  # touch
-                    import os as _os
-                    import fcntl as _fcntl
-                    _fcntl.fcntl(self._evdev_device.fd, _fcntl.F_SETFL,
-                                 _fcntl.fcntl(self._evdev_device.fd,
-                                              _fcntl.F_GETFL) | _os.O_NONBLOCK)
-                    break
+            self._evdev_device = _open_pointer_device()
         except Exception:
             self._evdev_device = None
         # X11 polling fallback for compositors (KWin) that never deliver

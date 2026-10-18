@@ -211,8 +211,9 @@ class RealPortalIO:
         from gi.repository import Gio, GLib  # noqa: PLC0415
         self._Gio = Gio
         self._GLib = GLib
+        self._context = GLib.MainContext.new()
         self._loop = None
-        self._tick_id = None
+        self._tick_source = None
         self._connection = None
 
     # -- fast synchronous pre-check (caller thread) -------------------------
@@ -273,14 +274,23 @@ class RealPortalIO:
         return f"/org/freedesktop/portal/desktop/request/{suffix}/{token}"
 
     def subscribe_response(self, conn, path, callback):
-        return conn.signal_subscribe(
+        return self._subscribe(conn,
             None, REQUEST_IFACE, "Response", path, None,
             self._Gio.DBusSignalFlags.NONE, callback, None)
 
     def subscribe_signal(self, conn, member, arg0, callback):
-        return conn.signal_subscribe(
+        return self._subscribe(conn,
             None, PORTAL_IFACE, member, PORTAL_PATH, arg0,
             self._Gio.DBusSignalFlags.NONE, callback, None)
+
+    def _subscribe(self, conn, *args):
+        # GIO dispatches signals on the subscribing thread's default context.
+        # Keep portal callbacks off GTK's main context and UI thread.
+        self._context.push_thread_default()
+        try:
+            return conn.signal_subscribe(*args)
+        finally:
+            self._context.pop_thread_default()
 
     def unsubscribe(self, conn, sub_id):
         try:
@@ -324,10 +334,11 @@ class RealPortalIO:
         return self._GLib.Variant(fmt, value)
 
     def run_loop(self):
-        self._loop = self._GLib.MainLoop()
+        self._loop = self._GLib.MainLoop.new(self._context, False)
         self._loop.run()
 
     def quit_loop(self):
+        self.untick()
         loop, self._loop = self._loop, None
         if loop is not None:
             try:
@@ -342,15 +353,14 @@ class RealPortalIO:
                 pass
 
     def tick_each_second(self, callback):
-        self._tick_id = self._GLib.timeout_add_seconds(1, callback)
+        self._tick_source = self._GLib.timeout_source_new_seconds(1)
+        self._tick_source.set_callback(lambda *_args: callback())
+        self._tick_source.attach(self._context)
 
     def untick(self):
-        tick_id, self._tick_id = self._tick_id, None
-        if tick_id is not None:
-            try:
-                self._GLib.source_remove(tick_id)
-            except Exception:
-                pass
+        source, self._tick_source = self._tick_source, None
+        if source is not None:
+            source.destroy()
 
 
 # ---------------------------------------------------------------------------

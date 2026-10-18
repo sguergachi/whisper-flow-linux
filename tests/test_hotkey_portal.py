@@ -55,6 +55,26 @@ def test_real_transport_registers_its_identity_before_creating_a_session(monkeyp
     connection.close_sync.assert_called_once_with(None)
 
 
+def test_portal_signals_and_timers_use_a_context_separate_from_gtk():
+    pytest.importorskip("gi")
+    from gi.repository import GLib
+
+    transport = RealPortalIO()
+    assert transport._context != GLib.MainContext.default()
+    connection = Mock()
+    contexts = []
+    connection.signal_subscribe.side_effect = lambda *a: contexts.append(
+        GLib.MainContext.get_thread_default()) or 1
+    transport.subscribe_response(connection, "/request", lambda *a: None)
+    transport.subscribe_signal(connection, "Activated", None, lambda *a: None)
+    assert contexts == [transport._context, transport._context]
+    transport.tick_each_second(lambda: True)
+    source = transport._tick_source
+    assert source.get_context() == transport._context
+    transport.quit_loop()
+    assert source.is_destroyed()
+
+
 # ------------------------------------------------------------- trigger mapping
 def test_default_chord_maps_to_a_shortcuts_spec_trigger():
     assert config_to_trigger("super+alt") == "LOGO+Alt_L"

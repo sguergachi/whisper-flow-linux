@@ -358,12 +358,15 @@ class SystemManager:
                 # ignored by the compositor, exit status still 0), and the
                 # words then appear nowhere with nothing in the log.
                 if type_inject.type_text(sanitized):
+                    log("[PASTE] typed via app injector")
                     return True
 
                 if self._ydotool_type(sanitized):
+                    log("[PASTE] typed via ydotool")
                     return True
 
                 if self._wtype_type(sanitized):
+                    log("[PASTE] typed via wtype")
                     return True
 
                 log("[PASTE] direct typing failed, falling back to the clipboard")
@@ -425,9 +428,14 @@ class SystemManager:
                 return False
             return system_win.type_text(sanitized)
         if self._is_wayland():
-            if (type_inject.type_text(sanitized)
-                    or self._ydotool_type(sanitized)
-                    or self._wtype_type(sanitized)):
+            if type_inject.type_text(sanitized):
+                log("[PASTE] typed via app injector")
+                return True
+            if self._ydotool_type(sanitized):
+                log("[PASTE] typed via ydotool")
+                return True
+            if self._wtype_type(sanitized):
+                log("[PASTE] typed via wtype")
                 return True
             # Live finalize used to stop here. A multi-sentence tail (~500
             # chars) timed out ydotool's old 15s budget on KDE, wtype is

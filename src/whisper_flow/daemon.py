@@ -752,6 +752,14 @@ class WhisperFlowDaemon:
             log(f"[DAEMON] Processing lock released for mode: {mode}")
             self.is_processing = False
             self.recording_start_time = None
+            # Release any modifier the hotkey manager may still hold, so the
+            # next keystroke is not read as a shortcut (mission control, lock,
+            # logout). Best-effort and bounded inside the listener; never
+            # blocks the finish path.
+            try:
+                self.hotkey_manager.sweep_input()
+            except Exception as e:
+                log(f"[DAEMON] modifier sweep failed: {e}")
             # Now there is a transcript, or a failure. Either way the waiting
             # is over and the overlay has said all it can.
             self._take_down_overlay()

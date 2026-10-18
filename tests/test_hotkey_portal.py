@@ -2,6 +2,7 @@
 
 import threading
 import time
+from unittest.mock import Mock
 
 import pytest
 
@@ -10,8 +11,29 @@ from whisper_flow.hotkey_portal import (
     PortalBindPlan,
     PortalHotkeyListener,
     PortalUnavailable,
+    RealPortalIO,
     config_to_trigger,
 )
+
+
+@pytest.mark.parametrize("owned", [True, False])
+def test_real_transport_checks_the_portal_with_a_boolean_reply(monkeypatch, owned):
+    pytest.importorskip("gi")
+    from gi.repository import Gio, GLib
+
+    connection = Mock()
+    connection.call_sync.return_value = GLib.Variant("(b)", (owned,))
+    monkeypatch.setattr(Gio, "bus_get_sync", lambda *args: connection)
+    transport = RealPortalIO()
+    if owned:
+        transport.quick_check()
+    else:
+        with pytest.raises(PortalUnavailable, match="not running"):
+            transport.quick_check()
+    args = connection.call_sync.call_args.args
+    assert args[3] == "NameHasOwner"
+    assert args[4].get_type_string() == "(s)"
+    assert args[5].dup_string() == "(b)"
 
 
 # ------------------------------------------------------------- trigger mapping

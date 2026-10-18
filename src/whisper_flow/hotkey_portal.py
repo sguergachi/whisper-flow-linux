@@ -223,7 +223,7 @@ class RealPortalIO:
         try:
             (owned,) = conn.call_sync(
                 DBUS_BUS, DBUS_PATH, DBUS_IFACE, "NameHasOwner",
-                self._params("s", PORTAL_BUS), self._reply("b"),
+                self._params("s", PORTAL_BUS), self._GLib.VariantType.new("(b)"),
                 Gio.DBusCallFlags.NONE, 3000, None).unpack()
         except Exception as exc:
             raise PortalUnavailable(f"portal bus check failed: {exc}")

@@ -317,7 +317,6 @@ class _FakePortalListener:
 def test_manager_prefers_portal_then_falls_back_on_fast_failure(
         monkeypatch):
     _wayland(monkeypatch)
-    from whisper_flow import hotkey_manager as manager_module
     from whisper_flow.hotkey_manager import HotkeyManager, HotkeyMode
 
     built_observer = []

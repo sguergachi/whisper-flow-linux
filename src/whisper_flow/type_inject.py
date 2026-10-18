@@ -151,3 +151,29 @@ def type_text(text: str) -> bool:
                 pass
         return typed > 0
     return typed > 0
+
+
+def release_modifiers() -> None:
+    """Release every modifier we know about, through our own device.
+
+    KWin tracks modifier state globally, across keyboards, so a modifier
+    that the hotkey manager held and then dropped without a clean release
+    stays "pressed" in the compositor. The next ordinary keystroke then
+    arrives as a shortcut - mission control, lock screen, logout - instead
+    of text. Sending releases through a device we own (which KWin accepts)
+    clears that state without depending on the host injector, which may
+    itself be disabled. Only releases are ever sent, never presses, so the
+    worst case is a redundant key-up.
+    """
+    ui = _device()
+    if ui is None:
+        return
+    for code in _MODIFIER_KEYS:
+        try:
+            ui.write(ecodes.EV_KEY, code, 0)
+        except Exception:
+            pass
+    try:
+        ui.syn()
+    except Exception:
+        pass

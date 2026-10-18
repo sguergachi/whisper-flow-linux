@@ -23,6 +23,24 @@ def _transcriber(typed, transcribe=lambda p: None):
     )
 
 
+def test_partial_typing_stops_retries_including_the_final_pass():
+    from whisper_flow.type_inject import PartialTypingError
+
+    calls = []
+
+    def interrupted(text):
+        calls.append(text)
+        raise PartialTypingError(2)
+
+    live = LiveTranscriber(lambda _: None, interrupted, 16000)
+    live._commit("hello there world")
+    live._commit("hello there world")
+    live._commit("hello there world again")
+    live.finalize("hello there world again")
+    assert len(calls) == 1
+    assert live.delivery_failed
+
+
 def test_a_word_is_typed_only_once_two_passes_agree():
     """Whisper revises earlier words; typing a guess cannot be undone."""
     typed = []

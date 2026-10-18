@@ -353,6 +353,9 @@ def _waiting(daemon, window=None):
 def test_prewarming_builds_a_window_nobody_has_asked_for_yet(daemon, monkeypatch):
     monkeypatch.setattr(sys, "platform", "win32")
     monkeypatch.setattr(sys, "frozen", False, raising=False)
+    # A mocked process's wait() returns immediately. Its real exit watcher
+    # would race these assertions and clear the resident flags.
+    monkeypatch.setattr(daemon, "_after_tool_window", Mock())
     with patch("whisper_flow.daemon.subprocess.Popen") as popen:
         popen.return_value.poll.return_value = None
         assert daemon._start_tool_window(

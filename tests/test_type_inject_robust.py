@@ -7,7 +7,7 @@ gracefully when the device cannot be opened.
 
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -52,7 +52,7 @@ def _patch_evdev(monkeypatch, device_factory=_FakeDevice):
     fake_evdev.UInput = lambda caps, name=None, bustype=None: device_factory()
     fake_ecodes = MagicMock()
     # Map the names type_inject uses to stable integers.
-    for attr in ("KEY_LEFTSHIFT", "KEY_SPACE", "KEY_ENTER", "EV_KEY"):
+    for attr in ("KEY_LEFTSHIFT", "KEY_LEFTCTRL", "KEY_SPACE", "KEY_ENTER", "EV_KEY"):
         setattr(fake_ecodes, attr, hash(attr) & 0xFFFF)
     # _codes_for uses getattr(ecodes, "KEY_A") etc.; provide them.
     for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789":
@@ -62,6 +62,7 @@ def _patch_evdev(monkeypatch, device_factory=_FakeDevice):
     monkeypatch.setattr(ti, "UInput", fake_evdev.UInput, raising=False)
     monkeypatch.setattr(ti, "ecodes", fake_ecodes, raising=False)
     monkeypatch.setattr(ti, "HAVE_EVDEV", True)
+    monkeypatch.setattr(ti.time, "sleep", lambda _: None)
     # Make 'import evdev' inside _device return our fake.
     monkeypatch.setitem(__import__("sys").modules, "evdev", fake_evdev)
     # Patch the module-level ecodes that _codes_for uses.
@@ -105,11 +106,12 @@ def test_type_text_releases_modifiers_on_write_failure(monkeypatch):
     monkeypatch.setattr(ti, "UInput", fake_evdev.UInput, raising=False)
 
     # 'X' is uppercase -> shift down, then KEY_X (ord('X')) fails.
-    result = ti.type_text("aXb")
+    with pytest.raises(ti.PartialTypingError) as caught:
+        ti.type_text("aXb")
     # Partial success: 'a' was already delivered, so we must not claim total
     # failure (the caller would retry and duplicate it). Modifiers are still
     # released, which is what this test is really pinning.
-    assert result is True
+    assert caught.value.typed == 1
     # The shift that was pressed for 'X' must have been released.
     shift_code = fake_ecodes.KEY_LEFTSHIFT
     # Find the last shift write: should be a release (0).
@@ -154,18 +156,113 @@ def test_type_text_does_not_create_device_for_empty(monkeypatch):
     fake_evdev.UInput.assert_not_called()
 
 
-def test_type_text_skips_untypable_chars(monkeypatch):
+def test_type_text_refuses_untypable_chars_before_any_input(monkeypatch):
     fake_dev = _FakeDevice()
     fake_evdev, fake_ecodes = _patch_evdev(monkeypatch)
     fake_evdev.UInput = lambda caps, name=None, bustype=None: fake_dev
     monkeypatch.setattr(ti, "UInput", fake_evdev.UInput, raising=False)
 
-    # "\u2014" (em dash) has no US key -> skipped. "ab" typed.
+    # Refuse the whole sentence, so a fallback can preserve the em dash.
     result = ti.type_text("a\u2014b")
-    assert result is True
-    # Only 'a' and 'b' produced key writes (2 keys * 2 = 4 down/up + syns).
-    key_writes = [w for w in fake_dev.writes if len(w) == 3]
-    assert len(key_writes) == 5  # modifier release + a-down, a-up, b-down, b-up
+    assert result is False
+    assert fake_dev.writes == []
+    assert ti._DEVICE is None
+
+
+def test_failed_key_up_releases_the_key_and_discards_device(monkeypatch):
+    fake_dev = _FakeDevice()
+    _, codes = _patch_evdev(monkeypatch)
+    monkeypatch.setattr(ti, "UInput", lambda *a, **kw: fake_dev)
+    original = fake_dev.write
+    failed = False
+
+    def fail_once(etype, code, value):
+        nonlocal failed
+        if code == codes.KEY_A and value == 0 and not failed:
+            failed = True
+            raise OSError("key-up failed")
+        original(etype, code, value)
+
+    fake_dev.write = fail_once
+    with pytest.raises(ti.PartialTypingError) as caught:
+        ti.type_text("ab")
+    assert caught.value.typed == 1  # don't retry the already sent prefix
+    assert fake_dev.writes[-2:] == [(codes.EV_KEY, codes.KEY_A, 0), ("syn",)]
+    assert fake_dev.closed
+    assert ti._DEVICE is None
+
+
+def test_interruption_cleans_up_held_keys(monkeypatch):
+    fake_dev = _FakeDevice()
+    _, codes = _patch_evdev(monkeypatch)
+    monkeypatch.setattr(ti, "UInput", lambda *a, **kw: fake_dev)
+    original = fake_dev.write
+
+    def interrupt(etype, code, value):
+        if code == codes.KEY_A and value == 0:
+            raise KeyboardInterrupt
+        original(etype, code, value)
+
+    fake_dev.write = interrupt
+    with pytest.raises(KeyboardInterrupt):
+        ti.type_text("A")
+    assert fake_dev.closed
+    assert ti._DEVICE is None
+
+
+def test_release_does_not_create_an_input_device(monkeypatch):
+    create = MagicMock()
+    monkeypatch.setattr(ti, "UInput", create, raising=False)
+    ti.release_modifiers()
+    create.assert_not_called()
+
+
+def test_clipboard_paste_uses_the_owned_keyboard(monkeypatch):
+    device = _FakeDevice()
+    _, codes = _patch_evdev(monkeypatch)
+    monkeypatch.setattr(ti, "UInput", lambda *a, **kw: device)
+    assert ti.paste_clipboard()
+    assert (codes.EV_KEY, codes.KEY_LEFTCTRL, 1) in device.writes
+    assert (codes.EV_KEY, codes.KEY_V, 1) in device.writes
+    assert (codes.EV_KEY, codes.KEY_LEFTCTRL, 0) in device.writes
+
+
+def test_modifier_release_cannot_interleave_with_typing(monkeypatch):
+    import threading
+
+    device = _FakeDevice()
+    _, codes = _patch_evdev(monkeypatch)
+    monkeypatch.setattr(ti, "UInput", lambda *a, **kw: device)
+    pressed, finish, attempted, released = [threading.Event() for _ in range(4)]
+    original = device.write
+
+    def pause_after_press(etype, code, value):
+        original(etype, code, value)
+        if code == codes.KEY_A and value == 1:
+            pressed.set()
+            assert finish.wait(5)
+
+    def release():
+        attempted.set()
+        ti.release_modifiers()
+        released.set()
+
+    device.write = pause_after_press
+    typing = threading.Thread(target=lambda: ti.type_text("A"))
+    releasing = threading.Thread(target=release)
+    typing.start()
+    try:
+        assert pressed.wait(5)
+        releasing.start()
+        assert attempted.wait(5)
+        assert not released.wait(.02)
+    finally:
+        finish.set()
+        typing.join(5)
+        if releasing.ident is not None:
+            releasing.join(5)
+    assert released.is_set()
+    assert not typing.is_alive()
 
 
 def test_type_text_no_evdev_returns_false(monkeypatch):

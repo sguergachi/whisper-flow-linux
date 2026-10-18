@@ -520,6 +520,8 @@ class WhisperFlow:
             True if successful, False otherwise
 
         """
+        self._undelivered_transcript = None
+
         def live_pass(path):
             # One attempt, short timeout. A live pass is superseded by the
             # next one, so retrying it with backoff only delays the words
@@ -573,10 +575,13 @@ class WhisperFlow:
                 return False
 
             if live.delivery_failed:
-                # There were words, and none of them landed. Reporting success
-                # here is how this looked like "it just does nothing".
+                self._undelivered_transcript = final_text or None
+                if final_text:
+                    self.system_manager.copy_to_clipboard(final_text)
+                # Preserve the complete transcript when delivery was refused
+                # or stopped after a partial write.
                 log(f"[LIVE] transcribed {len(final_text or '')} chars but "
-                    f"nothing could be typed into the focused window")
+                    f"typing into the focused window did not complete")
                 return False
 
             log("Live transcription complete")

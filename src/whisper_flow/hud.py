@@ -224,10 +224,10 @@ class HUD:
         # missing layer-shell) leaves a trace in the daemon log instead of
         # vanishing into a temp file nobody reads.
         threading.Thread(
-            target=self._watch_overlay_exit, args=(self._process,),
+            target=self._watch_overlay_exit, args=(self._process, self._log_path),
             daemon=True, name="whisper-flow-hud-watcher").start()
 
-    def _watch_overlay_exit(self, process) -> None:
+    def _watch_overlay_exit(self, process, log_path) -> None:
         """Log an unexpected overlay exit (crash) with its output tail."""
         try:
             code = process.wait()
@@ -235,14 +235,16 @@ class HUD:
             return
         if code in (0, None):
             return
-        tail = ""
-        path = getattr(self, "_log_path", None)
-        if path and os.path.exists(path):
-            try:
-                text = open(path, encoding="utf-8", errors="replace").read().strip()
-                tail = text[-1500:]
-            except OSError:
-                pass
+        with self._lock:
+            if self._process is not process:
+                return  # intentionally hidden, shut down, or superseded
+            tail = ""
+            if log_path:
+                try:
+                    with open(log_path, encoding="utf-8", errors="replace") as output:
+                        tail = output.read().strip()[-1500:]
+                except OSError:
+                    pass
         log(f"[HUD] overlay exited with code {code}")
         if tail:
             log(f"[HUD] overlay output at exit:\n{tail}")

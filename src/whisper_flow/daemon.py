@@ -16,10 +16,6 @@ from pathlib import Path
 from PIL import Image
 
 from . import backend as backend_module
-try:
-    from . import type_inject
-except Exception:
-    type_inject = None
 from . import icon
 from . import updater
 from .icon import ICON_IDLE, ICON_RECORDING
@@ -90,10 +86,11 @@ def _has_display() -> bool:
     """
     if sys.platform == "win32":
         return True
-    if os.environ.get("DISPLAY") or _wayland_claim_is_live():
+    if (_wayland_claim_is_live()
+            or (os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"))):
         return True
     _adopt_session_display_env()
-    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+    return bool(os.environ.get("DISPLAY") or _wayland_claim_is_live())
 
 
 def _adopt_session_display_env() -> None:
@@ -107,12 +104,14 @@ def _adopt_session_display_env() -> None:
     adopted = []
     for line in out.splitlines():
         name, sep, value = line.partition("=")
-        if sep and name in _DISPLAY_ENV and value and not os.environ.get(name):
+        if (sep and name in _DISPLAY_ENV and value
+                and (not os.environ.get(name)
+                     or (name == "WAYLAND_DISPLAY" and not _wayland_claim_is_live()))):
             os.environ[name] = value
             adopted.append(f"{name}={value}")
-    if not os.environ.get("DISPLAY"):
-        # No X server: hand windows to the compositor via the socket the
-        # session actually published. find_wayland_socket returns nothing
+    if not _wayland_claim_is_live():
+        # Correct Wayland even when DISPLAY belongs to XWayland.
+        # find_wayland_socket returns nothing
         # when the inherited claim already names a live socket, so a
         # systemd-pinned name whose socket never appeared (wayland-0 under
         # a wayland-1 session) is corrected right here.
@@ -690,11 +689,10 @@ class WhisperFlowDaemon:
                 log(f"[DAEMON] System busy, dropping {mode} request")
                 # Do not leave the compositor holding Super/Alt: a later key
                 # would arrive as a shortcut (mission control, lock, logout).
-                if type_inject is not None:
-                    try:
-                        type_inject.release_modifiers()
-                    except Exception as e:
-                        log(f"[DAEMON] modifier release failed: {e}")
+                try:
+                    self.hotkey_manager.sweep_input()
+                except Exception as e:
+                    log(f"[DAEMON] modifier sweep failed: {e}")
                 self.notify("⏳ Still working on the last one")
                 return
             # Queue the request
@@ -1139,6 +1137,7 @@ class WhisperFlowDaemon:
         orig_transcribe = None
         try:
             app = self._get_app_for_mode(mode)
+            app._undelivered_transcript = None
             app_for_mode = app
             log(f"[DAEMON] Using app instance for mode: {mode}")
             orig_transcribe = app.transcription_service.transcribe_audio
@@ -1211,7 +1210,12 @@ class WhisperFlowDaemon:
                         self.notify("Engine was down — revived on CPU, press again")
                 log(f"[DAEMON] Recording failed for mode: {mode}")
                 if mode not in ("auto_transcribe", "command"):
-                    self._report_failure(f"Recording failed ({mode})")
+                    transcript = getattr(app, "_undelivered_transcript", None)
+                    if isinstance(transcript, str) and transcript:
+                        self._report_failure(f"Recording failed ({mode})",
+                                             transcript=transcript)
+                    else:
+                        self._report_failure(f"Recording failed ({mode})")
             else:
                 log(f"[DAEMON] Recording completed successfully for mode: {mode}")
 
@@ -2133,13 +2137,15 @@ class WhisperFlowDaemon:
         self.notify("Log copied to clipboard" if copied
                     else "Could not reach the clipboard")
 
-    def _report_failure(self, headline: str, detail: str | None = None) -> None:
+    def _report_failure(self, headline: str, detail: str | None = None,
+                        *, transcript: str | None = None) -> None:
         """Notify about a failure and put the whole story on the clipboard.
 
         A toast holds one line, which is never enough to act on and never
         enough to send to anyone. Anything that fails in front of the user
         goes through here so the notification names the problem and the
-        clipboard carries the log that explains it.
+        clipboard carries the log that explains it. A recovered transcript
+        takes priority; diagnostics still remain under Copy last error.
         """
         text = self._diagnostics(headline, detail)
         self._last_failure = text
@@ -2147,14 +2153,15 @@ class WhisperFlowDaemon:
         copied = False
         try:
             copied = bool(
-                self.transcribe_app.system_manager.copy_to_clipboard(text))
+                self.transcribe_app.system_manager.copy_to_clipboard(transcript or text))
         except Exception as e:
             log(f"[DAEMON] could not copy the failure report: {e}")
 
         # Say which happened. Silently dropping the report is how this went
         # unnoticed: the notification looked the same whether the clipboard
         # held the details or nothing at all.
-        suffix = (" - details copied to clipboard" if copied
+        copied_content = "transcript" if transcript else "details"
+        suffix = (f" - {copied_content} copied to clipboard" if copied
                   else " - could not reach the clipboard")
         self.notify(f"❌ {headline}{suffix}")
 

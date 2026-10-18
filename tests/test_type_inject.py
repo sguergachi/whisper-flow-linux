@@ -14,6 +14,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+pytest.importorskip("evdev")
 type_inject = pytest.importorskip("whisper_flow.type_inject")
 
 

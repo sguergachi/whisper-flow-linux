@@ -1950,7 +1950,7 @@ def _command_loop(win: "HudWindow"):
     os._exit(0)
 
 
-def main() -> int:
+def _tee_hud_output() -> None:
     # A persistent copy of everything the overlay prints, so a crash leaves
     # evidence even when the daemon that spawned it is gone.
     try:
@@ -1966,13 +1966,27 @@ def main() -> int:
                                   errors="replace")
 
             def write(self, data):
-                self._stream.write(data)
-                self._file.write(data)
+                try:
+                    self._file.write(data)
+                except OSError:
+                    pass
+                try:
+                    if self._stream is not None:
+                        self._stream.write(data)
+                except OSError:
+                    pass
                 return len(data)
 
             def flush(self):
-                self._stream.flush()
-                self._file.flush()
+                try:
+                    self._file.flush()
+                except OSError:
+                    pass
+                try:
+                    if self._stream is not None:
+                        self._stream.flush()
+                except OSError:
+                    pass
 
             def __getattr__(self, name):
                 return getattr(self._stream, name)
@@ -1983,6 +1997,9 @@ def main() -> int:
     except Exception:
         pass
 
+
+def main() -> int:
+    _tee_hud_output()
     level_file = os.environ.get("WHISPER_FLOW_HUD_LEVEL_FILE", "")
     monitor = os.environ.get("WHISPER_FLOW_HUD_MONITOR") or None
     # Only when the daemon says so: run by hand, stdin is inherited and would

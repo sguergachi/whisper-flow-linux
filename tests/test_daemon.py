@@ -283,6 +283,8 @@ class TestWhisperFlowDaemon:
         window on the developer's desktop.
         """
         monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")
+        # These tests cover click dispatch, not session socket discovery.
+        monkeypatch.setattr("whisper_flow.daemon._has_display", lambda: True)
         # Popen is mocked below, which also swallows the nvidia-smi probe the
         # daemon runs to learn the accelerator. On a machine that actually
         # has nvidia-smi the probe dies on the mock instead, so pin the
@@ -336,6 +338,7 @@ class TestWhisperFlowDaemon:
         Windows. Clicks inside the debounce window must not reach it.
         """
         monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")
+        monkeypatch.setattr("whisper_flow.daemon._has_display", lambda: True)
         monkeypatch.setattr(
             "whisper_flow.backend.detect_accelerator", lambda: "cpu")
         with (

@@ -109,6 +109,27 @@ def test_the_notification_says_the_details_were_copied(daemon):
     assert "copied to clipboard" in daemon.notify.call_args[0][0]
 
 
+def test_failed_typing_keeps_the_transcript_instead_of_overwriting_it(daemon):
+    seen = _clipboard(daemon)
+    app = daemon.transcribe_app
+    def failed_delivery(**kwargs):
+        app._undelivered_transcript = "the complete dictated sentence"
+        return False
+
+    app.run_voice_flow_push_to_talk_live.side_effect = failed_delivery
+    daemon._ensure_backend_running = Mock(return_value=False)
+    daemon._stop_recording = Mock()
+    daemon._release_stuck_modifiers = Mock()
+    daemon._finish_processing = Mock()
+
+    daemon._record_audio_thread("transcribe")
+
+    assert seen["text"] == "the complete dictated sentence"
+    assert "transcript copied to clipboard" in daemon.notify.call_args[0][0]
+    # Diagnostics remain available via Copy last error.
+    assert "Recording failed (transcribe)" in daemon._last_failure
+
+
 def test_a_failure_is_still_announced_when_the_clipboard_refuses(daemon):
     from whisper_flow.system import SystemManager
     manager = Mock(spec=SystemManager)

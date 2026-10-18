@@ -36,6 +36,25 @@ def test_real_transport_checks_the_portal_with_a_boolean_reply(monkeypatch, owne
     assert args[5].dup_string() == "(b)"
 
 
+def test_real_transport_registers_its_identity_before_creating_a_session(monkeypatch):
+    pytest.importorskip("gi")
+    from gi.repository import Gio
+
+    connection = Mock()
+    monkeypatch.setattr(Gio, "dbus_address_get_for_bus_sync", lambda *a: "test-bus")
+    monkeypatch.setattr(Gio.DBusConnection, "new_for_address_sync",
+                        lambda *a: connection)
+    transport = RealPortalIO()
+    assert transport.connect() is connection
+    transport.call_create_session(connection, "/request", "handle", "session")
+    calls = connection.call_sync.call_args_list
+    assert [call.args[3] for call in calls] == ["Register", "CreateSession"]
+    assert calls[0].args[4].get_type_string() == "(sa{sv})"
+    assert calls[0].args[4].unpack() == ("whisper-flow", {})
+    transport.quit_loop()
+    connection.close_sync.assert_called_once_with(None)
+
+
 # ------------------------------------------------------------- trigger mapping
 def test_default_chord_maps_to_a_shortcuts_spec_trigger():
     assert config_to_trigger("super+alt") == "LOGO+Alt_L"
@@ -199,6 +218,9 @@ def _bind(listener, io, session="/session/1"):
     create_path = io.created[0][0]
     io.emit_response(create_path, 0, {"session_handle": session})
     assert _wait_for(lambda: len(io.bound_calls) == 1)
+    # BindShortcuts must use the token of the subscribed response path.
+    requested = io.request_path("9_99", io.bound_calls[0][2])
+    assert requested in io.response_subs
     return session
 
 

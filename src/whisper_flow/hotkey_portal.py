@@ -32,6 +32,8 @@ _log = logging.getLogger(__name__)
 PORTAL_BUS = "org.freedesktop.portal.Desktop"
 PORTAL_PATH = "/org/freedesktop/portal/desktop"
 PORTAL_IFACE = "org.freedesktop.portal.GlobalShortcuts"
+REGISTRY_IFACE = "org.freedesktop.host.portal.Registry"
+APP_ID = "whisper-flow"  # installed whisper-flow.desktop
 REQUEST_IFACE = "org.freedesktop.portal.Request"
 SESSION_IFACE = "org.freedesktop.portal.Session"
 DBUS_BUS = "org.freedesktop.DBus"
@@ -211,6 +213,7 @@ class RealPortalIO:
         self._GLib = GLib
         self._loop = None
         self._tick_id = None
+        self._connection = None
 
     # -- fast synchronous pre-check (caller thread) -------------------------
     def quick_check(self) -> None:
@@ -237,7 +240,31 @@ class RealPortalIO:
 
     # -- worker-thread transport ---------------------------------------------
     def connect(self):
-        return self._Gio.bus_get_sync(self._Gio.BusType.SESSION, None)
+        # Registration must precede every other portal call on this peer.
+        # Use a private connection so GTK's settings/file-picker requests
+        # cannot associate our shortcut peer with an empty application ID.
+        address = self._Gio.dbus_address_get_for_bus_sync(
+            self._Gio.BusType.SESSION, None)
+        conn = self._Gio.DBusConnection.new_for_address_sync(
+            address, self._Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT
+            | self._Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION, None, None)
+        try:
+            try:
+                conn.call_sync(
+                    PORTAL_BUS, PORTAL_PATH, REGISTRY_IFACE, "Register",
+                    self._GLib.Variant("(sa{sv})", (APP_ID, {})), None,
+                    self._Gio.DBusCallFlags.NONE, 3000, None)
+            except self._GLib.Error as error:
+                # Older portals predate host registration and do not require it.
+                if not any(error.matches(self._Gio.dbus_error_quark(), code)
+                           for code in (self._Gio.DBusError.UNKNOWN_METHOD,
+                                        self._Gio.DBusError.UNKNOWN_INTERFACE)):
+                    raise
+        except Exception:
+            conn.close_sync(None)
+            raise
+        self._connection = conn
+        return conn
 
     def unique_suffix(self, conn) -> str:
         return conn.get_unique_name().lstrip(":").replace(".", "_")
@@ -305,6 +332,12 @@ class RealPortalIO:
         if loop is not None:
             try:
                 loop.quit()
+            except Exception:
+                pass
+        conn, self._connection = self._connection, None
+        if conn is not None:
+            try:
+                conn.close_sync(None)
             except Exception:
                 pass
 
@@ -475,7 +508,7 @@ class PortalHotkeyListener:
         create_path = io.request_path(suffix, create_token)
         bind_path = io.request_path(suffix, bind_token)
         state = {"create_path": create_path, "bind_path": bind_path,
-                 "session": None, "done": False}
+                 "bind_token": bind_token, "session": None, "done": False}
 
         def on_response(conn, _sender, _path, _iface, _signal, params, _data):
             try:
@@ -547,7 +580,7 @@ class PortalHotkeyListener:
             self._session_handle = session
             try:
                 io.call_bind_shortcuts(
-                    self._conn, session, plan.shortcut_arguments(), make_token())
+                    self._conn, session, plan.shortcut_arguments(), state["bind_token"])
             except Exception as exc:
                 self._fail(f"portal bind call failed: {exc}")
         elif path == state["bind_path"]:

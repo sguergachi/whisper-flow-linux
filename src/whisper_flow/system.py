@@ -409,6 +409,16 @@ class SystemManager:
         """
         if not text:
             return True
+        # Clear any modifier the hotkey path may still hold: KWin tracks
+        # modifier state globally, so a keystroke sent while Super/Alt is
+        # recorded as held arrives as a shortcut (mission control, lock,
+        # logout) instead of text. Only releases are sent, so the worst
+        # case is a redundant key-up. Best-effort: never block typing on it.
+        try:
+            from . import type_inject
+            type_inject.release_modifiers()
+        except Exception:
+            pass
         sanitized = text.replace("\n", " ")
         if IS_WINDOWS:
             if not self._restore_saved_focus() and only_where_it_started:

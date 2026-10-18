@@ -1,18 +1,18 @@
 """Typing that does not depend on the host's input injector.
 
 The transcripts have to arrive as keystrokes, and the usual route - ydotool
-through its daemon - can silently stop working: KWin ignores the daemon's
-device outright on some setups (seen here: keystrokes reach the kernel and
-are dropped by the compositor), and ydotool still exits 0, so nothing looks
-wrong from the outside and the words simply never appear.
+through its daemon - can silently stop working: KWin discards every keystroke
+from its device on some setups (its device disabled in kcminputrc) while
+ydotoold still exits 0, so the failure is invisible and the fallbacks never
+run.
 
 This module owns its injection device instead. It is the same mechanism
 ydotool uses - a uinput keyboard - with one difference that matters: the
 device is created by this process, so it is new to the compositor and
-subject to none of the per-device state (disabled devices, stale settings)
-that can accumulate for the daemon's device. The app already creates a
-uinput proxy for its hotkey grabs, so this is not a new kind of dependency,
-and it works on any compositor that accepts injected input at all.
+subject to none of the per-device state (disabled, stale) that can
+accumulate for the daemon's device. The app already creates a uinput proxy
+for its hotkey grabs, so this is not a new kind of dependency, and it
+works on any compositor that accepts injected input at all.
 
 Delivery is still verified the same way as everything else the app types:
 if writing fails, the callers fall back to ydotool, wtype, or the clipboard.
@@ -23,7 +23,7 @@ from __future__ import annotations
 import time
 
 try:
-    import evdev  # noqa: F401  (imported for availability check)
+    import evdev  # noqa: F401
     from evdev import UInput, ecodes
 
     HAVE_EVDEV = True
@@ -31,32 +31,36 @@ except Exception:  # pragma: no cover - evdev is a hard dependency elsewhere
     HAVE_EVDEV = False
 
 # Characters that need no modifier on a US layout.
-_PLAIN = {
-    " ": ecodes.KEY_SPACE if HAVE_EVDEV else 0,
-    "-": ecodes.KEY_MINUS if HAVE_EVDEV else 0,
-    "=": ecodes.KEY_EQUAL if HAVE_EVDEV else 0,
-    "[": ecodes.KEY_LEFTBRACE if HAVE_EVDEV else 0,
-    "]": ecodes.KEY_RIGHTBRACE if HAVE_EVDEV else 0,
-    "\\": ecodes.KEY_BACKSLASH if HAVE_EVDEV else 0,
-    ";": ecodes.KEY_SEMICOLON if HAVE_EVDEV else 0,
-    "'": ecodes.KEY_APOSTROPHE if HAVE_EVDEV else 0,
-    ",": ecodes.KEY_COMMA if HAVE_EVDEV else 0,
-    ".": ecodes.KEY_DOT if HAVE_EVDEV else 0,
-    "/": ecodes.KEY_SLASH if HAVE_EVDEV else 0,
-    "`": ecodes.KEY_GRAVE if HAVE_EVDEV else 0,
-    "\n": ecodes.KEY_ENTER if HAVE_EVDEV else 0,
-    "\t": ecodes.KEY_TAB if HAVE_EVDEV else 0,
-}
+_PLAIN = {}
+_SHIFTED = {}
+if HAVE_EVDEV:
+    _PLAIN = {
+        " ": ecodes.KEY_SPACE,
+        "-": ecodes.KEY_MINUS,
+        "=": ecodes.KEY_EQUAL,
+        "[": ecodes.KEY_LEFTBRACE,
+        "]": ecodes.KEY_RIGHTBRACE,
+        "\\": ecodes.KEY_BACKSLASH,
+        ";": ecodes.KEY_SEMICOLON,
+        "'": ecodes.KEY_APOSTROPHE,
+        ",": ecodes.KEY_COMMA,
+        ".": ecodes.KEY_DOT,
+        "/": ecodes.KEY_SLASH,
+        "`": ecodes.KEY_GRAVE,
+        "\n": ecodes.KEY_ENTER,
+        "\t": ecodes.KEY_TAB,
+    }
+    _SHIFTED = {
+        "!": "1", "@": "2", "#": "3", "$": "4", "%": "5",
+        "^": "6", "&": "7", "*": "8", "(": "9", ")": "0",
+        "_": "-", "+": "=", "{": "[", "}": "]", "|": "\\",
+        ":": ";", '"': "'", "<": ",", ">": ".", "?": "/", "~": "`",
+    }
 
-# Characters that are the shifted form of another key.
-_SHIFTED = {
-    "!": "1", "@": "2", "#": "3", "$": "4", "%": "5",
-    "^": "6", "&": "7", "*": "8", "(": "9", ")": "0",
-    "_": "-", "+": "=", "{": "[", "}": "]", "|": "\\",
-    ":": ";", '"': "'", "<": ",", ">": ".", "?": "/", "~": "`",
-}
+# Modifiers a failed run must never leave held.
+_MODIFIER_KEYS = (ecodes.KEY_LEFTSHIFT,) if HAVE_EVDEV else ()
 
-_DEVICE: "UInput | None" = None
+_DEVICE = None
 _DEVICE_FAILED = False
 
 
@@ -82,7 +86,7 @@ def _device():
     if _DEVICE is not None or _DEVICE_FAILED or not HAVE_EVDEV:
         return _DEVICE
     try:
-        keys = set(_PLAIN.values()) | {ecodes.KEY_LEFTSHIFT}
+        keys = set(_PLAIN.values()) | {_MODIFIER_KEYS[0]}
         for c in "abcdefghijklmnopqrstuvwxyz0123456789":
             keys.add(getattr(ecodes, f"KEY_{c.upper()}"))
         for base in _SHIFTED.values():
@@ -92,13 +96,11 @@ def _device():
         _DEVICE = UInput(
             {ecodes.EV_KEY: sorted(keys)},
             name="whisper-flow-typing",
-            # BUS_VIRTUAL keeps the hotkey grabber away from it: that one
-            # grabs real keyboards only, and a device it grabbed would be
-            # swallowed and re-emitted under the user's held modifiers.
+            # BUS_VIRTUAL so the hotkey grabber ignores it (real keyboards
+            # only), and so it is new to the compositor regardless of the
+            # host injector's state.
             bustype=0x06,
         )
-        # Small settle before the first keystroke, so the compositor has the
-        # device in hand when the first character arrives.
         time.sleep(0.15)
     except Exception:
         _DEVICE = None
@@ -110,21 +112,26 @@ def type_text(text: str) -> bool:
     """Type `text` as keystrokes. False if nothing could be delivered.
 
     Characters with no place on a US layout (smart quotes, em dashes, and
-    the like - which transcripts do contain) are dropped rather than allowed
-    to corrupt the sentence; the caller still has the clipboard fallback for
-    a faithful copy.
+    the like, which transcripts do contain) are dropped rather than allowed
+    to corrupt the sentence; the caller still has the clipboard for a faithful
+    copy. Modifiers are always released, even on failure, so a crashed run
+    cannot leave a key held down.
     """
     ui = _device()
     if ui is None or not text:
         return False
-    shift = ecodes.KEY_LEFTSHIFT
+    shift = _MODIFIER_KEYS[0]
     typed = 0
-    for char in text:
-        found = _codes_for(char)
-        if found is None:
-            continue
-        code, needs_shift = found
-        try:
+    try:
+        # Clear any modifier state left by a previous, interrupted run.
+        for code in _MODIFIER_KEYS:
+            ui.write(ecodes.EV_KEY, code, 0)
+        ui.syn()
+        for char in text:
+            found = _codes_for(char)
+            if found is None:
+                continue
+            code, needs_shift = found
             if needs_shift:
                 ui.write(ecodes.EV_KEY, shift, 1)
             ui.write(ecodes.EV_KEY, code, 1)
@@ -132,11 +139,15 @@ def type_text(text: str) -> bool:
             if needs_shift:
                 ui.write(ecodes.EV_KEY, shift, 0)
             ui.syn()
-        except Exception:
-            return typed > 0
-        typed += 1
-        # Long strings are queued faster than a terminal can consume them;
-        # a hair of pacing keeps the order intact without feeling slow.
-        if typed % 32 == 0:
-            time.sleep(0.01)
+            typed += 1
+            if typed % 32 == 0:
+                time.sleep(0.01)
+    except Exception:
+        for code in _MODIFIER_KEYS:
+            try:
+                ui.write(ecodes.EV_KEY, code, 0)
+                ui.syn()
+            except Exception:
+                pass
+        return typed > 0
     return typed > 0

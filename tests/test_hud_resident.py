@@ -179,6 +179,29 @@ def test_the_overlay_opens_the_display_itself():
         "GTK has to be initialised before the window is constructed")
 
 
+def test_exit_watcher_ignores_an_overlay_that_was_replaced(hud, monkeypatch, tmp_path):
+    old = FakeProcess()
+    old.wait = Mock(return_value=-15)
+    hud._process = FakeProcess()
+    messages = []
+    monkeypatch.setattr(hud_module, "log", messages.append)
+    hud._watch_overlay_exit(old, str(tmp_path / "old.log"))
+    assert messages == []
+
+
+def test_exit_watcher_reports_the_failed_process_log(hud, monkeypatch, tmp_path):
+    process = FakeProcess()
+    process.wait = Mock(return_value=1)
+    hud._process = process
+    output = tmp_path / "failed.log"
+    output.write_text("the actual crash")
+    hud._log_path = str(tmp_path / "unrelated.log")
+    messages = []
+    monkeypatch.setattr(hud_module, "log", messages.append)
+    hud._watch_overlay_exit(process, str(output))
+    assert any("the actual crash" in message for message in messages)
+
+
 def _hud_app_source() -> str:
     return (Path(__file__).resolve().parents[1]
             / "src/whisper_flow/hud_app.py").read_text(encoding="utf-8")

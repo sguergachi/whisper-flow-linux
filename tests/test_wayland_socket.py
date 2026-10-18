@@ -17,6 +17,7 @@ from whisper_flow import paths  # noqa: E402
 
 def test_a_live_session_keeps_its_own_answer(monkeypatch):
     monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-1")
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
 
     assert paths.find_wayland_socket() is None
 
@@ -88,6 +89,7 @@ def test_daemon_counts_a_dead_claim_as_no_display(monkeypatch, tmp_path):
     """
     import whisper_flow.daemon as daemon_module
 
+    monkeypatch.setattr(sys, "platform", "linux")
     monkeypatch.delenv("DISPLAY", raising=False)
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
     (tmp_path / "wayland-1").touch()
@@ -105,3 +107,31 @@ def test_daemon_counts_a_live_claim_as_a_display(monkeypatch, tmp_path):
     monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-1")
 
     assert daemon_module._wayland_claim_is_live() is True
+
+
+def test_stale_wayland_is_corrected_even_with_xwayland(monkeypatch, tmp_path):
+    from unittest.mock import Mock
+    import whisper_flow.daemon as daemon
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setenv("DISPLAY", ":0")
+    monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    (tmp_path / "wayland-1").touch()
+    monkeypatch.setattr(daemon.subprocess, "run", Mock(return_value=Mock(stdout="")))
+
+    assert daemon._has_display()
+    assert daemon.os.environ["WAYLAND_DISPLAY"] == "wayland-1"
+
+
+def test_missing_wayland_socket_does_not_claim_a_display(monkeypatch, tmp_path):
+    from unittest.mock import Mock
+    import whisper_flow.daemon as daemon
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.delenv("DISPLAY", raising=False)
+    monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    monkeypatch.setattr(daemon.subprocess, "run", Mock(return_value=Mock(stdout="")))
+
+    assert daemon._has_display() is False

@@ -321,7 +321,6 @@ def test_manager_prefers_portal_then_falls_back_on_fast_failure(
     from whisper_flow.hotkey_manager import HotkeyManager, HotkeyMode
 
     built_observer = []
-    real_observer = manager_module.__dict__.get("HotkeyManager")
 
     class FakeObserver:
         def __init__(self):

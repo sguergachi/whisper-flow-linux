@@ -1950,7 +1950,56 @@ def _command_loop(win: "HudWindow"):
     os._exit(0)
 
 
+def _tee_hud_output() -> None:
+    # A persistent copy of everything the overlay prints, so a crash leaves
+    # evidence even when the daemon that spawned it is gone.
+    try:
+        _log_dir = os.path.join(os.path.expanduser("~"), ".config",
+                                "whisper-flow")
+        os.makedirs(_log_dir, exist_ok=True)
+        _log_path = os.path.join(_log_dir, "hud.log")
+
+        class _Tee:
+            def __init__(self, stream, path):
+                self._stream = stream
+                self._file = open(path, "a", buffering=1, encoding="utf-8",
+                                  errors="replace")
+
+            def write(self, data):
+                try:
+                    self._file.write(data)
+                except OSError:
+                    pass
+                try:
+                    if self._stream is not None:
+                        self._stream.write(data)
+                except OSError:
+                    pass
+                return len(data)
+
+            def flush(self):
+                try:
+                    self._file.flush()
+                except OSError:
+                    pass
+                try:
+                    if self._stream is not None:
+                        self._stream.flush()
+                except OSError:
+                    pass
+
+            def __getattr__(self, name):
+                return getattr(self._stream, name)
+
+        sys.stdout = _Tee(sys.stdout, _log_path)
+        sys.stderr = _Tee(sys.stderr, _log_path)
+        print(f"[HUD] log -> {_log_path}", flush=True)
+    except Exception:
+        pass
+
+
 def main() -> int:
+    _tee_hud_output()
     level_file = os.environ.get("WHISPER_FLOW_HUD_LEVEL_FILE", "")
     monitor = os.environ.get("WHISPER_FLOW_HUD_MONITOR") or None
     # Only when the daemon says so: run by hand, stdin is inherited and would

@@ -3052,7 +3052,11 @@ def main() -> int:
     # stream at once, which would close the window as soon as it opened.
     resident = os.environ.get("WHISPER_FLOW_SETTINGS_RESIDENT") == "1"
 
-    app = Adw.Application(application_id="dev.whisperflow.settings")
+    # A background prewarm must not activate an existing instance. Service
+    # registration declines a duplicate without sending it an activate call.
+    flags = (Gio.ApplicationFlags.IS_SERVICE if resident
+             else Gio.ApplicationFlags.FLAGS_NONE)
+    app = Adw.Application(application_id="dev.whisperflow.settings", flags=flags)
     # A raise inside activate is not an error anyone sees. GObject catches
     # whatever a Python signal handler throws, prints it to a stderr nobody
     # is reading, and returns; the application then runs its main loop with
@@ -3096,7 +3100,13 @@ def main() -> int:
                 # Realized now, so the surface, its HWND, the CSS and the
                 # first style pass are all done before the click. What is
                 # left for the click is a map.
+                # Realize creates the surface but must not show it: on some
+                # compositors a realized-but-not-hidden window flashes on
+                # screen at startup, which reads as a "settings prompt"
+                # popping up unasked.
+                window.set_visible(False)
                 window.realize()
+                window.hide()
                 _mark("built and waiting for the click")
                 threading.Thread(
                     target=_command_loop, args=(window,), daemon=True,
@@ -3109,6 +3119,8 @@ def main() -> int:
             log(f"[SETTINGS] the window could not be built:\n{failure[0]}")
             app.quit()
 
+    if resident:
+        app.connect("startup", build)
     app.connect("activate", build)
     status = app.run(sys.argv[:1])
     if failure:

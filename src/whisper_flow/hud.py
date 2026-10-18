@@ -219,6 +219,35 @@ class HUD:
         except Exception as e:
             log(f"[HUD] Failed to spawn overlay {argv}: {e}")
             self._cleanup_files()
+            return
+        # Watch the overlay's lifetime so a crash (blur claim, GLib assert,
+        # missing layer-shell) leaves a trace in the daemon log instead of
+        # vanishing into a temp file nobody reads.
+        threading.Thread(
+            target=self._watch_overlay_exit, args=(self._process, self._log_path),
+            daemon=True, name="whisper-flow-hud-watcher").start()
+
+    def _watch_overlay_exit(self, process, log_path) -> None:
+        """Log an unexpected overlay exit (crash) with its output tail."""
+        try:
+            code = process.wait()
+        except Exception:
+            return
+        if code in (0, None):
+            return
+        with self._lock:
+            if self._process is not process:
+                return  # intentionally hidden, shut down, or superseded
+            tail = ""
+            if log_path:
+                try:
+                    with open(log_path, encoding="utf-8", errors="replace") as output:
+                        tail = output.read().strip()[-1500:]
+                except OSError:
+                    pass
+        log(f"[HUD] overlay exited with code {code}")
+        if tail:
+            log(f"[HUD] overlay output at exit:\n{tail}")
 
     def crash_log(self) -> str:
         """Whatever the overlay printed before dying, for a failure report.

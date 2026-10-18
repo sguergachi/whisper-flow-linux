@@ -13,6 +13,16 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 
+@pytest.fixture(autouse=True)
+def block_real_typing_device(monkeypatch):
+    """Unit tests must never inject keys into the developer's desktop."""
+    from whisper_flow import type_inject
+
+    monkeypatch.setattr(type_inject, "UInput", Mock(
+        side_effect=PermissionError("real typing devices are disabled in tests")),
+        raising=False)
+
+
 @pytest.fixture
 def temp_config_dir():
     """Create a temporary configuration directory for testing."""

@@ -19,6 +19,7 @@ import time
 import wave
 
 from .logging import log
+from .type_inject import PartialTypingError
 from .transcription import collapse_repetition
 
 # Trailing words carry no right-hand context yet, so they are the ones whisper
@@ -78,6 +79,7 @@ class LiveTranscriber:
         self._emitted_any = False
         self._delivered_any = False
         self._delivery_failures = 0
+        self._delivery_aborted = False
         # Guards the committed state and typing. A pass can outlive the join in
         # finalize - the transcription call has its own, much longer timeout -
         # and without this it would commit on top of the tail already typed,
@@ -210,6 +212,14 @@ class LiveTranscriber:
                 self._delivery_failures += 1
                 log(f"[LIVE] emit reported failure for {len(chunk)} chars")
                 return False
+        except PartialTypingError as e:
+            self._delivery_failures += 1
+            self._delivery_aborted = True
+            self._closed = True
+            self._running = False
+            self._wake.set()
+            log(f"[LIVE] stopping after partial typing: {e}")
+            return False
         except Exception as e:
             self._delivery_failures += 1
             log(f"[LIVE] emit failed: {e}")
@@ -266,12 +276,13 @@ class LiveTranscriber:
 
     @property
     def delivery_failed(self) -> bool:
-        """True when text was produced but none of it reached the screen.
+        """True when delivery was refused or aborted after a partial write.
 
         Distinguishes "nothing was said" from "everything was said and the
         typing was rejected", which look identical to the user otherwise.
         """
-        return bool(self._delivery_failures and not self._delivered_any)
+        return self._delivery_aborted or bool(
+            self._delivery_failures and not self._delivered_any)
 
     @property
     def committed_text(self) -> str:

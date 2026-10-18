@@ -1,6 +1,8 @@
 """System integration functionality for whisper-flow."""
 
+import ast
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -501,29 +503,15 @@ class SystemManager:
 
                 sanitized = text.replace('\n', ' ')
 
-                # Own device first, for the same reason as in type_text: a
-                # host injector that fails silently must not eat the paste.
-                try:
-                    if type_inject.type_text(sanitized):
-                        return True
-                except Exception as e:
-                    log(f"[PASTE] app injector failed: {e}")
-
                 if (target_window and self._kdotool_available()
                         and not self._activate_window_and_wait(target_window)):
                     self.copy_to_clipboard(sanitized)
                     return False
 
-                # A fail-open modifier-only Alt chord reaches the target app.
-                # Electron/Chromium commonly leaves its menu focused after the
-                # release, so a perfectly valid Ctrl+V has no editable target.
                 self._repair_modifier_only_alt_focus()
 
-                # Electron/Chromium can accept ydotool's synthetic key events
-                # and return success while dropping the resulting text. A
-                # clipboard paste follows the same path as a user's Ctrl+V
-                # and, crucially, leaves the transcript recoverable even if
-                # the target control refuses the paste.
+                # Preserve master's clipboard path for Electron/XWayland,
+                # after confirming that the saved target owns focus.
                 if self.copy_to_clipboard(sanitized):
                     if self._xdotool_paste_if_target_is_x11(target_window):
                         log("[PASTE] clipboard paste keystroke sent with xdotool")
@@ -532,8 +520,7 @@ class SystemManager:
                         return True
 
                 log("[PASTE] clipboard paste failed, trying direct typing")
-                return (self._wtype_type(sanitized)
-                        or self._ydotool_type(sanitized))
+                return self._type_wayland(sanitized, prefer_wtype=True)
 
             if shutil.which("xdotool"):
                 subprocess.run(
@@ -578,29 +565,7 @@ class SystemManager:
                 return False
             return system_win.type_text(sanitized)
         if self._is_wayland():
-            # Release any modifier the hotkey path may still hold first, so a
-            # keystroke cannot arrive as a shortcut (mission control, lock,
-            # logout). Only releases are sent, so the worst case is a
-            # redundant key-up.
-            try:
-                type_inject.release_modifiers()
-            except Exception:
-                pass
-            # The app's own injector runs first: ydotool can fail silently
-            # (its device ignored by the compositor, exit status still 0), and
-            # the words then appear nowhere with nothing in the log.
-            if type_inject.type_text(sanitized):
-                return True
-            if self._ydotool_type(sanitized) or self._wtype_type(sanitized):
-                return True
-            # Live finalize used to stop here. A multi-sentence tail (~500
-            # chars) timed out ydotool's old 15s budget on KDE, wtype is
-            # rejected by compositors without virtual-keyboard, and the
-            # whole transcript was dropped with nothing on the clipboard.
-            log("[PASTE] direct typing failed, falling back to the clipboard")
-            if not self.copy_to_clipboard(sanitized):
-                return False
-            return self._send_paste_keystroke()
+            return self._type_wayland(sanitized)
         if shutil.which("xdotool"):
             result = subprocess.run(
                 ["xdotool", "type", "--clearmodifiers", "--", sanitized],
@@ -610,10 +575,79 @@ class SystemManager:
             return result.returncode == 0
         return False
 
+    def _type_wayland(self, text: str, *, prefer_wtype: bool = False) -> bool:
+        if prefer_wtype and self._wtype_type(text):
+            log("[PASTE] typed via wtype")
+            return True
+        partial = None
+        scan_codes_match = self._us_layout_active()
+        try:
+            if scan_codes_match and type_inject.type_text(text):
+                log("[PASTE] typed via app injector")
+                return True
+        except type_inject.PartialTypingError as error:
+            partial = error
+            # Complete only the unsent suffix, never duplicate the prefix.
+            text = text[error.typed:]
+            if not text:
+                return True
+        if scan_codes_match and self._ydotool_type(text):
+            log("[PASTE] typed via ydotool")
+            return True
+        if not prefer_wtype and self._wtype_type(text):
+            log("[PASTE] typed via wtype")
+            return True
+        log("[PASTE] direct typing failed, falling back to the clipboard")
+        delivered = self.copy_to_clipboard(text) and self._send_paste_keystroke()
+        if not delivered and partial is not None:
+            # Live typing must stop instead of offering the prefix again.
+            raise partial
+        return bool(delivered)
+
+    @staticmethod
+    def _us_layout_active() -> bool:
+        """Only use the US scan-code table when the compositor confirms it.
+
+        KDE publishes the active layout over D-Bus. Other desktops use
+        wtype's own keymap or the clipboard until their layout is known.
+        Query every chunk: the user can switch layouts during dictation.
+        """
+        if not shutil.which("gdbus"):
+            return False
+        command = ["gdbus", "call", "--session", "--dest", "org.kde.keyboard",
+                   "--object-path", "/Layouts", "--method"]
+        try:
+            index = subprocess.run(
+                [*command, "org.kde.KeyboardLayouts.getLayout"],
+                capture_output=True, text=True, timeout=0.5, check=False)
+            match = re.fullmatch(r"\(uint32 (\d+),\)\s*", index.stdout)
+            if index.returncode or not match:
+                return False
+            listed = subprocess.run(
+                [*command, "org.kde.KeyboardLayouts.getLayoutsList"],
+                capture_output=True, text=True, timeout=0.5, check=False)
+            if listed.returncode:
+                return False
+            layouts = ast.literal_eval(listed.stdout)[0]
+            layout = layouts[int(match[1])]
+            return layout[0] == "us" and layout[1] == ""
+        except (OSError, subprocess.TimeoutExpired, ValueError, SyntaxError,
+                IndexError, TypeError):
+            return False
+
     def _send_paste_keystroke(self) -> bool:
         if self._wtype_paste():
             log("[PASTE] clipboard paste keystroke sent with wtype")
             return True
+        if not self._us_layout_active():
+            log("[PASTE] keyboard layout unknown or non-US; text remains on clipboard")
+            return False
+        try:
+            if type_inject.paste_clipboard():
+                log("[PASTE] clipboard paste keystroke sent with app injector")
+                return True
+        except type_inject.PartialTypingError:
+            return True  # A second paste could duplicate the sent key-down.
         if self._ydotool_paste():
             log("[PASTE] clipboard paste keystroke sent with ydotool")
             return True
@@ -758,6 +792,10 @@ class SystemManager:
         return max(15.0, min(120.0, 5.0 + 0.04 * len(text)))
 
     def _ydotool_type(self, text: str) -> bool:
+        # ydotool's scan-code table cannot represent Unicode either. A zero
+        # exit status for smart punctuation must not bypass wtype/clipboard.
+        if not text.isascii():
+            return False
         self._release_modifiers()
         with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
             f.write(text)

@@ -21,6 +21,9 @@ if writing fails, the callers fall back to ydotool, wtype, or the clipboard.
 from __future__ import annotations
 
 import time
+import threading
+
+from .logging import log
 
 try:
     import evdev  # noqa: F401
@@ -62,6 +65,15 @@ _MODIFIER_KEYS = (ecodes.KEY_LEFTSHIFT,) if HAVE_EVDEV else ()
 
 _DEVICE = None
 _DEVICE_FAILED = False
+_DEVICE_LOCK = threading.RLock()
+
+
+class PartialTypingError(RuntimeError):
+    """Some character key-downs were sent; retrying the prefix is unsafe."""
+
+    def __init__(self, typed: int):
+        super().__init__(f"typing interrupted after {typed} characters")
+        self.typed = typed
 
 
 def _codes_for(char: str):
@@ -82,11 +94,16 @@ def _codes_for(char: str):
 
 def _device():
     """The long-lived injection keyboard, created on first use."""
+    with _DEVICE_LOCK:
+        return _device_locked()
+
+
+def _device_locked():
     global _DEVICE, _DEVICE_FAILED
     if _DEVICE is not None or _DEVICE_FAILED or not HAVE_EVDEV:
         return _DEVICE
     try:
-        keys = set(_PLAIN.values()) | {_MODIFIER_KEYS[0]}
+        keys = set(_PLAIN.values()) | {_MODIFIER_KEYS[0], ecodes.KEY_LEFTCTRL}
         for c in "abcdefghijklmnopqrstuvwxyz0123456789":
             keys.add(getattr(ecodes, f"KEY_{c.upper()}"))
         for base in _SHIFTED.values():
@@ -111,69 +128,99 @@ def _device():
 def type_text(text: str) -> bool:
     """Type `text` as keystrokes. False if nothing could be delivered.
 
-    Characters with no place on a US layout (smart quotes, em dashes, and
-    the like, which transcripts do contain) are dropped rather than allowed
-    to corrupt the sentence; the caller still has the clipboard for a faithful
-    copy. Modifiers are always released, even on failure, so a crashed run
-    cannot leave a key held down.
+    Refuse unsupported text before sending any keys so a Unicode-capable
+    fallback can deliver the whole sentence. Device writes and cleanup are
+    serialized with modifier releases.
     """
-    ui = _device()
-    if ui is None or not text:
+    if not text or not HAVE_EVDEV or not text.isascii():
         return False
-    shift = _MODIFIER_KEYS[0]
+    codes = [_codes_for(char) for char in text]
+    if any(code is None for code in codes):
+        return False
+    with _DEVICE_LOCK:
+        return _type_codes(codes)
+
+
+def paste_clipboard() -> bool:
+    """Send Ctrl+V through the same owned keyboard as direct typing."""
+    if not HAVE_EVDEV:
+        return False
+    with _DEVICE_LOCK:
+        return _type_codes([(ecodes.KEY_V, True)], ecodes.KEY_LEFTCTRL)
+
+
+def _type_codes(codes, modifier=None) -> bool:
+    global _DEVICE
+    ui = _device()
+    if ui is None:
+        return False
+    shift = modifier if modifier is not None else _MODIFIER_KEYS[0]
     typed = 0
+    held = set()
+    failed = True
     try:
         # Clear any modifier state left by a previous, interrupted run.
         for code in _MODIFIER_KEYS:
             ui.write(ecodes.EV_KEY, code, 0)
         ui.syn()
-        for char in text:
-            found = _codes_for(char)
-            if found is None:
-                continue
-            code, needs_shift = found
+        for code, needs_shift in codes:
             if needs_shift:
+                held.add(shift)
                 ui.write(ecodes.EV_KEY, shift, 1)
+            held.add(code)
             ui.write(ecodes.EV_KEY, code, 1)
+            typed += 1
             ui.write(ecodes.EV_KEY, code, 0)
+            held.discard(code)
             if needs_shift:
                 ui.write(ecodes.EV_KEY, shift, 0)
+                held.discard(shift)
             ui.syn()
-            typed += 1
             if typed % 32 == 0:
                 time.sleep(0.01)
-    except Exception:
-        for code in _MODIFIER_KEYS:
-            try:
-                ui.write(ecodes.EV_KEY, code, 0)
-                ui.syn()
-            except Exception:
-                pass
-        return typed > 0
+        failed = False
+    except Exception as error:
+        log(f"[PASTE] app injector failed after {typed}/{len(codes)} chars: {error}")
+        if typed:
+            raise PartialTypingError(typed) from error
+        return False
+    finally:
+        try:
+            for code in held:
+                try:
+                    ui.write(ecodes.EV_KEY, code, 0)
+                    ui.syn()
+                except Exception:
+                    pass
+        finally:
+            if failed:
+                # Removing a damaged device releases all of its keys even
+                # when writing a key-up failed. Never reuse it in that state.
+                try:
+                    ui.close()
+                except Exception:
+                    pass
+                finally:
+                    _DEVICE = None
     return typed > 0
 
 
 def release_modifiers() -> None:
-    """Release every modifier we know about, through our own device.
+    """Release this injector's Shift, without creating another keyboard.
 
-    KWin tracks modifier state globally, across keyboards, so a modifier
-    that the hotkey manager held and then dropped without a clean release
-    stays "pressed" in the compositor. The next ordinary keystroke then
-    arrives as a shortcut - mission control, lock screen, logout - instead
-    of text. Sending releases through a device we own (which KWin accepts)
-    clears that state without depending on the host injector, which may
-    itself be disabled. Only releases are ever sent, never presses, so the
-    worst case is a redundant key-up.
+    Hotkey modifiers belong to the listener's proxy and are swept there;
+    releases on an unrelated keyboard cannot repair that device's state.
     """
-    ui = _device()
-    if ui is None:
-        return
-    for code in _MODIFIER_KEYS:
+    with _DEVICE_LOCK:
+        ui = _DEVICE
+        if ui is None:
+            return
+        for code in _MODIFIER_KEYS:
+            try:
+                ui.write(ecodes.EV_KEY, code, 0)
+            except Exception:
+                pass
         try:
-            ui.write(ecodes.EV_KEY, code, 0)
+            ui.syn()
         except Exception:
             pass
-    try:
-        ui.syn()
-    except Exception:
-        pass

@@ -8,6 +8,7 @@ import tempfile
 import time
 
 from .config import Config
+from . import type_inject
 from .logging import log
 
 IS_WINDOWS = sys.platform == "win32"
@@ -353,6 +354,12 @@ class SystemManager:
 
                 sanitized = text.replace('\n', ' ')
 
+                # Own device first: ydotool can fail silently (its device
+                # ignored by the compositor, exit status still 0), and the
+                # words then appear nowhere with nothing in the log.
+                if type_inject.type_text(sanitized):
+                    return True
+
                 if self._ydotool_type(sanitized):
                     return True
 
@@ -408,7 +415,9 @@ class SystemManager:
                 return False
             return system_win.type_text(sanitized)
         if self._is_wayland():
-            if self._ydotool_type(sanitized) or self._wtype_type(sanitized):
+            if (type_inject.type_text(sanitized)
+                    or self._ydotool_type(sanitized)
+                    or self._wtype_type(sanitized)):
                 return True
             # Live finalize used to stop here. A multi-sentence tail (~500
             # chars) timed out ydotool's old 15s budget on KDE, wtype is

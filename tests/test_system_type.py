@@ -28,6 +28,7 @@ def test_type_text_falls_back_to_clipboard_when_direct_type_fails(
     monkeypatch.setattr(manager, "_is_wayland", lambda: True)
     monkeypatch.setattr(manager, "_ydotool_type", lambda text: False)
     monkeypatch.setattr(manager, "_wtype_type", lambda text: False)
+    monkeypatch.setattr("whisper_flow.system.type_inject.type_text", lambda text: False)
 
     copied = []
     monkeypatch.setattr(
@@ -44,6 +45,7 @@ def test_type_text_does_not_touch_clipboard_when_ydotool_works(
     monkeypatch.setattr("whisper_flow.system.IS_WINDOWS", False)
     manager = SystemManager(Config(config_dir=tmp_path))
     monkeypatch.setattr(manager, "_is_wayland", lambda: True)
+    monkeypatch.setattr("whisper_flow.system.type_inject.type_text", lambda text: False)
     monkeypatch.setattr(manager, "_ydotool_type", lambda text: True)
     clipboard = Mock(return_value=True)
     monkeypatch.setattr(manager, "copy_to_clipboard", clipboard)
@@ -59,6 +61,7 @@ def test_wayland_paste_waits_until_saved_window_is_really_active(
     manager._saved_window = "target"
     monkeypatch.setattr(manager, "_is_wayland", lambda: True)
     monkeypatch.setattr(manager, "_kdotool_available", lambda: True)
+    monkeypatch.setattr("whisper_flow.system.type_inject.type_text", lambda text: False)
     active = iter(("hud", "hud", "target"))
     monkeypatch.setattr(manager, "_get_active_window", lambda: next(active))
     activate = Mock(return_value=True)
@@ -88,6 +91,7 @@ def test_wayland_paste_preserves_text_if_focus_never_reaches_target(
     monkeypatch.setattr(manager, "_kdotool_available", lambda: True)
     monkeypatch.setattr(
         manager, "_activate_window_and_wait", lambda _target: False)
+    monkeypatch.setattr("whisper_flow.system.type_inject.type_text", lambda text: False)
     typed = Mock(return_value=True)
     copied = Mock(return_value=True)
     monkeypatch.setattr(manager, "_ydotool_type", typed)
@@ -110,6 +114,7 @@ def test_wayland_paste_falls_back_to_direct_type_if_clipboard_paste_fails(
     monkeypatch.setattr(manager, "_send_paste_keystroke", lambda: False)
     wtype = Mock(return_value=True)
     ydotool = Mock(return_value=True)
+    monkeypatch.setattr("whisper_flow.system.type_inject.type_text", lambda text: False)
     monkeypatch.setattr(manager, "_wtype_type", wtype)
     monkeypatch.setattr(manager, "_ydotool_type", ydotool)
 
@@ -140,6 +145,7 @@ def test_wayland_modifier_only_alt_repairs_focus_before_copy_and_paste(
     monkeypatch.setattr(manager, "_is_wayland", lambda: True)
     monkeypatch.setattr(manager, "_kdotool_available", lambda: True)
     monkeypatch.setattr(manager, "_activate_window_and_wait", lambda _target: True)
+    monkeypatch.setattr("whisper_flow.system.type_inject.type_text", lambda text: False)
 
     events = []
     monkeypatch.setattr(
@@ -179,6 +185,7 @@ def test_wayland_x11_target_prefers_xdotool_paste(
     monkeypatch.setattr(manager, "_kdotool_available", lambda: True)
     monkeypatch.setattr(manager, "_activate_window_and_wait", lambda _target: True)
     monkeypatch.setattr(manager, "_repair_modifier_only_alt_focus", lambda: True)
+    monkeypatch.setattr("whisper_flow.system.type_inject.type_text", lambda text: False)
     monkeypatch.setattr(manager, "copy_to_clipboard", lambda _text: True)
     x11_paste = Mock(return_value=True)
     generic_paste = Mock(return_value=True)

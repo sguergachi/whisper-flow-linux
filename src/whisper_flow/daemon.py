@@ -16,6 +16,10 @@ from pathlib import Path
 from PIL import Image
 
 from . import backend as backend_module
+try:
+    from . import type_inject
+except Exception:
+    type_inject = None
 from . import icon
 from . import updater
 from .icon import ICON_IDLE, ICON_RECORDING
@@ -729,6 +733,13 @@ class WhisperFlowDaemon:
                 # drains the key is long released, so the recording would run
                 # until the max-duration watchdog kills it.
                 log(f"[DAEMON] System busy, dropping {mode} request")
+                # Do not leave the compositor holding Super/Alt: a later key
+                # would arrive as a shortcut (mission control, lock, logout).
+                if type_inject is not None:
+                    try:
+                        type_inject.release_modifiers()
+                    except Exception as e:
+                        log(f"[DAEMON] modifier release failed: {e}")
                 self.notify("⏳ Still working on the last one")
                 return
             # Queue the request
@@ -786,6 +797,14 @@ class WhisperFlowDaemon:
             log(f"[DAEMON] Processing lock released for mode: {mode}")
             self.is_processing = False
             self.recording_start_time = None
+            # Release any modifier the hotkey manager may still hold, so the
+            # next keystroke is not read as a shortcut (mission control, lock,
+            # logout). Best-effort and bounded inside the listener; never
+            # blocks the finish path.
+            try:
+                self.hotkey_manager.sweep_input()
+            except Exception as e:
+                log(f"[DAEMON] modifier sweep failed: {e}")
             # Now there is a transcript, or a failure. Either way the waiting
             # is over and the overlay has said all it can.
             self._take_down_overlay()

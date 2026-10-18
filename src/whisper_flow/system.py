@@ -8,6 +8,7 @@ import tempfile
 import time
 
 from .config import Config
+from . import type_inject
 from .logging import log
 
 IS_WINDOWS = sys.platform == "win32"
@@ -500,6 +501,14 @@ class SystemManager:
 
                 sanitized = text.replace('\n', ' ')
 
+                # Own device first, for the same reason as in type_text: a
+                # host injector that fails silently must not eat the paste.
+                try:
+                    if type_inject.type_text(sanitized):
+                        return True
+                except Exception as e:
+                    log(f"[PASTE] app injector failed: {e}")
+
                 if (target_window and self._kdotool_available()
                         and not self._activate_window_and_wait(target_window)):
                     self.copy_to_clipboard(sanitized)
@@ -569,6 +578,19 @@ class SystemManager:
                 return False
             return system_win.type_text(sanitized)
         if self._is_wayland():
+            # Release any modifier the hotkey path may still hold first, so a
+            # keystroke cannot arrive as a shortcut (mission control, lock,
+            # logout). Only releases are sent, so the worst case is a
+            # redundant key-up.
+            try:
+                type_inject.release_modifiers()
+            except Exception:
+                pass
+            # The app's own injector runs first: ydotool can fail silently
+            # (its device ignored by the compositor, exit status still 0), and
+            # the words then appear nowhere with nothing in the log.
+            if type_inject.type_text(sanitized):
+                return True
             if self._ydotool_type(sanitized) or self._wtype_type(sanitized):
                 return True
             # Live finalize used to stop here. A multi-sentence tail (~500

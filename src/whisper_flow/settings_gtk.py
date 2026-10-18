@@ -3096,7 +3096,13 @@ def main() -> int:
                 # Realized now, so the surface, its HWND, the CSS and the
                 # first style pass are all done before the click. What is
                 # left for the click is a map.
+                # Realize creates the surface but must not show it: on some
+                # compositors a realized-but-not-hidden window flashes on
+                # screen at startup, which reads as a "settings prompt"
+                # popping up unasked.
+                window.set_visible(False)
                 window.realize()
+                window.hide()
                 _mark("built and waiting for the click")
                 threading.Thread(
                     target=_command_loop, args=(window,), daemon=True,

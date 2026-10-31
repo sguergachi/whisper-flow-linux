@@ -11,6 +11,11 @@ Text is inserted without the keyboard when the focused control allows it
 SendInput batch: spoil, release modifiers, Unicode characters, restore the
 hotkey keys, spoil again. One batch means nothing can land between those
 steps.
+
+Super is the exception to "the keys are still held": the hotkey listener
+takes it out of the OS's key state at the press (strip_super) and never
+presses it back, so every character below is plain text rather than a shell
+combination. See strip_super.
 """
 
 import contextlib
@@ -40,10 +45,12 @@ VK_ESCAPE = 0x1B
 # documented as an ordinary unassigned key, and can be ignored by the shell.
 VK_MENU_MASK = 0xE8
 MODIFIERS = (VK_CONTROL, VK_MENU, VK_SHIFT, VK_LWIN, VK_RWIN)
-# Cleared for typing. Super is deliberately excluded: KEYUP+KEYDOWN of the
-# Windows key mid-hold is what arms the Start menu for the next release
-# (ours or the user's), which then steals the foreground and the topmost
-# band from the recording overlay. KEYEVENTF_UNICODE does not need Super up.
+# Cleared for typing. Super is deliberately excluded here: the hotkey
+# listener takes it out of the key state once, at the press
+# (strip_super below), and it is never pressed back. Releasing and
+# re-pressing it per word is what arms the Start menu for the next release.
+# KEYEVENTF_UNICODE does not need Super up anyway - once it is out of the
+# state table, the characters are plain text to the shell.
 CLEAR_FOR_TYPE = (VK_CONTROL, VK_MENU, VK_SHIFT)
 WIN_KEYS = (VK_LWIN, VK_RWIN)
 
@@ -514,6 +521,44 @@ def spoil_start_menu() -> None:
     """
     _note("sent the no-op key on its own")
     _send(_spoil_events())
+
+
+def strip_super() -> tuple:
+    """Take every held Windows key out of the OS's key state, and leave it out.
+
+    Live dictation types while the push-to-talk keys are physically down, and
+    a held Windows key turns every keystroke into a shell combination instead
+    of text: Win+Down minimises the focused window, Win+D shows the desktop,
+    Win+E opens Explorer. That is the "things happen while I talk" report,
+    and no amount of spoiling the Start menu prevents it - the key is still
+    down for every character.
+
+    So it comes out here, once, at the press, and is never pressed back:
+    a synthetic Windows-key press is a fresh press, and its release is what
+    opens Start under the live words. The listener keeps the chord satisfied
+    on its own while the rest of it is held (hotkey_win's virtual hold).
+
+    The release is wrapped in the no-op key, because a Windows-key release
+    with no key in between is a lone tap and opens Start by itself.
+
+    Returns the Windows keys that were down, which is empty when there was
+    nothing to do or SendInput refused the batch.
+    """
+    down = tuple(vk for vk in WIN_KEYS
+                 if _user32.GetAsyncKeyState(vk) & HELD_MASK)
+    if not down:
+        return ()
+    events = [_key_event(VK_MENU_MASK, 0, 0)]
+    events += [_key_event(vk, 0, KEYEVENTF_KEYUP) for vk in down]
+    events += [_key_event(VK_MENU_MASK, 0, KEYEVENTF_KEYUP)]
+    if not _send(events):
+        log("[WIN] SendInput refused the Windows-key release; it stays down "
+            "for the hold")
+        return ()
+    _note("took the Windows key out of the hold")
+    log(f"[WIN] released the Windows key for the hold "
+        f"({len(down)} key(s)); it is not pressed back")
+    return down
 
 
 @contextlib.contextmanager

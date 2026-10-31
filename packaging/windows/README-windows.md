@@ -2,7 +2,7 @@
 
 **Requires Windows 11 22H2 (build 22621) or later.**
 
-Run the installer, then hold **Ctrl+Alt**, talk, and let go.
+Run the installer, then hold **Win+Alt**, talk, and let go.
 
 There is one executable, `whisper-flow.exe`. It runs the tray app; it also
 provides the recording overlay, which it launches for itself. The words are
@@ -24,7 +24,7 @@ It lives in the notification area — there is no main window.
 # Point at your own server, or leave blank for the managed one
 WHISPER_FLOW_LOCAL_WHISPER_URL=http://127.0.0.1:8082
 
-WHISPER_FLOW_HOTKEY_TRANSCRIBE=ctrl+alt
+WHISPER_FLOW_HOTKEY_TRANSCRIBE=super+alt
 WHISPER_FLOW_LIVE_TRANSCRIPTION=true
 
 # Set to false if the notifications get in the way
@@ -82,10 +82,15 @@ security policies; this design does not disable or alter them.
   while another thread holds it Windows blocks *all* system input waiting —
   the mouse and keyboard freeze. Polling key state cannot stall anything and
   cannot swallow a keystroke.
+* **The Windows key is taken out of the hold before anything is typed.**
+  A held Win turns every injected character into a shell combination —
+  Win+Down minimises the window, Win+D shows the desktop — so holding
+  Win+Alt to dictate used to make the desktop do things on its own. The
+  listener releases Win once, at the press, inside the no-op keystroke that
+  stops Start opening, and never presses it back. It reads the end of the
+  hold from the other key in the chord.
 * **The overlay is composited by DWM** — acrylic backdrop, rounded corners,
   border — which is why the build floor is 22H2.
-* **Ctrl+Alt is the default, not Super.** Windows reserves most Win
-  combinations and a bare tap opens the Start menu.
 
 ## Known limitations
 

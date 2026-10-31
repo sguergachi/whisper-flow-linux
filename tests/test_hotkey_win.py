@@ -131,7 +131,7 @@ def test_escape_fires_even_during_a_held_combination(listener):
 
 
 
-def _fake_system_win(monkeypatch, spoil, dismiss=None):
+def _fake_system_win(monkeypatch, spoil, dismiss=None, strip=None):
     """Replace whisper_flow.system_win for `from . import system_win`.
 
     Patching sys.modules alone is not enough: once the package has the
@@ -146,6 +146,7 @@ def _fake_system_win(monkeypatch, spoil, dismiss=None):
     fake = types.ModuleType("whisper_flow.system_win")
     fake.spoil_start_menu = spoil
     fake.dismiss_start_menu = dismiss or (lambda: False)
+    fake.strip_super = strip or (lambda: ())
     monkeypatch.setitem(sys.modules, "whisper_flow.system_win", fake)
     monkeypatch.setattr(whisper_flow, "system_win", fake, raising=False)
     return fake
@@ -412,3 +413,212 @@ def test_closing_it_does_not_cancel_the_dictation(listener, monkeypatch):
         fired.append(listener._callbacks.get_nowait()[0])
     assert "escape" not in fired, (
         "the Escape that closed the Start menu cancelled the dictation")
+
+
+# ------------------------------------ the Windows key while words are typed
+def test_a_super_chord_releases_the_windows_key_at_the_press(
+        listener, monkeypatch):
+    """A held Windows key turns live text into shell shortcuts.
+
+    Win+Down minimises the focused window, Win+D shows the desktop: every
+    character the app types while Super is still down is read as a shell
+    combination instead of text. The press is the only moment it can be
+    released without a re-press to follow.
+    """
+    module = listener._module
+    stripped = []
+    _fake_system_win(
+        monkeypatch, lambda: None,
+        strip=lambda: (stripped.append(1), (module.NAME_TO_VK["super"],))[1])
+
+    listener.register_hotkey("transcribe", "super+alt", lambda: None)
+    down = {module.NAME_TO_VK["super"], module.NAME_TO_VK["alt"]}
+    listener._check_bindings(down, rising=True)
+
+    assert stripped == [1], "the Windows key was left down for the whole hold"
+    # The poll must not read the release we just sent as the user letting go.
+    assert module.NAME_TO_VK["super"] in listener._held()
+
+
+def test_the_release_is_only_sent_once_per_hold(listener, monkeypatch):
+    """A release on every poll would be a keystroke storm, not a fix."""
+    module = listener._module
+    stripped = []
+    _fake_system_win(
+        monkeypatch, lambda: None,
+        strip=lambda: (stripped.append(1), (module.NAME_TO_VK["super"],))[1])
+
+    listener.register_hotkey("transcribe", "super+alt", lambda: None)
+    down = {module.NAME_TO_VK["super"], module.NAME_TO_VK["alt"]}
+    for _ in range(5):
+        listener._check_bindings(down, rising=True)
+    assert stripped == [1]
+
+
+def test_the_chord_ends_when_the_other_key_comes_up(listener, monkeypatch):
+    """The release is read from the rest of the chord, not from Super.
+
+    GetAsyncKeyState cannot tell the user's Windows-key release from the one
+    the app sent, so a stripped Super would keep the recording running
+    forever if it were the only key holding the chord together.
+    """
+    module = listener._module
+    super_vk = module.NAME_TO_VK["super"]
+    _fake_system_win(monkeypatch, lambda: None, strip=lambda: (super_vk,))
+
+    listener.register_hotkey("transcribe", "super+alt", lambda: None,
+                             lambda: None)
+    listener._check_bindings({super_vk, module.NAME_TO_VK["alt"]},
+                             rising=True)
+
+    listener._check_bindings({super_vk}, rising=False)
+
+    # The release callback runs on the dispatch thread, which no test starts.
+    queued = []
+    while not listener._callbacks.empty():
+        name, kind, cb = listener._callbacks.get_nowait()
+        if kind == "release":
+            queued.append(name)
+            cb()
+    assert queued == ["transcribe"], "letting go of Alt did not end the recording"
+    assert not listener._synthetic_down, "the virtual hold outlived the chord"
+
+
+def test_super_coming_back_is_taken_out_again(listener, monkeypatch):
+    """The key chatters, or is pressed again, during the hold.
+
+    Until it is out again, every character is a shell shortcut. Releasing it
+    once at the press is not enough for a key that comes back.
+    """
+    module = listener._module
+    stripped = []
+    _fake_system_win(
+        monkeypatch, lambda: None,
+        strip=lambda: (stripped.append(1), (module.NAME_TO_VK["super"],))[1])
+
+    listener.register_hotkey("transcribe", "super+alt", lambda: None)
+    down = {module.NAME_TO_VK["super"], module.NAME_TO_VK["alt"]}
+    listener._check_bindings(down, rising=True)
+
+    listener._keep_super_out({module.NAME_TO_VK["alt"]})     # it stays out
+    listener._keep_super_out(down)                          # ...then comes back
+    assert stripped == [1, 1], "Super was left down after coming back"
+
+    listener._keep_super_out(down)
+    listener._keep_super_out(down)
+    assert stripped == [1, 1], (
+        "a state table that keeps reporting the key down is retried on every "
+        "poll, which is sixty keystroke pairs a second into the target app")
+
+
+def test_a_super_only_chord_is_left_alone(listener, monkeypatch):
+    """With nothing else in the chord there is no release left to read.
+
+    Releasing the only key would be a recording that nothing can end, which
+    is worse than the shortcuts it avoids.
+    """
+    module = listener._module
+    stripped = []
+    _fake_system_win(
+        monkeypatch, lambda: None,
+        strip=lambda: (stripped.append(1), (module.NAME_TO_VK["super"],))[1])
+
+    listener.register_hotkey("transcribe", "super", lambda: None)
+    listener._check_bindings({module.NAME_TO_VK["super"]}, rising=True)
+    assert stripped == []
+
+
+def test_a_failed_release_does_not_stop_the_dictation(listener, monkeypatch):
+    """SendInput can be refused. The recording still has to start."""
+    module = listener._module
+    def explode():
+        raise OSError("SendInput refused")
+
+    _fake_system_win(monkeypatch, lambda: None, strip=explode)
+    fired = []
+    listener.register_hotkey("transcribe", "super+alt",
+                             lambda: fired.append(1))
+
+    listener._check_bindings({module.NAME_TO_VK["super"],
+                              module.NAME_TO_VK["alt"]}, rising=True)
+    name, kind, cb = listener._callbacks.get_nowait()
+    cb()
+
+    assert fired == [1]
+    assert not listener._synthetic_down
+
+
+def test_no_keystrokes_are_spent_once_super_is_out_of_the_hold(
+        listener, monkeypatch):
+    """The key that the cadence exists to spoil is no longer down.
+
+    Every one of those keystrokes goes into the window being dictated into,
+    ten times a second, for as long as the chord is held - which is exactly
+    the kind of thing the user reports as the desktop doing things on its
+    own.
+    """
+    module = listener._module
+    super_vk = module.NAME_TO_VK["super"]
+    calls = []
+    _fake_system_win(monkeypatch, lambda: calls.append(1),
+                     strip=lambda: (super_vk,))
+
+    listener.register_hotkey("transcribe", "super+alt", lambda: None)
+    down = {super_vk, module.NAME_TO_VK["alt"]}
+    listener._check_bindings(down, rising=True)
+    calls.clear()
+
+    for _ in range(3):
+        listener._keep_start_menu_spoiled(down)
+
+    assert calls == [], "the menu was disarmed again with Super already up"
+
+
+def test_the_hold_survives_the_windows_key_leaving_and_ends_on_alt(
+        listener, monkeypatch):
+    """The wiring, not the methods: poll, press, stripped hold, and release.
+
+    The whole risk in taking Super out of the state table is that the poll
+    then reads the chord as released and stops the recording at the first
+    word. It must keep the press alive until the *other* key comes up.
+    """
+    import threading
+    import time
+
+    module = listener._module
+    super_vk = module.NAME_TO_VK["super"]
+    alt_vk = module.NAME_TO_VK["alt"]
+    stripped = []
+
+    def strip():
+        # SendInput takes the key out of the state table, so the next poll
+        # reads it as up - as Windows does.
+        listener._held_set.discard(super_vk)
+        stripped.append(1)
+        return (super_vk,)
+
+    _fake_system_win(monkeypatch, lambda: None, strip=strip)
+    listener.register_hotkey("transcribe", "super+alt",
+                             lambda: None, lambda: None)
+    listener._held_set.update({super_vk, alt_vk})
+
+    listener._running = True
+    thread = threading.Thread(target=listener._poll_loop, daemon=True)
+    thread.start()
+    time.sleep(0.12)
+    assert stripped == [1], "the Windows key was not released at the press"
+    assert listener._press_triggered == {"transcribe"}, (
+        "the recording ended when the Windows key left the state table")
+
+    listener._held_set.discard(alt_vk)      # the user lets go
+    time.sleep(0.12)
+    listener._running = False
+    thread.join(timeout=2)
+
+    kinds = []
+    while not listener._callbacks.empty():
+        name, kind, cb = listener._callbacks.get_nowait()
+        kinds.append(kind)
+        cb()
+    assert "press" in kinds and "release" in kinds
+    assert not listener._synthetic_down

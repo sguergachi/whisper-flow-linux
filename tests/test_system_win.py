@@ -687,3 +687,72 @@ def test_insert_via_messages_uses_replace_sel_on_edit(system_win, monkeypatch):
     assert system_win._insert_via_messages("hello") is True
     _ago, what = system_win.last_injection()
     assert "EM_REPLACESEL" in what
+
+
+# ------------------------------------- the Windows key, out of the hold
+def test_the_windows_key_is_taken_out_of_the_hold(system_win, monkeypatch):
+    """A held Windows key turns every typed character into a shell shortcut.
+
+    Win+Down minimises the focused window, Win+D shows the desktop. Live
+    dictation types while the chord is physically held, so the key has to
+    leave the state table - once, at the press - or the words never reach
+    the window and the desktop starts doing things on its own.
+    """
+    held = {system_win.VK_LWIN, system_win.VK_RWIN}
+    monkeypatch.setattr(
+        system_win._user32, "GetAsyncKeyState",
+        lambda vk: -0x8000 if vk in held else 0)
+    batches = []
+    monkeypatch.setattr(system_win, "_send",
+                        lambda events: (batches.append(list(events)), True)[1])
+
+    released = system_win.strip_super()
+
+    assert set(released) == held
+    assert len(batches) == 1, "the release must be one atomic batch"
+    batch = batches[0]
+    vks = [event.union.ki.wVk for event in batch]
+    assert vks == [system_win.VK_MENU_MASK, system_win.VK_LWIN,
+                   system_win.VK_RWIN, system_win.VK_MENU_MASK], (
+        "the no-op key must bracket the release, or the Windows-key release "
+        "is a lone tap and opens Start")
+    assert batch[0].union.ki.dwFlags == 0
+    assert batch[-1].union.ki.dwFlags & system_win.KEYEVENTF_KEYUP
+    for event in batch[1:-1]:
+        assert event.union.ki.dwFlags & system_win.KEYEVENTF_KEYUP, (
+            "the Windows key was pressed, not released")
+    assert not system_win._injected_down, (
+        "it is never pressed back, so there is nothing of ours to release")
+
+
+def test_nothing_is_released_when_the_windows_key_is_not_down(
+        system_win, monkeypatch):
+    monkeypatch.setattr(system_win._user32, "GetAsyncKeyState", lambda vk: 0)
+    batches = []
+    monkeypatch.setattr(system_win, "_send",
+                        lambda events: (batches.append(list(events)), True)[1])
+
+    assert system_win.strip_super() == ()
+    assert batches == []
+
+
+def test_a_refused_release_does_not_claim_the_key_is_up(system_win, monkeypatch):
+    """The listener must not fake a hold for a release that never happened."""
+    monkeypatch.setattr(
+        system_win._user32, "GetAsyncKeyState",
+        lambda vk: -0x8000 if vk == system_win.VK_LWIN else 0)
+    monkeypatch.setattr(system_win, "_send", lambda events: False)
+
+    assert system_win.strip_super() == ()
+
+
+def test_the_last_injection_says_the_windows_key_was_released(
+        system_win, monkeypatch):
+    monkeypatch.setattr(
+        system_win._user32, "GetAsyncKeyState",
+        lambda vk: -0x8000 if vk == system_win.VK_LWIN else 0)
+    monkeypatch.setattr(system_win, "_send", lambda events: True)
+
+    system_win.strip_super()
+    _ago, what = system_win.last_injection()
+    assert "Windows key" in what

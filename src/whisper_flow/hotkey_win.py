@@ -45,6 +45,11 @@ for _d in "0123456789":
 for _n in range(1, 25):
     NAME_TO_VK[f"f{_n}"] = 0x6F + _n
 
+# The right-hand Windows key. Windows has no combined code for the Windows
+# key the way it has 0x11/0x12/0x10 for the others, so it is aliased onto the
+# left one in VK_ALIASES below.
+VK_RWIN = 0x5C
+
 POLL_INTERVAL = 0.016   # ~60Hz; a tap shorter than this can be missed
 HELD_MASK = 0x8000      # high bit of GetAsyncKeyState means currently down
 
@@ -59,6 +64,21 @@ SPOIL_INTERVAL = 0.1
 # Start menu that opened anyway. See _close_start_menu_if_it_opened.
 START_MENU_CHECK = 0.2
 START_RELEASE_GRACE = 0.75
+
+# The Windows key cannot stay down while the app types. Every keystroke
+# injected while it is down is read as a shell combination rather than text:
+# Win+Down minimises the focused window, Win+D shows the desktop, Win+E
+# opens Explorer. Push-to-talk on Super+Alt therefore takes the Windows key
+# out of the OS's key state once, at the press, and leaves it out for the
+# whole hold. See _take_super_out_of_the_hold.
+#
+# The release is then inferred from the rest of the chord, because once the
+# Windows key has been released GetAsyncKeyState cannot tell the user's
+# key-up from the one we sent. A Super-only chord has no rest of the chord
+# to watch, so it is left alone: the alternative is a recording that nothing
+# can end.
+SUPER_VK = NAME_TO_VK["super"]
+WIN_KEYS = frozenset((SUPER_VK, VK_RWIN))
 
 # While this app is injecting keystrokes of its own, the key state is not the
 # user's and must not be read as if it were.
@@ -116,7 +136,6 @@ def _suppressed() -> bool:
 # are the combined codes and already report either side. Windows has no
 # combined code for the Windows key, so without this the right-hand one
 # silently did nothing.
-VK_RWIN = 0x5C
 VK_ALIASES = {VK_RWIN: NAME_TO_VK["super"]}
 
 # The listener currently running, so the typing path can ask what the user is
@@ -163,6 +182,13 @@ class WinHotkeyListener:
         self._user32 = ctypes.WinDLL("user32", use_last_error=True)
         self._user32.GetAsyncKeyState.restype = ctypes.c_short
         self._user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+        # Keys of a held chord that the app has released in the OS's key
+        # state on the user's behalf. They keep the chord satisfied until
+        # the rest of it comes up. See _take_super_out_of_the_hold.
+        self._synthetic_down = set()
+        # Whether a released key has been seen up since, which is the only
+        # thing that makes a second release worth sending.
+        self._super_came_back = False
 
     @staticmethod
     def parse_keys(key_string: str) -> frozenset:
@@ -227,7 +253,7 @@ class WinHotkeyListener:
         for vk in self._watched:
             if self._user32.GetAsyncKeyState(vk) & HELD_MASK:
                 down.add(VK_ALIASES.get(vk, vk))
-        return down
+        return down | self._synthetic_down
 
     @property
     def _watched(self):
@@ -253,8 +279,10 @@ class WinHotkeyListener:
                 if _suppressed():
                     time.sleep(self._poll_interval)
                     continue
-                down = {VK_ALIASES.get(vk, vk)
-                        for vk in watched if get(vk) & HELD_MASK}
+                physical = {VK_ALIASES.get(vk, vk)
+                            for vk in watched if get(vk) & HELD_MASK}
+                self._keep_super_out(physical)
+                down = physical | self._synthetic_down
                 super_vk = NAME_TO_VK["super"]
                 if super_vk in down and super_vk not in previous:
                     # A new Windows-key press belongs to the user. Do not
@@ -321,12 +349,27 @@ class WinHotkeyListener:
         while the user is merely holding the Windows key themselves, whose
         Start menu is theirs to open.
 
+        Not at all once the Windows key has been taken out of the state
+        table for the hold: then there is no Super press left to arm
+        anything, the release that took it out is already wrapped in this
+        same no-op key, and a key that comes back is released again the same
+        way. See _take_super_out_of_the_hold.
+
         The poll loop skips this entirely while text is being injected, which
         is where the typing path does its own disarming.
         """
         keys = self.triggered_keys()
         super_vk = NAME_TO_VK["super"]
         if super_vk not in keys or super_vk not in down:
+            return
+        if self._synthetic_down:
+            # The Windows key is out of the state table (see
+            # _take_super_out_of_the_hold), so there is nothing left for
+            # Windows to arm Start with. The release that took it out was
+            # wrapped in the no-op key, and a key that comes back is
+            # released again - also wrapped. Sending the keystroke on a
+            # cadence here would only put ten unnecessary key events a
+            # second into whatever the user is dictating text into.
             return
         now = time.monotonic()
         if now < self._spoil_due:
@@ -386,16 +429,89 @@ class WinHotkeyListener:
                 if name not in self._press_triggered and rising:
                     self._press_triggered.add(name)
                     self._spoil_start_menu_if_needed(_keys)
+                    # Before the recording starts, not before the first word
+                    # is typed: from here on the user is going to be speaking
+                    # into an application with the chord still held.
+                    self._take_super_out_of_the_hold(_keys)
                     if cb_press:
                         self._callbacks.put((name, "press", cb_press))
             elif name in self._press_triggered:
                 self._press_triggered.discard(name)
+                if not self._press_triggered:
+                    # Nothing of ours is firing any more, so there is no
+                    # chord left to keep the released Windows key held for.
+                    self._synthetic_down.clear()
+                    self._super_came_back = False
                 if NAME_TO_VK["super"] in _keys:
                     # Start opens on release, precisely when triggered_keys
                     # stops containing Super. Keep the check alive briefly.
                     self._start_release_until = time.monotonic() + START_RELEASE_GRACE
                 if cb_release:
                     self._callbacks.put((name, "release", cb_release))
+
+    def _take_super_out_of_the_hold(self, keys) -> None:
+        """Release the Windows key for the rest of a Super chord's hold.
+
+        A held Windows key turns every keystroke into a shell combination:
+        the text the app types goes to the shell's shortcut handling instead
+        of the focused window, which minimises windows, opens Start, and
+        switches desktops during a dictation. Releasing it once, here, is
+        the only place it can be done without a re-press to follow - and a
+        synthetic re-press is itself a fresh press whose release opens Start.
+
+        Only for a chord with another key in it. The user's own release is
+        then read from that other key, because GetAsyncKeyState cannot tell
+        their key-up from ours once the Windows key is out of the table. A
+        Super-only chord is left alone: it would be a recording that nothing
+        can end.
+
+        Best effort. If the release fails the dictation still runs, exactly
+        as it did before this existed.
+        """
+        if not (keys - WIN_KEYS):
+            return
+        self._release_super()
+
+    def _keep_super_out(self, physical: set) -> None:
+        """Take Super back out if it came back while the chord is held.
+
+        Once released, the Windows key is out of the state table, so it can
+        only reappear if the user pressed it again or the key chattered.
+        Either way the chord is still held and text is still being typed,
+        and from that moment every character is a shell shortcut again - so
+        it is released again.
+
+        Only once it has actually been seen up in between. Releasing on every
+        poll that still reports it down would be sixty keystroke pairs a
+        second into the window being dictated into, and it would buy nothing:
+        a release that the state table ignored is not going to start working
+        on the next poll.
+        """
+        if not self._synthetic_down:
+            return
+        if SUPER_VK not in physical:
+            self._super_came_back = True
+            return
+        if not self._super_came_back:
+            return
+        self._release_super()
+
+    def _release_super(self) -> None:
+        """Take every held Windows key out of the OS's key state, once."""
+        try:
+            from . import system_win
+
+            released = system_win.strip_super()
+        except Exception as e:
+            log.debug("could not release the Windows key for the hold: %s", e)
+            return
+        if released:
+            # Keep the chord looked held until the rest of it comes up.
+            self._synthetic_down.add(SUPER_VK)
+            # Nothing to take out again until it has been seen up once.
+            self._super_came_back = False
+            log.info("[HOTKEY] released the Windows key for the hold; "
+                     "the chord stays held until the other keys are let go")
 
     def stop(self):
         global _active_listener
@@ -410,3 +526,5 @@ class WinHotkeyListener:
             self._dispatch_thread.join(timeout=2)
             self._dispatch_thread = None
         self._press_triggered.clear()
+        self._synthetic_down.clear()
+        self._super_came_back = False
